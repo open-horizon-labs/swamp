@@ -417,6 +417,8 @@ pub struct UnownedRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniqueEstimate {
+    #[serde(default)]
+    pub sharing: Option<crate::sharing::SharingSummary>,
     /// Allocated regular-file bytes across observed roots and units, excluding
     /// Docker. Deduplicated by device/inode, not shared filesystem extents.
     /// Not a sum of the per-root charges, and not a reclaimability estimate.
@@ -2635,8 +2637,13 @@ pub fn observe_scope(
     // unchanged roots to recover sharing identities that folded rows discard.
     let prior_unique = store_dir
         .and_then(|dir| crate::growth::read_run_row(dir, &scope_snapshot_key(scope)))
-        .and_then(|r| r.unique_bytes.zip(r.unique_reconciled_at))
-        .map(|(bytes, reconciled_at)| UniqueEstimate {
+        .and_then(|r| {
+            r.unique_bytes
+                .zip(r.unique_reconciled_at)
+                .map(|(bytes, at)| (bytes, at, r.sharing))
+        })
+        .map(|(bytes, reconciled_at, sharing)| UniqueEstimate {
+            sharing,
             bytes,
             reconciled_at,
             needs_reconciliation: true,
@@ -2673,8 +2680,24 @@ pub fn observe_scope(
             .iter()
             .map(|p| PathBuf::from(&p.pattern))
             .collect();
-        if let Some(bytes) = crate::walk::reconcile_unique_bytes(&paths, &excluded) {
+        let mut containers = paths.clone();
+        for project in &merged.projects {
+            for worktree in &project.worktrees {
+                containers.push(worktree.path.clone());
+                containers.extend(
+                    worktree
+                        .artifacts
+                        .iter()
+                        .filter(|a| !a.source.tool.starts_with("docker"))
+                        .map(|a| a.path.clone()),
+                );
+            }
+        }
+        if let Some((bytes, sharing)) =
+            crate::walk::reconcile_shared_bytes(&paths, &excluded, &containers)
+        {
             merged.reconciliation.unique_estimate = Some(UniqueEstimate {
+                sharing: Some(sharing),
                 bytes,
                 reconciled_at: observed_at,
                 needs_reconciliation: false,

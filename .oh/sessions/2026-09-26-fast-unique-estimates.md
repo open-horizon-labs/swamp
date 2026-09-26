@@ -105,3 +105,119 @@ Final focused checks also cover the last unowned-view warning: 16 build/history
 tests and six scope-accounting tests, plus the 30 TUI frame tests. Four direct
 unit checks cover the ephemeral ledger and absent optional run columns.
 No user filesystem data was removed, and no binary was installed or released.
+
+## Solution Space — remaining shared-file attribution
+
+Problem: explain sharing between meaningful artifact containers so users can
+choose cleanup, without exact per-file auditing or slowing ordinary refresh.
+Criteria: decision usefulness, unchanged refresh work, compact folded storage,
+stable history, explicit scope/age. The original #131 exact incremental charge
+criteria conflict with the subsequently selected stale-estimate policy; issue
+acceptance needs explicit reconciliation before claiming completion.
+
+Candidates: (A) retain aggregate-only warning; (B) retain a persistent inode
+membership index; (C) aggregate shared-container relationships during explicit
+reconciliation; (D) inspect only selected cleanup units on demand. Recommend
+C plus the existing D selection estimator, subject to architectural dissent
+before schema/API implementation. A remains a fallback, B is rejected by the
+no-per-file-persistence constraint. No implementation is authorized by this
+solution-space turn.
+
+For C, associate observed hardlinked identities with disjoint folded accounting
+units during the explicit reconciliation walk, then discard identities. Store
+container-level sharing groups, bytes, observation time and coverage in typed
+Parquet, not pairwise per-file edges or JSON. Three owners of one inode form one
+sharing group, not three additive byte charges. Parent views derive membership
+from those units; ancestors are not extra owners. Ordinary refresh marks this
+evidence stale; neither row allocations nor growth history change. Incomplete
+link membership is explicit, not a guessed peer path. Allocation, scope-unique
+bytes and selection reclaimability remain distinct. File hardlinks do not
+establish APFS extent ownership.
+
+Risk-retirement plan (planned checks, not completed evidence):
+- Three-way store/project sharing: reject pairwise summation and first-root
+  ownership; reverse root order and assert identical groups and union totals.
+- Nested/excluded/out-of-scope links: reject ancestor-as-peer and falsely
+  complete membership; selected-set estimate must retain outside-link limits.
+- Incremental removal/replacement: reject stale peers presented as current,
+  synthetic growth from charge reassignment, and eager sibling rescans. Include
+  cold report restoration and explicit-full refresh of relationships.
+- High fan-out: measure 20k-file fixture and actual cache layout, in-memory peak,
+  persisted bytes and refresh counters; reject per-file retained membership or
+  quadratic pair edges. Pivot to bounded aggregate summaries if group diversity
+  defeats compactness; disclose truncation, never claim exhaustive peers.
+- Cleanup: reject treating sharing as a deletion prohibition; selecting one vs
+  all links changes the estimate, not deletion eligibility by itself.
+- Accepted: peer discovery only in observed scope, stale between reconciliation,
+  extra explicit-full cost, no exact APFS free-space promise.
+
+Lineage: W1b under W1 / G1 remains selected; this is a candidate implementation
+of that existing step, not a new scope reduction. W1a is a sibling requirement,
+not newly selected or claimed complete here. Broader issue closure requires
+updating its conflicting acceptance criteria with owner approval.
+
+## Execute — container sharing (owner authorized)
+
+Selected C plus existing D. Success: dated shared-container evidence in TUI and
+reconciliation text/JSON, no additional ordinary refresh traversal, compact typed
+storage, no charge transfers or cleanup prohibitions. Stop if peer discovery
+requires a persistent file inventory or global ordinary refresh. Owner execution
+approval also authorizes aligning #131's acceptance criteria; updated the issue,
+left it open. No release/installation or user-data cleanup is part of this work.
+
+Architecture dissent: pairwise edges are a tempting but wrong local optimum:
+three-way sharing becomes three charges and fan-out becomes quadratic. Use one
+membership group instead. Deepest-container assignment describes a disjoint
+measurement partition, not project ownership. Adoption risk: a user could mistake
+observed sharing for reclaimability; every displayed line names observation time,
+staleness and not-reclaimable semantics. Opportunity-cost risk: enumerating peers
+could undo folding; bound aggregate payload and explicitly disclose omissions.
+Verdict: adjust/proceed with groups, no per-file persistence, no automatic census.
+
+Implementation: explicit reconciliation's existing parallel walker collects only
+hardlinked identities into ephemeral container membership sets. Aggregate groups
+and unknown-link evidence share the existing estimate's age/invalidation; typed
+List/Struct columns in runs.parquet carry them through cold reports. Max 4,096
+groups, 65,536 memberships and 1 MiB path text; omitted totals are explicit.
+No filesystem traversal was added to rendering or normal refresh. Source-audit
+capability checks pass after using the existing metadata gate exports.
+
+Risk retirement evidence:
+- Three-way/nested/excluded/outside membership and reversed order: walker fixture
+  rejects pairwise edges, first-root charging, ancestor-as-peer and invented peers.
+- Link replacement plus cold stale state: six scope integration tests reject
+  refreshed-looking old relationships and scanning the unchanged 96-file sibling;
+  unchanged counters remain zero. Full reconciliation removes obsolete relations.
+- Persistence: typed roundtrip and absent optional-column regression reject JSON
+  blobs, transient-only state and unreadable older rows. Compact fixture run table
+  is 5,721 bytes including all fields, representing 20,000 entries / 1,000 identities
+  collapsed into one 20-container group (not 20,000 persisted rows).
+- Fan-out: 1,000 containers form one group with 1,000 memberships; 5,000 distinct
+  groups explicitly omit 904 after the 4,096 cap. No pairwise expansion.
+- Real 20,000-entry filesystem fixture and synthetic grouping checks passed in
+  6.46s including fixture creation/removal, maximum RSS 15,810,560 bytes. This is
+  process RSS, not an isolated collector-memory claim.
+- Real uv cache: explicit full observation of 1,744,928,768 unique bytes in 1.62s,
+  max RSS 69,795,840 bytes; run table 5.6 KiB. No cross-container groups found in
+  that selected root, so this is cost evidence, not proof of real peer discovery.
+- TUI: selected-worktree evidence includes peer path, timestamp and stale warning
+  at 80x24 and 200x60. No selection eligibility code changes; existing plan-set
+  reclaimability tests remain the cleanup accounting guard.
+- History: only run metadata gains sharing columns; no artifact/delta writes or
+  charge reassignment added. Existing history suite is the regression check.
+
+Accepted limits: scan-time evidence is not an atomic audit; scope excludes unknown
+peers; hardlinks do not identify filesystem clones/snapshots; extra cost only on
+explicit full. Human verification remains readability of the new selected-row
+facts in normal use, not accounting correctness.
+
+Final review: aligned, no charge ownership or deletion policy changes. Largest
+groups are retained/displayed first, with deterministic ties and explicit caps.
+`scripts/check.sh` passed at 14:52:59 (format, Clippy, audits, release graph,
+workspace tests, named targets and greps). After final refinements, focused
+reruns passed: five sharing-related unit tests, two typed-persistence tests,
+six scope integration tests, all 31 TUI frames, source audits and strict
+workspace/all-target Clippy. Logs: `/tmp/swamp-sharing-routine.log`,
+`/tmp/swamp-sharing-final-focused.log`, `/tmp/swamp-sharing-final-clippy.log`.
+No remaining model-checkable risk from this handoff is intentionally deferred.
+Native CI/release remain separate gates; no installation or release claimed.

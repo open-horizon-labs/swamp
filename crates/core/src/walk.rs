@@ -504,6 +504,7 @@ pub mod progress {
 }
 
 struct AttrShared {
+    sharing: Option<Mutex<crate::sharing::Collector>>,
     seen_inodes: ShardedInodeSet,
     artifacts_by_worktree: Mutex<HashMap<String, Vec<ArtifactRow>>>,
     source_bytes: Mutex<HashMap<String, u64>>,
@@ -559,8 +560,20 @@ struct AttrShared {
 /// Explicit reconciliation only. The ordinary folded sizing pool visits the
 /// selected paths with one ephemeral device/inode ledger. Neither identities
 /// nor charge ownership escape this call; history keeps its existing basis.
+#[cfg(test)]
 pub(crate) fn reconcile_unique_bytes(paths: &[PathBuf], excluded: &[PathBuf]) -> Option<u64> {
+    reconcile_shared_bytes(paths, excluded, paths).map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn reconcile_shared_bytes(
+    paths: &[PathBuf],
+    excluded: &[PathBuf],
+    containers: &[PathBuf],
+) -> Option<(u64, crate::sharing::SharingSummary)> {
     let shared = Arc::new(AttrShared {
+        sharing: Some(Mutex::new(crate::sharing::Collector::new(
+            containers.to_vec(),
+        ))),
         seen_inodes: ShardedInodeSet::new(),
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),
@@ -637,13 +650,58 @@ pub(crate) fn reconcile_unique_bytes(paths: &[PathBuf], excluded: &[PathBuf]) ->
             slots * std::mem::size_of::<(u64, u64)>()
         );
     }
-    (!shared.incomplete.load(Ordering::Relaxed))
-        .then(|| shared.walked_total.load(Ordering::Relaxed))
+    (!shared.incomplete.load(Ordering::Relaxed)).then(|| {
+        (
+            shared.walked_total.load(Ordering::Relaxed),
+            shared.sharing.as_ref().unwrap().lock().unwrap().summary(),
+        )
+    })
 }
 
 #[cfg(test)]
 mod scope_reconciliation_tests {
     use super::*;
+
+    #[test]
+    fn sharing_groups_are_not_pair_edges_or_ancestor_ownership() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let cache = tmp.path().join("cache");
+        let nested = a.join("node_modules");
+        for dir in [&nested, &b, &cache] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(cache.join("file"), vec![1u8; 8192]).unwrap();
+        fs::hard_link(cache.join("file"), nested.join("file")).unwrap();
+        fs::hard_link(cache.join("file"), b.join("file")).unwrap();
+        let roots = vec![a.clone(), b.clone(), cache.clone()];
+        let containers = vec![a.clone(), nested.clone(), b.clone(), cache.clone()];
+        let (bytes, summary) = reconcile_shared_bytes(&roots, &[], &containers).unwrap();
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].bytes, bytes);
+        assert_eq!(summary.groups[0].containers.len(), 3);
+        assert!(!summary.groups[0].containers.contains(&a));
+        assert!(!summary.groups[0].unresolved_links);
+        let mut reverse = roots.clone();
+        reverse.reverse();
+        assert_eq!(
+            reconcile_shared_bytes(&reverse, &[], &containers).unwrap(),
+            (bytes, summary)
+        );
+        let (_, excluded) = reconcile_shared_bytes(&roots, &[cache.clone()], &containers).unwrap();
+        assert_eq!(excluded.groups.len(), 1);
+        assert!(excluded.groups[0].unresolved_links);
+        assert!(!excluded.groups[0].containers.contains(&cache));
+        fs::remove_file(b.join("file")).unwrap();
+        fs::write(b.join("file"), vec![2u8; 8192]).unwrap();
+        let (_, changed) = reconcile_shared_bytes(&roots, &[], &containers).unwrap();
+        assert_eq!(changed.groups.len(), 1);
+        assert_eq!(changed.groups[0].containers.len(), 2);
+        assert!(!changed.groups[0].containers.contains(&b));
+        assert!(!changed.groups[0].unresolved_links);
+    }
 
     #[test]
     fn reconciliation_keys_include_the_device() {
@@ -756,6 +814,7 @@ fn attribute_parallel_inner(
 
     let shared = Arc::new(AttrShared {
         seen_inodes: ShardedInodeSet::new(),
+        sharing: None,
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),
         source_local: Mutex::new(HashMap::new()),
@@ -1102,6 +1161,11 @@ fn record_file(
     known: &[KnownWorktree],
     shared: &AttrShared,
 ) -> (i64, FileTally) {
+    if meta.nlink() > 1
+        && let Some(collector) = &shared.sharing
+    {
+        collector.lock().unwrap().record(path, meta);
+    }
     let mtime = meta.mtime();
     if meta.nlink() > 1 && nearest_worktree(known, path).is_none() {
         shared
@@ -1310,6 +1374,11 @@ fn process_size(
             own_allocated += allocated_bytes(&meta);
             dir_mtime_max = dir_mtime_max.max(meta.mtime());
             let key = (meta.dev(), meta.ino());
+            if meta.nlink() > 1
+                && let Some(collector) = &shared.sharing
+            {
+                collector.lock().unwrap().record(&entry.path(), &meta);
+            }
             group
                 .mtime_max
                 .fetch_max(meta.mtime().max(0) as u64, Ordering::Relaxed);
@@ -1848,6 +1917,7 @@ pub fn resize_artifact_stamped(
     // spends on it.
     let shared = Arc::new(AttrShared {
         seen_inodes: ShardedInodeSet::new(),
+        sharing: None,
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),
         source_local: Mutex::new(HashMap::new()),

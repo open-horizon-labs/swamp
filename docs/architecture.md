@@ -1266,8 +1266,17 @@ Hardlinks do not force a whole-target walk when interior measurements are availa
 parallel folded walker and a shared, ephemeral `(device, inode)` set. Project
 roots, external units and agent member paths form one union; nested paths are
 visited once and user exclusions are pruned. Docker is separate. Only the
-aggregate `unique_estimate` (bytes, timestamp, `needs_reconciliation`) survives
-in `runs.parquet`. This deliberately costs an additional traversal on an
+aggregate `unique_estimate` (bytes, timestamp, `needs_reconciliation`) and
+container-level sharing groups survive in typed columns in `runs.parquet`.
+The reconciliation walker temporarily maps hardlinked inodes to the deepest
+matching artifact, worktree, external/member or root container. Parents are
+not additional members. Inodes with the same container membership and unresolved
+link status collapse into one group; three-way sharing is one group, not three
+pairwise charges. No inode or file membership is persisted. Summaries retain at
+most 4,096 groups, 65,536 container memberships and 1 MiB of container path text,
+with omitted groups/bytes
+reported explicitly. Unknown peers outside coverage are never invented.
+This deliberately costs an additional traversal on an
 explicit full observation, not on normal refresh. Ordinary observations retain
 the last reconciled value as stale; incomplete coverage cannot certify a new
 one. A cold report restores the same accounting state without scanning.
@@ -1279,7 +1288,9 @@ totals remain local measurements, not an additive scope-wide unique total.
 Cleanup still measures its selected members; neither total promises reclaimable
 space.
 
-The transient ledger is O(distinct measured inodes), released after the pass.
+The transient ledger is O(distinct measured inodes), plus hardlink/container
+memberships, released after the pass. The following key-set measurement predates
+the sharing collector and does not include its membership allocations.
 The 20,000-entry fixture (1,000 inodes, 20 links each) used 1,792 hash-set key
 slots: 28,672 bytes of key capacity, excluding hash/control/allocator overhead
 and the walker's other working memory. This is not a peak-RSS claim. Its second
@@ -1638,8 +1649,9 @@ function pointer on the event thread is rejected rather than followed.
   exactly once, and the merge is root-order independent. Those local sums
   still include cross-root shared inodes. The separate `unique_estimate`
   reconciles sharing across roots and units on explicit `observe --full`;
-  normal refresh marks it as needing reconciliation. Per-row shared-with
-  attribution is not inferred from the aggregate, and remains unfinished.
+  normal refresh marks it as needing reconciliation. Container-level shared-with
+  groups are measured in that same explicit pass, not inferred from total bytes;
+  they retain the same timestamp/staleness and disclose unresolved or omitted peers.
   Each root's own `series_by_key`/`total_series` sparkline buckets are
   computed independently (each root's own wall-clock `now`) and merged
   bucket-for-bucket only when their lengths already match; a length

@@ -379,6 +379,24 @@ separately (#50).
 
 ## External and shared storage
 
+### Which projects share these bytes?
+
+`swamp observe --full` records hardlink-sharing groups between folded containers.
+Select an artifact or worktree in the TUI to see its sharing evidence, or use
+`swamp report --view reconciliation` (`--json` for the stored groups).
+For example, a package-manager store and two projects can share one 400 MB
+group: that is 400 MB counted once, not 400 MB for each pair.
+
+These facts carry their reconciliation time. Normal refresh retains them with
+“needs reconciliation”; it does not rescan other projects to rediscover peers.
+Links outside scanned coverage remain unresolved, and very large summaries
+explicitly report omissions. Absence of a listed peer is not proof of exclusivity.
+
+Sharing is not a deletion prohibition or an ownership claim. Cleanup estimates
+are calculated for the selection: deleting one link may free no space, while
+deleting all its links can free the inode's storage. APFS clones and snapshots
+can still affect actual savings. Sharing groups do not change growth history.
+
 Storage with no containing project -- the Cargo registry, rustup
 toolchains, a Homebrew prefix, and future detector-resolved locations
 (model stores, package caches, ...) -- is measured as a first-class

@@ -2042,6 +2042,7 @@ pub fn write_run_row(swamp_dir: &Path, scope_key: &str, run: &RunFacts<'_>) -> R
         .filter(|r| r.scope_key != scope_key)
         .collect();
     rows.push(columns::StoredRunRow {
+        sharing: run.unique_estimate.and_then(|u| u.sharing.clone()),
         unique_bytes: run.unique_estimate.map(|u| u.bytes),
         unique_reconciled_at: run.unique_estimate.map(|u| u.reconciled_at),
         unique_needs_reconciliation: run.unique_estimate.map(|u| u.needs_reconciliation),
@@ -2168,6 +2169,7 @@ pub(crate) fn derive_report_views(
         .unique_bytes
         .zip(run.unique_reconciled_at)
         .map(|(bytes, reconciled_at)| crate::report::UniqueEstimate {
+            sharing: run.sharing.clone(),
             bytes,
             reconciled_at,
             needs_reconciliation: run.unique_needs_reconciliation.unwrap_or(true),

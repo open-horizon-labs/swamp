@@ -194,6 +194,14 @@ fn full_scope_reconciles_cross_root_hardlinks_independent_of_order_and_roundtrip
         .unwrap();
     assert_eq!(estimate.bytes, expected);
     assert!(!estimate.needs_reconciliation);
+    let sharing = estimate.sharing.as_ref().unwrap();
+    assert_eq!(sharing.groups.len(), 1);
+    assert_eq!(sharing.groups[0].containers.len(), 2);
+    assert!(!sharing.groups[0].unresolved_links);
+    assert_eq!(
+        sharing.groups[0].bytes,
+        fs::metadata(a.join("shared.bin")).unwrap().blocks() * 512
+    );
 
     let stored = report::report_scope_from_store(&scope, store.path()).unwrap();
     let roundtripped = stored
@@ -202,6 +210,7 @@ fn full_scope_reconciles_cross_root_hardlinks_independent_of_order_and_roundtrip
         .unique_estimate
         .expect("reconciliation estimate persisted");
     assert_eq!(roundtripped.bytes, estimate.bytes);
+    assert_eq!(roundtripped.sharing, estimate.sharing);
     assert_eq!(roundtripped.reconciled_at, estimate.reconciled_at);
     assert_eq!(
         roundtripped.needs_reconciliation,
@@ -280,6 +289,7 @@ fn incremental_observation_keeps_prior_estimate_stale_until_full_reconciliation(
         "fast refresh preserves prior estimate"
     );
     assert!(carried.needs_reconciliation);
+    assert_eq!(carried.sharing, prior.sharing);
     assert!(
         work.dirs_listed == 0
             && work.files_statted == 0
@@ -297,6 +307,7 @@ fn incremental_observation_keeps_prior_estimate_stale_until_full_reconciliation(
     assert_eq!(roundtripped.bytes, carried.bytes);
     assert_eq!(roundtripped.reconciled_at, carried.reconciled_at);
     assert!(roundtripped.needs_reconciliation);
+    assert_eq!(roundtripped.sharing, prior.sharing);
 
     // A real localized event in B's target container must not force a
     // root-wide walk of A. The source canonicalizes and filters events
@@ -309,6 +320,7 @@ fn incremental_observation_keeps_prior_estimate_stale_until_full_reconciliation(
     let changed_estimate = changed.merged.reconciliation.unique_estimate.unwrap();
     assert_eq!(changed_estimate.bytes, prior.bytes);
     assert!(changed_estimate.needs_reconciliation);
+    assert_eq!(changed_estimate.sharing, prior.sharing);
     assert!(
         changed
             .merged
@@ -330,6 +342,7 @@ fn incremental_observation_keeps_prior_estimate_stale_until_full_reconciliation(
     let current = reconciled.merged.reconciliation.unique_estimate.unwrap();
     assert_eq!(current.bytes, expected_after_replace);
     assert!(!current.needs_reconciliation);
+    assert!(current.sharing.as_ref().unwrap().groups.is_empty());
 
     fs::remove_file(a.join("target/shared.bin")).unwrap();
     let expected_after_remove = unique_allocated_bytes(&roots);

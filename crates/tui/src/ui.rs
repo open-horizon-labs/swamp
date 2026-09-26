@@ -720,7 +720,23 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     // Keep the selection visible even in projects with hundreds of build groups.
     let selected_evidence_lines: Vec<String> = rows
         .get(app.selected)
-        .map(|r| ordered_evidence_lines(&r.evidence))
+        .map(|r| {
+            let path = r
+                .unit
+                .as_ref()
+                .map(|u| std::path::Path::new(&u.0))
+                .or_else(|| r.worktree.as_ref().map(|w| w.path.as_path()));
+            let mut lines = if let Some(path) = path {
+                swamp_core::render::render_sharing_lines(
+                    app.report.reconciliation.unique_estimate.as_ref(),
+                    Some(path),
+                )
+            } else {
+                Vec::new()
+            };
+            lines.extend(ordered_evidence_lines(&r.evidence));
+            lines
+        })
         .unwrap_or_default();
     let base_detail = if cleanup_view { 3 } else { 2 };
     // Each evidence line can itself wrap to several physical rows at a

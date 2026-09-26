@@ -1569,7 +1569,82 @@ pub fn render_view_reconciliation(report: &Report) -> String {
         }
         None => out.push_str("filesystem unique=unknown; swamp observe --full to reconcile\n"),
     }
+    for line in render_sharing_lines(r.unique_estimate.as_ref(), None) {
+        let _ = writeln!(out, "{line}");
+    }
     out
+}
+
+/// Bounded display of reconciliation evidence; never a reclaimability claim.
+pub fn render_sharing_lines(
+    estimate: Option<&crate::report::UniqueEstimate>,
+    path: Option<&Path>,
+) -> Vec<String> {
+    let Some(estimate) = estimate else {
+        return Vec::new();
+    };
+    let Some(summary) = &estimate.sharing else {
+        return Vec::new();
+    };
+    let matching: Vec<_> = summary
+        .groups
+        .iter()
+        .filter(|g| path.is_none_or(|p| g.containers.iter().any(|c| c.starts_with(p))))
+        .collect();
+    let mut lines = Vec::new();
+    for group in matching.iter().take(4) {
+        let peers: Vec<_> = group
+            .containers
+            .iter()
+            .filter(|c| path.is_none_or(|p| !c.starts_with(p)))
+            .collect();
+        let names = peers
+            .iter()
+            .take(3)
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!(
+            "{} shared {}{}{} · observed {}{} · not reclaimable bytes",
+            human_bytes(group.bytes),
+            if names.is_empty() {
+                "within selection / unresolved peers"
+            } else {
+                "with "
+            },
+            names,
+            if peers.len() > 3 {
+                format!(" (+{} containers)", peers.len() - 3)
+            } else {
+                String::new()
+            },
+            estimate.reconciled_at,
+            if estimate.needs_reconciliation {
+                "; needs reconciliation"
+            } else {
+                ""
+            }
+        ));
+        if group.unresolved_links {
+            lines.push(
+                "Other links may exist outside observed scope; peer list is incomplete".into(),
+            );
+        }
+    }
+    if matching.len() > 4 {
+        lines.push(format!(
+            "{} more sharing groups; see reconciliation JSON",
+            matching.len() - 4
+        ));
+    }
+    if summary.omitted_groups > 0 {
+        lines.push(format!(
+            "Sharing summary bounded: {} groups / {} omitted",
+            summary.omitted_groups,
+            human_bytes(summary.omitted_bytes)
+        ));
+    }
+    lines
 }
 
 /// `--worktree <path>`: signals for one worktree, matched by exact path

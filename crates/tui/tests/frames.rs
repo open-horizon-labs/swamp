@@ -379,6 +379,7 @@ fn capture(app: &App, w: u16, h: u16) -> String {
 fn scope_unique_estimate_is_labeled_even_in_a_narrow_header() {
     let mut report = fixture_report();
     report.reconciliation.unique_estimate = Some(swamp_core::report::UniqueEstimate {
+        sharing: None,
         bytes: 8192,
         reconciled_at: report.observed_at,
         needs_reconciliation: true,
@@ -388,6 +389,40 @@ fn scope_unique_estimate_is_labeled_even_in_a_narrow_header() {
     assert!(narrow.contains("unique totals not recomputed"), "{narrow}");
     let wide = capture(&app, 180, 24);
     assert!(wide.contains("needs reconciliation"), "{wide}");
+}
+
+#[test]
+fn selected_worktree_shows_dated_shared_container_evidence() {
+    let mut report = fixture_report();
+    report.projects.truncate(1);
+    let path = report.projects[0].worktrees[0].path.clone();
+    report.reconciliation.unique_estimate = Some(swamp_core::report::UniqueEstimate {
+        bytes: 8192,
+        reconciled_at: 12345,
+        needs_reconciliation: true,
+        sharing: Some(swamp_core::sharing::SharingSummary {
+            groups: vec![swamp_core::sharing::SharingGroup {
+                containers: vec![path.join("node_modules"), PathBuf::from("/shared/pnpm")],
+                bytes: 4096,
+                unresolved_links: false,
+            }],
+            ..Default::default()
+        }),
+    });
+    let mut app = App::new(report, "/Users/dev/src".into());
+    app.clear_filter();
+    app.drill_into_selected();
+    app.selected = app
+        .rows()
+        .iter()
+        .position(|r| r.worktree.as_ref().is_some_and(|w| w.path == path))
+        .unwrap();
+    for (width, height) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, width, height);
+        assert!(frame.contains("shared with /shared/pnpm"), "{frame}");
+        assert!(frame.contains("12345"), "{frame}");
+        assert!(frame.contains("needs reconciliation"), "{frame}");
+    }
 }
 
 fn check(name: &str, got: &str) {

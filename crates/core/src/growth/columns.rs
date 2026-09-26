@@ -1831,6 +1831,7 @@ pub(super) fn read_note_rows(path: &Path) -> Result<Vec<StoredNoteRow>> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredRunRow {
+    pub sharing: Option<crate::sharing::SharingSummary>,
     pub unique_bytes: Option<u64>,
     pub unique_reconciled_at: Option<u64>,
     pub unique_needs_reconciliation: Option<bool>,
@@ -1843,6 +1844,102 @@ pub struct StoredRunRow {
     pub github_worktrees_enriched: Option<u32>,
     pub github_elapsed_secs: Option<f64>,
     pub schedule_line: Option<String>,
+}
+
+fn sharing_builder() -> arrow_array::builder::ListBuilder<arrow_array::builder::StructBuilder> {
+    use arrow_array::builder::*;
+    let mut members = ListBuilder::new(StringBuilder::new());
+    let fields = vec![
+        Field::new("containers", members.finish().data_type().clone(), false),
+        Field::new("bytes", DataType::UInt64, false),
+        Field::new("unresolved_links", DataType::Boolean, false),
+    ];
+    ListBuilder::new(StructBuilder::new(
+        fields,
+        vec![
+            Box::new(members),
+            Box::new(UInt64Builder::new()),
+            Box::new(BooleanBuilder::new()),
+        ],
+    ))
+}
+
+fn sharing_array(rows: &[StoredRunRow]) -> ArrayRef {
+    use arrow_array::builder::*;
+    let mut builder = sharing_builder();
+    for row in rows {
+        if let Some(summary) = &row.sharing {
+            for group in &summary.groups {
+                let item = builder.values();
+                let members = item.field_builder::<ListBuilder<StringBuilder>>(0).unwrap();
+                for path in &group.containers {
+                    members.values().append_value(path.to_string_lossy());
+                }
+                members.append(true);
+                item.field_builder::<UInt64Builder>(1)
+                    .unwrap()
+                    .append_value(group.bytes);
+                item.field_builder::<BooleanBuilder>(2)
+                    .unwrap()
+                    .append_value(group.unresolved_links);
+                item.append(true);
+            }
+        }
+        builder.append(row.sharing.is_some());
+    }
+    Arc::new(builder.finish())
+}
+
+fn read_sharing(batch: &RecordBatch, i: usize) -> Result<Option<crate::sharing::SharingSummary>> {
+    use arrow_array::{ListArray, StructArray};
+    let Some(column) = batch.column_by_name("sharing_groups") else {
+        return Ok(None);
+    };
+    let list = column
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .context("sharing_groups must be a list")?;
+    if list.is_null(i) {
+        return Ok(None);
+    }
+    let values = list.value(i);
+    let groups = values
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .context("sharing group must be a struct")?;
+    let members = groups
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .context("sharing members must be a list")?;
+    let bytes = groups
+        .column(1)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .context("sharing bytes must be u64")?;
+    let unresolved = groups
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .context("sharing unresolved must be bool")?;
+    let mut result = crate::sharing::SharingSummary {
+        groups: Vec::new(),
+        omitted_groups: opt_u64(batch, "sharing_omitted_groups", i)?.unwrap_or(0),
+        omitted_bytes: opt_u64(batch, "sharing_omitted_bytes", i)?.unwrap_or(0),
+    };
+    for j in 0..groups.len() {
+        let paths = members.value(j);
+        let paths = paths
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("sharing paths must be strings")?;
+        result.groups.push(crate::sharing::SharingGroup {
+            containers: paths.iter().flatten().map(PathBuf::from).collect(),
+            bytes: bytes.value(j),
+            unresolved_links: unresolved.value(j),
+        });
+    }
+    Ok(Some(result))
 }
 
 fn runs_schema() -> Arc<Schema> {
@@ -1859,6 +1956,13 @@ fn runs_schema() -> Arc<Schema> {
         Field::new("github_worktrees_enriched", DataType::UInt32, true),
         Field::new("github_elapsed_secs", DataType::Float64, true),
         Field::new("schedule_line", DataType::Utf8, true),
+        Field::new(
+            "sharing_groups",
+            sharing_array(&[]).data_type().clone(),
+            true,
+        ),
+        Field::new("sharing_omitted_groups", DataType::UInt64, true),
+        Field::new("sharing_omitted_bytes", DataType::UInt64, true),
     ]))
 }
 
@@ -1915,6 +2019,17 @@ pub(super) fn write_run_rows(path: &Path, rows: &[StoredRunRow]) -> Result<()> {
                     .map(|r| r.schedule_line.as_deref())
                     .collect::<Vec<_>>(),
             )),
+            sharing_array(rows),
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|r| r.sharing.as_ref().map(|s| s.omitted_groups))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                rows.iter()
+                    .map(|r| r.sharing.as_ref().map(|s| s.omitted_bytes))
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -1945,6 +2060,7 @@ pub(super) fn read_run_rows(path: &Path) -> Result<Vec<StoredRunRow>> {
         let include_dirs = downcast_bool(&batch, "include_dirs")?;
         for i in 0..batch.num_rows() {
             rows.push(StoredRunRow {
+                sharing: read_sharing(&batch, i)?,
                 unique_bytes: batch
                     .column_by_name("unique_bytes")
                     .map(|_| opt_u64(&batch, "unique_bytes", i))
@@ -1980,10 +2096,52 @@ mod unique_estimate_tests {
     use super::*;
 
     #[test]
+    fn sharing_groups_persist_as_compact_typed_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runs.parquet");
+        // 20,000 linked entries / 1,000 identities with identical membership
+        // produce this one aggregate, not a persisted file inventory.
+        let row = StoredRunRow {
+            sharing: Some(crate::sharing::SharingSummary {
+                groups: vec![crate::sharing::SharingGroup {
+                    containers: (0..20)
+                        .map(|i| PathBuf::from(format!("/projects/{i}/node_modules")))
+                        .collect(),
+                    bytes: 4096000,
+                    unresolved_links: true,
+                }],
+                omitted_groups: 4,
+                omitted_bytes: 16384,
+            }),
+            unique_bytes: Some(4096000),
+            unique_reconciled_at: Some(100),
+            unique_needs_reconciliation: Some(true),
+            scope_key: "scope".into(),
+            observed_at: 101,
+            since_secs: 3600,
+            retention_days: 30,
+            include_dirs: false,
+            github_calls_made: None,
+            github_worktrees_enriched: None,
+            github_elapsed_secs: None,
+            schedule_line: None,
+        };
+        write_run_rows(&path, std::slice::from_ref(&row)).unwrap();
+        assert_eq!(read_run_rows(&path).unwrap(), vec![row]);
+        let size = std::fs::metadata(&path).unwrap().len();
+        eprintln!("sharing fixture runs.parquet: {size} bytes including all run fields");
+        assert!(
+            size < 16384,
+            "aggregate regressed into oversized persisted state: {size}"
+        );
+    }
+
+    #[test]
     fn a_run_without_unique_columns_is_unknown_not_an_unreadable_store() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("runs.parquet");
         let row = StoredRunRow {
+            sharing: None,
             unique_bytes: None,
             unique_reconciled_at: None,
             unique_needs_reconciliation: None,
@@ -2005,7 +2163,7 @@ mod unique_estimate_tests {
             .unwrap()
             .unwrap();
         let old = batch
-            .project(&(3..batch.num_columns()).collect::<Vec<_>>())
+            .project(&(3..batch.num_columns() - 3).collect::<Vec<_>>())
             .unwrap();
         crate::fs_gate::columns::write_parquet_atomic(
             &path,
