@@ -156,7 +156,7 @@ enum Command {
         store: Option<PathBuf>,
     },
     /// Project x worktree x artifact growth report -- a pure read of
-    /// what `swamp observe` last wrote (R12): never walks a directory,
+    /// what `swamp observe` last wrote: never walks a directory,
     /// scans artifact metadata, or spawns a subprocess. Root presence
     /// is checked to resolve scope. Exits 2 (JSON:
     /// `{"error":"no_observation", ...}`) when the scope has never been
@@ -287,8 +287,9 @@ enum Command {
         enrich: bool,
     },
     /// Linux: watch the scope's roots with inotify until stopped and keep
-    /// a bounded change list, so a later `observe`/`report` can walk only
-    /// what changed (#82). Opt-in, user-owned, foreground; refuses on
+    /// a bounded change list, so a later `observe` can reuse measurements
+    /// where event coverage is complete. Reports remain stored reads.
+    /// Opt-in, user-owned, foreground; refuses on
     /// macOS, where FSEvents already keeps the history.
     Collect {
         /// Defaults to every present root in the configured scope.
@@ -301,8 +302,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Install, report on, or remove the opt-in per-user LaunchAgent that
-    /// runs `observe` on a fixed interval (#31).
+    /// Install, inspect, or remove scheduled observations: a per-user
+    /// LaunchAgent on macOS or systemd user timer on Linux. No cleanup.
     Schedule {
         /// Install (or replace) the schedule with this interval, e.g.
         /// "30m", "1h", "12h", "1d".
