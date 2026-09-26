@@ -1,0 +1,11 @@
+error[E0603]: function `zstd_properties` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/parquet_codec_is_not_selectable.rs
+  |
+  |     let _ = swamp_core::fs_gate::columns::zstd_properties(3);
+  |                                           ^^^^^^^^^^^^^^^ private function
+  |
+note: the function `zstd_properties` is defined here
+ --> $WORKSPACE/crates/core/src/fs_gate/columns.rs
+  |
+  | fn zstd_properties(level: i32) -> WriterProperties {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

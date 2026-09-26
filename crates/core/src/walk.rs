@@ -19,18 +19,20 @@
 //! collapse that distinction; the two are kept as independent parallel
 //! passes here to preserve it exactly.
 
-use crate::attribution::{AttributionResult, allocated_bytes, classify_at, is_shared_cache_name};
+use crate::attribution::{
+    AttributionResult, Classified, allocated_bytes, classified_at, is_shared_cache_name,
+};
 use crate::entities::{Confidence, id_for};
+use crate::fs_gate as fs;
+use crate::fs_gate::MetadataExt;
 use crate::git::{DiscoveredWorktree, classify_git_file, classify_main_checkout};
 use crate::report::{
     ArtifactKind, ArtifactRow, DirRollup, FileRow, Source, UnownedReason, UnownedRow,
 };
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Same boundary `git::discover` stops recursion at: `.git` itself, plus
@@ -125,11 +127,19 @@ impl<J: Send> Pool<J> {
     /// responsible for calling `pool.push` for follow-on work and must
     /// not call `finish_one` itself.
     fn drain(self: &Arc<Self>, workers: usize, process: impl Fn(J) + Sync) {
+        // The work these threads do belongs to whoever started the pool:
+        // without this, a `work_counters::measured` scope would miss
+        // every listing and stat the pool performs, which is exactly how
+        // the instrument came to report "2 dirs listed" for a
+        // 20,000-file traversal.
+        let counters = crate::work_counters::current();
         std::thread::scope(|scope| {
             for _ in 0..workers {
                 let pool = Arc::clone(self);
                 let process = &process;
+                let counters = counters.clone();
                 scope.spawn(move || {
+                    crate::work_counters::install(counters);
                     while let Some(job) = pool.next() {
                         process(job);
                         pool.finish_one();
@@ -169,7 +179,8 @@ pub(crate) struct DirectoryMeasurement {
 /// metadata reads in wide compiler-output directories. At most 256 entries per
 /// worker are materialized; no per-file measurements survive the call.
 pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasurement> {
-    let entries = Mutex::new(fs::read_dir(path)?);
+    let entries = Mutex::new(crate::fs_gate::read_dir(path)?);
+    crate::work_counters::record_dir_listed();
     let result = Mutex::new(DirectoryMeasurement::default());
     let error = Mutex::new(None);
     let pool = Arc::new(Pool::new());
@@ -202,7 +213,8 @@ pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasure
                         .children
                         .push(entry.file_name().to_string_lossy().into_owned());
                 } else if ft.is_file() {
-                    let m = match fs::symlink_metadata(entry.path()) {
+                    crate::work_counters::record_files_statted(1);
+                    let m = match crate::fs_gate::symlink_metadata(entry.path()) {
                         Ok(m) => m,
                         Err(e) => {
                             *error.lock().unwrap() = Some(e);
@@ -236,17 +248,17 @@ pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasure
 fn shallow_parallel_measurement_counts_allocations_without_following_links_or_children() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("measured");
-    fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
     let mut expected = 0;
     for i in 0..513 {
         let path = root.join(format!("{i}.o"));
-        fs::write(&path, vec![1u8; 4096]).unwrap();
+        std::fs::write(&path, vec![1u8; 4096]).unwrap();
         expected += fs::symlink_metadata(path).unwrap().blocks() * 512;
     }
-    fs::hard_link(root.join("0.o"), root.join("alias.o")).unwrap();
+    std::fs::hard_link(root.join("0.o"), root.join("alias.o")).unwrap();
     expected += fs::symlink_metadata(root.join("0.o")).unwrap().blocks() * 512;
-    fs::create_dir(root.join("child")).unwrap();
-    fs::write(root.join("child/not-counted"), vec![1u8; 8192]).unwrap();
+    std::fs::create_dir(root.join("child")).unwrap();
+    std::fs::write(root.join("child/not-counted"), vec![1u8; 8192]).unwrap();
     std::os::unix::fs::symlink(root.join("child"), root.join("symlink")).unwrap();
     let measured = measure_directory(&root).unwrap();
     assert_eq!(measured.allocated, expected);
@@ -256,16 +268,19 @@ fn shallow_parallel_measurement_counts_allocations_without_following_links_or_ch
     assert!(measured.hardlinked);
 }
 
-/// Parallel equivalent of `git::discover`: same stop conditions
-/// (`STOP_DIRS` plus `.git`), same per-directory `.git` identity
-/// resolution, same device/symlink guards. Order of the returned rows is
-/// unspecified (workers race), which is fine: callers group by
-/// `project_id`/`worktree_id`, not position.
-pub fn discover_parallel(root: &Path) -> Result<Vec<DiscoveredWorktree>> {
-    if !root.exists() {
+/// Same as [`discover_parallel`], pruning any subtree at or under a path
+/// in `excluded` (#42 -- `scope::EffectiveScope::pruned_subtrees`): a
+/// pruned directory is never entered, so nothing under it is ever
+/// discovered as a worktree. Excluded, not partially observed -- the
+/// coverage region for it is `Excluded`, never `Missing`/`Partial`.
+fn discover_parallel_excluding(
+    root: &Path,
+    excluded: &[PathBuf],
+) -> Result<Vec<DiscoveredWorktree>> {
+    if !crate::fs_gate::exists(root) {
         return Ok(Vec::new());
     }
-    let device = fs::symlink_metadata(root)
+    let device = crate::fs_gate::symlink_metadata(root)
         .with_context(|| format!("stat {}", root.display()))?
         .dev();
 
@@ -274,7 +289,7 @@ pub fn discover_parallel(root: &Path) -> Result<Vec<DiscoveredWorktree>> {
     pool.push(root.to_path_buf());
 
     pool.drain(worker_count(), |path| {
-        discover_one(&path, device, &pool, &discovered);
+        discover_one(&path, device, &pool, &discovered, excluded);
     });
 
     Ok(discovered.into_inner().unwrap())
@@ -285,8 +300,13 @@ fn discover_one(
     device: u64,
     pool: &Pool<PathBuf>,
     discovered: &Mutex<Vec<DiscoveredWorktree>>,
+    excluded: &[PathBuf],
 ) {
-    let Ok(meta) = fs::symlink_metadata(dir) else {
+    if excluded.iter().any(|e| dir == e || dir.starts_with(e)) {
+        return;
+    }
+    crate::work_counters::record_files_statted(1);
+    let Ok(meta) = crate::fs_gate::symlink_metadata(dir) else {
         return;
     };
     if meta.dev() != device || meta.file_type().is_symlink() || !meta.is_dir() {
@@ -294,7 +314,8 @@ fn discover_one(
     }
 
     let git_path = dir.join(".git");
-    if let Ok(git_meta) = fs::symlink_metadata(&git_path) {
+    crate::work_counters::record_files_statted(1);
+    if let Ok(git_meta) = crate::fs_gate::symlink_metadata(&git_path) {
         let dw = if git_meta.is_dir() {
             classify_main_checkout(dir, &git_path)
         } else if git_meta.is_file() {
@@ -307,9 +328,10 @@ fn discover_one(
         }
     }
 
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = crate::fs_gate::read_dir(dir) else {
         return;
     };
+    crate::work_counters::record_dir_listed();
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -432,10 +454,12 @@ enum AttrJob {
     /// An unclassified directory: recurse, classifying each child by
     /// name and either sizing it as a unit or walking further.
     Walk(PathBuf),
-    /// A directory inside an already-classified artifact subtree.
+    /// A directory inside an already-classified artifact subtree. The
+    /// [`Classified`] is the proof it is one.
     Size {
         path: PathBuf,
         group: Arc<SizeGroup>,
+        classified: Classified,
     },
 }
 
@@ -480,6 +504,7 @@ pub mod progress {
 }
 
 struct AttrShared {
+    sharing: Option<Mutex<crate::sharing::Collector>>,
     seen_inodes: ShardedInodeSet,
     artifacts_by_worktree: Mutex<HashMap<String, Vec<ArtifactRow>>>,
     source_bytes: Mutex<HashMap<String, u64>>,
@@ -487,6 +512,7 @@ struct AttrShared {
     /// counted into it (see `ArtifactRow::local_bytes`).
     source_local: Mutex<HashMap<String, LocalAcc>>,
     unowned: Mutex<Vec<UnownedRow>>,
+    unowned_hardlinks: Mutex<HashSet<PathBuf>>,
     walked_total: AtomicU64,
     attributed_total: AtomicU64,
     unowned_total: AtomicU64,
@@ -505,41 +531,266 @@ struct AttrShared {
     /// takes the row instead of sizing the tree again. Empty on a full
     /// walk.
     carry: HashMap<PathBuf, ArtifactRow>,
+    /// Subtrees pruned from measurement (#42 --
+    /// `scope::EffectiveScope::pruned_subtrees`). A directory at or under
+    /// one of these is never entered: not measured, not reported as
+    /// unowned, not walked at all. Excluded, never partially observed.
+    excluded: Vec<PathBuf>,
+    /// One entry per directory a `Size` job actually listed, with the
+    /// stamp that decides whether the same directory can be believed
+    /// unchanged on a later pass without listing it again
+    /// (`folded_measurement::reuse_folded_measurement`). Populated only
+    /// when `stamp_dirs` is set -- the full walk has no use for it and
+    /// would pay for a vector the size of the tree's directory count.
+    dir_stamps: Mutex<Vec<DirStamp>>,
+    stamp_dirs: bool,
+    /// Set when any `Size` job hit a directory it could not list, root or
+    /// not. `dirs` only carries per-directory completeness for a real
+    /// Source-tree worktree (`worktree_root: Some`); a folded re-size
+    /// called with no worktree (every external-unit and build-container
+    /// measurement) gets no `DirRollup`s at all, so a caller that needs
+    /// "did this fold see everything" -- `resize_artifact_stamped`'s
+    /// fourth return value -- reads this flag instead
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`: an
+    /// unreadable subdirectory is incomplete coverage, never a smaller
+    /// complete tree).
+    incomplete: AtomicBool,
 }
 
-/// Parallel equivalent of `attribution::attribute`: same classification
-/// table, same nearest-containing-worktree attribution (by longest path
-/// prefix over the full `worktrees` list, computed once up front —
-/// unlike discovery, attribution never changes what worktrees exist
-/// while it runs), same hardlink dedup, same one-`Source`-row-per-worktree
-/// fold at the end.
-pub fn attribute_parallel(
-    root: &Path,
-    worktrees: &[(&Path, &str)],
-    observed_at: u64,
-    large_file_min_bytes: u64,
-) -> AttributionResult {
-    attribute_parallel_carrying(
-        root,
-        worktrees,
-        observed_at,
-        large_file_min_bytes,
-        HashMap::new(),
-    )
+/// Explicit reconciliation only. The ordinary folded sizing pool visits the
+/// selected paths with one ephemeral device/inode ledger. Neither identities
+/// nor charge ownership escape this call; history keeps its existing basis.
+#[cfg(test)]
+pub(crate) fn reconcile_unique_bytes(paths: &[PathBuf], excluded: &[PathBuf]) -> Option<u64> {
+    reconcile_shared_bytes(paths, excluded, paths).map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn reconcile_shared_bytes(
+    paths: &[PathBuf],
+    excluded: &[PathBuf],
+    containers: &[PathBuf],
+) -> Option<(u64, crate::sharing::SharingSummary)> {
+    let shared = Arc::new(AttrShared {
+        sharing: Some(Mutex::new(crate::sharing::Collector::new(
+            containers.to_vec(),
+        ))),
+        seen_inodes: ShardedInodeSet::new(),
+        artifacts_by_worktree: Mutex::new(HashMap::new()),
+        source_bytes: Mutex::new(HashMap::new()),
+        source_local: Mutex::new(HashMap::new()),
+        unowned: Mutex::new(Vec::new()),
+        unowned_hardlinks: Mutex::new(HashSet::new()),
+        walked_total: AtomicU64::new(0),
+        attributed_total: AtomicU64::new(0),
+        unowned_total: AtomicU64::new(0),
+        observed_at: 0,
+        dirs: Mutex::new(HashMap::new()),
+        files: Mutex::new(Vec::new()),
+        large_file_min_bytes: u64::MAX,
+        carry: HashMap::new(),
+        excluded: excluded.to_vec(),
+        dir_stamps: Mutex::new(Vec::new()),
+        stamp_dirs: false,
+        incomplete: AtomicBool::new(false),
+    });
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let pool = Arc::new(Pool::new());
+    for path in paths {
+        if roots.iter().chain(excluded).any(|r| path.starts_with(r)) {
+            continue;
+        }
+        let meta = crate::fs_gate::symlink_metadata(&path).ok()?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        roots.push(path.clone());
+        if meta.is_file() {
+            record_file(&path, &meta, &[], &shared);
+        } else if meta.is_dir() {
+            pool.push(AttrJob::Size {
+                group: Arc::new(SizeGroup {
+                    root_path: path.clone(),
+                    kind: ArtifactKind::Cache,
+                    worktree: None,
+                    worktree_root: None,
+                    total: AtomicU64::new(0),
+                    local_total: AtomicU64::new(0),
+                    local_seen: Mutex::new(HashSet::new()),
+                    remaining: AtomicUsize::new(1),
+                    mtime_max: AtomicU64::new(0),
+                }),
+                path,
+                classified: Classified::stored(ArtifactKind::Cache),
+            });
+        }
+    }
+    progress::start();
+    pool.drain(worker_count(), |job| {
+        if let AttrJob::Size {
+            path,
+            group,
+            classified,
+        } = job
+        {
+            process_size(path, &group, &classified, &shared, &pool);
+        }
+    });
+    progress::finish();
+    #[cfg(test)]
+    {
+        let (entries, slots) = shared.seen_inodes.shards.iter().fold((0, 0), |(n, c), s| {
+            let shard = s.lock().unwrap();
+            (n + shard.len(), c + shard.capacity())
+        });
+        eprintln!(
+            "reconciliation ledger: {entries} distinct inodes, {slots} key slots, {} key-capacity bytes (excluding hash/control/allocator overhead)",
+            slots * std::mem::size_of::<(u64, u64)>()
+        );
+    }
+    (!shared.incomplete.load(Ordering::Relaxed)).then(|| {
+        (
+            shared.walked_total.load(Ordering::Relaxed),
+            shared.sharing.as_ref().unwrap().lock().unwrap().summary(),
+        )
+    })
+}
+
+#[cfg(test)]
+mod scope_reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn sharing_groups_are_not_pair_edges_or_ancestor_ownership() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let cache = tmp.path().join("cache");
+        let nested = a.join("node_modules");
+        for dir in [&nested, &b, &cache] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(cache.join("file"), vec![1u8; 8192]).unwrap();
+        fs::hard_link(cache.join("file"), nested.join("file")).unwrap();
+        fs::hard_link(cache.join("file"), b.join("file")).unwrap();
+        let roots = vec![a.clone(), b.clone(), cache.clone()];
+        let containers = vec![a.clone(), nested.clone(), b.clone(), cache.clone()];
+        let (bytes, summary) = reconcile_shared_bytes(&roots, &[], &containers).unwrap();
+        assert_eq!(summary.groups.len(), 1);
+        assert_eq!(summary.groups[0].bytes, bytes);
+        assert_eq!(summary.groups[0].containers.len(), 3);
+        assert!(!summary.groups[0].containers.contains(&a));
+        assert!(!summary.groups[0].unresolved_links);
+        let mut reverse = roots.clone();
+        reverse.reverse();
+        assert_eq!(
+            reconcile_shared_bytes(&reverse, &[], &containers).unwrap(),
+            (bytes, summary)
+        );
+        let (_, excluded) = reconcile_shared_bytes(&roots, &[cache.clone()], &containers).unwrap();
+        assert_eq!(excluded.groups.len(), 1);
+        assert!(excluded.groups[0].unresolved_links);
+        assert!(!excluded.groups[0].containers.contains(&cache));
+        fs::remove_file(b.join("file")).unwrap();
+        fs::write(b.join("file"), vec![2u8; 8192]).unwrap();
+        let (_, changed) = reconcile_shared_bytes(&roots, &[], &containers).unwrap();
+        assert_eq!(changed.groups.len(), 1);
+        assert_eq!(changed.groups[0].containers.len(), 2);
+        assert!(!changed.groups[0].containers.contains(&b));
+        assert!(!changed.groups[0].unresolved_links);
+    }
+
+    #[test]
+    fn reconciliation_keys_include_the_device() {
+        let ledger = ShardedInodeSet::new();
+        assert!(ledger.insert_first((1, 7)));
+        assert!(ledger.insert_first((2, 7)));
+        assert!(!ledger.insert_first((1, 7)));
+    }
+
+    #[test]
+    fn reconciliation_prunes_exclusions_and_does_not_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("keep"), vec![1; 8192]).unwrap();
+        std::fs::write(root.join("excluded"), vec![1; 16384]).unwrap();
+        std::fs::write(tmp.path().join("outside"), vec![1; 32768]).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside"), root.join("link")).unwrap();
+        let expected = allocated_bytes(&std::fs::metadata(root.join("keep")).unwrap());
+        assert_eq!(
+            reconcile_unique_bytes(&[root.clone(), root.join("keep")], &[root.join("excluded")]),
+            Some(expected)
+        );
+        assert_eq!(
+            reconcile_unique_bytes(&[tmp.path().join("missing")], &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn twenty_thousand_shared_entries_are_counted_once_without_retained_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        let mut expected = 0;
+        for i in 0..1000 {
+            let source = a.join(i.to_string());
+            std::fs::write(&source, [1; 32]).unwrap();
+            expected += allocated_bytes(&std::fs::metadata(&source).unwrap());
+            for j in 0..19 {
+                std::fs::hard_link(&source, b.join(format!("{i}-{j}"))).unwrap();
+            }
+        }
+        let (value, work) = crate::work_counters::measured(|| reconcile_unique_bytes(&[b, a], &[]));
+        assert_eq!(value, Some(expected));
+        assert_eq!(work.dirs_listed, 2);
+        assert_eq!(work.files_statted, 20002);
+        // A subsequent independent call cannot inherit the prior pass's set.
+        assert_eq!(
+            reconcile_unique_bytes(&[tmp.path().join("a")], &[]),
+            Some(expected)
+        );
+    }
+}
+
+/// One directory's identity and change stamp, recorded while it was
+/// listed. `mtime_ns`/`ctime_ns` are the directory's own, so an entry
+/// added, removed or renamed inside it moves the stamp; a file rewritten
+/// *in place* does not (see the limitation recorded on
+/// `folded_measurement::reuse_folded_measurement`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirStamp {
+    pub path: PathBuf,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
 }
 
 /// `attribute_parallel` that takes `carry`ed artifact rows as read (see
-/// `AttrShared::carry`), for the incremental path.
-pub fn attribute_parallel_carrying(
+/// `AttrShared::carry`) and a set of subtrees to prune (#42), for the
+/// full-walk and incremental paths respectively.
+fn attribute_parallel_carrying(
     root: &Path,
     worktrees: &[(&Path, &str)],
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
+    excluded: &[PathBuf],
 ) -> AttributionResult {
     progress::start();
-    let result =
-        attribute_parallel_inner(root, worktrees, observed_at, large_file_min_bytes, carry);
+    let result = attribute_parallel_inner(
+        root,
+        worktrees,
+        observed_at,
+        large_file_min_bytes,
+        carry,
+        excluded,
+    );
     progress::finish();
     result
 }
@@ -550,6 +801,7 @@ fn attribute_parallel_inner(
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
+    excluded: &[PathBuf],
 ) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -562,10 +814,12 @@ fn attribute_parallel_inner(
 
     let shared = Arc::new(AttrShared {
         seen_inodes: ShardedInodeSet::new(),
+        sharing: None,
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),
         source_local: Mutex::new(HashMap::new()),
         unowned: Mutex::new(Vec::new()),
+        unowned_hardlinks: Mutex::new(HashSet::new()),
         walked_total: AtomicU64::new(0),
         attributed_total: AtomicU64::new(0),
         unowned_total: AtomicU64::new(0),
@@ -574,6 +828,10 @@ fn attribute_parallel_inner(
         files: Mutex::new(Vec::new()),
         large_file_min_bytes,
         carry,
+        excluded: excluded.to_vec(),
+        dir_stamps: Mutex::new(Vec::new()),
+        stamp_dirs: false,
+        incomplete: AtomicBool::new(false),
     });
 
     let pool: Arc<Pool<AttrJob>> = Arc::new(Pool::new());
@@ -581,7 +839,11 @@ fn attribute_parallel_inner(
 
     pool.drain(worker_count(), |job| match job {
         AttrJob::Walk(path) => process_walk(path, &known, &shared, &pool),
-        AttrJob::Size { path, group } => process_size(path, &group, &shared, &pool),
+        AttrJob::Size {
+            path,
+            group,
+            classified,
+        } => process_size(path, &group, &classified, &shared, &pool),
     });
 
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
@@ -627,6 +889,7 @@ fn attribute_parallel_inner(
                 containers: Vec::new(),
                 shared_with: Vec::new(),
                 dangling: false,
+                evidence: Vec::new(),
             });
     }
 
@@ -650,24 +913,45 @@ fn attribute_parallel_inner(
 /// (`is_dir`/`is_symlink` come from `DirEntry::file_type` for every other
 /// call site), so it alone still needs its own `symlink_metadata` check.
 fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, pool: &Pool<AttrJob>) {
-    let Ok(meta) = fs::symlink_metadata(&path) else {
+    // Pruned by a config exclusion (#42): not entered, not measured, not
+    // reported as unowned. This is what makes a subtree exclusion inside
+    // an otherwise-included root an `Excluded` coverage region rather
+    // than merely a recorded-but-ignored note.
+    if shared
+        .excluded
+        .iter()
+        .any(|e| path == *e || path.starts_with(e))
+    {
+        return;
+    }
+    crate::work_counters::record_files_statted(1);
+    let Ok(meta) = crate::fs_gate::symlink_metadata(&path) else {
         return;
     };
     if meta.file_type().is_symlink() {
         return;
     }
     if meta.is_file() {
-        record_file(&path, &meta, known, shared);
+        // The walk root itself is a single file (rare: an explicit
+        // include naming a file, not a directory) -- at most one row,
+        // so no directory to fold into; push it directly.
+        if let (_, FileTally::Unowned(bytes)) = record_file(&path, &meta, known, shared) {
+            push_unowned_dir(&path, bytes, shared);
+        }
         return;
     }
     if !meta.is_dir() {
         return;
     }
 
-    let entries = match fs::read_dir(&path) {
-        Ok(e) => e,
+    let entries = match crate::fs_gate::read_dir(&path) {
+        Ok(e) => {
+            crate::work_counters::record_dir_listed();
+            e
+        }
         Err(_) => {
             shared.unowned.lock().unwrap().push(UnownedRow {
+                measurement: None,
                 path_or_object: path.display().to_string(),
                 bytes: 0,
                 reason: UnownedReason::PermissionDenied,
@@ -678,6 +962,7 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             });
             return;
         }
@@ -687,6 +972,10 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     // classified below. Only recorded at the end if `path` is inside a
     // known worktree's Source tree (`nearest_worktree` returns `Some`).
     let mut dir_own_allocated: u64 = 0;
+    // Direct-file unowned bytes, folded into exactly one `UnownedRow` for
+    // `path` at the end of this call instead of one row per file (#R10
+    // item 1).
+    let mut dir_unowned_bytes: u64 = 0;
     let mut dir_file_count: u32 = 0;
     let mut dir_dir_count: u32 = 0;
     let mut dir_symlink_count: u32 = 0;
@@ -701,20 +990,27 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         let child_path = entry.path();
         if ft.is_symlink() {
             dir_symlink_count += 1;
-            if let Ok(smeta) = fs::symlink_metadata(&child_path) {
+            crate::work_counters::record_files_statted(1);
+            if let Ok(smeta) = crate::fs_gate::symlink_metadata(&child_path) {
                 dir_mtime_max = dir_mtime_max.max(smeta.mtime());
             }
             continue;
         }
         if ft.is_file() {
             dir_file_count += 1;
-            if let Some((mtime, bytes_opt)) = record_file_typed(&child_path, known, shared) {
+            if let Some((mtime, tally)) = record_file_typed(&child_path, known, shared) {
                 dir_mtime_max = dir_mtime_max.max(mtime);
-                if let Some(bytes) = bytes_opt {
-                    dir_own_allocated += bytes;
-                    if bytes >= shared.large_file_min_bytes {
-                        record_large_file(&child_path, bytes, mtime, known, shared);
+                match tally {
+                    FileTally::Owned(bytes) => {
+                        dir_own_allocated += bytes;
+                        if bytes >= shared.large_file_min_bytes {
+                            record_large_file(&child_path, bytes, mtime, known, shared);
+                        }
                     }
+                    FileTally::Unowned(bytes) => {
+                        dir_unowned_bytes += bytes;
+                    }
+                    FileTally::Duplicate => {}
                 }
             }
         } else if ft.is_dir() {
@@ -722,7 +1018,8 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
             progress::DIRS.fetch_add(1, Ordering::Relaxed);
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if let Some(kind) = classify_at(&path, &name) {
+            if let Some(classified) = classified_at(&path, &name) {
+                let kind = classified.kind().clone();
                 let worktree = nearest_worktree(known, &child_path).map(str::to_string);
                 let worktree_root = worktree
                     .as_deref()
@@ -759,12 +1056,18 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 pool.push(AttrJob::Size {
                     path: child_path,
                     group,
+                    classified,
                 });
             } else {
                 pool.push(AttrJob::Walk(child_path));
             }
         }
     }
+
+    // Direct-file unowned bytes fold into exactly one row for this
+    // directory (never one per file); zero when `path` is inside a known
+    // worktree, since every direct child file then shares that worktree.
+    push_unowned_dir(&path, dir_unowned_bytes, shared);
 
     if let Some(worktree_id) = nearest_worktree(known, &path).map(str::to_string)
         && let Some(root) = worktree_root_path(known, &worktree_id)
@@ -819,19 +1122,36 @@ fn record_large_file(
     });
 }
 
+/// What a recorded file's allocated bytes counted against, so the caller
+/// can fold unowned bytes per *directory* instead of pushing one
+/// [`UnownedRow`] per file (#R10 item 1: a store that scales with the
+/// unowned file count, not the directory count, is exactly the "giant
+/// JSON artifact cache" the handoff forbids).
+enum FileTally {
+    /// Already counted via another hardlink to the same inode; no bytes
+    /// to fold into any rollup.
+    Duplicate,
+    /// Counted against a known worktree.
+    Owned(u64),
+    /// Counted against no known worktree -- folds into this file's
+    /// containing directory's unowned row, never its own row.
+    Unowned(u64),
+}
+
 /// Like `record_file`, but for an entry already known (from
 /// `DirEntry::file_type`) to be a non-symlink file, so it does the one
 /// `lstat` a regular file needs for size/hardlink identity without a
-/// redundant type check first. Returns `(mtime_secs, bytes_if_newly_counted)`
-/// so the caller can fold this file into its directory's rollup (mtime
-/// always; bytes only when this was not a hardlink dup, matching how
+/// redundant type check first. Returns `(mtime_secs, tally)` so the
+/// caller can fold this file into its directory's rollup (mtime always;
+/// bytes only when this was not a hardlink dup, matching how
 /// `walked_total`/`attributed_total` already dedup).
 fn record_file_typed(
     path: &Path,
     known: &[KnownWorktree],
     shared: &AttrShared,
-) -> Option<(i64, Option<u64>)> {
-    let meta = fs::symlink_metadata(path).ok()?;
+) -> Option<(i64, FileTally)> {
+    crate::work_counters::record_files_statted(1);
+    let meta = crate::fs_gate::symlink_metadata(path).ok()?;
     Some(record_file(path, &meta, known, shared))
 }
 
@@ -840,8 +1160,20 @@ fn record_file(
     meta: &fs::Metadata,
     known: &[KnownWorktree],
     shared: &AttrShared,
-) -> (i64, Option<u64>) {
+) -> (i64, FileTally) {
+    if meta.nlink() > 1
+        && let Some(collector) = &shared.sharing
+    {
+        collector.lock().unwrap().record(path, meta);
+    }
     let mtime = meta.mtime();
+    if meta.nlink() > 1 && nearest_worktree(known, path).is_none() {
+        shared
+            .unowned_hardlinks
+            .lock()
+            .unwrap()
+            .insert(path.parent().unwrap_or(path).to_path_buf());
+    }
     // Per-row local figure first: independent of which row the global
     // dedup below happens to charge.
     if let Some(worktree_id) = nearest_worktree(known, path) {
@@ -852,7 +1184,7 @@ fn record_file(
         }
     }
     if !shared.seen_inodes.insert_first((meta.dev(), meta.ino())) {
-        return (mtime, None);
+        return (mtime, FileTally::Duplicate);
     }
     let bytes = allocated_bytes(meta);
     shared.walked_total.fetch_add(bytes, Ordering::Relaxed);
@@ -866,17 +1198,44 @@ fn record_file(
                 .unwrap()
                 .entry(worktree_id.to_string())
                 .or_default() += bytes;
+            (mtime, FileTally::Owned(bytes))
         }
         None => {
             shared.unowned_total.fetch_add(bytes, Ordering::Relaxed);
-            push_unowned_file(path, bytes, shared);
+            (mtime, FileTally::Unowned(bytes))
         }
     }
-    (mtime, Some(bytes))
 }
 
-fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
-    let name = path
+/// Pushes exactly one folded [`UnownedRow`] for a directory none of whose
+/// direct files belong to a known worktree, summing every direct
+/// unowned file's bytes into `bytes` -- never one row per file. The
+/// directory's own name decides the shared-cache label, matching
+/// `finish_size_job`'s already-folded convention for classified unowned
+/// artifact directories (e.g. a stray `node_modules` outside any
+/// worktree) so both folding paths agree on labeling.
+fn push_unowned_dir(dir_path: &Path, bytes: u64, shared: &AttrShared) {
+    let hardlinked = shared.unowned_hardlinks.lock().unwrap().contains(dir_path);
+    if bytes == 0 && !hardlinked {
+        return;
+    }
+    shared.unowned.lock().unwrap().push(unowned_row(
+        dir_path,
+        bytes,
+        if hardlinked {
+            crate::report::UnownedMeasurement::DirectShared
+        } else {
+            crate::report::UnownedMeasurement::Direct
+        },
+    ));
+}
+
+fn unowned_row(
+    dir_path: &Path,
+    bytes: u64,
+    measurement: crate::report::UnownedMeasurement,
+) -> UnownedRow {
+    let name = dir_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
@@ -885,8 +1244,9 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
     } else {
         UnownedReason::NoContainingRepo
     };
-    shared.unowned.lock().unwrap().push(UnownedRow {
-        path_or_object: path.display().to_string(),
+    UnownedRow {
+        measurement: Some(measurement),
+        path_or_object: dir_path.display().to_string(),
         bytes,
         reason,
         shared_bytes: None,
@@ -896,7 +1256,8 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
         shared_with: Vec::new(),
         dangling: false,
         docker_kind: None,
-    });
+        evidence: Vec::new(),
+    }
 }
 
 /// Sizes one directory inside a classified artifact subtree: sums
@@ -905,19 +1266,89 @@ fn push_unowned_file(path: &Path, bytes: u64, shared: &AttrShared) {
 /// `Size` jobs under the same group. Read errors here are swallowed, same
 /// as the serial `size_as_unit`, since a classified directory is sized as
 /// a best-effort unit rather than reported as a permission gap.
-fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool: &Pool<AttrJob>) {
-    let Ok(entries) = fs::read_dir(&path) else {
+fn process_size(
+    path: PathBuf,
+    group: &Arc<SizeGroup>,
+    classified: &Classified,
+    shared: &AttrShared,
+    pool: &Pool<AttrJob>,
+) {
+    // Pruned (#45-#49's external-location double-measurement fix): a
+    // subtree named in `shared.excluded` is measured independently
+    // elsewhere (typically as its own external unit), so this job
+    // contributes nothing for it -- same "not entered, not measured"
+    // contract as `process_walk`'s identical check.
+    if shared
+        .excluded
+        .iter()
+        .any(|e| path == *e || path.starts_with(e))
+    {
+        finish_size_job(group, shared);
+        return;
+    }
+    let Ok(entries) = crate::fs_gate::read_dir(&path) else {
+        // The unit is still sized best-effort, but the directory that
+        // could not be listed is recorded as an *incomplete* row rather
+        // than silently absent: without it every ancestor's rollup said
+        // `complete: true` over bytes it never saw, and a `node_modules`
+        // with one unreadable package read as a complete, smaller tree
+        // (#65: partial/unreadable containers are incomplete coverage,
+        // never a disappearance or a quiet shrink).
+        shared.incomplete.store(true, Ordering::Relaxed);
+        if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
+            let rel_path = rel_path_string(root, &path);
+            let parent_rel_path = parent_rel_path_of(&rel_path);
+            shared.dirs.lock().unwrap().insert(
+                (worktree_id.clone(), rel_path.clone()),
+                DirRollup {
+                    worktree_id: worktree_id.clone(),
+                    track: None,
+                    rel_path,
+                    parent_rel_path,
+                    allocated_total: 0,
+                    own_allocated: 0,
+                    file_count: 0,
+                    entry_count: 0,
+                    symlink_count: 0,
+                    mod_time_min: 0,
+                    complete: false,
+                    growth_bytes: None,
+                },
+            );
+        }
         finish_size_job(group, shared);
         return;
     };
+    crate::work_counters::record_dir_listed();
     // This directory's own rollup (store depth inside the folded unit).
     let mut own_allocated: u64 = 0;
     let mut file_count: u32 = 0;
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
-    let mut dir_mtime_max: i64 = fs::symlink_metadata(&path).map(|m| m.mtime()).unwrap_or(0);
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
+    crate::work_counters::record_files_statted(1);
+    let own_meta = crate::fs_gate::symlink_metadata(&path);
+    if shared.stamp_dirs
+        && let Ok(m) = own_meta.as_ref()
+    {
+        shared.dir_stamps.lock().unwrap().push(DirStamp {
+            path: path.clone(),
+            mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+            ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+        });
+    }
+    let mut dir_mtime_max: i64 = own_meta.map(|m| m.mtime()).unwrap_or(0);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            shared.incomplete.store(true, Ordering::Relaxed);
+            continue;
+        };
+        if shared.excluded.iter().any(|e| entry.path().starts_with(e)) {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            shared.incomplete.store(true, Ordering::Relaxed);
+            continue;
+        };
         if ft.is_symlink() {
             symlink_count += 1;
             continue;
@@ -928,9 +1359,12 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             pool.push(AttrJob::Size {
                 path: entry.path(),
                 group: Arc::clone(group),
+                classified: classified.clone(),
             });
         } else if ft.is_file() {
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            crate::work_counters::record_files_statted(1);
+            let Ok(meta) = crate::fs_gate::symlink_metadata(entry.path()) else {
+                shared.incomplete.store(true, Ordering::Relaxed);
                 continue;
             };
             if meta.file_type().is_symlink() || !meta.is_file() {
@@ -940,6 +1374,11 @@ fn process_size(path: PathBuf, group: &Arc<SizeGroup>, shared: &AttrShared, pool
             own_allocated += allocated_bytes(&meta);
             dir_mtime_max = dir_mtime_max.max(meta.mtime());
             let key = (meta.dev(), meta.ino());
+            if meta.nlink() > 1
+                && let Some(collector) = &shared.sharing
+            {
+                collector.lock().unwrap().record(&entry.path(), &meta);
+            }
             group
                 .mtime_max
                 .fetch_max(meta.mtime().max(0) as u64, Ordering::Relaxed);
@@ -1021,6 +1460,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                     containers: Vec::new(),
                     shared_with: Vec::new(),
                     dangling: false,
+                    evidence: Vec::new(),
                 });
         }
         None => {
@@ -1035,6 +1475,11 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 UnownedReason::NoContainingRepo
             };
             shared.unowned.lock().unwrap().push(UnownedRow {
+                measurement: Some(if group.local_seen.lock().unwrap().is_empty() {
+                    crate::report::UnownedMeasurement::Subtree
+                } else {
+                    crate::report::UnownedMeasurement::SubtreeShared
+                }),
                 path_or_object: group.root_path.display().to_string(),
                 bytes,
                 reason,
@@ -1045,6 +1490,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             });
         }
     }
@@ -1058,6 +1504,296 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 // `attribute_parallel` above -- they simply start the same machinery at a
 // narrower root than the whole scan root.
 // ---------------------------------------------------------------------
+
+/// Refresh folded unowned measurements without entering unchanged siblings.
+/// `None` asks the caller for reconciliation (unknown boundaries,
+/// unreadable paths, or changed project ownership). Sharing is an explicitly
+/// stale estimate, not a reason to walk unrelated containers.
+pub(crate) fn refresh_unowned(
+    root: &Path,
+    previous: &[UnownedRow],
+    changed: &[PathBuf],
+    worktrees: &[PathBuf],
+    excluded: &[PathBuf],
+    observed_at: u64,
+    shared_root: bool,
+) -> Option<Vec<UnownedRow>> {
+    use crate::report::UnownedMeasurement::{
+        Direct, DirectEstimate, Hardlinked, Subtree, SubtreeEstimate,
+    };
+    if previous
+        .iter()
+        .any(|r| matches!(r.measurement, None | Some(Hardlinked)))
+    {
+        return None;
+    }
+    let mut rows = previous.to_vec();
+    let mut sharing = shared_root
+        || previous
+            .iter()
+            .any(|r| !matches!(r.measurement, Some(Direct | Subtree)));
+    if sharing {
+        for row in &mut rows {
+            row.measurement = row.measurement.map(|m| {
+                if m.folded() {
+                    SubtreeEstimate
+                } else {
+                    DirectEstimate
+                }
+            });
+        }
+    }
+    let mut pending: Vec<PathBuf> = changed
+        .iter()
+        .filter(|p| !worktrees.iter().any(|w| p.starts_with(w)))
+        .map(|p| {
+            previous
+                .iter()
+                .find(|r| {
+                    r.measurement.is_some_and(|m| m.folded()) && p.starts_with(&r.path_or_object)
+                })
+                .map(|r| PathBuf::from(&r.path_or_object))
+                .unwrap_or_else(|| p.clone())
+        })
+        .collect();
+    pending.sort();
+    pending.dedup();
+    let mut visited = HashSet::new();
+    while let Some(path) = pending.pop() {
+        if !visited.insert(path.clone())
+            || excluded.iter().any(|e| path.starts_with(e))
+            || worktrees.iter().any(|w| path.starts_with(w))
+        {
+            continue;
+        }
+        if !path.starts_with(root) {
+            return None;
+        }
+        // Checking only the final component would follow a replaced ancestor.
+        let mut blocked = None;
+        for ancestor in path.ancestors().take_while(|p| p.starts_with(root)) {
+            crate::work_counters::record_files_statted(1);
+            match crate::fs_gate::symlink_metadata(ancestor) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    blocked = Some(ancestor.to_path_buf());
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    blocked = Some(ancestor.to_path_buf());
+                    break;
+                }
+                Err(_) => return None,
+            }
+        }
+        if let Some(blocked) = blocked {
+            rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&blocked));
+            if let Some(parent) = blocked.parent().filter(|p| p.starts_with(root)) {
+                pending.push(parent.to_path_buf());
+            }
+            continue;
+        }
+        // Classify only after rejecting symlink ancestors: cache tags read
+        // marker bytes, not just compare a basename.
+        if let Some(boundary) = path
+            .ancestors()
+            .take_while(|a| *a != root && a.starts_with(root))
+            .filter(|a| unowned_classification(a).is_some())
+            .last()
+            && boundary != path
+        {
+            pending.push(boundary.to_path_buf());
+            continue;
+        }
+        if path
+            .ancestors()
+            .take_while(|p| p.starts_with(root))
+            .any(|p| crate::fs_gate::exists(p.join(".git")))
+        {
+            return None;
+        }
+        crate::work_counters::record_files_statted(1);
+        let meta = crate::fs_gate::symlink_metadata(&path).ok()?;
+        if !meta.is_dir() {
+            // Item events have no independent row: relist their parent once.
+            let parent = path.parent().filter(|p| p.starts_with(root))?;
+            pending.push(parent.to_path_buf());
+            continue;
+        }
+        let classified_now = path != root && unowned_classification(&path).is_some();
+        let was_folded = previous.iter().any(|r| {
+            r.path_or_object == path.to_string_lossy() && r.measurement.is_some_and(|m| m.folded())
+        });
+        if was_folded && !classified_now {
+            return None;
+        }
+        if classified_now {
+            if worktrees.iter().any(|w| w.starts_with(&path)) {
+                return None;
+            }
+            let (measured, _, _, complete) = resize_artifact_stamped(
+                &path,
+                ArtifactKind::Cache,
+                observed_at,
+                None,
+                excluded,
+                false,
+            );
+            if !complete {
+                return None;
+            }
+            sharing |= measured.hardlinked;
+            rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&path));
+            rows.push(unowned_row(
+                &path,
+                measured.bytes,
+                if sharing || measured.hardlinked {
+                    SubtreeEstimate
+                } else {
+                    Subtree
+                },
+            ));
+            continue;
+        }
+        let measured = measure_directory(&path).ok()?;
+        sharing |= measured.hardlinked;
+        let children: HashSet<PathBuf> = measured
+            .children
+            .iter()
+            .map(|name| path.join(name))
+            .collect();
+        // A removed known checkout needs the normal discovery/history path.
+        if worktrees
+            .iter()
+            .any(|w| w.starts_with(&path) && !crate::fs_gate::exists(w))
+        {
+            return None;
+        }
+        rows.retain(|r| {
+            let p = Path::new(&r.path_or_object);
+            let Ok(rel) = p.strip_prefix(&path) else {
+                return true;
+            };
+            rel.components()
+                .next()
+                .is_some_and(|c| children.contains(&path.join(c)))
+        });
+        if measured.allocated > 0 {
+            rows.push(UnownedRow {
+                measurement: Some(if sharing || measured.hardlinked {
+                    DirectEstimate
+                } else {
+                    Direct
+                }),
+                path_or_object: path.display().to_string(),
+                bytes: measured.allocated,
+                reason: if is_shared_cache_name(
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default(),
+                ) {
+                    UnownedReason::SharedCache
+                } else {
+                    UnownedReason::NoContainingRepo
+                },
+                shared_bytes: None,
+                note: None,
+                docker_kind: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
+                evidence: Vec::new(),
+            });
+        }
+        for child in children {
+            if excluded.iter().any(|e| child.starts_with(e))
+                || worktrees.iter().any(|w| child.starts_with(w))
+            {
+                continue;
+            }
+            if previous
+                .iter()
+                .any(|r| Path::new(&r.path_or_object).starts_with(&child))
+            {
+                continue;
+            }
+            // An unknown child might contain a new checkout. Discovery is
+            // bounded to this new subtree, never an unchanged sibling.
+            let mut pruned = excluded.to_vec();
+            pruned.extend_from_slice(worktrees);
+            if !discover_parallel_excluding(&child, &pruned)
+                .ok()?
+                .is_empty()
+            {
+                return None;
+            }
+            let classified = unowned_classification(&child);
+            let fresh = if let Some(classified) = classified {
+                if worktrees.iter().any(|w| w.starts_with(&child)) {
+                    return None;
+                }
+                let (measured, _, _, complete) = resize_artifact_stamped(
+                    &child,
+                    classified.kind().clone(),
+                    observed_at,
+                    None,
+                    &pruned,
+                    false,
+                );
+                if !complete {
+                    return None;
+                }
+                vec![unowned_row(
+                    &child,
+                    measured.bytes,
+                    if sharing || measured.hardlinked {
+                        SubtreeEstimate
+                    } else {
+                        Subtree
+                    },
+                )]
+            } else {
+                attribute_parallel_carrying(
+                    &child,
+                    &[],
+                    observed_at,
+                    u64::MAX,
+                    HashMap::new(),
+                    &pruned,
+                )
+                .unowned
+            };
+            if fresh
+                .iter()
+                .any(|r| matches!(r.measurement, None | Some(Hardlinked)))
+            {
+                return None;
+            }
+            rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&child));
+            sharing |= fresh
+                .iter()
+                .any(|r| !matches!(r.measurement, Some(Direct | Subtree)));
+            rows.extend(fresh);
+        }
+    }
+    if sharing {
+        for row in &mut rows {
+            row.measurement = row.measurement.map(|m| {
+                if m.folded() {
+                    SubtreeEstimate
+                } else {
+                    DirectEstimate
+                }
+            });
+        }
+    }
+    Some(rows)
+}
+
+fn unowned_classification(path: &Path) -> Option<Classified> {
+    classified_at(path.parent()?, path.file_name()?.to_str()?)
+}
 
 /// Re-walks exactly one worktree, matching `discover_and_attribute`'s
 /// per-worktree slice of `attribute_parallel` but seeded at
@@ -1088,18 +1824,23 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
 /// walk) is an accepted, documented trade for not having to carry the
 /// whole tree's inode set forward between observations.
 pub fn attribute_one_worktree(
+    _stage: &crate::bus::Stage,
     worktree_root: &Path,
     all_worktrees: &[(&Path, &str)],
     observed_at: u64,
     large_file_min_bytes: u64,
     carry: HashMap<PathBuf, ArtifactRow>,
 ) -> AttributionResult {
+    // The incremental caller (`growth::stage_tracked_with_source`) filters
+    // `changed_dirs` against `pruned_subtrees` before ever reaching here,
+    // so this re-walk never targets an excluded worktree.
     attribute_parallel_carrying(
         worktree_root,
         all_worktrees,
         observed_at,
         large_file_min_bytes,
         carry,
+        &[],
     )
 }
 
@@ -1115,6 +1856,22 @@ pub fn resize_artifact(root_path: &Path, kind: ArtifactKind, observed_at: u64) -
     resize_artifact_with_dirs(root_path, kind, observed_at, None).0
 }
 
+/// `resize_artifact`, excluding `excluded` subtrees from the measurement
+/// entirely -- not measured, not folded into the total, exactly like
+/// `process_walk`'s config-exclusion contract (#42). Used by
+/// `crate::external::discover_and_measure` so a location that contains
+/// another, separately-measured detector location (e.g. Cargo home
+/// containing the registry/git subtrees it also proposes as their own
+/// units) is not double-measured (#45-#49).
+pub fn resize_artifact_excluding(
+    root_path: &Path,
+    kind: ArtifactKind,
+    observed_at: u64,
+    excluded: &[PathBuf],
+) -> ArtifactRow {
+    resize_artifact_with_dirs_excluding(root_path, kind, observed_at, None, excluded).0
+}
+
 /// `resize_artifact` that also returns the unit's interior directory
 /// rollups (relative to `worktree`), for the store.
 pub fn resize_artifact_with_dirs(
@@ -1123,16 +1880,49 @@ pub fn resize_artifact_with_dirs(
     observed_at: u64,
     worktree: Option<(&str, &Path)>,
 ) -> (ArtifactRow, Vec<DirRollup>) {
+    resize_artifact_with_dirs_excluding(root_path, kind, observed_at, worktree, &[])
+}
+
+/// `resize_artifact_with_dirs`, excluding `excluded` subtrees (see
+/// [`resize_artifact_excluding`]).
+pub fn resize_artifact_with_dirs_excluding(
+    root_path: &Path,
+    kind: ArtifactKind,
+    observed_at: u64,
+    worktree: Option<(&str, &Path)>,
+    excluded: &[PathBuf],
+) -> (ArtifactRow, Vec<DirRollup>) {
+    let (row, dirs, _, _) =
+        resize_artifact_stamped(root_path, kind, observed_at, worktree, excluded, false);
+    (row, dirs)
+}
+
+/// [`resize_artifact_with_dirs_excluding`] that can also return one
+/// [`DirStamp`] per directory it listed, so the next pass can decide
+/// whether this unit still measures the same without listing anything
+/// (`folded_measurement::reuse_folded_measurement`). The stamps come
+/// from the `symlink_metadata` each `Size` job already takes, so
+/// `stamp_dirs` costs a push per directory and no extra syscall.
+pub fn resize_artifact_stamped(
+    root_path: &Path,
+    kind: ArtifactKind,
+    observed_at: u64,
+    worktree: Option<(&str, &Path)>,
+    excluded: &[PathBuf],
+    stamp_dirs: bool,
+) -> (ArtifactRow, Vec<DirRollup>, Vec<DirStamp>, bool) {
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
     // took ~1.8 s serially; on the pool it takes what the full walk
     // spends on it.
     let shared = Arc::new(AttrShared {
         seen_inodes: ShardedInodeSet::new(),
+        sharing: None,
         artifacts_by_worktree: Mutex::new(HashMap::new()),
         source_bytes: Mutex::new(HashMap::new()),
         source_local: Mutex::new(HashMap::new()),
         unowned: Mutex::new(Vec::new()),
+        unowned_hardlinks: Mutex::new(HashSet::new()),
         walked_total: AtomicU64::new(0),
         attributed_total: AtomicU64::new(0),
         unowned_total: AtomicU64::new(0),
@@ -1141,6 +1931,10 @@ pub fn resize_artifact_with_dirs(
         files: Mutex::new(Vec::new()),
         large_file_min_bytes: u64::MAX,
         carry: HashMap::new(),
+        excluded: excluded.to_vec(),
+        dir_stamps: Mutex::new(Vec::new()),
+        stamp_dirs,
+        incomplete: AtomicBool::new(false),
     });
     let wt_id = worktree
         .map(|(id, _)| id.to_string())
@@ -1162,13 +1956,20 @@ pub fn resize_artifact_with_dirs(
     pool.push(AttrJob::Size {
         path: root_path.to_path_buf(),
         group,
+        classified: Classified::stored(kind.clone()),
     });
     pool.drain(worker_count(), |job| match job {
         AttrJob::Walk(path) => process_walk(path, &[], &shared, &pool),
-        AttrJob::Size { path, group } => process_size(path, &group, &shared, &pool),
+        AttrJob::Size {
+            path,
+            group,
+            classified,
+        } => process_size(path, &group, &classified, &shared, &pool),
     });
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
+    let complete = !shared.incomplete.load(Ordering::Relaxed);
     let dirs: Vec<DirRollup> = shared.dirs.into_inner().unwrap().into_values().collect();
+    let stamps: Vec<DirStamp> = shared.dir_stamps.into_inner().unwrap();
     let mut rows = shared
         .artifacts_by_worktree
         .into_inner()
@@ -1197,6 +1998,7 @@ pub fn resize_artifact_with_dirs(
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
+        evidence: Vec::new(),
     });
     row.kind = kind;
     row.source = Source::new("filesystem.fsevents");
@@ -1204,7 +2006,7 @@ pub fn resize_artifact_with_dirs(
     // `local_bytes` (the full walk charges shared inodes to whichever row
     // saw them first; the incremental merge applies the local delta).
     row.local_bytes = row.bytes.max(row.local_bytes);
-    (row, dirs)
+    (row, dirs, stamps, complete)
 }
 
 /// Checkouts at `dir` and its immediate children only: what a changed
@@ -1213,7 +2015,8 @@ pub fn resize_artifact_with_dirs(
 /// the clone itself); a recursive discovery of `~/src` here cost ~0.5 s
 /// per incremental observation and found nothing new.
 pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
-    let Ok(meta) = fs::symlink_metadata(dir) else {
+    crate::work_counters::record_files_statted(1);
+    let Ok(meta) = crate::fs_gate::symlink_metadata(dir) else {
         return Vec::new();
     };
     if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -1222,18 +2025,23 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
     let device = meta.dev();
     let discovered: Mutex<Vec<DiscoveredWorktree>> = Mutex::new(Vec::new());
     let pool: Pool<PathBuf> = Pool::new();
-    discover_one(dir, device, &pool, &discovered);
+    // The incremental path filters `changed_dirs` against
+    // `pruned_subtrees` before this is ever called (see
+    // `growth::stage_tracked_with_source`), so no exclusion list is
+    // needed here.
+    discover_one(dir, device, &pool, &discovered, &[]);
     // discover_one queued the children it would have recursed into; take
     // exactly one level of them, without recursing further.
     while let Some(child) = pool.try_pop() {
-        let Ok(cm) = fs::symlink_metadata(&child) else {
+        crate::work_counters::record_files_statted(2);
+        let Ok(cm) = crate::fs_gate::symlink_metadata(&child) else {
             continue;
         };
         if cm.file_type().is_symlink() || !cm.is_dir() || cm.dev() != device {
             continue;
         }
         let git_path = child.join(".git");
-        if let Ok(git_meta) = fs::symlink_metadata(&git_path) {
+        if let Ok(git_meta) = crate::fs_gate::symlink_metadata(&git_path) {
             let dw = if git_meta.is_dir() {
                 classify_main_checkout(&child, &git_path)
             } else if git_meta.is_file() {
@@ -1256,15 +2064,21 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
 /// Runs the parallel discovery pass, then the parallel attribution pass
 /// over the resulting worktree list, matching the two sequential calls
 /// `report_with` used to make to `git::discover` and
-/// `attribution::attribute`.
+/// `attribution::attribute`. `excluded` (#42 --
+/// `scope::EffectiveScope::pruned_subtrees`) prunes every subtree in it
+/// from both passes: nothing under an excluded path is discovered as a
+/// worktree, measured, or reported as unowned. Empty for every caller
+/// with no scope-level exclusions to enforce.
 pub fn discover_and_attribute(
+    _stage: &crate::bus::Stage,
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,
+    excluded: &[PathBuf],
 ) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
-    let discovered = discover_parallel(root)?;
+    let discovered = discover_parallel_excluding(root, excluded)?;
     if trace {
         eprintln!("[trace] walk::discover_parallel: {:?}", t0.elapsed());
     }
@@ -1277,7 +2091,14 @@ pub fn discover_and_attribute(
         .map(|(p, id)| (p.as_path(), id.as_str()))
         .collect();
     let t1 = std::time::Instant::now();
-    let attribution = attribute_parallel(root, &worktree_refs, observed_at, large_file_min_bytes);
+    let attribution = attribute_parallel_carrying(
+        root,
+        &worktree_refs,
+        observed_at,
+        large_file_min_bytes,
+        HashMap::new(),
+        excluded,
+    );
     if trace {
         eprintln!("[trace] walk::attribute_parallel: {:?}", t1.elapsed());
     }

@@ -6,51 +6,51 @@
 
 web
 
-<!-- Schema compatibility only: the product is a macOS terminal application. The schema has no terminal value. Use terminal frames at 80×24 and 200×60 for visual review. -->
+<!-- Schema compatibility only: the product is a macOS/Linux terminal application. The schema has no terminal value. Use terminal frames at 80×24 and 200×60 for visual review. -->
 
 ## Stack
 
-Rust workspace. `swamp-core` builds the report and provides storage and action primitives. `swamp` provides the CLI and a ratatui/crossterm UI; `swamp-mcp` provides a stdio MCP server.
+Rust workspace. `swamp-core` owns observation, attribution, storage, and action primitives. The CLI and ratatui/crossterm TUI consume stored report facts. `skills/swamp/` documents the CLI's agent interface; there is no MCP server.
 
 ## Users
 
-Developers with multiple checkouts, linked worktrees, build systems, and Docker workloads on one Mac. Coding agents add another source of builds and dependency installs. Developers and their agents need to locate storage growth and inspect the affected project before acting.
+Developers with multiple projects, clones, linked worktrees, build systems, containers, and coding agents on macOS or Linux. They need to understand growth and choose what to keep without opening each project by hand.
 
 ## Product Purpose
 
-Explain disk growth by Git project, checkout or worktree, and artifact. Keep observations so users can compare changes over time, inspect the relevant context, and remove selected units from the same tool.
+Help a developer decide what to keep, remove, or investigate by answering: what grew, which project it belongs to, and what removal would cost.
 
-## Positioning
-
-Swamp combines a development-specific storage model with observation history, incremental filesystem updates, Git and Docker context, and CLI, TUI, and MCP interfaces. Describe these capabilities directly; do not claim exclusive ownership of disk-usage history or use an unverified competitor matrix.
+A larger detector catalog is useful only when it improves that decision. Swamp is a developer-storage tool, not a perfect audit of every file, writer, or access.
 
 ## Operating Context
 
-macOS terminal. Observations come from report commands, MCP report tools, the open TUI, or an optional LaunchAgent. The TUI watches for filesystem events while open. Scheduled observation refreshes data without performing cleanup.
+`observe`, the TUI, and optional scheduled observations measure storage and record facts. `report` reads the last stored observation; it does not refresh it. The TUI watches for changes while open. Linux can also use an opt-in collector; macOS can replay persisted FSEvents.
+
+The effective scope combines defaults, enabled tool-location detectors, and configured additions/exclusions. Explicit roots replace that root selection, while configured exclusions still apply. Scope and coverage must remain visible.
 
 ## Capabilities and Constraints
 
-- Core report data is shared across interfaces. Filtering, display, and action orchestration differ; see the [usage reference](docs/usage.md).
-- The initial TUI filter is `growth > 100MB in 7d`; saved choices override it. Views cover projects, trees, builds, dependencies, Docker, kinds, unowned storage, and ecosystems.
-- History starts with observation and is bounded by retained measurements. It contains metadata and sizes, not file contents or writer identity. See [known implementation limits](docs/architecture.md#limits-of-the-current-implementation).
-- Artifacts, source directories, whole checkouts, linked worktrees, and some unowned paths can be selected for actions. Confirmation must make the selected scope and recovery behavior visible.
-- Filesystem paths go to Trash. Docker images and volumes are removed by the daemon without a backup. Build-cache records are report-only.
-- Git status and activity are evidence for the user's decision. Dirty, unpushed, and untracked warnings do not universally block removal.
-- Plans require authorization. MCP has no grant-writing tool; this does not prevent a process with shell access from invoking the CLI.
-- Coverage and unowned storage remain visible. Docker has separate reconciliation totals from the filesystem walk.
+- Group checkouts and linked worktrees by project, including separate clones with a matching normalized Git remote.
+- Model external tool homes and agent storage without assigning ambiguous ownership to a convenient project.
+- Identify build units by purpose. Show age, size, and removal consequences before statistics or implementation detail.
+- Keep current measurements and reverse-delta history in the existing Parquet store. Fold artifacts; request deeper inspection on demand instead of persisting an exhaustive file index.
+- Keep incremental observation local to changes. Label stale unique-byte estimates until explicit reconciliation.
+- Record history coverage honestly. History begins with observation and contains sizes and metadata, not recoverable contents or writer identity.
+- Offer cleanup only for supported units. Filesystem actions use Trash; Docker image/volume deletion has no Trash recovery. External shared stores may be inspection-only.
+- Keep removal human-confirmed in the TUI. There is no CLI deletion or approval command. Facts are not all re-checked between marking and confirmation.
+- Distinguish rebuilding a cache from losing a conversation, checkpoint, local source change, or other unique data.
 
-## Brand Commitments
-
-Name: swamp. Use concrete descriptions, documented commands, and qualified measurements. Ecosystem glyphs identify project types in the terminal; prose needs no decorative icons or slogans.
-
-## Evidence on Hand
-
-The implementation, committed report and TUI fixtures, and integration tests are the primary evidence. Historical timings in the changelog came from individual developer trees, not a controlled benchmark. The [documentation accuracy report](docs/accuracy.md) records checked claims and corrections.
+See [usage](docs/usage.md), the [trust model](skills/swamp/references/trust-model.md), and [implementation limits](docs/architecture.md#limits-of-the-current-implementation).
 
 ## Product Principles
 
-1. Lead with growth, with size available alongside it.
-2. Preserve project and worktree context when inspecting individual artifacts.
-3. Show the paths, warnings, and recovery behavior before an action.
-4. Distinguish measured data, cached facts, missing evidence, and unknown ownership.
-5. Keep repeated observations cheap enough to make history practical; verify this with representative workloads.
+1. Lead with the user's decision: growth, ownership, and consequences.
+2. Preserve project and worktree context through drilldown.
+3. Show exact action scope and recovery behavior.
+4. Distinguish measurements, cached facts, inference, and unknowns.
+5. Make repeated observation cheap enough that useful history accumulates.
+6. Deliver each supported adapter through shared views and actions; do not imply the entire ecosystem catalog is complete.
+
+## Evidence on Hand
+
+Implementation, fixtures, integration tests, installed-binary trials, and native CI are the evidence. Individual timings are not general performance guarantees. The [accuracy report](docs/accuracy.md) records the release's claim checks.

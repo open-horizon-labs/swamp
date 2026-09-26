@@ -1,7 +1,3 @@
-use crate::{entities::*, grants::*, ledger::*};
-use anyhow::Result;
-use std::{fs, path::Path};
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Outcome {
     pub unit_id: String,
@@ -11,39 +7,19 @@ pub struct Outcome {
     pub observed_free_space_delta: Option<i64>,
 }
 
-/// Execute only after the caller supplies a human-originated grant. The
-/// filesystem is re-read immediately before the sink; an index row is never
-/// accepted as a substitute for that observation.
-pub fn execute_delete(
-    artifact: &Artifact,
-    plan_unit: &PlanUnit,
-    grant: &Grant,
-    ledger: &Ledger,
-    trash_root: &Path,
-    actor: &str,
-) -> Result<Outcome> {
-    if plan_unit.artifact_id != artifact.id {
-        anyhow::bail!("plan unit does not identify artifact")
-    }
-    grant.validate(artifact, now())?;
-    if crate::occupancy::occupied(&artifact.path) {
-        anyhow::bail!("occupied")
-    }
-    let current = fs::symlink_metadata(&artifact.path)
-        .map_err(|_| anyhow::anyhow!("could not re-observe path"))?;
-    if current.len() != artifact.bytes && current.is_file() {
-        anyhow::bail!("activity changed")
-    }
-    let destination = trash_root.join(format!("{}-{}", now(), artifact.id));
-    fs::create_dir_all(trash_root)?;
-    fs::rename(&artifact.path, &destination)?;
-    let outcome = Outcome {
-        unit_id: artifact.id.clone(),
-        status: "completed".into(),
-        reason: None,
-        intended_bytes: artifact.bytes,
-        observed_free_space_delta: None,
-    };
-    ledger.append(&ActionRecord{id:new_id(),verb:grant.verb.clone(),entity_id:artifact.id.clone(),evidence:serde_json::json!({"observed_at":artifact.meta.observed_at,"bytes":artifact.bytes}),grant_id:grant.id.clone(),actor:actor.into(),outcome:"completed".into(),recovery_location:Some(destination),measured_free_space_delta:None,observed_path_state:Some("trashed".into()),recorded_at:now()})?;
-    Ok(outcome)
-}
+// `execute_delete` lived here until 2026-09-22: a second delete
+// implementation that moved a user artifact to Trash after
+// `occupancy::occupied` -- the *boolean* probe whose own doc comment says
+// "never call this from a destructive sink" -- plus a `len()` comparison.
+// It had no callers anywhere in the workspace; `crates/tui/src/actions.rs`
+// pointed at it in a doc comment while calling its own `trash_path`.
+//
+// It is deleted rather than repaired, following this codebase's own
+// precedent with `is_human_protected`: the right response to "the audit
+// could inspect the wrong one of two implementations" is to remove the
+// one nobody calls. `actions::execute_with_trash` and the TUI's
+// `trash_path` are the two real sinks, and both recheck live state
+// (`.oh/guardrails/execution-sinks-recheck-live-state.md`).
+//
+// Found by the hardened `execution_sinks_recheck_live_state` audit, which
+// derives sink files from the workspace instead of a hand-written list.

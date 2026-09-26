@@ -18,15 +18,36 @@ impl Consumer for GrowthConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::CargoAnnotated]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let Event::CargoAnnotated(draft) = event else {
             return Ok(vec![]);
         };
+        let trace_all = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+        let t0 = std::time::Instant::now();
         let mut d: Draft = (**draft).clone();
+        if trace_all {
+            eprintln!("[trace] growth: clone draft: {:?}", t0.elapsed());
+        }
+        let t0 = std::time::Instant::now();
         // CargoAnnotated carries directory totals already aggregated once.
         let roots = crate::report::artifact_roots(&d.projects);
         let nested_shadow_paths =
             add_nested_history_rows(&mut d.projects, &d.nested_artifacts, ctx.observed_at);
+        // R15 item 3: the artifact history stores each row's ecosystem,
+        // so it has to be known before the store is written, not one
+        // stage later in tracking.
+        crate::report::annotate_artifact_ecosystems(&mut d.projects);
+        if trace_all {
+            eprintln!(
+                "[trace] growth: nested rows + ecosystems: {:?}",
+                t0.elapsed()
+            );
+        }
         if let Some(dir) = &ctx.store_dir {
             // The store is scoped to the canonical requested root, not just
             // the device. Multiple roots on one volume must never share
@@ -42,19 +63,24 @@ impl Consumer for GrowthConsumer {
             let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
             let t = std::time::Instant::now();
             if ctx.observe {
+                let protected_worktree_ids: std::collections::HashSet<String> =
+                    d.protected_worktree_ids.iter().cloned().collect();
                 crate::growth::observe_and_annotate(
+                    stage,
                     dir,
                     volume_id,
                     &mut d.projects,
                     ctx.observed_at,
                     config.retention_days,
                     since_secs,
+                    &protected_worktree_ids,
                 )?;
                 if trace {
                     eprintln!("[trace] growth: artifacts store: {:?}", t.elapsed());
                 }
                 let t = std::time::Instant::now();
                 crate::growth::observe_and_annotate_dirs(
+                    stage,
                     dir,
                     volume_id,
                     &mut d.dirs,
@@ -71,6 +97,7 @@ impl Consumer for GrowthConsumer {
                 }
                 let t = std::time::Instant::now();
                 crate::growth::observe_and_annotate_files(
+                    stage,
                     dir,
                     volume_id,
                     &mut d.files,
@@ -111,35 +138,22 @@ impl Consumer for GrowthConsumer {
                     since_secs,
                 )?;
             }
+            let t = std::time::Instant::now();
             d.schedule_line = Some(crate::schedule::header_line(
                 dir,
                 &ctx.root,
                 ctx.observed_at,
             ));
-        }
-        let measured: HashMap<_, _> = d
-            .dirs
-            .iter()
-            .map(|row| ((row.worktree_id.as_str(), row.rel_path.as_str()), row))
-            .collect();
-        for project in &mut d.projects {
-            for wt in &mut project.worktrees {
-                for artifact in &mut wt.artifacts {
-                    let rel = artifact
-                        .path
-                        .strip_prefix(&wt.path)
-                        .unwrap_or(&artifact.path)
-                        .to_string_lossy();
-                    if !roots.contains(&(wt.worktree_id.clone(), rel.to_string())) {
-                        continue;
-                    }
-                    if let Some(dir) = measured.get(&(wt.worktree_id.as_str(), rel.as_ref())) {
-                        artifact.allocated_bytes = Some(dir.allocated_total);
-                        artifact.allocated_growth_bytes = dir.growth_bytes;
-                    }
-                }
+            if trace_all {
+                eprintln!("[trace] growth: schedule line: {:?}", t.elapsed());
             }
         }
+        let t0 = std::time::Instant::now();
+        crate::report::attach_allocated_from_dirs(&mut d.projects, &d.dirs, &roots);
+        if trace_all {
+            eprintln!("[trace] growth: allocated from dirs: {:?}", t0.elapsed());
+        }
+        let t0 = std::time::Instant::now();
         // Interior rows of folded artifacts live in the store only: the
         // report shows an artifact as one unit.
         d.dirs
@@ -161,8 +175,15 @@ impl Consumer for GrowthConsumer {
                     .or_default()
                     .push(row);
             }
+            crate::report::sort_drill_down(&mut by_dir, &mut by_file);
             d.dirs_by_worktree = Some(by_dir);
             d.files_by_worktree = Some(by_file);
+        }
+        if trace_all {
+            eprintln!(
+                "[trace] growth: retain/nested/group/sort: {:?}",
+                t0.elapsed()
+            );
         }
         Ok(vec![Event::GrowthAnnotated(Arc::new(d))])
     }
@@ -212,6 +233,7 @@ fn add_nested_history_rows(
             containers: Vec::new(),
             shared_with: Vec::new(),
             dangling: false,
+            evidence: Vec::new(),
         });
         paths.push((unit.id.clone(), unit.path.clone()));
     }

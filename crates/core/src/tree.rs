@@ -58,12 +58,32 @@ pub struct TreeWorktree {
     pub rows: Vec<TreeRow>,
 }
 
+/// One tool's collapsed contribution to a project's linked agent
+/// storage (#100's "project tree shows the collapsed 'Agent storage
+/// (linked)' row for every tool"): never a session/transcript-level
+/// drill-down here (that stays `report --view agents`/the Agents view)
+/// -- just enough to answer "does this project have linked agent
+/// storage, from which tools, how much" from the project tree itself.
+#[derive(Debug, Clone)]
+pub struct ProjectAgentToolRow {
+    pub tool_id: String,
+    pub tool_name: String,
+    pub bytes: u64,
+    pub growth_bytes: Option<i64>,
+    pub unit_count: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectTree {
     pub name: String,
     pub bytes: u64,
     pub growth_bytes: Option<i64>,
     pub worktrees: Vec<TreeWorktree>,
+    /// Agent-storage units whose `project_link` names this project
+    /// (`Linked` by name, or `Shared` naming this project's id),
+    /// aggregated per tool. Empty when no agent-storage unit is linked
+    /// here -- absence is not rendered as a zero row.
+    pub agent_rows: Vec<ProjectAgentToolRow>,
 }
 
 fn kind_label(kind: &ArtifactKind) -> &'static str {
@@ -172,14 +192,77 @@ fn build_rows(worktree_root: &Path, artifacts: &[ArtifactRow]) -> Vec<TreeRow> {
     rows
 }
 
+/// True when `unit`'s `project_link` names `project` -- either directly
+/// (`Linked` by name, matched case-insensitively, the same rule
+/// `crate::agents`' own CLI helper uses) or as one of several projects
+/// a `Shared` unit's members collectively named (matched by id, since
+/// `Shared` only carries ids, never names). Every other link state
+/// (`Unresolved`/`Missing`/`NotAProject`/`Moved`/`Remote`/
+/// `NotApplicable`) is, by construction, never "this project" -- they
+/// are surfaced elsewhere (the Agents view/`--view agents`), never
+/// silently folded into a project's row.
+fn agent_unit_links_project(unit: &crate::agents::AgentUnit, project: &ProjectRow) -> bool {
+    match &unit.project_link {
+        crate::agents::ProjectLinkState::Linked { project_name, .. } => {
+            project_name.eq_ignore_ascii_case(&project.name)
+        }
+        crate::agents::ProjectLinkState::Shared { project_ids } => {
+            project_ids.iter().any(|id| id == &project.project_id)
+        }
+        _ => false,
+    }
+}
+
+/// Aggregates `agent_units` linked to `project`, one row per tool,
+/// sorted by bytes desc so the largest contributor is named first. See
+/// [`ProjectAgentToolRow`] for what "collapsed" means here.
+pub fn agent_rows_for_project(
+    project: &ProjectRow,
+    agent_units: &[crate::agents::AgentUnit],
+) -> Vec<ProjectAgentToolRow> {
+    let mut by_tool: std::collections::BTreeMap<String, ProjectAgentToolRow> =
+        std::collections::BTreeMap::new();
+    for u in agent_units {
+        if !agent_unit_links_project(u, project) {
+            continue;
+        }
+        let entry = by_tool
+            .entry(u.tool_id.clone())
+            .or_insert_with(|| ProjectAgentToolRow {
+                tool_id: u.tool_id.clone(),
+                tool_name: u.tool_name.clone(),
+                bytes: 0,
+                growth_bytes: None,
+                unit_count: 0,
+            });
+        entry.bytes += u.bytes;
+        entry.unit_count += 1;
+        if let Some(g) = u.growth_bytes {
+            entry.growth_bytes = Some(entry.growth_bytes.unwrap_or(0) + g);
+        }
+    }
+    let mut rows: Vec<ProjectAgentToolRow> = by_tool.into_values().collect();
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
+    rows
+}
+
 /// Builds the tree for one project. `project_root` is the path every
 /// worktree's own path is made relative to (a checkout's own path
 /// relative to itself is `.`; a linked worktree is typically a sibling
 /// or a `.worktrees/<name>` child, so it is left as whatever path it
 /// actually has relative to `project_root` -- there is no requirement
 /// that every worktree live under a single common root, only that the
-/// display stays relative rather than absolute).
-pub fn build_project_tree(project: &ProjectRow, project_root: &Path) -> ProjectTree {
+/// display stays relative rather than absolute). `agent_units` is the
+/// full agent-storage catalog (any tool, any project); this function
+/// filters it down to this project's own collapsed summary row(s)
+/// (#100) -- pass an empty slice when agent-storage is not being
+/// computed for this call (e.g. a caller that never touches the Agents
+/// view), which yields the same tree as before agent linkage existed.
+pub fn build_project_tree(
+    project: &ProjectRow,
+    project_root: &Path,
+    agent_units: &[crate::agents::AgentUnit],
+) -> ProjectTree {
     let mut worktrees: Vec<TreeWorktree> = Vec::new();
     let mut total_bytes = 0u64;
     let mut total_growth: Option<i64> = None;
@@ -235,5 +318,6 @@ pub fn build_project_tree(project: &ProjectRow, project_root: &Path) -> ProjectT
         bytes: total_bytes,
         growth_bytes: if have_growth { total_growth } else { None },
         worktrees,
+        agent_rows: agent_rows_for_project(project, agent_units),
     }
 }

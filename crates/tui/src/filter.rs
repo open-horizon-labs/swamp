@@ -1,5 +1,5 @@
 //! The TUI's filter line speaks the same grammar as `--filter` on the CLI
-//! and the MCP tools — it *is* `swamp_core::filter`. This module only
+//! (interactive and `--json`) — it *is* `swamp_core::filter`. This module only
 //! adds the TUI's conveniences: the default line, the `0` = no filter
 //! shorthand, and small accessors the row builders need.
 //!
@@ -161,6 +161,7 @@ pub fn type_passes(f: &Filter, project: &swamp_core::report::ProjectRow) -> bool
                 containers: Vec::new(),
                 shared_with: Vec::new(),
                 dangling: false,
+                evidence: Vec::new(),
             };
             Filter {
                 predicates: vec![Predicate::Type(t.clone())],

@@ -1,17 +1,37 @@
+#![cfg_attr(
+    not(test),
+    deny(clippy::disallowed_methods, clippy::disallowed_types, unsafe_code)
+)]
+
+mod collect;
+mod output;
 mod schedule;
+
+#[macro_export]
+macro_rules! safe_print {
+    ($($arg:tt)*) => {{
+        $crate::output::write_stdout(format_args!($($arg)*))?;
+    }};
+}
+
+#[macro_export]
+macro_rules! safe_println {
+    ($($arg:tt)*) => {{
+        $crate::output::write_stdout_line(format_args!($($arg)*))?;
+    }};
+}
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use swamp_core::{
-    artifact::{ArtifactRole, NestedArtifact},
     filter,
     render::{
-        OverviewSort, render_kinds, render_overview_sorted, render_project_tree, render_types,
-        render_view_builds, render_view_deps, render_view_docker, render_view_reconciliation,
-        render_view_unowned, render_worktree_signals, render_worktrees,
+        OverviewSort, render_kinds, render_overview_sorted, render_project_tree_with_agents,
+        render_types, render_view_builds, render_view_deps, render_view_docker,
+        render_view_reconciliation, render_view_unowned, render_worktree_signals, render_worktrees,
     },
-    report::{Report, report_full_mode, to_json},
+    report::Report,
     scan::{ScanOptions, observation},
     store::Store,
 };
@@ -36,6 +56,43 @@ enum View {
     /// Nested Cargo target/build units with physical-accounting and
     /// evidence/unknown details. Inspection only.
     Rust,
+    /// Ranked list of every discovered project: name, id, total bytes,
+    /// growth, checkout+worktree count, remote. JSON only.
+    Projects,
+    /// Rows with growth > 0 since the window, sorted desc, plus an
+    /// unowned-bytes summary and coverage (walked/du/unowned totals,
+    /// permission-denied count, history span). JSON only.
+    Grown,
+    /// External/shared storage units (#43): Cargo registry, rustup
+    /// toolchains, Homebrew, and other detector-resolved locations with
+    /// no containing project. Identity, category, size/growth/regrowth
+    /// history and declared consumers. Read-only: this view never
+    /// removes anything, in this command or any other.
+    External,
+    /// Agent-tool storage (#91-#99/#100): sessions, caches, logs,
+    /// checkpoints and protected config for every named coding-agent
+    /// tool (Claude Code, Codex, Oh My Pi, OpenCode, Gemini CLI, Pi,
+    /// Aider, GitHub Copilot CLI, Cursor, Windsurf, Cline, Roo Code,
+    /// Continue), grouped tool → category → unit with size/growth/age
+    /// and project linkage. `--project` filters to units linked to that
+    /// project. Redaction-aware by construction (this view never has
+    /// session content to print). Read-only from this command; removal
+    /// is TUI-only (Space/Backspace/Enter) -- see `swamp protect` for
+    /// the human-keep-intent surface this view respects.
+    Agents,
+}
+
+impl View {
+    /// The name this view is addressed by in `--view` and echoed back in
+    /// `report --json`'s `"view"` field -- derived from clap's own
+    /// kebab-case rendering of the variant so the flag value and the
+    /// JSON contract never drift apart.
+    fn name(self) -> String {
+        use clap::ValueEnum;
+        self.to_possible_value()
+            .map(|v| v.get_name().to_string())
+            .unwrap_or_else(|| "worktrees".to_string())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -74,36 +131,23 @@ enum ConfigAction {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Review Cargo cleanup groups, oldest modified first, then largest. Creates unapproved plans;
-    /// never authorizes or deletes. Reports blocked groups without widening scope.
-    CleanupCheck {
-        root: PathBuf,
-        /// Exact Cargo group paths from a Rust report. Categories are not expanded.
-        #[arg(long = "path")]
-        paths: Vec<PathBuf>,
-        /// Restrict to one role, for example test-executable or incremental.
-        #[arg(long, value_parser = ["test-executable", "example", "incremental", "build-script-output"])]
-        role: Option<String>,
-        /// Maximum groups to check (1–20). This is not an exhaustive cleanup search.
-        #[arg(long, default_value_t = 5)]
-        limit: usize,
-        /// Skip this many age-ranked candidates. Pages may shift after a rebuild.
-        #[arg(long, default_value_t = 0)]
-        offset: usize,
-        /// Review individual groups within this directory, never the directory itself.
-        #[arg(long)]
-        within: Option<PathBuf>,
+    /// On-demand, bounded inspection of an existing Cargo profile. Does not run Cargo.
+    InspectCargo {
+        profile: PathBuf,
         #[arg(long)]
         json: bool,
+        #[arg(long, default_value_t = 262144)]
+        max_entries: usize,
+        #[arg(long, default_value_t = 5000)]
+        max_ms: u64,
     },
     /// Diffstat-ledger terminal UI (ratatui). Default when no
     /// subcommand is given.
     Ui {
-        #[arg(default_value = ".")]
-        root: PathBuf,
-        /// Skip persisting a new observation; render the last one.
-        #[arg(long)]
-        no_observe: bool,
+        /// Defaults to the configured effective scope's first present
+        /// root when omitted (see `swamp scope`); an explicit root
+        /// still replaces the configured scope for this invocation.
+        root: Option<PathBuf>,
     },
     Scan {
         #[arg(default_value = ".")]
@@ -111,38 +155,39 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
-    /// Project x worktree x artifact growth report.
+    /// Project x worktree x artifact growth report -- a pure read of
+    /// what `swamp observe` last wrote: never walks a directory,
+    /// scans artifact metadata, or spawns a subprocess. Root presence
+    /// is checked to resolve scope. Exits 2 (JSON:
+    /// `{"error":"no_observation", ...}`) when the scope has never been
+    /// observed; run `swamp observe` first.
     Report {
-        #[arg(default_value = ".")]
-        root: PathBuf,
+        /// Roots of the stored observation. Pass the same roots as
+        /// `observe`; omitted roots use the configured effective scope
+        /// (see `swamp scope`). Explicit roots replace that scope,
+        /// while configured exclusions still apply.
+        roots: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
-        #[arg(long)]
-        docker_facts: Option<PathBuf>,
-        /// Also run `du -skPx` on the root as an independent total (slow).
+        /// Print the `du -skPx` total the last `swamp observe
+        /// --verify-du` stored, when present. Never runs `du` itself --
+        /// `report` never spawns a subprocess.
         #[arg(long)]
         verify_du: bool,
-        /// How far back to look for the growth baseline (e.g. "24h",
-        /// "30m", "7d"). Overrides the `since` setting in config.toml.
-        #[arg(long)]
-        since: Option<String>,
-        /// Skip persisting this observation into the growth store; the
-        /// report is read-only and growth/regrowth stay unset.
-        #[arg(long)]
-        no_observe: bool,
         /// Drill into one project: worktree -> kind -> path -> bytes ->
-        /// growth -> regrowth -> signals. Text output only.
+        /// growth -> regrowth -> signals. Applies to text and JSON.
         #[arg(long)]
         project: Option<String>,
-        /// Bytes and count per artifact kind across the root. Text output
-        /// only. Deprecated alias for `--view kinds`.
+        /// Bytes and count per artifact kind across the scope.
+        /// Deprecated alias for `--view kinds` (text or JSON).
         #[arg(long)]
         kinds: bool,
         /// Named view, at root or narrowed with `--project`: worktrees
         /// (git-enriched one-line-per-worktree listing at root, the tree
         /// drill with `--project`), builds, deps, docker, kinds, unowned,
         /// reconciliation, rust. Every question the issue lists is exactly one
-        /// command through this flag. Text output only.
+        /// command through this flag. Supports text and JSON;
+        /// projects and grown views require JSON.
         #[arg(long, value_enum)]
         view: Option<View>,
         /// Signals for one worktree (matched by exact or root-relative
@@ -155,15 +200,8 @@ enum Command {
         /// by `--view worktrees` at root.
         #[arg(long)]
         filter: Option<String>,
-        /// Refresh GitHub enrichment live before reading it, instead of
-        /// reading `enrich.parquet` as-is. By default `report` never
-        /// shells out to `gh` -- run `swamp observe` (or wait for
-        /// the schedule) to keep the cache warm, and reach for this flag
-        /// only when you're fine waiting on live calls right now.
-        #[arg(long)]
-        enrich: bool,
-        /// Show every project row instead of the default top-N. Text
-        /// output only.
+        /// Show all text rows: projects, agent units, or Rust units
+        /// (Rust defaults to 30 per container). JSON uses --limit/--offset.
         #[arg(long)]
         all: bool,
         /// List every unjoined Docker object individually instead of the
@@ -181,10 +219,6 @@ enum Command {
         /// every directory.
         #[arg(long)]
         depth: Option<usize>,
-        /// Skip the FSEvents-driven incremental attempt and force a full
-        /// walk (also re-anchors the stored event id for next time).
-        #[arg(long)]
-        full: bool,
         /// Order of the overview's project rows: growth (default), size,
         /// name, type (grouped by ecosystem), age (oldest artifact first).
         #[arg(long, value_enum, default_value = "growth")]
@@ -192,6 +226,29 @@ enum Command {
         /// Reverse the sort order (smallest first, newest first, …).
         #[arg(long)]
         reverse: bool,
+        /// Bound a JSON array-shaped result (the `result` array with
+        /// `--view`, or the `projects` array without one) to this many
+        /// rows. Only consulted with `--json`; the envelope's `total`
+        /// and `truncated` fields say whether this is a partial page.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Bound units within each build/dependency JSON interior.
+        /// Family totals remain complete; units_total/units_truncated
+        /// describe the page. Independent of top-level --limit.
+        #[arg(long, default_value_t = 30)]
+        unit_limit: usize,
+        /// Offset within each JSON interior's unit list.
+        #[arg(long, default_value_t = 0)]
+        unit_offset: usize,
+        /// Skip this many rows of a JSON array-shaped result before
+        /// applying `--limit`. Only consulted with `--json`.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// With `--view docker --json`, restrict to Docker objects with
+        /// no join evidence to a project (never attributed by name
+        /// similarity in this mode).
+        #[arg(long)]
+        unowned_only: bool,
     },
     /// Observe-only: walk `root`s, write the growth store, and refresh
     /// GitHub enrichment live for every GitHub-remote worktree found
@@ -200,15 +257,53 @@ enum Command {
     /// the only `swamp` command that calls `gh` on your behalf by
     /// default; `report` reads whatever this last wrote.
     Observe {
-        #[arg(required = true)]
+        /// Defaults to every present root in the configured effective
+        /// scope when omitted (see `swamp scope`); explicit roots still
+        /// replace the configured scope for this invocation, though
+        /// configured exclusions still apply.
         roots: Vec<PathBuf>,
         /// Skip the FSEvents-driven incremental attempt and force a full
-        /// walk (also re-anchors the stored event id for next time).
+        /// walk (on macOS, stages a pre-scan event anchor for the next run;
+        /// published only after the observation succeeds).
         #[arg(long)]
         full: bool,
+        #[arg(long)]
+        docker_facts: Option<PathBuf>,
+        /// Also run `du -skPx` on each root as an independent total
+        /// (slow); `swamp report --verify-du` prints whatever this
+        /// stores.
+        #[arg(long)]
+        verify_du: bool,
+        /// How far back to look for the growth baseline (e.g. "24h",
+        /// "30m", "7d"). Overrides the `since` setting in config.toml.
+        #[arg(long)]
+        since: Option<String>,
+        /// Refresh GitHub enrichment live before persisting it, instead
+        /// of leaving `enrich.parquet` as-is. Every `swamp observe`
+        /// already shells out to `gh` for enrichment (see the command's
+        /// own doc); this additionally forces a live refresh rather
+        /// than trusting the cache's TTL.
+        #[arg(long)]
+        enrich: bool,
     },
-    /// Install, report on, or remove the opt-in per-user LaunchAgent that
-    /// runs `observe` on a fixed interval (#31).
+    /// Linux: watch the scope's roots with inotify until stopped and keep
+    /// a bounded change list, so a later `observe` can reuse measurements
+    /// where event coverage is complete. Reports remain stored reads.
+    /// Opt-in, user-owned, foreground; refuses on
+    /// macOS, where FSEvents already keeps the history.
+    Collect {
+        /// Defaults to every present root in the configured scope.
+        roots: Vec<PathBuf>,
+        /// Print each root's checkpoint and whether its collector is
+        /// running, then exit. Reads only.
+        #[arg(long)]
+        status: bool,
+        /// With --status: the CLI's JSON contract instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install, inspect, or remove scheduled observations: a per-user
+    /// LaunchAgent on macOS or systemd user timer on Linux. No cleanup.
     Schedule {
         /// Install (or replace) the schedule with this interval, e.g.
         /// "30m", "1h", "12h", "1d".
@@ -217,45 +312,12 @@ enum Command {
         /// Remove the schedule.
         #[arg(long)]
         off: bool,
+        /// Linux: also install the optional `swamp collect` user service,
+        /// which keeps a live change list between scheduled runs so they
+        /// can walk only what changed. Refused on macOS (not needed).
+        #[arg(long)]
+        collector: bool,
         roots: Vec<PathBuf>,
-    },
-    /// Propose cleanup for exact artifact, Cargo group, or worktree paths, or
-    /// a filter. Review paths, sizes, warnings and recovery before
-    /// authorizing. Use report --view worktrees for worktree signals; for
-    /// individual Cargo builds, start with cleanup-check. Nothing is deleted
-    /// by this command.
-    #[command(
-        after_help = "Whole-worktree example:\n  swamp report ~/src --view worktrees\n  swamp propose ~/src --path /absolute/path/to/a-worktree\nReview the plan; proposing never authorizes removal."
-    )]
-    Propose {
-        root: PathBuf,
-        /// Narrow to rows matching this filter, e.g. "kind:BuildOutput idle > 30d".
-        #[arg(long)]
-        filter: Option<String>,
-        /// Exact artifact, Cargo group, or worktree paths from a report.
-        #[arg(long = "path")]
-        paths: Vec<PathBuf>,
-        #[arg(long)]
-        since: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Human authorization for ONE plan: writes a one-shot grant scoped to
-    /// that plan id. Only a human at this keyboard should run this.
-    Approve { plan_id: String },
-    /// Execute an approved plan: sink re-derivation, Trash, ledger,
-    /// measured free space. Refuses per unit with the fact that refused it.
-    Execute {
-        plan_id: String,
-        #[arg(long, default_value = "human:cli")]
-        actor: String,
-        #[arg(long)]
-        json: bool,
-        /// Before trashing a build directory, copy compiled outputs to
-        /// `<worktree>/bin/`: Rust `target/{release,debug}` executables,
-        /// Python `dist/*.whl` and `build/**/*.so`. Other kinds: no-op.
-        #[arg(long, short = 'k')]
-        keep_executables: bool,
     },
     /// The configuration file: `config show` prints effective values,
     /// `config path` where it lives, `config init` writes one with every
@@ -264,193 +326,660 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// List plans (newest first).
-    Plans {
+    /// Print the effective scan scope (#41): every root swamp would use
+    /// for this invocation, its status (present/missing/unreadable/
+    /// skipped-as-nested/excluded) and every reason it is in scope --
+    /// built-in default, detector (with id/category/provenance),
+    /// configured include, or explicit command root -- plus the full
+    /// detector catalog (including disabled/not-present/unresolved
+    /// entries) and the detector catalog version. With explicit roots,
+    /// shows what those roots resolve to (configured exclusions still
+    /// apply) instead of the configured scope. This is the one shared
+    /// resolution every scope-aware command (`report`, `observe`, `ui`,
+    /// `schedule`) uses when no explicit root is given -- never a
+    /// separate ad hoc computation.
+    Scope {
+        roots: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Show every root, including folded-as-nested and Unclassified
+        /// detector locations, which the default text view hides as
+        /// noise (#R13 item B). `--json` is always the full, unfiltered
+        /// scope -- this flag only changes the text renderer.
+        #[arg(long)]
+        verbose: bool,
     },
-    /// Standing grants: `grant add '<predicate>' --budget 5GB --expires 7d`,
-    /// `grant list`, `grant revoke <id>`. Predicates: kind:, project:,
-    /// idle > <dur>, merge-complete. Only a human at this keyboard should
-    /// add grants; MCP has no tool that can.
-    Grant {
+    /// Human keep/protect intent for agent-storage paths (#100/#101):
+    /// survives refresh and is never itself inferred from observation --
+    /// only this command changes it. The TUI's mark step refuses to
+    /// queue anything under a protected path for the Trash.
+    Protect {
         #[command(subcommand)]
-        cmd: GrantCmd,
+        cmd: ProtectCmd,
     },
 }
 
 #[derive(Subcommand)]
-enum GrantCmd {
+enum ProtectCmd {
     Add {
-        predicate: String,
-        /// Total bytes this grant may ever authorize, e.g. 5GB.
-        #[arg(long)]
-        budget: String,
-        /// Lifetime, e.g. 7d.
-        #[arg(long)]
-        expires: String,
-        /// Maximum number of units this grant may authorize.
-        #[arg(long)]
-        max_units: Option<u32>,
+        path: PathBuf,
     },
-    List,
-    Revoke {
-        grant_id: String,
+    Remove {
+        path: PathBuf,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
     },
 }
 
-fn parse_size_arg(s: &str) -> Result<u64> {
-    let t = s.trim().to_uppercase();
-    let (num, mult) = if let Some(n) = t.strip_suffix("TB") {
-        (n, 1_000_000_000_000u64)
-    } else if let Some(n) = t.strip_suffix("GB") {
-        (n, 1_000_000_000)
-    } else if let Some(n) = t.strip_suffix("MB") {
-        (n, 1_000_000)
-    } else if let Some(n) = t.strip_suffix("KB") {
-        (n, 1_000)
-    } else if let Some(n) = t.strip_suffix('B') {
-        (n, 1)
-    } else {
-        (t.as_str(), 1)
-    };
-    let v: f64 = num
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("bad size {s:?}"))?;
-    Ok((v * mult as f64) as u64)
-}
-
-fn print_plan(plan: &swamp_core::actions::Plan) {
-    println!(
-        "plan {}  {} units  {}  expires in {}s",
-        plan.id,
-        plan.units.len(),
-        swamp_core::render::human_bytes_pub(plan.planned_bytes()),
-        plan.expires_at.saturating_sub(swamp_core::entities::now())
-    );
-    for u in &plan.units {
-        println!(
-            "  {:<14} {:>10}  {:>+10}  {}  {}  [{}]  {}",
-            format!("{:?}", u.kind).to_lowercase(),
-            swamp_core::render::human_bytes_pub(u.bytes),
-            u.growth_bytes
-                .map(swamp_core::render::human_bytes_signed)
-                .unwrap_or_else(|| "—".into()),
-            u.project,
-            u.path.display(),
-            u.recovery,
-            u.signals.join(" · ")
-        );
-        if let Some(t) = u.track {
-            print!("    [{}]", t.label());
-        }
-        if !u.warnings.is_empty() {
-            print!("  ⚠ {}", u.warnings.join(" · "));
-        }
-        if u.track.is_some() || !u.warnings.is_empty() {
-            println!();
-        }
-    }
-    for r in &plan.refused {
-        println!("  refused  {}  — {}", r.path.display(), r.cause);
-    }
-    println!(
-        "authorize (human only): {}",
-        swamp_core::actions::approve_command(&plan.id)
-    );
-}
-
-/// `${SWAMP_DIR}`, defaulting to `~/.local/share/swamp`.
+/// The resolved swamp dir (`$SWAMP_DIR`, else `~/.local/share/swamp`):
+/// the gate's one resolver, `fs_gate::store::StoreDir::resolved`. Same on
+/// Linux and macOS; ported from the Linux track's XDG-aware
+/// `platform::data_dir` deliberately narrowed back to this one resolver
+/// so there remains exactly one place that decides where swamp's state
+/// lives (see the port session note).
 fn swamp_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("SWAMP_DIR") {
-        return PathBuf::from(dir);
+    swamp_core::fs_gate::store::StoreDir::resolved()
+        .path()
+        .to_path_buf()
+}
+
+/// The one shared resolution every scope-aware command (#41) goes
+/// through: built-in defaults, detector results, and configured
+/// include/exclude/disabled-detectors, or -- when `explicit` is
+/// non-empty -- exactly those roots (configured exclusions still
+/// apply). A malformed `config.toml` is a hard error here (nonzero
+/// exit via `main`'s `Result`, message on stderr): scope resolution
+/// never silently falls back to a broader default on invalid config.
+fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveScope> {
+    let store_dir = swamp_dir();
+    let cfg = swamp_core::growth::load_config_checked(&store_dir)?;
+    let env = swamp_core::locations::Environment::from_process();
+    let registry = swamp_core::locations::Registry::with_builtins();
+    Ok(swamp_core::scope::resolve_effective_scope(
+        &env,
+        &cfg.scan,
+        explicit,
+        &registry,
+        swamp_core::entities::now(),
+    ))
+}
+
+/// Persists the just-resolved scope and, when a previous one exists,
+/// prints a one-line coverage-change note to stderr (#41's "explain
+/// effective coverage and baseline changes"). This never touches byte
+/// history: it is coverage bookkeeping only, per
+/// `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
+fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::EffectiveScope) {
+    if let Some(previous) = swamp_core::scope::load_last_effective_scope(store_dir) {
+        let changes = swamp_core::scope::coverage_changes(&previous, scope);
+        if !changes.is_empty() {
+            let summary = changes
+                .iter()
+                .map(|c| {
+                    let sign = match c.kind {
+                        swamp_core::scope::CoverageChangeKind::Added => '+',
+                        swamp_core::scope::CoverageChangeKind::Removed => '-',
+                    };
+                    format!("{sign}root {} ({})", c.path.display(), c.reason)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("coverage changed since last observation: {summary}");
+        }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/swamp")
+    if let Err(e) = swamp_core::scope::persist_effective_scope(store_dir, scope) {
+        eprintln!("note: could not persist effective scope for next run: {e}");
+    }
 }
 
-const CLEANUP_COVERAGE_DETAIL_ROWS: usize = 20;
-const CLEANUP_COVERAGE_DETAIL_LIMITS: usize = 8;
-
-#[derive(Debug, PartialEq, Eq)]
-struct CleanupCoverageDetail {
-    path: PathBuf,
-    limits: Vec<String>,
+/// One line per non-`Complete` root from a `report_scope` call (#42):
+/// missing/excluded/inaccessible/partial regions, so a coherent
+/// multi-root observation never silently under-reports without saying
+/// why. A `Complete` root prints nothing -- the ordinary case should not
+/// be noisy.
+fn print_scope_coverage_note(coverage: &[swamp_core::coverage::RootCoverage]) {
+    use swamp_core::coverage::RegionStatus;
+    let incomplete: Vec<&swamp_core::coverage::RootCoverage> = coverage
+        .iter()
+        .filter(|c| !matches!(c.status, RegionStatus::Complete))
+        .collect();
+    if incomplete.is_empty() {
+        return;
+    }
+    // Missing/excluded/detector-only paths are the usual state of a
+    // machine that has fewer tools installed than the catalog knows:
+    // one count, `swamp scope` for the list. Only a root that *should*
+    // have been walked and was not (partial, inaccessible) is named.
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut named = Vec::new();
+    for c in &incomplete {
+        match &c.status {
+            RegionStatus::Partial { .. } | RegionStatus::Inaccessible { .. } => {
+                named.push(format!("{} ({})", c.path.display(), c.status.label()))
+            }
+            RegionStatus::Missing => *counts.entry("missing").or_default() += 1,
+            RegionStatus::Excluded => *counts.entry("excluded").or_default() += 1,
+            RegionStatus::DetectorOnly => *counts.entry("detector-only").or_default() += 1,
+            RegionStatus::Complete => {}
+        }
+    }
+    let mut parts: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    parts.extend(named);
+    eprintln!(
+        "scope coverage: {} (swamp scope for the list)",
+        parts.join(", ")
+    );
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct CleanupScopeSummary {
-    nested_row_count: usize,
-    coverage_limited_count: usize,
-    unknown_or_residual_count: usize,
-    coverage_limited_details: Vec<CleanupCoverageDetail>,
+fn render_scope_text(scope: &swamp_core::scope::EffectiveScope, verbose: bool) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "platform {} · catalog {} · defaults={} · disabled=[{}] · {}",
+        // The same fact `--json` carries in `platform`: whose conventions
+        // produced these roots. Without it, a scope printed on one OS and
+        // read on the other is a list of missing paths with no
+        // explanation.
+        swamp_core::platform::Os::from(scope.platform).as_str(),
+        scope.catalog_version,
+        scope.defaults_enabled,
+        scope.disabled_detectors.join(", "),
+        if scope.explicit {
+            "explicit roots (configured exclusions still apply)"
+        } else {
+            "configured scope"
+        }
+    );
+
+    fn reason_labels(root: &swamp_core::scope::ScopeRoot) -> Vec<String> {
+        root.reasons
+            .iter()
+            .map(|r| match r {
+                swamp_core::scope::RootReason::BuiltinDefault => "built-in default".to_string(),
+                swamp_core::scope::RootReason::Detector {
+                    detector_id,
+                    category,
+                    provenance,
+                } => format!(
+                    "detector:{detector_id} ({}, {})",
+                    swamp_core::external::category_label(*category),
+                    swamp_core::locations::provenance_label(provenance)
+                ),
+                swamp_core::scope::RootReason::Included => "include".to_string(),
+                swamp_core::scope::RootReason::ExplicitCommand => "explicit".to_string(),
+                swamp_core::scope::RootReason::NestedFrom { path } => {
+                    format!("covers nested {}", path.display())
+                }
+            })
+            .collect()
+    }
+    fn status_label(status: &swamp_core::scope::RootStatus) -> String {
+        match status {
+            swamp_core::scope::RootStatus::Present => "present".to_string(),
+            swamp_core::scope::RootStatus::Missing => "missing".to_string(),
+            swamp_core::scope::RootStatus::Unreadable { reason } => {
+                format!("unreadable ({reason})")
+            }
+            swamp_core::scope::RootStatus::SkippedAsNested { parent } => {
+                format!("skipped-as-nested (folded into {})", parent.display())
+            }
+            swamp_core::scope::RootStatus::Excluded { pattern } => format!("excluded ({pattern})"),
+        }
+    }
+    // Noise the default view hides (#R13 item B): a root already folded
+    // into a parent's walk tells a reader nothing beyond what its
+    // parent's own row already says -- `--verbose`/`--json` still show
+    // it in full.
+    fn is_noise(root: &swamp_core::scope::ScopeRoot) -> bool {
+        matches!(
+            root.status,
+            swamp_core::scope::RootStatus::SkippedAsNested { .. }
+        )
+    }
+
+    // Two classes (#R13 item B): project roots get ordinary Git/
+    // ecosystem discovery and an unowned remainder; detector locations
+    // are measured only as external units. `swamp report`'s coverage
+    // (`RegionStatus::DetectorOnly`) is this same split at observe time.
+    let (project_roots, detector_roots): (Vec<_>, Vec<_>) =
+        scope.roots.iter().partition(|r| r.is_project_root());
+
+    let _ = writeln!(
+        out,
+        "project roots (Git/ecosystem discovery, unowned remainder):"
+    );
+    for root in &project_roots {
+        if !verbose && is_noise(root) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  {:<10} {}  [{}]",
+            status_label(&root.status),
+            root.path.display(),
+            reason_labels(root).join("; ")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "detector locations (measured as external units only, never a project):"
+    );
+    for root in &detector_roots {
+        if !verbose && is_noise(root) {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "  {:<10} {}  [{}]",
+            status_label(&root.status),
+            root.path.display(),
+            reason_labels(root).join("; ")
+        );
+    }
+    if !verbose {
+        let hidden = scope.roots.iter().filter(|r| is_noise(r)).count();
+        if hidden > 0 {
+            let _ = writeln!(
+                out,
+                "({hidden} nested/Unclassified root(s) hidden; --verbose to show)"
+            );
+        }
+    }
+
+    if !scope.pruned_subtrees.is_empty() {
+        let _ = writeln!(out, "pruned subtrees (excluded, inside an in-scope root):");
+        for p in &scope.pruned_subtrees {
+            let _ = writeln!(out, "  {} under {}", p.pattern, p.root.display());
+        }
+    }
+    let _ = writeln!(out, "detectors:");
+    for d in &scope.detectors {
+        for loc in d.locations_for_display() {
+            let status = match &loc.status {
+                swamp_core::locations::LocationStatus::Resolved => "resolved".to_string(),
+                swamp_core::locations::LocationStatus::NotPresent => "not-present".to_string(),
+                // `disabled (default off)` names *why* this one is off
+                // without the config saying so -- a system-wide install
+                // tree like Homebrew (`Detector::default_enabled`) --
+                // distinct from a plain `disabled`, which the user's own
+                // `disabled_detectors` caused. `[scan] enabled_detectors
+                // = ["<id>"]` turns either kind back on.
+                swamp_core::locations::LocationStatus::Disabled => {
+                    if scope.default_off_detectors.contains(&d.detector_id) {
+                        "disabled (default off)".to_string()
+                    } else {
+                        "disabled".to_string()
+                    }
+                }
+                swamp_core::locations::LocationStatus::UnresolvedWithReason { reason } => {
+                    format!("unresolved ({reason})")
+                }
+            };
+            let path = loc
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let _ = writeln!(out, "  {:<12} {:<10} {}", d.detector_id, status, path);
+        }
+    }
+    // "Not applicable" is its own answer, distinct from "found nothing"
+    // and from "could not tell" (#84). Omitting these would leave a
+    // Linux user wondering whether Xcode detection failed rather than
+    // knowing it does not apply.
+    if !scope.not_applicable_detectors.is_empty() {
+        let _ = writeln!(
+            out,
+            "not applicable on this platform (not failures, and not absences):"
+        );
+        for d in &scope.not_applicable_detectors {
+            let applies: Vec<&str> = d
+                .applies_to
+                .iter()
+                .map(|p| swamp_core::platform::Os::from(*p).as_str())
+                .collect();
+            let _ = writeln!(
+                out,
+                "  {:<12} {:<10} {} (applies to: {})",
+                d.detector_id,
+                "n/a",
+                d.name,
+                applies.join(", ")
+            );
+        }
+    }
+    out
 }
 
-fn cleanup_path_in_scope(path: &Path, within: Option<&Path>) -> bool {
-    within.is_none_or(|scope| path != scope && path.starts_with(scope))
+/// `swamp protect add|remove|list`: the human keep list. Read-only
+/// otherwise, this is the one CLI surface that still writes state, since
+/// it never deletes anything -- it only ever keeps a path out of the
+/// TUI's Trash.
+fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
+    let store_dir = swamp_dir();
+    match cmd {
+        ProtectCmd::Add { path } => {
+            // Resolve a relative argument against the cwd before
+            // storing, rather than printing "protected: debug" for an
+            // entry that protects nothing (the 2026-09-22 re-review's
+            // CE5). `protect_add` refuses a non-absolute path outright;
+            // doing the join here means `swamp protect add debug` from
+            // inside a tool home does the obvious thing and *says* which
+            // path it protected.
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()?.join(&path)
+            };
+            swamp_core::agents::protect_add(&store_dir, &resolved)?;
+            safe_println!("protected: {}", resolved.display());
+        }
+        ProtectCmd::Remove { path } => {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()?.join(&path)
+            };
+            swamp_core::agents::protect_remove(&store_dir, &resolved)?;
+            safe_println!("no longer protected: {}", resolved.display());
+        }
+        ProtectCmd::List { json } => {
+            let listing = swamp_core::agents::protect_listing(&store_dir)?;
+            if json {
+                safe_println!("{}", serde_json::to_string_pretty(&listing)?);
+            } else if listing.is_empty() {
+                safe_println!("no protected agent-storage paths");
+            } else {
+                safe_println!("{listing}");
+            }
+        }
+    }
+    Ok(())
 }
 
-fn cleanup_path_at_or_below_scope(path: &Path, within: Option<&Path>) -> bool {
-    within.is_none_or(|scope| path == scope || path.starts_with(scope))
+/// Whether `u`'s project linkage names `project` (case-insensitive,
+/// matching this codebase's other `--project` matching): only a
+/// `Linked` unit can match; every other linkage state (unresolved,
+/// missing, not-a-project, moved, remote, shared, not-applicable) is
+/// filtered out by a project filter, never silently included. `None`
+/// (no filter given) matches everything.
+fn agent_unit_matches_project(u: &swamp_core::agents::AgentUnit, project: Option<&str>) -> bool {
+    let Some(project) = project else { return true };
+    matches!(
+        &u.project_link,
+        swamp_core::agents::ProjectLinkState::Linked { project_name, .. }
+            if project_name.eq_ignore_ascii_case(project)
+    )
 }
 
-fn cleanup_scope_summary(
-    nested_artifacts: &[NestedArtifact],
-    within: Option<&Path>,
-) -> CleanupScopeSummary {
-    let mut summary = CleanupScopeSummary {
-        nested_row_count: 0,
-        coverage_limited_count: 0,
-        unknown_or_residual_count: 0,
-        coverage_limited_details: Vec::new(),
-    };
-    for unit in nested_artifacts {
-        let in_scope = cleanup_path_at_or_below_scope(&unit.path, within);
-        // An incomplete Cargo container above `within` limits what can be
-        // established inside the requested scope, so retain that evidence
-        // without counting the ancestor as a row inside the scope.
-        let relevant_ancestor = within.is_some_and(|scope| {
-            unit.path != scope
-                && scope.starts_with(&unit.path)
-                && (!unit.coverage.complete || !unit.coverage.supported)
+/// The bounded, documented JSON contract behind `report --json` (see
+/// `skills/swamp/references/commands-and-json.md`): with `--view`, an
+/// envelope `{view, project, result, observed_at, since,
+/// index_refreshed, total, truncated}` (plus `coverage` for `--view
+/// grown`); without one, the full (optionally project-scoped) report
+/// with the same `since`/`index_refreshed`/`total`/`truncated` fields
+/// added and its top-level `projects` array bounded by
+/// `--limit`/`--offset`. `--filter`, when given, narrows the whole
+/// report before any view is computed -- the same order the retired MCP
+/// `report` tool applied it in, so a filtered view and a filtered full
+/// report agree on what rows exist. This function is the only place
+/// that builds `report --json` output; every branch below funnels
+/// through it so `--view`/`--project`/`--filter` can never again be
+/// silently ignored in JSON mode the way the whole-report dump used to
+/// ignore them.
+fn bound_interior_units(value: &mut serde_json::Value, limit: usize, offset: usize) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(interior) = map.get_mut("interior")
+                && let Some(page) = interior
+                    .get_mut("units")
+                    .and_then(|units| swamp_core::agent_json::paginate(units, Some(limit), offset))
+            {
+                interior["units_total"] = serde_json::json!(page.total);
+                interior["units_truncated"] = serde_json::json!(page.truncated);
+                interior["units_offset"] = serde_json::json!(offset);
+            }
+            for child in map.values_mut() {
+                bound_interior_units(child, limit, offset);
+            }
+        }
+        serde_json::Value::Array(rows) => {
+            for row in rows {
+                bound_interior_units(row, limit, offset);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_json_envelope(
+    r: &Report,
+    root: &Path,
+    view: Option<View>,
+    project: Option<&str>,
+    parsed_filter: Option<&filter::Filter>,
+    since: Option<&str>,
+    index_refreshed: bool,
+    unowned_only: bool,
+    limit: Option<usize>,
+    offset: usize,
+    scope_coverage: &[swamp_core::coverage::RootCoverage],
+    external_units: &[swamp_core::external::ExternalUnit],
+    agent_units: &[swamp_core::agents::AgentUnit],
+    store_interiors: &[swamp_core::artifact::NestedArtifact],
+) -> Result<serde_json::Value> {
+    let store_dir = swamp_dir();
+    let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
+    let mut rr = r.clone();
+    if let Some(f) = parsed_filter {
+        swamp_core::agent_json::apply_filter_to_report(&mut rr, f);
+    }
+    let observed_at = rr.observed_at;
+
+    if let Some(v) = view {
+        let name = v.name();
+        let mut result = match v {
+            View::Grown => swamp_core::agent_json::what_grew_payload(&rr, project),
+            View::Projects => swamp_core::agent_json::list_projects_payload(&rr, project),
+            View::Worktrees => swamp_core::agent_json::list_worktrees_payload(
+                &rr,
+                &filter::Filter::default(),
+                project,
+            ),
+            View::Docker => {
+                swamp_core::agent_json::docker_objects_payload(&rr, unowned_only, project)
+            }
+            View::Rust => {
+                let units: Vec<_> = rr
+                    .nested_artifacts
+                    .iter()
+                    .filter(|unit| {
+                        project.is_none_or(|wanted| {
+                            swamp_core::render::nested_artifact_project_name(&rr, unit)
+                                == Some(wanted)
+                        })
+                    })
+                    .collect();
+                serde_json::json!(units)
+            }
+            View::External => serde_json::json!({
+                "units": external_units,
+                "total_bytes": swamp_core::external::total_bytes(external_units),
+                // Each machine-wide build store's identified interior,
+                // keyed by the external unit's path, in the shape
+                // `--view builds --json` uses for a project container.
+                "interiors": external_units
+                    .iter()
+                    .filter_map(|u| {
+                        swamp_core::agent_json::interior_json(&u.path, store_interiors)
+                            .map(|i| (u.path.display().to_string(), i))
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+            }),
+            View::Agents => {
+                let filtered: Vec<&swamp_core::agents::AgentUnit> = agent_units
+                    .iter()
+                    .filter(|u| agent_unit_matches_project(u, project))
+                    .collect();
+                serde_json::json!({
+                    "units": filtered,
+                    "total_bytes": filtered.iter().map(|u| u.bytes).sum::<u64>(),
+                })
+            }
+            _ => swamp_core::agent_json::view_payload(&rr, &name, project),
+        };
+        let page = swamp_core::agent_json::paginate(&mut result, limit, offset);
+        let mut envelope = serde_json::json!({
+            "view": name,
+            "project": project,
+            "result": result,
+            "observed_at": observed_at,
+            "since": since_str,
+            "index_refreshed": index_refreshed,
         });
-        if in_scope {
-            summary.nested_row_count += 1;
-            if matches!(unit.role, ArtifactRole::Unknown | ArtifactRole::Residual) {
-                summary.unknown_or_residual_count += 1;
-            }
+        if let Some(p) = page {
+            envelope["total"] = serde_json::json!(p.total);
+            envelope["truncated"] = serde_json::json!(p.truncated);
         }
-        if (in_scope || relevant_ancestor) && (!unit.coverage.complete || !unit.coverage.supported)
-        {
-            summary.coverage_limited_count += 1;
-            if summary.coverage_limited_details.len() < CLEANUP_COVERAGE_DETAIL_ROWS {
-                summary
-                    .coverage_limited_details
-                    .push(CleanupCoverageDetail {
-                        path: unit.path.clone(),
-                        limits: unit
-                            .coverage
-                            .limits
-                            .iter()
-                            .take(CLEANUP_COVERAGE_DETAIL_LIMITS)
-                            .cloned()
-                            .collect(),
-                    });
-            }
+        if !scope_coverage.is_empty() {
+            envelope["scope_coverage"] = serde_json::json!(scope_coverage);
+        }
+        if v == View::Docker && project.is_none() {
+            envelope["buildkit"] = swamp_core::agent_json::buildkit_payload(&rr);
+        }
+        if v == View::Grown {
+            envelope["coverage"] = serde_json::json!({
+                "walked_total": rr.reconciliation.walked_total,
+                "unique_estimate": rr.reconciliation.unique_estimate,
+                "du_total": rr.reconciliation.du_total,
+                "unowned_total": rr.reconciliation.unowned,
+                "attributed_total": rr.reconciliation.attributed,
+                "observed_at": observed_at,
+                "since": since_str,
+                "index_refreshed": index_refreshed,
+                "history": swamp_core::agent_json::history_block_for_scope(&store_dir, root, scope_coverage, Some(&since_str), observed_at),
+            });
+        }
+        return Ok(envelope);
+    }
+
+    if let Some(name) = project {
+        swamp_core::agent_json::scope_to_project(&mut rr, name);
+    }
+    let mut value = serde_json::to_value(&rr)?;
+    value["since"] = serde_json::json!(since_str);
+    value["index_refreshed"] = serde_json::json!(index_refreshed);
+    if !scope_coverage.is_empty() {
+        value["scope_coverage"] = serde_json::json!(scope_coverage);
+    }
+    // `--project NAME --json` (no `--view`): include this project's own
+    // linked agent-storage units inline, same linkage-state contract as
+    // `--view agents --project NAME` (#100's "the CLI `report --project
+    // X --json` includes linked agent units with linkage states" --
+    // this used to be silently absent whenever `--view agents` was not
+    // also passed).
+    if project.is_some() && !agent_units.is_empty() {
+        let filtered: Vec<&swamp_core::agents::AgentUnit> = agent_units
+            .iter()
+            .filter(|u| agent_unit_matches_project(u, project))
+            .collect();
+        value["agent_storage"] = serde_json::json!({
+            "units": filtered,
+            "total_bytes": filtered.iter().map(|u| u.bytes).sum::<u64>(),
+        });
+    }
+    if let Some(mut projects) = value.get("projects").cloned() {
+        let page = swamp_core::agent_json::paginate(&mut projects, limit, offset);
+        value["projects"] = projects;
+        if let Some(p) = page {
+            value["total"] = serde_json::json!(p.total);
+            value["truncated"] = serde_json::json!(p.truncated);
         }
     }
-    summary
+    Ok(value)
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Ui {
-        root: PathBuf::from("."),
-        no_observe: false,
-    }) {
-        Command::Ui { root, no_observe } => {
-            swamp_tui::run(&root, no_observe)?;
+    match cli.command.unwrap_or(Command::Ui { root: None }) {
+        Command::InspectCargo {
+            profile,
+            json,
+            max_entries,
+            max_ms,
+        } => {
+            use std::sync::atomic::AtomicBool;
+            let result = swamp_core::cargo_artifacts::inspect_profile(
+                &profile,
+                swamp_core::cargo_artifacts::CargoProfileInspectionLimits {
+                    max_entries,
+                    max_duration: std::time::Duration::from_millis(max_ms),
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            );
+            if json {
+                safe_println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                safe_println!(
+                    "Cargo profile: {} ({} bytes allocated; {} unique; coverage {})",
+                    profile.display(),
+                    result.allocated_bytes,
+                    result.unique_allocated_bytes,
+                    if result.coverage.complete {
+                        "complete"
+                    } else {
+                        "partial"
+                    }
+                );
+                safe_println!("{}", result.accounting_note);
+                for limit in &result.coverage.limits {
+                    safe_println!("Limit: {limit}");
+                }
+                for group in result.groups {
+                    safe_println!(
+                        "{} [{}; features {}; package {}]: {} bytes allocated{}",
+                        group.target.unwrap_or_else(|| "unknown/residual".into()),
+                        group.target_kind.as_deref().unwrap_or("unknown kind"),
+                        group.variant.features.as_deref().unwrap_or("unknown"),
+                        group.package_id.as_deref().unwrap_or("unknown"),
+                        group.allocated_bytes,
+                        group
+                            .residual_reason
+                            .map(|r| format!(" ({r})"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
+        Command::Ui { root } => {
+            if let Some(explicit) = root {
+                swamp_tui::run(&explicit)?;
+            } else {
+                // No explicit root: the TUI opens the *whole* configured
+                // multi-root scope (#51) -- project/shared/external/
+                // agent-tool storage from every present root at once,
+                // including a root with no Git checkout in it at all,
+                // not just the first present root the CLI used to pick
+                // before the TUI even started.
+                let scope = resolve_scope(&[])?;
+                if scope.scan_paths().is_empty() {
+                    if scope.is_empty_scope() {
+                        anyhow::bail!(
+                            "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
+                        );
+                    }
+                    anyhow::bail!(
+                        "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                    );
+                }
+                note_and_persist_scope(&swamp_dir(), &scope);
+                swamp_tui::run_scope(&scope)?;
+            }
         }
         Command::Scan { root, store } => {
             let obs = observation(&ScanOptions {
@@ -461,29 +990,30 @@ fn main() -> Result<()> {
             if let Some(s) = store {
                 Store::open(s)?.write(&obs)?;
             }
-            println!("{}", serde_json::to_string_pretty(&obs)?);
+            safe_println!("{}", serde_json::to_string_pretty(&obs)?);
         }
         Command::Report {
-            root,
+            roots,
             json,
-            docker_facts,
             verify_du,
-            since,
-            no_observe,
             project,
             kinds,
             view,
             worktree,
             filter: filter_expr,
-            enrich,
             all,
             docker,
             dirs,
             depth,
-            full,
             sort,
             reverse,
+            limit,
+            unit_limit,
+            unit_offset,
+            offset,
+            unowned_only,
         } => {
+            let single_explicit_root = roots.len() == 1;
             // `--kinds`/`--docker` are deprecated aliases folded under
             // `--view` (#33); an explicit `--view` wins if somehow both
             // are given.
@@ -496,28 +1026,63 @@ fn main() -> Result<()> {
                     None
                 }
             });
-            // The growth store is always consulted, even under
-            // `--no-observe`: growth is read from whatever prior
-            // observations already exist there (item 5), and only the
-            // *write* of a new observation is skipped. GitHub enrichment
-            // is a separate opt-in (`--enrich`): plain `report` never
-            // shells out to `gh`, regardless of `--no-observe`.
             let store_dir = swamp_dir();
-            let progress =
-                spawn_progress_line(!json && std::io::IsTerminal::is_terminal(&std::io::stderr()));
-            let r = report_full_mode(
-                &root,
-                docker_facts.as_deref(),
-                verify_du,
-                Some(&store_dir),
-                since.as_deref(),
-                !no_observe,
-                dirs,
-                enrich,
-                full,
-            );
-            progress.stop();
-            let r = r?;
+            // R12: `report` is a pure read. The scope this invocation
+            // names (an explicit root is a scope of one, #42) is
+            // resolved only to know *which* stored snapshot to read and
+            // how to describe it if there is none -- resolving a scope
+            // stats each candidate root for presence but never walks
+            // one, so this is not the "no filesystem walk" the pipeline
+            // otherwise avoids.
+            let scope = resolve_scope(&roots)?;
+            if scope.scan_paths().is_empty() {
+                if scope.is_empty_scope() {
+                    anyhow::bail!(
+                        "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
+                    );
+                }
+                anyhow::bail!(
+                    "configured scope has no present root (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                );
+            }
+            let snapshot = match swamp_core::report::report_scope_from_store(&scope, &store_dir) {
+                Ok(s) => s,
+                Err(e) => {
+                    if json {
+                        safe_println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "error": "no_observation",
+                                "scope": e.scope_description,
+                                "hint": "Pass the same roots to report as to observe; snapshots are scoped to that root set.",
+                            }))?
+                        );
+                    } else {
+                        eprintln!("{e}");
+                        eprintln!(
+                            "Pass the same roots to report as to observe; snapshots are scoped to that root set."
+                        );
+                    }
+                    std::process::exit(2);
+                }
+            };
+            let r = snapshot.report;
+            // An explicit root is a scope of one (#42): it never carried
+            // scope-level coverage noise even when the underlying pass
+            // is now the same coherent scope pipeline the catalog uses,
+            // so that contract is preserved here rather than in storage.
+            let coverage = if single_explicit_root {
+                Vec::new()
+            } else {
+                snapshot.coverage
+            };
+            let external_units = snapshot.external_units;
+            let agent_units = snapshot.agent_units;
+            let store_interiors = snapshot.store_interiors;
+            let root = r.root.clone();
+            if !coverage.is_empty() {
+                print_scope_coverage_note(&coverage);
+            }
             if !json
                 && r.projects
                     .iter()
@@ -526,7 +1091,7 @@ fn main() -> Result<()> {
                     .any(|a| a.dedup_stale)
             {
                 eprintln!(
-                    "Unique-byte totals are stale; use --full to reconcile. Allocated sizes are current and may count hardlinks multiple times."
+                    "Unique-byte totals were not recomputed this pass; use `swamp observe --full` to reconcile. Allocated sizes are current and may count hardlinks multiple times."
                 );
             }
             let parsed_filter = match filter_expr.as_deref().map(filter::parse) {
@@ -538,10 +1103,27 @@ fn main() -> Result<()> {
                 None => None,
             };
             if json {
-                println!("{}", to_json(&r)?);
+                let mut value = report_json_envelope(
+                    &r,
+                    &root,
+                    view,
+                    project.as_deref(),
+                    parsed_filter.as_ref(),
+                    None,
+                    false,
+                    unowned_only,
+                    limit,
+                    offset,
+                    &coverage,
+                    &external_units,
+                    &agent_units,
+                    &store_interiors,
+                )?;
+                bound_interior_units(&mut value, unit_limit, unit_offset);
+                safe_println!("{}", serde_json::to_string_pretty(&value)?);
             } else if let Some(wt_path) = worktree {
                 match render_worktree_signals(&r, &wt_path) {
-                    Some(text) => print!("{text}"),
+                    Some(text) => safe_print!("{text}"),
                     None => {
                         eprintln!(
                             "no worktree at {} found under {}",
@@ -553,7 +1135,7 @@ fn main() -> Result<()> {
                 }
             } else if dirs {
                 match render_dirs(&r, project.as_deref(), depth) {
-                    Ok(text) => print!("{text}"),
+                    Ok(text) => safe_print!("{text}"),
                     Err(name) => {
                         eprintln!("no project named {name:?} found under {}", root.display());
                         std::process::exit(1);
@@ -561,20 +1143,25 @@ fn main() -> Result<()> {
                 }
             } else if let Some(name) = project {
                 match view {
-                    None | Some(View::Worktrees) => match render_project_tree(&r, &name) {
-                        Some(text) => print!("{text}"),
-                        None => {
-                            eprintln!("no project named {name:?} found under {}", root.display());
-                            std::process::exit(1);
+                    None | Some(View::Worktrees) => {
+                        match render_project_tree_with_agents(&r, &name, &agent_units) {
+                            Some(text) => safe_print!("{text}"),
+                            None => {
+                                eprintln!(
+                                    "no project named {name:?} found under {}",
+                                    root.display()
+                                );
+                                std::process::exit(1);
+                            }
                         }
-                    },
-                    Some(View::Builds) => print!("{}", render_view_builds(&r, Some(&name))),
-                    Some(View::Deps) => print!("{}", render_view_deps(&r, Some(&name))),
-                    Some(View::Docker) => print!("{}", render_view_docker(&r, Some(&name))),
-                    Some(View::Kinds) => print!("{}", render_kinds(&r)),
-                    Some(View::Types) => print!("{}", render_types(&r)),
+                    }
+                    Some(View::Builds) => safe_print!("{}", render_view_builds(&r, Some(&name))),
+                    Some(View::Deps) => safe_print!("{}", render_view_deps(&r, Some(&name))),
+                    Some(View::Docker) => safe_print!("{}", render_view_docker(&r, Some(&name))),
+                    Some(View::Kinds) => safe_print!("{}", render_kinds(&r)),
+                    Some(View::Types) => safe_print!("{}", render_types(&r)),
                     Some(View::Rust) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_rust_with_limit(
                                 &r,
@@ -583,22 +1170,47 @@ fn main() -> Result<()> {
                             )
                         )
                     }
-                    Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
-                    Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
+                    Some(View::Unowned) => safe_print!("{}", render_view_unowned(&r)),
+                    Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
+                    Some(View::External) => {
+                        safe_print!(
+                            "{}",
+                            swamp_core::render::render_view_external_with(
+                                &external_units,
+                                &store_interiors,
+                                r.observed_at,
+                            )
+                        )
+                    }
+                    Some(View::Agents) => {
+                        safe_print!(
+                            "{}",
+                            swamp_core::render::render_view_agents(
+                                &agent_units,
+                                Some(&name),
+                                all,
+                                r.observed_at
+                            )
+                        )
+                    }
+                    Some(v @ (View::Projects | View::Grown)) => {
+                        eprintln!("--view {} is JSON only; add --json", v.name());
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 match view {
-                    Some(View::Worktrees) => print!(
+                    Some(View::Worktrees) => safe_print!(
                         "{}",
                         render_worktrees(&r, &parsed_filter.unwrap_or_default())
                     ),
-                    Some(View::Kinds) => print!("{}", render_kinds(&r)),
-                    Some(View::Builds) => print!("{}", render_view_builds(&r, None)),
-                    Some(View::Deps) => print!("{}", render_view_deps(&r, None)),
-                    Some(View::Docker) => print!("{}", render_view_docker(&r, None)),
-                    Some(View::Types) => print!("{}", render_types(&r)),
+                    Some(View::Kinds) => safe_print!("{}", render_kinds(&r)),
+                    Some(View::Builds) => safe_print!("{}", render_view_builds(&r, None)),
+                    Some(View::Deps) => safe_print!("{}", render_view_deps(&r, None)),
+                    Some(View::Docker) => safe_print!("{}", render_view_docker(&r, None)),
+                    Some(View::Types) => safe_print!("{}", render_types(&r)),
                     Some(View::Rust) => {
-                        print!(
+                        safe_print!(
                             "{}",
                             swamp_core::render::render_view_rust_with_limit(
                                 &r,
@@ -607,271 +1219,52 @@ fn main() -> Result<()> {
                             )
                         )
                     }
-                    Some(View::Unowned) => print!("{}", render_view_unowned(&r)),
-                    Some(View::Reconciliation) => print!("{}", render_view_reconciliation(&r)),
-                    None => print!(
+                    Some(View::Unowned) => safe_print!("{}", render_view_unowned(&r)),
+                    Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
+                    Some(View::External) => {
+                        safe_print!(
+                            "{}",
+                            swamp_core::render::render_view_external_with(
+                                &external_units,
+                                &store_interiors,
+                                r.observed_at,
+                            )
+                        )
+                    }
+                    Some(View::Agents) => {
+                        safe_print!(
+                            "{}",
+                            swamp_core::render::render_view_agents(
+                                &agent_units,
+                                None,
+                                all,
+                                r.observed_at
+                            )
+                        )
+                    }
+                    Some(v @ (View::Projects | View::Grown)) => {
+                        eprintln!("--view {} is JSON only; add --json", v.name());
+                        std::process::exit(1);
+                    }
+                    None => safe_print!(
                         "{}",
                         render_overview_sorted(&r, all, verify_du, docker, sort.into(), reverse)
                     ),
                 }
             }
         }
-        Command::CleanupCheck {
-            root,
-            paths,
-            role,
-            limit,
-            offset,
-            within,
-            json,
-        } => {
-            anyhow::ensure!((1..=20).contains(&limit), "limit must be between 1 and 20");
-            let root = std::fs::canonicalize(root)?;
-            anyhow::ensure!(
-                paths.is_empty() || (offset == 0 && within.is_none()),
-                "--path is an exact selection; do not combine it with --offset or --within"
-            );
-            let within = within.map(std::fs::canonicalize).transpose()?;
-            if let Some(within) = &within {
-                anyhow::ensure!(
-                    within.is_dir() && within.starts_with(&root),
-                    "--within must be a directory inside the scan root"
-                );
-            }
-            let store = swamp_dir();
-            let start = std::time::Instant::now();
-            let report = report_full_mode(
-                &root,
-                None,
-                false,
-                Some(&store),
-                None,
-                true,
-                false,
-                false,
-                false,
-            )?;
-            let report_ms = start.elapsed().as_millis();
-            let scope_summary = cleanup_scope_summary(&report.nested_artifacts, within.as_deref());
-            let mut candidates: Vec<_> = report
-                .nested_artifacts
-                .iter()
-                .filter(|u| {
-                    swamp_core::cargo_cleanup::candidate(u)
-                        && role.as_deref().is_none_or(|r| u.role.label() == r)
-                        && cleanup_path_in_scope(&u.path, within.as_deref())
-                })
-                .collect();
-            candidates
-                .sort_by(|a, b| swamp_core::cargo_cleanup::cleanup_order(a, b, report.observed_at));
-            let candidate_count = candidates.len();
-            let candidate_allocated_bytes: u64 = candidates.iter().map(|u| u.bytes).sum();
-            let selected: Vec<_> = if paths.is_empty() {
-                candidates
-                    .iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|u| u.path.clone())
-                    .collect()
-            } else {
-                paths.clone()
-            };
-            let next_offset = (paths.is_empty()
-                && offset.saturating_add(selected.len()) < candidate_count)
-                .then_some(offset.saturating_add(selected.len()));
-            let next_page = next_offset.map(|next| {
-                let mut args = vec![
-                    "swamp".to_string(),
-                    "cleanup-check".into(),
-                    root.display().to_string(),
-                    "--offset".into(),
-                    next.to_string(),
-                    "--limit".into(),
-                    limit.to_string(),
-                ];
-                if let Some(role) = &role {
-                    args.extend(["--role".into(), role.clone()]);
-                }
-                if let Some(within) = &within {
-                    args.extend(["--within".into(), within.display().to_string()]);
-                }
-                if json {
-                    args.push("--json".into());
-                }
-                args
-            });
-            if !json {
-                eprintln!(
-                    "{} candidate groups in scope ({} allocated, not reclaimable space). Checking {} on this page; checks read group contents.",
-                    candidate_count,
-                    swamp_core::render::human_bytes_pub(candidate_allocated_bytes),
-                    selected.len()
-                );
-            }
-            // Empty pages must not silently restart the default selection.
-            let results = if selected.is_empty() {
-                Vec::new()
-            } else {
-                swamp_core::cargo_cleanup::check(
-                    &report,
-                    &store,
-                    &selected,
-                    role.as_deref(),
-                    limit,
-                )?
-            };
-            let considered = candidates
-                .iter()
-                .filter(|u| results.iter().any(|r| r.path == u.path))
-                .count();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "root": root, "store": store, "report_ms": report_ms,
-                        "limit": limit, "checked_count": results.len(), "exhaustive": false,
-                        "offset": offset, "within": within,
-                        "observed_candidate_count": candidate_count,
-                        "candidate_allocated_bytes": candidate_allocated_bytes,
-                        "scoped_nested_row_count": scope_summary.nested_row_count,
-                        "coverage_limited_count": scope_summary.coverage_limited_count,
-                        "unknown_or_residual_count": scope_summary.unknown_or_residual_count,
-                        "coverage_limited_details": scope_summary.coverage_limited_details.iter().map(|d| serde_json::json!({
-                            "path": d.path,
-                            "limits": d.limits,
-                        })).collect::<Vec<_>>(),
-                        "not_checked_in_this_run": candidate_count.saturating_sub(considered),
-                        "next_offset": next_offset, "next_page": next_page,
-                        "note": "This is a bounded review of candidate groups, not a measure of total cleanup opportunity. A zero candidate count does not mean no cleanup opportunity; coverage-limited rows affecting the scope, including relevant ancestors, and noncandidate rows are reported separately. Allocated bytes are not guaranteed reclaimable. Checks are not evidence of disuse. No cleanup authorized or executed.",
-                        "results": results
-                    }))?
-                );
-            } else {
-                println!(
-                    "Cargo cleanup review · {} groups · report {report_ms} ms",
-                    results.len()
-                );
-                for r in results {
-                    println!("{} · {}", r.recommendation, r.consequence);
-                    println!(
-                        "{} · {} allocated · {} ms\n  {}\n  {}",
-                        r.check_status,
-                        swamp_core::render::human_bytes_pub(r.allocated_bytes),
-                        r.elapsed_ms,
-                        r.path.display(),
-                        r.message
-                    );
-                    for warning in r.warnings {
-                        println!("  {warning}");
-                    }
-                    if let Some(id) = r.plan_id {
-                        println!("  Unapproved plan: {id} (store {})", store.display());
-                    }
-                    println!("  Next (arguments): {:?}", r.next_command);
-                }
-                println!(
-                    "Bounded review, not an exhaustive search. Use --role test-executable or --path <exact-group> to narrow it. Allocated bytes are not guaranteed free space. Nothing approved or deleted."
-                );
-                println!(
-                    "{} of {candidate_count} candidate groups were not checked in this run.",
-                    candidate_count.saturating_sub(considered)
-                );
-                println!(
-                    "Scope contains {} nested Cargo rows: {} coverage-limited rows affecting scope (including ancestors) and {} unknown/residual non-candidates.",
-                    scope_summary.nested_row_count,
-                    scope_summary.coverage_limited_count,
-                    scope_summary.unknown_or_residual_count
-                );
-                if scope_summary.coverage_limited_count > 0 {
-                    println!(
-                        "Coverage-limited rows are not cleanup evidence; refresh before treating this scope as complete."
-                    );
-                    println!("Coverage-limited details (bounded):");
-                    for detail in &scope_summary.coverage_limited_details {
-                        let limits = if detail.limits.is_empty() {
-                            "limits not recorded".to_string()
-                        } else {
-                            detail.limits.join(" · ")
-                        };
-                        println!("  {} — {limits}", detail.path.display());
-                    }
-                }
-                if let Some(args) = next_page {
-                    println!("Next page (same SWAMP_DIR, arguments): {args:?}");
-                }
-            }
-        }
-        Command::Propose {
-            root,
-            filter,
-            paths,
-            since,
-            json,
-        } => {
-            let store_dir = swamp_dir();
-            let r = report_full_mode(
-                &root,
-                None,
-                false,
-                Some(&store_dir),
-                since.as_deref(),
-                true,
-                false,
-                false,
-                false,
-            )?;
-            let parsed = match filter.as_deref().map(filter::parse) {
-                Some(Ok(f)) => Some(f),
-                Some(Err(e)) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-                None => None,
-            };
-            let plan = swamp_core::actions::propose(&r, parsed.as_ref(), &paths, "human:cli")?;
-            swamp_core::actions::save_plan(&store_dir, &plan)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-            } else {
-                print_plan(&plan);
-            }
-        }
-        Command::Approve { plan_id } => {
-            // The human's confirm line: every unit with the facts on it,
-            // before the grant is written.
-            let plan = swamp_core::actions::load_plan(&swamp_dir(), &plan_id)?;
-            for u in &plan.units {
-                println!(
-                    "  {:<16} {:>10}  {}{}",
-                    u.verb,
-                    swamp_core::render::human_bytes_pub(u.bytes),
-                    u.path.display(),
-                    if u.warnings.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  ⚠ {}", u.warnings.join(" · "))
-                    }
-                );
-            }
-            let g = swamp_core::actions::approve(&swamp_dir(), &plan_id, "human:cli")?;
-            println!(
-                "approved plan {} with one-shot grant {} (budget {}, {} units, expires {})",
-                plan_id,
-                g.id,
-                swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
-                g.max_units.unwrap_or(0),
-                g.expires_at
-            );
-            println!("execute with: swamp execute {plan_id}");
-        }
+        Command::Protect { cmd } => cmd_protect(cmd)?,
         Command::Config { action } => {
             let dir = swamp_dir();
             let path = dir.join("config.toml");
             match action {
-                ConfigAction::Path => println!("{}", path.display()),
+                ConfigAction::Path => safe_println!("{}", path.display()),
                 ConfigAction::Show => {
-                    print!("{}", swamp_core::growth::load_config(&dir).to_toml());
-                    if !path.exists() {
+                    safe_print!(
+                        "{}",
+                        swamp_core::growth::load_config_checked(&dir)?.to_toml()
+                    );
+                    if !swamp_core::fs_gate::exists(&path) {
                         eprintln!(
                             "(defaults; no file at {} — `swamp config init` writes one)",
                             path.display()
@@ -879,150 +1272,129 @@ fn main() -> Result<()> {
                     }
                 }
                 ConfigAction::Init => {
-                    if path.exists() {
+                    if swamp_core::fs_gate::exists(&path) {
                         eprintln!("{} already exists; not overwriting", path.display());
                         std::process::exit(1);
                     }
-                    std::fs::create_dir_all(&dir)?;
-                    std::fs::write(&path, swamp_core::growth::GrowthConfig::default().to_toml())?;
-                    println!("wrote {}", path.display());
-                }
-            }
-        }
-        Command::Execute {
-            plan_id,
-            actor,
-            json,
-            keep_executables,
-        } => {
-            let res = if keep_executables {
-                swamp_core::actions::execute_keeping_executables(&swamp_dir(), &plan_id, &actor)?
-            } else {
-                swamp_core::actions::execute(&swamp_dir(), &plan_id, &actor)?
-            };
-            if json {
-                println!("{}", serde_json::to_string_pretty(&res)?);
-            } else {
-                println!("plan {}: {}", res.plan_id, res.state);
-                for o in &res.outcomes {
-                    println!(
-                        "  {:<9} {:>10}  {}{}",
-                        o.status,
-                        swamp_core::render::human_bytes_pub(o.planned_bytes),
-                        o.path.display(),
-                        o.cause
-                            .as_ref()
-                            .map(|c| format!("  — {c}"))
-                            .unwrap_or_default()
-                    );
-                    for kept in &o.preserved {
-                        println!("            kept {}", kept.display());
-                    }
-                }
-                let permanent = if res.removed_permanently_bytes > 0 {
-                    format!(
-                        " · removed permanently {}",
-                        swamp_core::render::human_bytes_pub(res.removed_permanently_bytes)
-                    )
-                } else {
-                    String::new()
-                };
-                println!(
-                    "planned {} · trashed {}{permanent} · free space measured {}",
-                    swamp_core::render::human_bytes_pub(res.planned_bytes),
-                    swamp_core::render::human_bytes_pub(res.trashed_bytes),
-                    res.freed_measured
-                        .map(swamp_core::render::human_bytes_signed)
-                        .unwrap_or_else(|| "n/a".into())
-                );
-                if let Some(n) = &res.next_step {
-                    println!("next: {n}");
-                }
-            }
-        }
-        Command::Plans { json } => {
-            let plans = swamp_core::actions::list_plans(&swamp_dir())?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&plans)?);
-            } else if plans.is_empty() {
-                println!("no plans");
-            } else {
-                for p in plans {
-                    println!(
-                        "{}  {:?}  {} units  {}  created {}  expires {}",
-                        p.id,
-                        p.status,
-                        p.units.len(),
-                        swamp_core::render::human_bytes_pub(p.planned_bytes()),
-                        p.created_at,
-                        p.expires_at
-                    );
-                }
-            }
-        }
-        Command::Grant { cmd } => {
-            let dir = swamp_dir();
-            match cmd {
-                GrantCmd::Add {
-                    predicate,
-                    budget,
-                    expires,
-                    max_units,
-                } => {
-                    let budget_bytes = parse_size_arg(&budget)?;
-                    let expires_secs = swamp_core::growth::parse_duration_secs(&expires)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("bad --expires {expires:?} (e.g. 7d, 12h)")
-                        })?;
-                    let g = swamp_core::actions::add_standing_grant(
-                        &dir,
-                        &predicate,
-                        budget_bytes,
-                        max_units,
-                        expires_secs,
-                        "human:cli",
+                    swamp_core::fs_gate::store::write_text(
+                        swamp_core::fs_gate::store::TextFile::Config {
+                            store: &swamp_core::fs_gate::store::StoreDir::resolved(),
+                        },
+                        &swamp_core::growth::GrowthConfig::default().to_toml(),
                     )?;
-                    println!(
-                        "grant {} added: delete where {} · budget {} · expires {}",
-                        g.id, g.predicate, budget, expires
-                    );
-                }
-                GrantCmd::List => {
-                    let gs = swamp_core::actions::list_grants(&dir)?;
-                    if gs.is_empty() {
-                        println!("no grants");
-                    }
-                    for g in gs {
-                        println!(
-                            "{}  {}  {}  budget {} spent {}  units {}/{}  expires {}  by {}",
-                            g.id,
-                            if g.revoked { "revoked" } else { "live" },
-                            g.plan_id
-                                .as_ref()
-                                .map(|p| format!("plan {p}"))
-                                .unwrap_or_else(|| format!("where {}", g.predicate)),
-                            swamp_core::render::human_bytes_pub(g.budget_bytes.unwrap_or(0)),
-                            swamp_core::render::human_bytes_pub(g.spent_bytes),
-                            g.used_units,
-                            g.max_units
-                                .map(|m| m.to_string())
-                                .unwrap_or_else(|| "∞".into()),
-                            g.expires_at,
-                            g.actor
-                        );
-                    }
-                }
-                GrantCmd::Revoke { grant_id } => {
-                    swamp_core::actions::revoke_grant(&dir, &grant_id)?;
-                    println!("grant {grant_id} revoked");
+                    safe_println!("wrote {}", path.display());
                 }
             }
         }
-        Command::Observe { roots, full } => {
-            schedule::cmd_observe(swamp_dir(), roots, full)?;
+        Command::Scope {
+            roots,
+            json,
+            verbose,
+        } => {
+            let scope = resolve_scope(&roots)?;
+            if json {
+                safe_println!("{}", serde_json::to_string_pretty(&scope)?);
+            } else {
+                safe_print!("{}", render_scope_text(&scope, verbose));
+                if scope.is_empty_scope() {
+                    eprintln!(
+                        "effective scan scope is empty: no built-in default, detector, or configured include is enabled -- this is explicit, never a silent fallback to cwd or home."
+                    );
+                }
+            }
         }
-        Command::Schedule { every, off, roots } => {
-            schedule::cmd_schedule(swamp_dir(), every, off, roots)?;
+        Command::Observe {
+            roots,
+            full,
+            docker_facts,
+            verify_du,
+            since,
+            enrich,
+        } => {
+            let store_dir = swamp_dir();
+            let scope = resolve_scope(&roots)?;
+            if scope.scan_paths().is_empty() {
+                if scope.is_empty_scope() {
+                    anyhow::bail!(
+                        "effective scan scope is empty: no built-in default, detector, or configured include is enabled. This is explicit, not a fallback to the current directory -- see `swamp scope --json`, or pass a root explicitly."
+                    );
+                }
+                anyhow::bail!(
+                    "no present root to observe (every candidate is missing/unreadable/excluded) -- see `swamp scope --json`, or pass a root explicitly."
+                );
+            }
+            note_and_persist_scope(&store_dir, &scope);
+            let progress =
+                spawn_progress_line(std::io::IsTerminal::is_terminal(&std::io::stderr()));
+            let result = schedule::cmd_observe(
+                store_dir,
+                scope,
+                full,
+                docker_facts,
+                verify_du,
+                since,
+                enrich,
+            );
+            progress.stop();
+            result?;
+        }
+        Command::Collect {
+            roots,
+            status,
+            json,
+        } => {
+            let store_dir = swamp_dir();
+            let scope = resolve_scope(&roots)?;
+            let (authorized, _) = scope.authorized_roots();
+            let present: Vec<collect::Root> = authorized
+                .into_iter()
+                .filter(|r| r.nested_in.is_none() && swamp_core::fs_gate::is_dir(&r.path))
+                .map(|r| collect::Root {
+                    excluded: r.pruned_subtrees.clone(),
+                    path: swamp_core::fs_gate::canonicalize(&r.path).unwrap_or(r.path),
+                })
+                .collect();
+            if present.is_empty() {
+                anyhow::bail!(
+                    "no present root to collect for -- see `swamp scope --json`, or pass a root explicitly."
+                );
+            }
+            if status {
+                let roots = present.into_iter().map(|r| r.path).collect();
+                collect::cmd_collect_status(store_dir, roots, json)?;
+            } else {
+                collect::cmd_collect(store_dir, present)?;
+            }
+        }
+        Command::Schedule {
+            every,
+            off,
+            collector,
+            roots,
+        } => {
+            let store_dir = swamp_dir();
+            // No explicit roots: install `observe` with none baked into
+            // the plist's argv at all (#42/#50), so every scheduled fire
+            // re-resolves the configured scope itself (same code path
+            // `swamp observe` with no roots already takes) instead of
+            // replaying whatever was present at `schedule --every` time.
+            // A config edit therefore takes effect on the next scheduled
+            // run, not only after `schedule --every` is run again. This
+            // is a validate-then-install check only: it fails fast on an
+            // empty scope now rather than installing a schedule that can
+            // never do anything, but it does not freeze the resolved
+            // list into the plist -- explicit roots on the command line
+            // still do, exactly as an explicit root has always replaced
+            // the configured scope for one invocation.
+            if roots.is_empty() && !off && every.is_some() {
+                let scope = resolve_scope(&[])?;
+                if scope.scan_paths().is_empty() {
+                    anyhow::bail!(
+                        "effective scan scope is empty; nothing to schedule -- see `swamp scope --json`, or pass roots explicitly."
+                    );
+                }
+            }
+            schedule::cmd_schedule(store_dir, every, off, collector, roots)?;
         }
     }
     Ok(())
@@ -1116,7 +1488,7 @@ fn render_dirs(
                         .collect()
                 })
                 .unwrap_or_default();
-            file_rows.sort_by(|a, b| b.growth_bytes.cmp(&a.growth_bytes));
+            file_rows.sort_by_key(|a| std::cmp::Reverse(a.growth_bytes));
             for f in file_rows {
                 let _ = writeln!(
                     out,
@@ -1199,130 +1571,5 @@ fn spawn_progress_line(enabled: bool) -> ProgressLine {
     ProgressLine {
         stop,
         handle: Some(handle),
-    }
-}
-
-#[cfg(test)]
-mod cleanup_check_tests {
-    use super::{
-        ArtifactRole, CLEANUP_COVERAGE_DETAIL_LIMITS, CLEANUP_COVERAGE_DETAIL_ROWS, Path, PathBuf,
-        cleanup_scope_summary,
-    };
-    use swamp_core::artifact::{ArtifactCoverage, Membership, NestedArtifact};
-
-    fn synthetic(
-        path: impl Into<PathBuf>,
-        role: ArtifactRole,
-        supported: bool,
-        complete: bool,
-        limits: Vec<String>,
-    ) -> NestedArtifact {
-        let path = path.into();
-        NestedArtifact {
-            id: path.display().to_string(),
-            relative_path: path.display().to_string(),
-            path,
-            parent_id: None,
-            container_id: None,
-            role,
-            membership: Membership::Unknown,
-            is_dir: false,
-            device: 0,
-            inode: 0,
-            logical_bytes: 1,
-            bytes: 1,
-            physical_bytes: 1,
-            physical_total: 1,
-            mtime_max: 0,
-            variant: Default::default(),
-            producer_evidence: Vec::new(),
-            consumer_evidence: Vec::new(),
-            coverage: ArtifactCoverage {
-                supported,
-                complete,
-                limits,
-            },
-            action_group: None,
-            present: true,
-            growth_bytes: None,
-            regrowth_count: 0,
-        }
-    }
-
-    #[test]
-    fn cleanup_scope_summary_keeps_unknown_coverage_visible_and_bounded() {
-        let mut rows = vec![
-            synthetic(
-                "/root/target",
-                ArtifactRole::Container,
-                false,
-                false,
-                vec!["root coverage".into()],
-            ),
-            synthetic(
-                "/root/target/debug/deps/unknown",
-                ArtifactRole::Unknown,
-                false,
-                false,
-                vec!["unknown coverage".into()],
-            ),
-            synthetic(
-                "/root/target/debug/deps/residual",
-                ArtifactRole::Residual,
-                true,
-                true,
-                Vec::new(),
-            ),
-            synthetic(
-                "/root/target/debug/incremental/group",
-                ArtifactRole::Incremental,
-                true,
-                true,
-                Vec::new(),
-            ),
-            synthetic(
-                "/root/target/debug/incremental/group/child",
-                ArtifactRole::Residual,
-                true,
-                true,
-                Vec::new(),
-            ),
-        ];
-        for index in 0..25 {
-            rows.push(synthetic(
-                format!("/root/target/debug/deps/unknown-{index}"),
-                ArtifactRole::Unknown,
-                false,
-                false,
-                (0..10).map(|n| format!("limit-{n}")).collect(),
-            ));
-        }
-
-        let summary = cleanup_scope_summary(&rows, Some(Path::new("/root/target/debug")));
-        assert_eq!(summary.nested_row_count, rows.len() - 1);
-        assert_eq!(summary.coverage_limited_count, 27);
-        assert_eq!(summary.unknown_or_residual_count, 28);
-        assert_eq!(
-            summary.coverage_limited_details.len(),
-            CLEANUP_COVERAGE_DETAIL_ROWS
-        );
-        assert!(
-            summary
-                .coverage_limited_details
-                .iter()
-                .all(|detail| detail.limits.len() <= CLEANUP_COVERAGE_DETAIL_LIMITS)
-        );
-
-        let group_scope = cleanup_scope_summary(
-            &rows,
-            Some(Path::new("/root/target/debug/incremental/group")),
-        );
-        assert_eq!(group_scope.nested_row_count, 2);
-        assert_eq!(group_scope.coverage_limited_count, 1);
-        assert_eq!(
-            group_scope.coverage_limited_details[0].path,
-            PathBuf::from("/root/target")
-        );
-        assert_eq!(group_scope.unknown_or_residual_count, 1);
     }
 }

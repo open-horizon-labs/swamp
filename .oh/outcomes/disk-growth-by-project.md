@@ -21,7 +21,9 @@ files:
 - crates/core/src/bus/*
 - crates/core/src/consumers/*
 - crates/core/src/report.rs
-- crates/mcp/src/main.rs
+- crates/core/src/agent_json.rs
+- crates/cli/src/main.rs
+- skills/swamp/*
 - crates/tui/src/*
 - .oh/guardrails/*
 ---

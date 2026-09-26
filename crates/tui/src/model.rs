@@ -140,6 +140,12 @@ pub struct Row {
     /// artifacts without parsing the rendered label back into an
     /// identity.
     pub project: Option<String>,
+    /// Decision evidence (#53/#60) for the row's own unit -- an
+    /// `ArtifactRow`/`ExternalUnit`/`AgentUnit`'s already-populated
+    /// `evidence`, cloned at row-build time (never a fresh scan). Empty
+    /// for a structural row with no single unit backing it (a project
+    /// header, a worktree row, an aggregated kind/type bucket).
+    pub evidence: Vec<swamp_core::evidence::Evidence>,
 }
 
 impl Row {
@@ -165,6 +171,7 @@ impl Row {
             cleanup_summary: None,
             allocated: false,
             project: None,
+            evidence: Vec::new(),
         }
     }
 }
@@ -392,9 +399,9 @@ pub fn apply_sort(rows: &mut [Row], sort: Sort, reverse: bool) {
         // above one that grew by 1GB, at the top of a screen the human
         // is reading for things to delete. Shrinkage sorts last.
         Sort::Growth => {
-            rows.sort_by(|a, b| b.growth.unwrap_or(0).cmp(&a.growth.unwrap_or(0)));
+            rows.sort_by_key(|a| std::cmp::Reverse(a.growth.unwrap_or(0)));
         }
-        Sort::Size => rows.sort_by(|a, b| b.bytes.cmp(&a.bytes)),
+        Sort::Size => rows.sort_by_key(|a| std::cmp::Reverse(a.bytes)),
         Sort::Name => rows.sort_by(|a, b| {
             // Labels may carry ecosystem tags ("[rs][js] owner/repo");
             // sort on the name after the last tag so tags don't cluster rows.
@@ -535,6 +542,10 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             cleanup_summary: None,
             allocated: false,
             project: Some(p.name.clone()),
+            // No single unit backs a project header (it aggregates every
+            // worktree/artifact below it); drill into the tree/worktree
+            // rows for evidence, same as every other per-project fact.
+            evidence: Vec::new(),
         });
     }
     out
@@ -554,11 +565,28 @@ pub fn tree_rows(
     collapsed: &std::collections::HashSet<String>,
     track: &std::collections::HashMap<std::path::PathBuf, swamp_core::ignore::TrackState>,
 ) -> Vec<Row> {
+    tree_rows_with_agents(report, project_name, filter, collapsed, track, &[])
+}
+
+/// Same as [`tree_rows`], additionally appending the collapsed "Agent
+/// storage (linked)" summary row(s) #100 requires when `agent_units`
+/// names any unit linked to this project. The row is informational
+/// only (`unit: None`): acting on agent storage stays the dedicated
+/// Agents view's job (full per-unit protections/occupancy checks), not
+/// something the project tree can mark.
+pub fn tree_rows_with_agents(
+    report: &Report,
+    project_name: &str,
+    filter: &Filter,
+    collapsed: &std::collections::HashSet<String>,
+    track: &std::collections::HashMap<std::path::PathBuf, swamp_core::ignore::TrackState>,
+    agent_units: &[swamp_core::agents::AgentUnit],
+) -> Vec<Row> {
     let mut out = Vec::new();
     let Some(p) = report.projects.iter().find(|p| p.name == project_name) else {
         return out;
     };
-    let tree = swamp_core::tree::build_project_tree(p, &report.root);
+    let tree = swamp_core::tree::build_project_tree(p, &report.root, agent_units);
     let wt_count = tree.worktrees.len();
     for (wi, wt) in tree.worktrees.iter().enumerate() {
         // Look up the underlying `WorktreeRow` for its absolute path (the
@@ -636,6 +664,17 @@ pub fn tree_rows(
             cleanup_summary: None,
             allocated: false,
             project: None,
+            // #60: the worktree's own `Source` row is where
+            // `consumer_wiring::attach_associations` (#56/#57) attaches
+            // this project's toolchain-declaration/dependency-lockfile
+            // facts -- surfacing it here means selecting the worktree
+            // itself, not just one artifact under it, shows them.
+            evidence: source_wt
+                .artifacts
+                .iter()
+                .find(|a| a.kind == ArtifactKind::Source)
+                .map(|a| a.evidence.clone())
+                .unwrap_or_default(),
         });
         if is_collapsed {
             continue;
@@ -710,12 +749,46 @@ pub fn tree_rows(
             // path to mark; only an unfolded row is markable.
             if row.folded_count == 1 {
                 out_row.unit = Some(UnitId::for_artifact(&abs));
+                // #60: a folded group has no single evidence source, but
+                // an unfolded row maps to exactly one `ArtifactRow` --
+                // look it up by its already-known absolute path rather
+                // than adding an `evidence` field to `TreeRow` for a
+                // fact this same worktree's `artifacts` already holds.
+                if let Some(a) = source_wt.artifacts.iter().find(|a| a.path == abs) {
+                    out_row.evidence = a.evidence.clone();
+                }
             }
-            let cargo_children = if row.kind == Some(ArtifactKind::BuildOutput)
+            // Any row an adapter identified the interior of expands,
+            // not only `BuildOutput`. An installed dependency tree is a
+            // `DependencyTree` row, and `node_modules` is the row a
+            // person most often wants to open.
+            let identified_interior = report
+                .nested_artifacts
+                .iter()
+                .any(|u| u.path.starts_with(&abs) && u.path != abs && u.adapter.is_some());
+            // How the interior is presented follows the roles its units
+            // carry, never an adapter id: a container in the neutral
+            // vocabulary gets family groups, one whose units the Cargo
+            // cleanup module speaks for keeps its purpose groups.
+            let neutral_interior = identified_interior
+                && !report.nested_artifacts.iter().any(|u| {
+                    u.path.starts_with(&abs) && swamp_core::cargo_cleanup::speaks_for(&u.role)
+                });
+            let cargo_children = if neutral_interior {
+                family_tree_children(
+                    report,
+                    &abs,
+                    3,
+                    &format!("{child_prefix}{}", if r_last { "   " } else { "│  " }),
+                    collapsed,
+                )
+            } else if row.kind == Some(ArtifactKind::BuildOutput)
+                || identified_interior
                 || (row.folded_count == 1
                     && report.nested_artifacts.iter().any(|u| {
                         u.path == abs && u.role == swamp_core::artifact::ArtifactRole::Container
-                    })) {
+                    }))
+            {
                 cargo_tree_children(
                     report,
                     &abs,
@@ -776,10 +849,290 @@ pub fn tree_rows(
             }
         }
     }
+    if !tree.agent_rows.is_empty() {
+        let total_bytes: u64 = tree.agent_rows.iter().map(|r| r.bytes).sum();
+        let total_growth = tree
+            .agent_rows
+            .iter()
+            .filter_map(|r| r.growth_bytes)
+            .reduce(|a, b| a + b);
+        let tools = tree
+            .agent_rows
+            .iter()
+            .map(|r| r.tool_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut row = Row::leaf(
+            1,
+            format!("agent storage (linked)   {tools}"),
+            total_bytes,
+            total_growth,
+        );
+        row.rail = "└─ ".into();
+        // Deliberately no `unit`/`kind`: this collapsed summary row is
+        // never a mark target from the project tree (see doc comment
+        // above) -- the Agents view is where a specific unit's own
+        // protections/occupancy are checked before it can be marked.
+        out.push(row);
+    }
     out
 }
 
 pub use swamp_core::render::project_display_name;
+
+/// How many members an expanded family group lists before summarizing
+/// the rest in one "… and N more" row. A `node_modules` with thousands of
+/// packages is one group, not thousands of rows.
+const FAMILY_MEMBERS_SHOWN: usize = 25;
+
+/// The interior of a container identified in the ecosystem-neutral role
+/// vocabulary (Node, Gradle, Maven, ...): one collapsed row per role
+/// family, then one "Not identified" row for what no supported unit
+/// accounts for.
+///
+/// Each group row leads with **review guidance and what removing it
+/// costs** (`family_guidance`), then the count and oldest modification,
+/// so a narrow terminal gives up the numbers before the meaning -- the
+/// same ordering as Cargo's purpose groups. The adapter's own
+/// consequence, the accounting basis and the action capability are the
+/// row's signals. Groups open on demand (they start closed): a family is
+/// the answer to "what is this made of", and its members are the
+/// follow-up question.
+///
+/// Nothing here is selectable. No neutral-vocabulary adapter has an
+/// executor yet (#73), so every row carries the `blocked` signal and no
+/// `UnitId`, which is what keeps the confirmation path unreachable.
+fn family_tree_children(
+    report: &Report,
+    container: &std::path::Path,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    family_tree_children_of(
+        &report.nested_artifacts,
+        report.observed_at,
+        container,
+        depth,
+        prefix,
+        collapsed,
+    )
+}
+
+/// [`family_tree_children`] over any set of units: a project container's,
+/// a machine-wide store's (`ViewKind::External`) or a BuildKit builder's
+/// (`ViewKind::Docker`). One presentation for every interior.
+fn family_tree_children_of(
+    all: &[swamp_core::artifact::NestedArtifact],
+    observed_at: u64,
+    container: &std::path::Path,
+    depth: usize,
+    prefix: &str,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    use swamp_core::build_adapters::{family_members, summarize_container};
+    let units: Vec<swamp_core::artifact::NestedArtifact> = all
+        .iter()
+        .filter(|u| u.present && u.path.starts_with(container))
+        .cloned()
+        .collect();
+    let summary = summarize_container(container, &units);
+    let residual = summary.unsupported_bytes.unwrap_or(0) + summary.unaccounted_bytes.unwrap_or(0);
+    let show_residual = summary.unsupported_count > 0 || residual > 0;
+    let group_count = summary.families.len() + usize::from(show_residual);
+    let mut rows = Vec::new();
+    for (i, f) in summary.families.iter().enumerate() {
+        let last = i + 1 == group_count;
+        let key = format!("family-open:{}:{}", container.display(), f.family.label());
+        let open = collapsed.contains(&key);
+        let members = family_members(container, &units, f.family);
+        let mut row = Row::leaf(depth, f.family.title().to_string(), f.bytes, None);
+        row.rail = format!(
+            "{prefix}{}{}",
+            if last { "└─ " } else { "├─ " },
+            if open { "▾ " } else { "▸ " }
+        );
+        row.expandable = true;
+        row.expansion_key = Some(key);
+        row.collapsed_children = (!open).then_some(members.len());
+        row.allocated = true;
+        row.mtime_max = f.oldest_modified.unwrap_or(0);
+        row.cleanup_summary = Some(format!(
+            "{} · {} {} · oldest {}{}",
+            f.recommendation,
+            f.count,
+            if f.count == 1 { "item" } else { "items" },
+            match f.oldest_modified {
+                Some(t) => age_label(Some(observed_at.saturating_sub(t))),
+                None => "unknown".into(),
+            },
+            if f.unknown_age > 0 {
+                format!(" · {} of unknown age", f.unknown_age)
+            } else {
+                String::new()
+            }
+        ));
+        let mut signals = vec![match (&f.consequence, f.other_consequences) {
+            (Some(c), 0) => c.clone(),
+            (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
+            (None, _) => "consequence not established".into(),
+        }];
+        let actionable = members
+            .iter()
+            .filter(|u| u.action == swamp_core::artifact::NestedActionCapability::TrashPath)
+            .count();
+        signals.push(if actionable > 0 {
+            format!("Space marks {actionable} exact paths; remaining items are inspection only")
+        } else {
+            "inspection only: selective cleanup unsupported here".into()
+        });
+        signals.push(match f.basis {
+            swamp_core::artifact::AccountingBasis::Unknown => {
+                "mixed accounting bases: not summed".to_string()
+            }
+            basis => format!("{} bytes", basis.label()),
+        });
+        if !f.complete {
+            signals.push("measurement incomplete".into());
+        }
+        if actionable == 0 {
+            signals.push("blocked".into());
+        }
+        row.signals = signals;
+        rows.push(row);
+        if open {
+            let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
+            let shown = members.len().min(FAMILY_MEMBERS_SHOWN);
+            for (j, u) in members.iter().take(shown).enumerate() {
+                let m_last = j + 1 == shown && members.len() <= shown;
+                rows.push(family_member_row(
+                    u,
+                    depth + 1,
+                    &child_prefix,
+                    m_last,
+                    observed_at,
+                ));
+            }
+            if members.len() > shown {
+                let rest: u64 = members.iter().skip(shown).map(|u| u.bytes).sum();
+                let mut more = Row::leaf(
+                    depth + 1,
+                    format!("… and {} more", members.len() - shown),
+                    rest,
+                    None,
+                );
+                more.rail = format!("{child_prefix}└─ ");
+                more.allocated = true;
+                more.signals = vec!["blocked".into()];
+                rows.push(more);
+            }
+        }
+    }
+    if show_residual {
+        let mut row = Row::leaf(
+            depth,
+            swamp_core::artifact::RoleFamily::Residual
+                .title()
+                .to_string(),
+            residual,
+            None,
+        );
+        row.rail = format!("{prefix}└─ ");
+        row.allocated = true;
+        row.cleanup_summary = Some(format!(
+            "{}{}{}",
+            swamp_core::build_adapters::family_guidance(swamp_core::artifact::RoleFamily::Residual),
+            match summary.unsupported_count {
+                0 => String::new(),
+                1 => " · 1 unrecognised entry".to_string(),
+                n => format!(" · {n} unrecognised entries"),
+            },
+            match summary.unaccounted_bytes {
+                Some(b) if b > 0 => format!(" · {} no unit claims", human_bytes(b)),
+                Some(_) => String::new(),
+                None => " · remainder not reconciled".into(),
+            }
+        ));
+        row.signals = vec![
+            "not identified: an unsupported layout or bytes no unit accounts for".into(),
+            "blocked".into(),
+        ];
+        rows.push(row);
+    }
+    rows
+}
+
+fn family_member_row(
+    u: &swamp_core::artifact::NestedArtifact,
+    depth: usize,
+    prefix: &str,
+    last: bool,
+    observed_at: u64,
+) -> Row {
+    let name = u
+        .path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let label = match (&u.variant.package, &u.variant.version) {
+        (Some(p), Some(v)) if *p != name => format!("{name} ({p}@{v})"),
+        (Some(p), None) if *p != name => format!("{name} ({p})"),
+        (Some(_), Some(v)) => format!("{name}@{v}"),
+        _ => name,
+    };
+    let mut row = Row::leaf(depth, label, u.bytes, u.growth_bytes);
+    row.rail = format!("{prefix}{}", if last { "└─ " } else { "├─ " });
+    row.allocated = true;
+    row.mtime_max = u.mtime_max;
+    let age = (u.time_source != swamp_core::artifact::TimeSource::Unknown && u.mtime_max > 0)
+        .then(|| observed_at.saturating_sub(u.mtime_max));
+    row.cleanup_summary = Some(format!(
+        "{} · {} {}",
+        u.consequence
+            .clone()
+            .unwrap_or_else(|| "consequence not established".into()),
+        // A daemon's record time is the daemon's, never a file's.
+        if u.reported_by.is_some() {
+            "created (daemon)"
+        } else {
+            "modified"
+        },
+        match age {
+            Some(a) => age_label(Some(a)),
+            None => "unknown".into(),
+        }
+    ));
+    let action = match &u.action {
+        swamp_core::artifact::NestedActionCapability::TrashPath => {
+            "Space marks this exact path for Trash".into()
+        }
+        swamp_core::artifact::NestedActionCapability::Unsupported { reason } => {
+            format!("selective cleanup unsupported: {reason}")
+        }
+        swamp_core::artifact::NestedActionCapability::InspectionOnly => "inspection only".into(),
+    };
+    row.signals = vec![
+        u.role.label().to_string(),
+        action,
+        format!(
+            "{} bytes ({})",
+            u.basis.label(),
+            u.adapter
+                .clone()
+                .unwrap_or_else(|| "unknown adapter".into())
+        ),
+    ];
+    row.signals.extend(u.coverage.limits.iter().cloned());
+    if u.action == swamp_core::artifact::NestedActionCapability::TrashPath {
+        row.unit = Some(UnitId::for_artifact(&u.path));
+        row.kind = Some(ArtifactKind::BuildOutput);
+        row.evidence = u.decision_evidence.clone();
+    } else {
+        row.signals.push("blocked".into());
+    }
+    row
+}
 
 fn cargo_tree_children(
     report: &Report,
@@ -857,7 +1210,7 @@ fn cargo_children_from_index(
         row.expansion_key = has_children.then_some(key);
         row.collapsed_children = closed.then_some(count);
         let guidance = swamp_core::cargo_cleanup::guidance_at(unit, observed_at);
-        row.signals = vec![guidance.recommendation, guidance.consequence.into()];
+        row.signals = vec![guidance.recommendation, guidance.consequence];
         row.allocated = true;
         let (candidates, bytes, oldest) = candidate_summary(by_parent, &unit.path, observed_at);
         let advice = match unit.role {
@@ -974,6 +1327,27 @@ pub(crate) fn cleanup_members<'a>(
     key: &str,
 ) -> Vec<&'a swamp_core::artifact::NestedArtifact> {
     use swamp_core::artifact::ArtifactRole as R;
+    if let Some((container, family)) = key
+        .strip_prefix("family-open:")
+        .and_then(|s| s.rsplit_once(':'))
+    {
+        let Some(family) = report
+            .nested_artifacts
+            .iter()
+            .map(|u| u.role.family())
+            .find(|f| f.label() == family)
+        else {
+            return Vec::new();
+        };
+        return swamp_core::build_adapters::family_members(
+            std::path::Path::new(container),
+            &report.nested_artifacts,
+            family,
+        )
+        .into_iter()
+        .filter(|u| u.action == swamp_core::artifact::NestedActionCapability::TrashPath)
+        .collect();
+    }
     let selection = key
         .strip_prefix("cleanup:")
         .and_then(|k| k.split_once(':'))
@@ -1022,7 +1396,8 @@ pub(crate) fn cleanup_members<'a>(
 }
 
 pub(crate) fn is_cleanup_selection(report: &Report, key: &str) -> bool {
-    key.starts_with("cleanup:")
+    (key.starts_with("family-open:") && !cleanup_members(report, key).is_empty())
+        || key.starts_with("cleanup:")
         || key.strip_prefix("cargo:").is_some_and(|path| {
             report.nested_artifacts.iter().any(|u| {
                 u.present
@@ -1171,11 +1546,8 @@ fn append_cleanup_group(
                     report.observed_at
                 ))
             ));
-            row.signals = vec![
-                swamp_core::cargo_cleanup::guidance_at(u, report.observed_at)
-                    .consequence
-                    .into(),
-            ];
+            row.signals =
+                vec![swamp_core::cargo_cleanup::guidance_at(u, report.observed_at).consequence];
             rows.push(row);
         }
     }
@@ -1235,7 +1607,7 @@ fn source_children<'a>(
         .iter()
         .filter(|d| !d.rel_path.is_empty() && d.rel_path != "." && !d.rel_path.contains('/'))
         .collect();
-    top.sort_by(|a, b| b.allocated_total.cmp(&a.allocated_total));
+    top.sort_by_key(|a| std::cmp::Reverse(a.allocated_total));
     top
 }
 
@@ -1276,6 +1648,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             cleanup_summary: None,
             allocated: false,
             project: None,
+            evidence: Vec::new(),
         })
         .collect()
 }
@@ -1294,6 +1667,61 @@ pub fn docker_unowned_bytes(report: &Report) -> u64 {
 
 /// Docker view: unowned docker rows plus a per-project docker rollup.
 pub fn docker_rows(report: &Report) -> Vec<Row> {
+    docker_rows_with(report, &std::collections::HashSet::new())
+}
+
+/// [`docker_rows`], plus one row per BuildKit builder with its records
+/// in family groups -- sizes the daemon's logical figures, times the
+/// daemon's records, nothing selectable.
+pub fn docker_rows_with(
+    report: &Report,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    let mut out = docker_object_rows(report);
+    let mut builders: Vec<&swamp_core::artifact::NestedArtifact> = report
+        .nested_artifacts
+        .iter()
+        .filter(|u| u.reported_by.is_some() && Some(u.id.as_str()) == u.container_id.as_deref())
+        .collect();
+    builders.sort_by(|a, b| a.path.cmp(&b.path));
+    for b in builders {
+        let name = b
+            .path
+            .to_string_lossy()
+            .strip_prefix(swamp_core::build_adapters::DAEMON_STORE_SCHEME)
+            .unwrap_or_default()
+            .to_string();
+        let mut row = Row::leaf(
+            0,
+            format!("buildkit · builder {name} (daemon-reported, logical)"),
+            b.bytes,
+            None,
+        );
+        let key = format!("store-open:{}", b.path.display());
+        let open = collapsed.contains(&key);
+        let children = family_tree_children_of(
+            &report.nested_artifacts,
+            report.observed_at,
+            &b.path,
+            1,
+            "",
+            collapsed,
+        );
+        row.expandable = !children.is_empty();
+        row.expansion_key = Some(key);
+        row.rail = if open { "▾ ".into() } else { "▸ ".into() };
+        row.collapsed_children = (!open).then_some(children.len());
+        row.signals = b.coverage.limits.clone();
+        row.signals.push("blocked".into());
+        out.push(row);
+        if open {
+            out.extend(children);
+        }
+    }
+    out
+}
+
+fn docker_object_rows(report: &Report) -> Vec<Row> {
     let mut out = Vec::new();
     for p in &report.projects {
         for wt in &p.worktrees {
@@ -1314,6 +1742,7 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
                 );
                 row.kind = Some(a.kind.clone());
                 row.unit = Some(UnitId::for_artifact(&a.path));
+                row.evidence = a.evidence.clone();
                 out.push(row);
             }
         }
@@ -1333,6 +1762,7 @@ pub fn docker_rows(report: &Report) -> Vec<Row> {
         row.unit = Some(UnitId::for_artifact(std::path::Path::new(
             &u.path_or_object,
         )));
+        row.evidence = u.evidence.clone();
         out.push(row);
     }
     out
@@ -1347,13 +1777,20 @@ pub fn builds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         filter,
     );
     append_cargo_breakdowns(report, filter, &mut rows);
+    append_build_family_breakdowns(report, filter, &mut rows);
     rows
 }
 
 /// Deps view: every `DependencyTree` row across the whole root, same as
 /// the CLI's `--view deps`.
 pub fn deps_rows(report: &Report, filter: &Filter) -> Vec<Row> {
-    kind_filtered_rows(report, &[ArtifactKind::DependencyTree], filter)
+    let mut rows = kind_filtered_rows(report, &[ArtifactKind::DependencyTree], filter);
+    // An installed dependency tree is a `DependencyTree` row, not a
+    // build row, so its family breakdown belongs here as well as in
+    // Builds -- a `node_modules` that is 70% pnpm store is the question
+    // this view exists to answer.
+    append_build_family_breakdowns(report, filter, &mut rows);
+    rows
 }
 
 fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) -> Vec<Row> {
@@ -1390,6 +1827,7 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
                 row.kind = Some(a.kind.clone());
                 row.unit = Some(UnitId::for_artifact(&a.path));
                 row.mtime_max = a.mtime_max;
+                row.evidence = a.evidence.clone();
                 row.label.push_str(&swamp_core::render::allocation_note(a));
                 if let Some(t) = &a.ecosystem {
                     row.badges = swamp_core::ecosystem::glyph_for(t).to_string();
@@ -1400,6 +1838,85 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
         }
     }
     out
+}
+
+/// Adds one collapsed row per role family below a build row whose
+/// interior an adapter identified in the neutral role vocabulary (#68
+/// Node, #67 Gradle/Maven).
+///
+/// The ordering inside a row is deliberate and is the same one the
+/// Cargo purpose groups use: **what this is and what losing it costs**
+/// comes first, because that is the question, and the count, size and
+/// oldest modification follow when the width allows. A row that has to
+/// be truncated loses the numbers, not the consequence.
+///
+/// These rows are not selectable. Cargo's groups carry a `unit` because
+/// `cargo_cleanup` can check and plan them; no other adapter has an
+/// action yet (#73), so these rows say "inspection only" and offer no
+/// `UnitId` -- which is what stops the confirmation path ever being
+/// reached for a unit with no executor behind it.
+fn append_build_family_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>) {
+    let mut additions: Vec<(usize, Vec<Row>)> = Vec::new();
+    let none = std::collections::HashSet::new();
+    for p in &report.projects {
+        if !filter::type_passes(filter, p) {
+            continue;
+        }
+        if let Some(name) = filter::project_name(filter)
+            && !swamp_core::filter::name_matches(name, &p.name)
+        {
+            continue;
+        }
+        for wt in &p.worktrees {
+            for a in &wt.artifacts {
+                if !matches!(
+                    a.kind,
+                    ArtifactKind::BuildOutput | ArtifactKind::Cache | ArtifactKind::DependencyTree
+                ) {
+                    continue;
+                }
+                // Neutral-vocabulary interiors only; a container whose
+                // units the Cargo cleanup module speaks for has its own
+                // breakdown (`append_cargo_breakdowns`). Decided by the
+                // roles present, never by an adapter id.
+                let mut inside = report
+                    .nested_artifacts
+                    .iter()
+                    .filter(|u| u.present && u.path.starts_with(&a.path) && u.path != a.path);
+                let mut any = false;
+                let mut cargo_vocabulary = false;
+                for u in inside.by_ref() {
+                    any |= u.adapter.is_some();
+                    cargo_vocabulary |= swamp_core::cargo_cleanup::speaks_for(&u.role);
+                }
+                if !any || cargo_vocabulary {
+                    continue;
+                }
+                let Some(parent_index) = rows
+                    .iter()
+                    .position(|r| r.unit == Some(UnitId::for_artifact(&a.path)))
+                else {
+                    continue;
+                };
+                // The same group rows as the project tree, flattened: the
+                // Builds view is a list, so the rows neither expand nor
+                // carry an expansion glyph.
+                let mut children = family_tree_children(report, &a.path, 1, "", &none);
+                for row in &mut children {
+                    row.rail = row.rail.replace("▸ ", "").replace("▾ ", "");
+                    row.expandable = false;
+                    row.expansion_key = None;
+                    row.collapsed_children = None;
+                }
+                if !children.is_empty() {
+                    additions.push((parent_index + 1, children));
+                }
+            }
+        }
+    }
+    for (index, mut children) in additions.into_iter().rev() {
+        rows.splice(index..index, children.drain(..));
+    }
 }
 
 /// Adds a compact, non-actionable Cargo breakdown below build rows.  The
@@ -1465,7 +1982,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                             1,
                             format!(
                                 "{} · {}",
-                                match swamp_core::cargo_cleanup::guidance(u).next_action {
+                                match swamp_core::cargo_cleanup::guidance(u).next_action.as_str() {
                                     "inspect_groups" => "category",
                                     "review_cleanup" => "unchecked",
                                     _ => "inspection-only",
@@ -1487,7 +2004,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 swamp_core::cargo_cleanup::guidance_at(u, report.observed_at);
                             row.signals = vec![
                                 guidance.recommendation,
-                                guidance.consequence.into(),
+                                guidance.consequence,
                                 "review required".into(),
                             ];
                         } else {
@@ -1507,7 +2024,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                         let guidance = swamp_core::cargo_cleanup::guidance(u);
                         if guidance.check_status != "unchecked" {
                             row.signals
-                                .extend([guidance.recommendation, guidance.consequence.into()]);
+                                .extend([guidance.recommendation, guidance.consequence]);
                         }
                         row.signals
                             .push("allocated bytes; reclaimable space unknown".into());
@@ -1565,7 +2082,7 @@ pub fn types_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             row
         })
         .collect();
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     rows
 }
 
@@ -1595,6 +2112,127 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
             row
         })
         .collect()
+}
+
+/// External/shared storage view (#43/#51/#60): the same flat shape
+/// `unowned_rows` renders, one row per detector-resolved unit. Read-only
+/// by construction (`unit: None`, never markable) -- selection refusal
+/// for these units already lives at the action layer
+/// (`actions::execute` refuses every `PlanUnit::external_category`
+/// unconditionally); the TUI simply never offers a delete affordance
+/// the action layer would refuse anyway, rather than inventing a
+/// confirm flow only to refuse it.
+///
+/// Each machine-wide build store's identified interior sits under it:
+/// closed until opened (`Enter`), then the same family groups a project
+/// container shows. Every interior row is inspection only (`blocked`,
+/// no `UnitId`), exactly as there.
+pub fn external_rows_with(
+    units: &[swamp_core::external::ExternalUnit],
+    interiors: &[swamp_core::artifact::NestedArtifact],
+    collapsed: &std::collections::HashSet<String>,
+    observed_at: u64,
+) -> Vec<Row> {
+    let mut sorted: Vec<&swamp_core::external::ExternalUnit> = units.iter().collect();
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.bytes));
+    let mut rows = Vec::new();
+    for u in sorted {
+        let consumers = if u.consumers.is_empty() {
+            "no declared consumers".to_string()
+        } else {
+            format!("{} consumer(s)", u.consumers.len())
+        };
+        let mut row = Row::leaf(
+            0,
+            format!(
+                "{:?} · {} ({}) · {consumers}",
+                u.category,
+                u.path.display(),
+                u.detector_id
+            ),
+            u.bytes,
+            u.growth_bytes,
+        );
+        row.evidence = u.evidence.clone();
+        let has_interior = interiors
+            .iter()
+            .any(|i| i.path != u.path && i.path.starts_with(&u.path));
+        if has_interior {
+            let key = format!("store-open:{}", u.path.display());
+            let open = collapsed.contains(&key);
+            let children =
+                family_tree_children_of(interiors, observed_at, &u.path, 1, "", collapsed);
+            row.expandable = !children.is_empty();
+            row.expansion_key = Some(key);
+            row.rail = if open { "▾ ".into() } else { "▸ ".into() };
+            row.collapsed_children = (!open).then_some(children.len());
+            row.signals = vec!["store interior below · inspection only".into()];
+            rows.push(row);
+            if open {
+                rows.extend(children);
+            }
+        } else {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped
+/// tool → category via the label text (a flat list, same shape as
+/// `unowned_rows`/`external_rows_with`; a real tool → category → unit tree is
+/// left to `render::render_view_agents`'s CLI drill-down). `unit` is set
+/// for **every** row, protected/unsupported ones included: `app::mark_row`
+/// hands the exact path to `actions::propose_agents` either way, and that
+/// call's own refusal (protected category, no supported action, active
+/// session, ...) becomes the footer text -- never a silent "nothing to
+/// delete on this row" for a unit the human can plainly see. Backspace's
+/// confirmation and Enter's execution reuse the ordinary
+/// `MarkedUnit`/background-worker path (`crate::actions::execute_plan_progress`),
+/// same as every other markable view; nothing here blocks on the
+/// event/render thread.
+pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
+    let mut rows: Vec<Row> = units
+        .iter()
+        .map(|u| {
+            let link = match &u.project_link {
+                swamp_core::agents::ProjectLinkState::Linked {
+                    project_name,
+                    source: swamp_core::agents::LinkSource::Declared,
+                    ..
+                } => format!("project: {project_name}"),
+                swamp_core::agents::ProjectLinkState::Linked {
+                    project_name,
+                    source: swamp_core::agents::LinkSource::Inferred,
+                    fallback_reason,
+                    ..
+                } => match fallback_reason.as_deref() {
+                    Some(reason) => format!("project: {project_name} (inferred; {reason})"),
+                    None => format!("project: {project_name} (inferred)"),
+                },
+                swamp_core::agents::ProjectLinkState::NotApplicable => "tool-wide".to_string(),
+                other => format!("{other:?}"),
+            };
+            let protect = if u.protected { " [protected]" } else { "" };
+            let mut row = Row::leaf(
+                0,
+                format!(
+                    "{} · {} · {} · {link}{protect}",
+                    u.tool_name,
+                    u.category.label(),
+                    u.relative_path
+                ),
+                u.bytes,
+                u.growth_bytes,
+            );
+            row.mtime_max = u.mtime_max;
+            row.unit = Some(crate::units::UnitId::for_artifact(&u.path));
+            row.evidence = u.evidence.clone();
+            row
+        })
+        .collect();
+    rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
+    rows
 }
 
 /// Element-wise sum of several equal-length series; `None` if none.
@@ -1877,12 +2515,14 @@ mod tests {
             containers: Vec::new(),
             shared_with: Vec::new(),
             dangling: false,
+            evidence: Vec::new(),
         }
     }
 
     #[test]
     fn tree_rail_marks_last_sibling_with_an_elbow() {
         let report = Report {
+            store_dir: None,
             observed_at: 0,
             root: "/r".into(),
             projects: vec![swamp_core::report::ProjectRow {
@@ -1920,6 +2560,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: swamp_core::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
@@ -1970,7 +2611,7 @@ mod tests {
         let rows = builds_rows(&report, &Filter::default());
         assert!(
             rows.iter()
-                .any(|r| r.label.contains("unique stale; allocated"))
+                .any(|r| r.label.contains("unique not recomputed; allocated"))
         );
         let selected = UnitId::for_artifact(&target.join("debug/incremental/crate-a"));
         assert!(rows.iter().any(|r| r.unit == Some(selected.clone())));
@@ -1981,11 +2622,13 @@ mod tests {
     #[test]
     fn docker_unowned_bytes_sums_only_docker_no_join() {
         let report = Report {
+            store_dir: None,
             observed_at: 0,
             root: "/r".into(),
             projects: vec![],
             unowned: vec![
                 swamp_core::report::UnownedRow {
+                    measurement: None,
                     path_or_object: "img".into(),
                     bytes: 100,
                     reason: UnownedReason::DockerNoJoin,
@@ -1996,8 +2639,10 @@ mod tests {
                     containers: Vec::new(),
                     shared_with: Vec::new(),
                     dangling: false,
+                    evidence: Vec::new(),
                 },
                 swamp_core::report::UnownedRow {
+                    measurement: None,
                     path_or_object: "cache".into(),
                     bytes: 200,
                     reason: UnownedReason::SharedCache,
@@ -2008,9 +2653,11 @@ mod tests {
                     containers: Vec::new(),
                     shared_with: Vec::new(),
                     dangling: false,
+                    evidence: Vec::new(),
                 },
             ],
             reconciliation: swamp_core::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

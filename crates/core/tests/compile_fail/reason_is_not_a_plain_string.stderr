@@ -1,0 +1,17 @@
+error[E0277]: the trait bound `Reason: From<String>` is not satisfied
+ --> $WORKSPACE/crates/core/tests/compile_fail/reason_is_not_a_plain_string.rs
+  |
+  |     let _ = Evidence::unknown(kind, subtype, source, 0, String::from(""));
+  |             -----------------                           ^^^^^^^^^^^^^^^^ the trait `From<String>` is not implemented for `Reason`
+  |             |
+  |             required by a bound introduced by this call
+  |
+  = note: required for `String` to implement `Into<Reason>`
+note: required by a bound in `Evidence::unknown`
+ --> $WORKSPACE/crates/core/src/evidence.rs
+  |
+  |     pub fn unknown(
+  |            ------- required by a bound in this associated function
+...
+  |         reason: impl Into<Reason>,
+  |                      ^^^^^^^^^^^^ required by this bound in `Evidence::unknown`

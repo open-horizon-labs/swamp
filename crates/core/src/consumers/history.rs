@@ -16,7 +16,12 @@ impl Consumer for HistoryConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::GrowthAnnotated]
     }
-    async fn on_event(&self, _event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        _event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let Some(dir) = &ctx.store_dir else {
             return Ok(vec![Event::HistoryLoaded {
                 series_by_key: Arc::new(Default::default()),
@@ -25,7 +30,10 @@ impl Consumer for HistoryConsumer {
             }]);
         };
         let vol = crate::growth::volume_store_dir(dir, &ctx.root);
-        let now_s = crate::entities::now();
+        // R20: the observation's own timestamp, not a second clock read
+        // -- `runs.parquet` records it, and a read re-buckets the same
+        // history at the same instant.
+        let now_s = ctx.observed_at;
         let asked = ctx
             .since_override
             .as_deref()

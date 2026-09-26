@@ -1,0 +1,10 @@
+error[E0616]: field `protected` of struct `CandidateAgentUnit` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/agent_units_protection_not_via_a_binding.rs
+  |
+  |     let f = &mut u.protected;
+  |                    ^^^^^^^^^ private field
+  |
+help: a method `protected` also exists, call it with parentheses
+  |
+5 |     let f = &mut u.protected();
+  |                             ++

@@ -20,12 +20,18 @@ impl Consumer for ProjectsConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::RootObserved]
     }
-    async fn on_event(&self, event: &Event, _ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        _ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let Event::RootObserved {
             discovered,
             attribution,
             notes,
             rewalked,
+            unconfirmed_worktree_ids,
             ..
         } = event
         else {
@@ -125,6 +131,7 @@ impl Consumer for ProjectsConsumer {
             }
         }
         let reconciliation = Reconciliation {
+            unique_estimate: None,
             attributed: attribution.attributed_total,
             unowned: attribution.unowned_total,
             walked_total: attribution.walked_total,
@@ -143,6 +150,7 @@ impl Consumer for ProjectsConsumer {
             files: Arc::new(files),
             reconciliation,
             notes: notes.clone(),
+            unconfirmed_worktree_ids: unconfirmed_worktree_ids.clone(),
         }])
     }
 }

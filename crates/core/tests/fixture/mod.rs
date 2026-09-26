@@ -40,6 +40,11 @@ pub struct Fixture {
     pub shared_cache_bytes: u64,
     pub loose_file: PathBuf,
     pub loose_file_bytes: u64,
+    /// `loose_file`'s containing directory: since #R10 item 1, an
+    /// unowned row is folded per directory (never per file), so a
+    /// consumer asserting on the unowned row for a loose file must match
+    /// against this, not `loose_file` itself.
+    pub loose_dir: PathBuf,
     pub docker_facts: PathBuf,
     /// Only read by `report_golden.rs` (the compose-file-name join case);
     /// other fixture consumers don't need them.
@@ -399,6 +404,7 @@ pub fn build(tmp: &Path) -> Fixture {
         nested_repo_build_bytes,
         shared_cache,
         shared_cache_bytes,
+        loose_dir,
         loose_file,
         loose_file_bytes,
         docker_facts,

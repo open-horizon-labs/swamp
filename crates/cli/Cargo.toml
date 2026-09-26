@@ -11,4 +11,9 @@ swamp-core = { path = "../core" }
 swamp-tui = { path = "../tui" }
 
 [dev-dependencies]
+swamp-core = { path = "../core", features = ["testing"] }
 tempfile.workspace = true
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -1,0 +1,10 @@
+error[E0624]: associated function `begin` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/discovery_pass_has_no_public_constructor.rs
+  |
+  |     let _b = DiscoveryPass::begin();
+  |                             ^^^^^ private associated function
+  |
+ ::: $WORKSPACE/crates/core/src/report/pass.rs
+  |
+  |     pub(super) fn begin() -> DiscoveryPass {
+  |     -------------------------------------- private associated function defined here

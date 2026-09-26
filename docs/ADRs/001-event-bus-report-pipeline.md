@@ -8,10 +8,7 @@ validate:
     - bus::tests::consumer_receives_events_regardless_of_registration_order
     - bus::tests::registration_is_closed_once_run_starts
   audits:
-    - no_consumer_knows_other_consumers
-    - static_registration_only
-    - all_report_paths_through_bus
-    - extractors_are_pluggable
+    - bus_static_registration
 ---
 
 # ADR 001: Report construction through an in-memory event bus
@@ -50,3 +47,32 @@ Consumers must not import other consumers or register stages during a run. Repor
 - Source audits check selected structural constraints; tests check routing and report behavior. Run them through [the contributor checks](../../CONTRIBUTING.md#checks).
 
 The implemented types and dispatch loop are in [bus/mod.rs](../../crates/core/src/bus/mod.rs), with stages under [consumers](../../crates/core/src/consumers/).
+
+## Reconciliation, 2026-09-21
+
+`crates/mcp` (the "MCP server" named above) was removed (#104). The
+decision this ADR records -- one event-bus pipeline shared by every
+interface -- is unchanged and still implemented; only the set of
+interfaces sharing it changed, from CLI/TUI/MCP to CLI/TUI, where the
+CLI's `--json` output is now the agent-facing surface. The original
+Context/Decision/Consequences text above is left as written to preserve
+the record of what was decided and why on 2026-09-18.
+
+## Validation, 2026-09-22
+
+The four semantic source audits this ADR listed
+(`no_consumer_knows_other_consumers`, `static_registration_only`,
+`all_report_paths_through_bus`, `extractors_are_pluggable`) are retired
+with the rest of the `syn` call-graph model
+([architecture: capability gates](../architecture.md#capability-gates)).
+What they asserted is now held by:
+
+- **types** -- `EventBus::new` and `register` are private to
+  `bus::registry`, so `with_builtins` is the only registrar; every
+  pipeline stage (the walk included) takes a `bus::Stage` that only
+  `EventBus::run` mints, so no report path can bypass the bus. The
+  `bus_register_is_private`, `bus_has_no_empty_constructor` and
+  `bus_stage_is_minted_by_the_bus` compile-fail cases pin both;
+- **one exact audit** -- `bus_static_registration`: no consumer module
+  names another, and nothing outside the consumers and the registrar
+  names a path into one.

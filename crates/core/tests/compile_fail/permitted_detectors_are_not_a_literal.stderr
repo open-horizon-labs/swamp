@@ -1,0 +1,12 @@
+error: cannot construct `PermittedDetectors` with struct literal syntax due to private fields
+ --> $WORKSPACE/crates/core/tests/compile_fail/permitted_detectors_are_not_a_literal.rs
+  |
+  |     let _all = PermittedDetectors { disabled: vec![] };
+  |                ^^^^^^^^^^^^^^^^^^   ---------------- private field
+  |
+  = note: ...and other private field `default_off` that was not provided
+help: you might have meant to use the `from_config` associated function
+  |
+7 -     let _all = PermittedDetectors { disabled: vec![] };
+7 +     let _all = PermittedDetectors::from_config(_, _);
+  |

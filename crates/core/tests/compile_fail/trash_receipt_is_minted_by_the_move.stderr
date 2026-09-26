@@ -1,0 +1,9 @@
+error[E0451]: fields `anchor` and `dest` of struct `Trashed` are private
+ --> $WORKSPACE/crates/core/tests/compile_fail/trash_receipt_is_minted_by_the_move.rs
+  |
+  |     let _moved = Trashed {
+  |                  ------- in this type
+  |         anchor: PathBuf::from("/w/wt"),
+  |         ^^^^^^ private field
+  |         dest: PathBuf::from("/tmp/trash/wt"),
+  |         ^^^^ private field

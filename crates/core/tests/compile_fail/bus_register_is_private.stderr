@@ -1,0 +1,10 @@
+error[E0624]: method `register` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/bus_register_is_private.rs
+  |
+  |     let _ = bus.register(extra);
+  |                 ^^^^^^^^ private method
+  |
+ ::: $WORKSPACE/crates/core/src/bus/registry.rs
+  |
+  |     fn register(&mut self, consumer: Box<dyn Consumer>) -> Result<()> {
+  |     ----------------------------------------------------------------- private method defined here

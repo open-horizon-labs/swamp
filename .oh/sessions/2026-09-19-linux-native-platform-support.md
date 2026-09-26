@@ -68,3 +68,13 @@ The user pointed to https://github.com/clean-dev-dirs/clean-dev-dirs and explici
 #79 requires a reuse decision including licenses, API/dependency/build-script footprint, error visibility, target gating and maintenance. #80 evaluates generic traversal/reference/fallback; #81 evaluates notify without replacing retained FSEvents replay; #84 considers read-only upstream detectors; #85 prefers vetted Trash reuse with narrowly justified adapters. Generic cross-platform source is compatible with target-only builds when irrelevant OS implementations/dependencies are cfg-excluded. Custom code requires a demonstrated correctness or measured performance gap.
 
 Review trash's documented Linux mount-query thread-safety caveat and recovery-location/ledger support before adoption. Do not call a cleaner's default destructive CLI as a scan. No dependency is selected merely from documentation; exact versions and semantic fit are implementation-time evidence gates. Primary references: https://docs.rs/trash/latest/trash/ ; https://docs.rs/notify/latest/notify/ ; https://github.com/clean-dev-dirs/clean-dev-dirs/blob/main/Cargo.toml .
+
+## Reconciliation, 2026-09-21
+
+#103/#104 landed: `crates/mcp` is removed. Where this session says
+"CLI/TUI/MCP", read that as "CLI (interactive and `--json`) and TUI" --
+Linux native support inspects and acts through those two, plus the
+`skills/swamp/` agent skill, with no separate MCP server to package or
+target-gate. "Plain CLI/TUI/MCP works without a service" still holds
+for "plain CLI/TUI": no background installation or privileged changes
+by default.

@@ -80,7 +80,7 @@ fn parse_top_level_name(contents: &str) -> Option<String> {
 /// basename of its containing directory. Never follows symlinks and
 /// never reads a file bigger than [`MAX_COMPOSE_FILE_BYTES`].
 fn read_compose_file(path: &Path) -> Option<ComposeFile> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let metadata = crate::fs_gate::symlink_metadata(path).ok()?;
     if !metadata.is_file() {
         // Covers symlinks (is_file() is false for a symlink under
         // symlink_metadata, which does not follow it) as well as
@@ -95,7 +95,8 @@ fn read_compose_file(path: &Path) -> Option<ComposeFile> {
 
     let mut names = Vec::new();
     if metadata.len() <= MAX_COMPOSE_FILE_BYTES
-        && let Ok(contents) = std::fs::read_to_string(path)
+        && let Ok(contents) =
+            crate::fs_gate::read::bounded_string(path, crate::fs_gate::read::BoundedCap::MANIFEST)
         && let Some(name) = parse_top_level_name(&contents)
     {
         names.push(name);
@@ -114,7 +115,7 @@ fn read_compose_file(path: &Path) -> Option<ComposeFile> {
 
 /// Scans a single directory (non-recursively) for compose files.
 fn scan_dir(dir: &Path, out: &mut Vec<ComposeFile>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = crate::fs_gate::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -147,7 +148,7 @@ pub fn discover(worktree_root: &Path) -> Vec<ComposeFile> {
     let mut found = Vec::new();
     scan_dir(worktree_root, &mut found);
 
-    let Ok(entries) = std::fs::read_dir(worktree_root) else {
+    let Ok(entries) = crate::fs_gate::read_dir(worktree_root) else {
         return found;
     };
     for entry in entries.flatten() {

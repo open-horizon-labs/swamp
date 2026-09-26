@@ -3,7 +3,28 @@ name = "swamp-source-audit"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "swamp_source_audit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "swamp-source-audit"
+path = "src/main.rs"
+
 [dependencies]
-syn.workspace = true
+syn = { workspace = true, features = ["visit-mut"] }
 quote = "1"
-proc-macro2 = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+# The compile_fail cases (`crates/core/tests/compile_fail/`) build against
+# swamp-core *without* its `testing` feature -- the production API -- so
+# they run from this crate, not swamp-core's own test harness (which
+# enables `testing` through its self dev-dependency).
+swamp-core = { path = "../core" }
+trybuild = "1"
+serde_json.workspace = true
+
+[lints]
+workspace = true

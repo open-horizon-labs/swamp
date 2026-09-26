@@ -7,14 +7,15 @@
 
 use crate::artifact::{
     ArtifactCoverage, ArtifactEvidence, ArtifactRole, ArtifactVariant, Membership, NestedArtifact,
-    architecture_from_target, relative_path,
+    relative_path,
 };
 use crate::entities::Confidence;
+use crate::fs_gate::MetadataExt;
 use crate::report::{ArtifactKind, ProjectRow};
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CargoInspection {
@@ -38,6 +39,526 @@ pub struct CargoMessageEvidence {
     pub filenames: Vec<PathBuf>,
 }
 
+/// Hard bounds for one explicit Cargo-profile inspection. Values supplied by
+/// callers are clamped to these ceilings so an interactive caller cannot
+/// accidentally turn an inspection into an unbounded walk.
+#[derive(Debug, Clone)]
+pub struct CargoProfileInspectionLimits {
+    pub max_entries: usize,
+    pub max_duration: Duration,
+    pub max_metadata_bytes: usize,
+}
+
+impl Default for CargoProfileInspectionLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 262_144,
+            max_duration: Duration::from_secs(5),
+            max_metadata_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CargoProfileInspection {
+    pub profile_path: PathBuf,
+    pub inspected_at: u64,
+    pub elapsed_ms: u64,
+    pub entries_examined: usize,
+    pub groups: Vec<CargoDependencyGroup>,
+    /// Sum of allocated bytes for every observed dependency-directory entry;
+    /// hardlinks may be counted more than once.
+    pub allocated_bytes: u64,
+    /// Allocated bytes after de-duplicating inode identities across this
+    /// profile's dependency entries.
+    pub unique_allocated_bytes: u64,
+    pub metadata_bytes_read: u64,
+    pub coverage: ArtifactCoverage,
+    pub accounting_note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CargoDependencyGroup {
+    /// `None` for explicit unknown/residual groups. This name comes from a
+    /// target-named fingerprint file, never from the fingerprint hash.
+    pub target: Option<String>,
+    pub target_kind: Option<String>,
+    /// Cargo package identity is only set when metadata states it directly.
+    pub package_id: Option<String>,
+    pub variant: ArtifactVariant,
+    pub allocated_bytes: u64,
+    /// Inode-deduplicated within this group. A hardlink shared by groups may
+    /// therefore occur in each group's value; use the profile total above for
+    /// the cross-group unique total.
+    pub unique_allocated_bytes: u64,
+    pub logical_bytes: u64,
+    pub entries: usize,
+    pub hardlinked_entries: usize,
+    pub fingerprint_paths: Vec<PathBuf>,
+    pub residual_reason: Option<String>,
+}
+
+const MAX_PROFILE_INSPECTION_ENTRIES: usize = 262_144;
+const MAX_PROFILE_INSPECTION_TIME: Duration = Duration::from_secs(30);
+const MAX_PROFILE_METADATA_BYTES: usize = 64 * 1024 * 1024;
+type ProfileFingerprintEvidence = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    PathBuf,
+);
+
+fn parse_fingerprint_target(stem: &str) -> Option<(&'static str, &str)> {
+    [
+        ("test-integration-test-", "test-integration-test"),
+        ("integration-test-", "integration-test"),
+        ("test-example-", "test-example"),
+        ("test-proc-macro-", "test-proc-macro"),
+        ("test-bin-", "test-bin"),
+        ("test-lib-", "test-lib"),
+        ("proc-macro-", "proc-macro"),
+        ("example-", "example"),
+        ("bin-", "bin"),
+        ("lib-", "lib"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, kind)| stem.strip_prefix(prefix).map(|target| (kind, target)))
+}
+
+/// Inspect one already-selected Cargo profile without invoking Cargo or
+/// consulting project configuration. Fingerprint JSON is attribution evidence
+/// only; files that cannot be matched unambiguously remain residuals.
+pub fn inspect_profile(
+    profile_path: &Path,
+    limits: CargoProfileInspectionLimits,
+    cancelled: &AtomicBool,
+) -> CargoProfileInspection {
+    let started = Instant::now();
+    let max_entries = limits.max_entries.clamp(1, MAX_PROFILE_INSPECTION_ENTRIES);
+    let max_time = limits
+        .max_duration
+        .clamp(Duration::from_millis(1), MAX_PROFILE_INSPECTION_TIME);
+    let max_metadata = limits
+        .max_metadata_bytes
+        .clamp(1, MAX_PROFILE_METADATA_BYTES);
+    let mut coverage = ArtifactCoverage {
+        supported: false,
+        complete: true,
+        limits: Vec::new(),
+    };
+    let mut groups = Vec::new();
+    let mut entries_examined = 0;
+    let mut metadata_bytes_read = 0u64;
+    let mut unique = HashSet::new();
+    let mut allocated_bytes = 0u64;
+    let mut unique_allocated_bytes = 0u64;
+    let add_limit = |coverage: &mut ArtifactCoverage, reason: String| {
+        coverage.complete = false;
+        if !coverage.limits.contains(&reason) {
+            coverage.limits.push(reason);
+        }
+    };
+    let check_budget = |coverage: &mut ArtifactCoverage, entries: usize, bytes: u64| -> bool {
+        if cancelled.load(Ordering::Relaxed) {
+            add_limit(coverage, "inspection cancelled; results are partial".into());
+            return false;
+        }
+        if entries >= max_entries {
+            add_limit(coverage, format!("entry limit reached ({max_entries})"));
+            return false;
+        }
+        if started.elapsed() >= max_time {
+            add_limit(
+                coverage,
+                format!("time limit reached ({} ms)", max_time.as_millis()),
+            );
+            return false;
+        }
+        if bytes >= max_metadata as u64 {
+            add_limit(
+                coverage,
+                format!("fingerprint metadata byte limit reached ({max_metadata})"),
+            );
+            return false;
+        }
+        true
+    };
+
+    let deps = profile_path.join("deps");
+    let fingerprints = profile_path.join(".fingerprint");
+    let Ok(profile_meta) = crate::fs_gate::symlink_metadata(profile_path) else {
+        add_limit(&mut coverage, "selected profile is unavailable".into());
+        return profile_inspection_result(
+            profile_path,
+            started,
+            entries_examined,
+            groups,
+            allocated_bytes,
+            unique_allocated_bytes,
+            metadata_bytes_read,
+            coverage,
+        );
+    };
+    if !profile_meta.is_dir() {
+        add_limit(&mut coverage, "selected profile is not a directory".into());
+        return profile_inspection_result(
+            profile_path,
+            started,
+            entries_examined,
+            groups,
+            allocated_bytes,
+            unique_allocated_bytes,
+            metadata_bytes_read,
+            coverage,
+        );
+    }
+    coverage.supported = true;
+    // Inspection is a non-atomic observation, not a cleanup authorization.
+    // Do not mistake Cargo's persistent lock file for evidence of active use.
+    let mut evidence: HashMap<String, Vec<ProfileFingerprintEvidence>> = HashMap::new();
+    // Reserve room for dependency entries: a large fingerprint tree must not
+    // consume the entire scan budget before any storage rows can be returned.
+    let fingerprint_entry_limit = max_entries / 2;
+    let fingerprint_dir_safe = match crate::fs_gate::symlink_metadata(&fingerprints) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => true,
+        Ok(_) => {
+            add_limit(
+                &mut coverage,
+                "profile .fingerprint is not a real directory; not followed".into(),
+            );
+            false
+        }
+        Err(_) => {
+            add_limit(
+                &mut coverage,
+                "profile .fingerprint directory unavailable".into(),
+            );
+            false
+        }
+    };
+    if fingerprint_dir_safe && let Ok(dirs) = crate::fs_gate::read_dir(&fingerprints) {
+        'fingerprints: for dir in dirs {
+            if entries_examined >= fingerprint_entry_limit {
+                add_limit(
+                    &mut coverage,
+                    "fingerprint entry budget reached; remaining budget reserved for deps".into(),
+                );
+                break;
+            }
+            if !check_budget(&mut coverage, entries_examined, metadata_bytes_read) {
+                break;
+            }
+            let Ok(dir) = dir else {
+                add_limit(
+                    &mut coverage,
+                    "fingerprint directory entry could not be read".into(),
+                );
+                continue;
+            };
+            entries_examined += 1;
+            let dir_path = dir.path();
+            let Ok(dir_meta) = crate::fs_gate::symlink_metadata(&dir_path) else {
+                add_limit(
+                    &mut coverage,
+                    "fingerprint entry became unavailable during inspection".into(),
+                );
+                continue;
+            };
+            if dir_meta.file_type().is_symlink() {
+                add_limit(
+                    &mut coverage,
+                    "symlink in fingerprint directory was not followed".into(),
+                );
+                continue;
+            }
+            if !dir_meta.is_dir() {
+                continue;
+            }
+            let Ok(files) = crate::fs_gate::read_dir(&dir_path) else {
+                add_limit(
+                    &mut coverage,
+                    "fingerprint subdirectory could not be listed".into(),
+                );
+                continue;
+            };
+            for file in files {
+                if entries_examined >= fingerprint_entry_limit {
+                    add_limit(
+                        &mut coverage,
+                        "fingerprint entry budget reached; remaining budget reserved for deps"
+                            .into(),
+                    );
+                    break 'fingerprints;
+                }
+                if !check_budget(&mut coverage, entries_examined, metadata_bytes_read) {
+                    break 'fingerprints;
+                }
+                let Ok(file) = file else {
+                    add_limit(
+                        &mut coverage,
+                        "fingerprint file entry could not be read".into(),
+                    );
+                    continue;
+                };
+                entries_examined += 1;
+                let path = file.path();
+                let name = file.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".json") {
+                    continue;
+                }
+                let Ok(meta) = crate::fs_gate::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    add_limit(
+                        &mut coverage,
+                        "symlink fingerprint metadata was not followed".into(),
+                    );
+                    continue;
+                }
+                if !meta.is_file() {
+                    continue;
+                }
+                if metadata_bytes_read + meta.len() > max_metadata as u64
+                    || meta.len() > crate::fs_gate::read::BoundedCap::BUILD_MANIFEST.bytes() as u64
+                {
+                    add_limit(
+                        &mut coverage,
+                        "fingerprint metadata byte/file-size limit reached; remaining records omitted".into(),
+                    );
+                    break 'fingerprints;
+                }
+                let Ok(text) = crate::fs_gate::read::bounded_string(
+                    &path,
+                    crate::fs_gate::read::BoundedCap::BUILD_MANIFEST,
+                ) else {
+                    continue;
+                };
+                metadata_bytes_read += text.len() as u64;
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let stem = name.trim_end_matches(".json");
+                let Some((kind, target)) = parse_fingerprint_target(stem) else {
+                    continue;
+                };
+                let target = target.to_string();
+                let kind = kind.to_string();
+                let features = value.get("features").and_then(|v| {
+                    v.as_str().map(str::to_owned).or_else(|| {
+                        v.as_array().map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                    })
+                });
+                let package_id = value
+                    .get("package_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let toolchain = value
+                    .get("rustc")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let dirname = dir.file_name().to_string_lossy().into_owned();
+                let hash = dirname
+                    .rsplit_once('-')
+                    .map(|(_, hash)| hash)
+                    .unwrap_or(&dirname)
+                    .to_string();
+                evidence
+                    .entry(hash)
+                    .or_default()
+                    .push((target, kind, features, package_id, toolchain, path));
+            }
+        }
+    } else if fingerprint_dir_safe {
+        add_limit(
+            &mut coverage,
+            "fingerprint metadata unavailable; dependency files remain residual".into(),
+        );
+    }
+    let mut group_index: HashMap<String, usize> = HashMap::new();
+    let mut group_unique: HashMap<usize, HashSet<(u64, u64)>> = HashMap::new();
+    let deps_dir_safe = match crate::fs_gate::symlink_metadata(&deps) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => true,
+        Ok(_) => {
+            add_limit(
+                &mut coverage,
+                "profile deps is not a real directory; not followed".into(),
+            );
+            false
+        }
+        Err(_) => {
+            add_limit(&mut coverage, "profile deps directory unavailable".into());
+            false
+        }
+    };
+    match if deps_dir_safe {
+        Some(crate::fs_gate::read_dir(&deps))
+    } else {
+        None
+    } {
+        Some(Ok(files)) => {
+            for file in files {
+                if !check_budget(&mut coverage, entries_examined, metadata_bytes_read) {
+                    break;
+                }
+                let Ok(file) = file else {
+                    add_limit(
+                        &mut coverage,
+                        "dependency file entry could not be read".into(),
+                    );
+                    continue;
+                };
+                entries_examined += 1;
+                let path = file.path();
+                let Ok(meta) = crate::fs_gate::symlink_metadata(&path) else {
+                    add_limit(
+                        &mut coverage,
+                        "dependency entry became unavailable during inspection".into(),
+                    );
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    add_limit(
+                        &mut coverage,
+                        "symlink in dependency directory was not followed".into(),
+                    );
+                    continue;
+                }
+                if !meta.is_file() {
+                    continue;
+                }
+                let filename = file.file_name().to_string_lossy().into_owned();
+                let hash = filename
+                    .rsplit_once('-')
+                    .map(|(_, h)| h.split('.').next().unwrap_or(""));
+                let artifact_stem = filename
+                    .strip_prefix("lib")
+                    .unwrap_or(&filename)
+                    .split_once('-')
+                    .map(|(name, _)| name)
+                    .unwrap_or("");
+                let match_data = hash.and_then(|h| evidence.get(h)).and_then(|records| {
+                    let matching: Vec<_> = records
+                        .iter()
+                        .filter(|(target, _, _, _, _, _)| target == artifact_stem)
+                        .collect();
+                    (matching.len() == 1).then(|| matching[0])
+                });
+                let key =
+                    if let Some((target, kind, features, package_id, toolchain, _)) = match_data {
+                        format!("target:{target}:{kind}:{features:?}:{package_id:?}:{toolchain:?}")
+                    } else {
+                        "residual:missing-or-ambiguous-fingerprint".into()
+                    };
+                let idx = *group_index.entry(key.clone()).or_insert_with(|| {
+                    let mut variant = ArtifactVariant {
+                        profile: profile_path
+                            .file_name()
+                            .map(|v| v.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    };
+                    variant.unknowns.push("target triple/architecture".into());
+                    let (target, target_kind, package_id, residual_reason) =
+                        if let Some((target, kind, features, id, toolchain, _)) = match_data {
+                            variant.target = Some(target.clone());
+                            variant.features = features.clone();
+                            variant.toolchain = toolchain.clone();
+                            (Some(target.clone()), Some(kind.clone()), id.clone(), None)
+                        } else {
+                            variant.unknowns.push("target and package identity".into());
+                            (
+                                None,
+                                None,
+                                None,
+                                Some(
+                                    "no unique target-named fingerprint matched this artifact"
+                                        .into(),
+                                ),
+                            )
+                        };
+                    groups.push(CargoDependencyGroup {
+                        target,
+                        target_kind,
+                        package_id,
+                        variant,
+                        allocated_bytes: 0,
+                        unique_allocated_bytes: 0,
+                        logical_bytes: 0,
+                        entries: 0,
+                        hardlinked_entries: 0,
+                        fingerprint_paths: Vec::new(),
+                        residual_reason,
+                    });
+                    groups.len() - 1
+                });
+                if let Some((_, _, _, _, _, fingerprint_path)) = match_data
+                    && !groups[idx].fingerprint_paths.contains(fingerprint_path)
+                {
+                    groups[idx].fingerprint_paths.push(fingerprint_path.clone());
+                }
+                let bytes = meta.blocks().saturating_mul(512);
+                allocated_bytes = allocated_bytes.saturating_add(bytes);
+                unique_allocated_bytes = unique_allocated_bytes.saturating_add(
+                    if unique.insert((meta.dev(), meta.ino())) {
+                        bytes
+                    } else {
+                        0
+                    },
+                );
+                let g = &mut groups[idx];
+                g.allocated_bytes = g.allocated_bytes.saturating_add(bytes);
+                g.logical_bytes = g.logical_bytes.saturating_add(meta.len());
+                g.entries += 1;
+                if meta.nlink() > 1 {
+                    g.hardlinked_entries += 1;
+                }
+                if group_unique
+                    .entry(idx)
+                    .or_default()
+                    .insert((meta.dev(), meta.ino()))
+                {
+                    g.unique_allocated_bytes = g.unique_allocated_bytes.saturating_add(bytes);
+                }
+            }
+        }
+        Some(Err(_)) | None => add_limit(
+            &mut coverage,
+            "selected profile deps directory is unavailable".into(),
+        ),
+    }
+    profile_inspection_result(
+        profile_path,
+        started,
+        entries_examined,
+        groups,
+        allocated_bytes,
+        unique_allocated_bytes,
+        metadata_bytes_read,
+        coverage,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn profile_inspection_result(
+    path: &Path,
+    started: Instant,
+    entries_examined: usize,
+    groups: Vec<CargoDependencyGroup>,
+    allocated_bytes: u64,
+    unique_allocated_bytes: u64,
+    metadata_bytes_read: u64,
+    coverage: ArtifactCoverage,
+) -> CargoProfileInspection {
+    CargoProfileInspection { profile_path: path.to_path_buf(), inspected_at: crate::entities::now(), elapsed_ms: started.elapsed().as_millis() as u64, entries_examined, groups, allocated_bytes, unique_allocated_bytes, metadata_bytes_read, coverage, accounting_note: "This observation is not atomic; concurrent builds may change files. Allocated bytes count each dependency entry; profile unique bytes deduplicate filesystem inode identity. These are storage observations, not reclaimable bytes or proof of final-binary contribution.".into() }
+}
+
 /// The effective local Cargo directories that can be established without
 /// running Cargo. Environment variables are process facts; config values are
 /// read-only local metadata. Command-line overrides are necessarily unknown
@@ -59,7 +580,7 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
     while let Some(dir) = cursor {
         for name in ["config", "config.toml"] {
             let p = dir.join(".cargo").join(name);
-            if p.is_file() {
+            if crate::fs_gate::is_file(&p) {
                 config = Some(p);
                 break;
             }
@@ -71,9 +592,17 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
     }
     layout.config_path = config.clone();
 
+    // Bounded, through the shared manifest reader: a `.cargo/config`
+    // is a small TOML file, and reading it whole is the same unbounded
+    // read the build-adapter guardrail forbids inside an adapter. The
+    // adapter calls this function for its container roots, so the bound
+    // has to hold here too or the guardrail is satisfied only by where
+    // the code happens to live.
     let config_values = config
         .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|p| {
+            crate::fs_gate::read::bounded_string(p, crate::fs_gate::read::BoundedCap::MANIFEST).ok()
+        })
         .map(|text| parse_build_paths(&text));
     if let Some((target, build)) = config_values {
         layout.target_dir = target.map(|p| resolve_config_path(config.as_deref(), p));
@@ -207,7 +736,7 @@ pub fn inspect_target_incremental(
             copy_tree(path, old, children, out);
             return;
         }
-        let meta = match fs::symlink_metadata(path) {
+        let meta = match crate::fs_gate::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => {
                 limits.push(format!("{}: {e}", path.display()));
@@ -215,7 +744,7 @@ pub fn inspect_target_incremental(
             }
         };
         let rel = relative_path(root, path);
-        let (role, variant) = classify_path(&rel, meta.is_dir());
+        let (role, variant) = crate::build_adapters::cargo::classify_path(&rel, meta.is_dir());
         let id = NestedArtifact::within(scope, &rel);
         let parent = if path == root {
             None
@@ -271,7 +800,7 @@ pub fn inspect_target_incremental(
         }
         out.push(u);
         if meta.is_dir() {
-            match fs::read_dir(path) {
+            match crate::fs_gate::read_dir(path) {
                 Err(e) => limits.push(format!("{}: {e}", path.display())),
                 Ok(entries) => {
                     let mut paths = Vec::new();
@@ -333,149 +862,17 @@ pub fn inspect_target_incremental(
     }
 }
 
-/// Project decision-relevant units from the existing folded directory measurements.
-/// Only fingerprint metadata and example executables receive shallow extra reads.
-pub(crate) fn folded_units(
-    root: &Path,
-    projects: &[ProjectRow],
-    dirs: &[crate::report::DirRollup],
-) -> anyhow::Result<Vec<NestedArtifact>> {
-    let scope = NestedArtifact::storage_id(root, "");
-    let worktrees: HashMap<_, _> = projects
-        .iter()
-        .flat_map(|p| &p.worktrees)
-        .map(|w| (w.worktree_id.as_str(), w.path.as_path()))
-        .collect();
-    let mut units = Vec::new();
-    let mut fingerprints = Vec::new();
-    let mut examples = Vec::new();
-    let mut profiles = Vec::new();
-    let mut measurements = Vec::new();
-    for d in dirs {
-        let Some(worktree) = worktrees.get(d.worktree_id.as_str()) else {
-            continue;
-        };
-        let path = worktree.join(&d.rel_path);
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let rel = relative.to_string_lossy();
-        measurements.push((path.clone(), d.mod_time_min.max(0) as u64 * 60, d.complete));
-        let parts: Vec<_> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        let offset = usize::from(parts.first().is_some_and(|p| looks_like_target_triple(p)));
-        if parts.len() == offset + 1 {
-            profiles.push(path.clone());
-        }
-        if parts.len() == offset + 3 && parts.get(offset + 1) == Some(&".fingerprint") {
-            fingerprints.push(path.clone());
-        }
-        if parts.len() == offset + 2 && parts.get(offset + 1) == Some(&"examples") {
-            examples.push(path.clone());
-        }
-        let keep = parts.len() <= offset + 2
-            || (parts.len() == offset + 3
-                && matches!(parts.get(offset + 1), Some(&"incremental" | &"build")));
-        if !keep {
-            continue;
-        }
-        let mut u = folded_node(root, &scope, &path, true, d.allocated_total);
-        u.coverage.complete = d.complete;
-        u.mtime_max = d.mod_time_min.max(0) as u64 * 60;
-        units.push(u);
-    }
-    // A folded group's last change includes its deeper directories. Reuse their
-    // measured metadata; do not stat files to reconstruct an exact inventory.
-    let indexes: HashMap<_, _> = units
-        .iter()
-        .enumerate()
-        .map(|(i, u)| (u.path.clone(), i))
-        .collect();
-    for (path, mtime, complete) in measurements {
-        for ancestor in path.ancestors().take_while(|p| p.starts_with(root)) {
-            if let Some(&i) = indexes.get(ancestor) {
-                units[i].mtime_max = units[i].mtime_max.max(mtime);
-                units[i].coverage.complete &= complete;
-            }
-        }
-    }
-    // Temporary metadata nodes feed the shared parser, but are never retained.
-    // Ordinary compiler outputs in deps are not listed or statted here.
-    for dir in fingerprints {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some(stem) = name.strip_suffix(".json") else {
-                continue;
-            };
-            let target = stem
-                .strip_prefix("test-lib-")
-                .or_else(|| stem.strip_prefix("test-bin-"))
-                .or_else(|| stem.strip_prefix("test-integration-test-"));
-            let Some(target) = target else { continue };
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let dir = path.parent().unwrap();
-            let Some((_, hash)) = dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.rsplit_once('-'))
-            else {
-                continue;
-            };
-            let executable = dir
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("deps")
-                .join(format!("{target}-{hash}"));
-            if let Some(u) = folded_executable(root, &scope, &executable)? {
-                units.push(u);
-                units.push(folded_node(root, &scope, &path, false, 0));
-            }
-        }
-    }
-    for dir in examples {
-        for entry in fs::read_dir(dir)? {
-            if let Some(u) = folded_executable(root, &scope, &entry?.path())? {
-                units.push(u);
-            }
-        }
-    }
-    // Final outputs live immediately inside profiles, not inside deps. Keep
-    // executables and library products, but leave metadata and internal files
-    // folded. This is shallow even when the target contains millions of files.
-    for dir in profiles {
-        for entry in fs::read_dir(dir)? {
-            let path = entry?.path();
-            let library = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("rlib" | "a" | "so" | "dylib")
-            );
-            if let Some(u) = folded_output(root, &scope, &path, !library)? {
-                units.push(u);
-            }
-        }
-    }
-    enrich_fingerprints(root, &mut units);
-    units.retain(|u| {
-        u.is_dir
-            || matches!(
-                u.role,
-                ArtifactRole::TestExecutable | ArtifactRole::Example | ArtifactRole::FinalOutput
-            )
-    });
-    units.sort_by(|a, b| a.path.cmp(&b.path));
-    units.dedup_by(|a, b| a.path == b.path);
-    Ok(units)
-}
-
+/// A single directory/file node in the shape the legacy direct
+/// inspection produced, kept for the reviewed-role recheck below.
+///
+/// The folded identification that used to live here moved to
+/// `crate::build_adapters::cargo` when the adapters gained a trait and a
+/// registry; what stays is the direct `inspect_target` API (used by the
+/// TUI's own fixtures and by the cleanup rechecks), which walks a target
+/// directory on purpose rather than reading folded rows.
 fn folded_node(root: &Path, scope: &str, path: &Path, is_dir: bool, bytes: u64) -> NestedArtifact {
     let rel = relative_path(root, path);
-    let (role, variant) = classify_path(&rel, is_dir);
+    let (role, variant) = crate::build_adapters::cargo::classify_path(&rel, is_dir);
     let mut u = node(
         path,
         root,
@@ -507,50 +904,13 @@ fn folded_node(root: &Path, scope: &str, path: &Path, is_dir: bool, bytes: u64) 
     u
 }
 
-fn folded_executable(
-    root: &Path,
-    scope: &str,
-    path: &Path,
-) -> anyhow::Result<Option<NestedArtifact>> {
-    folded_output(root, scope, path, true)
-}
-
-fn folded_output(
-    root: &Path,
-    scope: &str,
-    path: &Path,
-    executable_required: bool,
-) -> anyhow::Result<Option<NestedArtifact>> {
-    let m = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if !m.is_file() || (executable_required && m.mode() & 0o111 == 0) {
-        return Ok(None);
-    }
-    let mut u = folded_node(root, scope, path, false, m.blocks() * 512);
-    u.device = m.dev();
-    u.inode = m.ino();
-    u.logical_bytes = m.len();
-    u.mtime_max = m.mtime().max(0) as u64;
-    if m.nlink() == 1 {
-        u.membership = Membership::Exclusive;
-        u.physical_total = u.bytes;
-        u.physical_bytes = u.bytes;
-    } else {
-        u.membership = Membership::SharedHardlink;
-    }
-    Ok(Some(u))
-}
-
 /// Recheck only the selected unit and its recorded producer evidence.
 pub(crate) fn reviewed_role(
     root: &Path,
     selected: &Path,
     fingerprints: &[PathBuf],
 ) -> anyhow::Result<(ArtifactRole, bool)> {
-    let meta = fs::symlink_metadata(selected)?;
+    let meta = crate::fs_gate::symlink_metadata(selected)?;
     let scope = NestedArtifact::storage_id(root, "");
     let mut units = vec![folded_node(root, &scope, selected, meta.is_dir(), 0)];
     for path in fingerprints {
@@ -558,42 +918,6 @@ pub(crate) fn reviewed_role(
     }
     enrich_fingerprints(root, &mut units);
     Ok((units[0].role.clone(), meta.is_dir()))
-}
-
-fn classify_path(rel: &str, is_dir: bool) -> (ArtifactRole, ArtifactVariant) {
-    if rel.is_empty() {
-        return (ArtifactRole::Container, ArtifactVariant::default());
-    }
-    let parts: Vec<_> = rel.split('/').collect();
-    let triple = looks_like_target_triple(parts[0]);
-    let offset = usize::from(triple);
-    let mut variant = profile_variant(parts.get(offset).copied().unwrap_or("unknown"));
-    if triple {
-        variant.architecture = architecture_from_target(parts[0]);
-        variant.configuration = Some(parts[0].into());
-        variant.unknowns.retain(|s| s != "architecture");
-    }
-    if parts.len() <= offset {
-        return (ArtifactRole::Container, variant);
-    }
-    if parts.len() == offset + 1 && is_dir {
-        return (ArtifactRole::Profile, variant);
-    }
-    let role = match parts.get(offset + 1).copied() {
-        Some("deps") => ArtifactRole::Dependency,
-        Some("examples") => ArtifactRole::Example,
-        Some("incremental") => ArtifactRole::Incremental,
-        Some("build") => ArtifactRole::BuildScriptOutput,
-        Some(".fingerprint") => ArtifactRole::CompanionMetadata,
-        _ if !is_dir && parts.len() == offset + 2 => ArtifactRole::FinalOutput,
-        _ => ArtifactRole::Residual,
-    };
-    let role = if !is_dir && rel.ends_with(".d") {
-        ArtifactRole::CompanionMetadata
-    } else {
-        role
-    };
-    (role, variant)
 }
 
 /// Fingerprints provide a baseline test/executable distinction without running
@@ -626,7 +950,10 @@ fn enrich_fingerprints(root: &Path, units: &mut [NestedArtifact]) {
         let Some(profile) = dir.parent().and_then(Path::parent) else {
             continue;
         };
-        let Ok(text) = fs::read_to_string(&u.path) else {
+        let Ok(text) = crate::fs_gate::read::bounded_string(
+            &u.path,
+            crate::fs_gate::read::BoundedCap::MANIFEST,
+        ) else {
             continue;
         };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -664,25 +991,6 @@ fn enrich_fingerprints(root: &Path, units: &mut [NestedArtifact]) {
             ));
         }
     }
-}
-
-fn profile_variant(profile: &str) -> ArtifactVariant {
-    let mut v = ArtifactVariant::default();
-    if profile != "unknown" {
-        v.profile = Some(profile.into());
-    } else {
-        v.unknowns.push("profile".into());
-    }
-    v.unknowns.extend(
-        ["architecture", "toolchain", "features", "generation"]
-            .into_iter()
-            .map(String::from),
-    );
-    v
-}
-
-fn looks_like_target_triple(name: &str) -> bool {
-    name.matches('-').count() >= 2 && !name.contains('.')
 }
 
 // Existing node-construction helper centralizes the full artifact record shape.
@@ -733,6 +1041,15 @@ fn node(
         present,
         growth_bytes: None,
         regrowth_count: 0,
+        decision_evidence: Vec::new(),
+        adapter: Some("cargo".into()),
+        basis: crate::artifact::AccountingBasis::Allocated,
+        time_source: crate::artifact::TimeSource::FileModification,
+        action: crate::artifact::NestedActionCapability::InspectionOnly,
+        consequence: None,
+        reported_by: None,
+        writer_lock: None,
+        guidance: crate::cargo_cleanup::Guidance::default(),
     }
 }
 
@@ -838,20 +1155,6 @@ pub fn apply_message_evidence(inspection: &mut CargoInspection, messages: &[Carg
     }
 }
 
-/// Inspect a target and apply only pre-existing Cargo JSON output. The text
-/// is supplied by the caller so observation never searches for or creates a
-/// build log and never invokes Cargo.
-pub fn inspect_target_with_json(
-    target_dir: &Path,
-    workspace_root: Option<&Path>,
-    json_text: &str,
-) -> CargoInspection {
-    let mut inspection = inspect_target(target_dir, workspace_root);
-    let messages = parse_json_messages(json_text);
-    apply_message_evidence(&mut inspection, &messages);
-    inspection
-}
-
 /// Parse existing JSON lines without executing Cargo. Unknown message kinds
 /// are ignored, as Cargo may add message variants over time.
 pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
@@ -901,16 +1204,6 @@ pub fn parse_json_messages(text: &str) -> Vec<CargoMessageEvidence> {
         .collect()
 }
 
-/// Finds Cargo target/build rows already discovered by the common walker and
-/// annotates them. It intentionally does not add an out-of-scope path to a
-/// report: an external shared target must be observed explicitly first.
-pub fn inspect_projects(projects: &[ProjectRow]) -> Vec<NestedArtifact> {
-    project_roots(projects)
-        .into_iter()
-        .flat_map(|(root, workspace)| inspect_target(&root, Some(&workspace)).units)
-        .collect()
-}
-
 /// Already observed Cargo build boundaries only, deduplicated across owners.
 pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
@@ -918,12 +1211,12 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
     for project in projects {
         for wt in &project.worktrees {
             let layout = layout_for(&wt.path);
-            let cargo_present = wt.path.join("Cargo.toml").is_file();
+            let cargo_present = crate::fs_gate::is_file(wt.path.join("Cargo.toml"));
             if !cargo_present && !project.ecosystems.iter().any(|t| t == "rs") {
                 continue;
             }
             for row in &wt.artifacts {
-                if row.kind != ArtifactKind::BuildOutput || !row.path.is_dir() {
+                if row.kind != ArtifactKind::BuildOutput || !crate::fs_gate::is_dir(&row.path) {
                     continue;
                 }
                 let matches_layout = layout.target_dir.as_ref().is_some_and(|p| p == &row.path)
@@ -932,7 +1225,8 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
                 if !matches_layout {
                     continue;
                 }
-                let canonical = fs::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
+                let canonical =
+                    crate::fs_gate::canonicalize(&row.path).unwrap_or_else(|_| row.path.clone());
                 if seen.insert(canonical) {
                     out.push((row.path.clone(), wt.path.clone()));
                 }
@@ -945,6 +1239,7 @@ pub fn project_roots(projects: &[ProjectRow]) -> Vec<(PathBuf, PathBuf)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
     use tempfile::tempdir;
 
@@ -1004,6 +1299,199 @@ mod tests {
                 .any(|u| u.membership == Membership::SharedHardlink)
         );
         assert!(report.units.iter().any(|u| u.parent_id.is_some()));
+    }
+
+    #[test]
+    fn bounded_profile_inspection_returns_explicit_partial_residuals() {
+        let tmp = tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        fs::write(profile.join("deps/librenamed-abc123.rlib"), b"artifact").unwrap();
+        fs::write(
+            profile.join("deps/libsecond-def456.rlib"),
+            b"second artifact",
+        )
+        .unwrap();
+        let cancelled = AtomicBool::new(true);
+        let result = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits::default(),
+            &cancelled,
+        );
+        assert!(!result.coverage.complete);
+        assert!(
+            result
+                .coverage
+                .limits
+                .iter()
+                .any(|s| s.contains("cancelled"))
+        );
+        assert_eq!(result.allocated_bytes, 0);
+
+        let result = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits {
+                max_entries: 1,
+                ..Default::default()
+            },
+            &AtomicBool::new(false),
+        );
+        assert!(!result.coverage.complete);
+        assert!(result.entries_examined <= 1);
+        assert!(result.allocated_bytes == 0 || !result.groups.is_empty());
+        assert!(result.accounting_note.contains("not reclaimable"));
+    }
+
+    #[test]
+    fn profile_inspection_counts_hardlinks_in_allocated_but_not_unique_total() {
+        let tmp = tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        fs::write(profile.join("deps/liba-abc.rlib"), vec![7u8; 4096]).unwrap();
+        fs::hard_link(
+            profile.join("deps/liba-abc.rlib"),
+            profile.join("deps/libb-def.rlib"),
+        )
+        .unwrap();
+        let result = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits::default(),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            result.allocated_bytes,
+            result.unique_allocated_bytes.saturating_mul(2)
+        );
+        assert_eq!(result.groups.iter().map(|g| g.entries).sum::<usize>(), 2);
+        assert!(result.groups.iter().all(|g| g.residual_reason.is_some()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_inspection_does_not_gate_on_cargo_build_lock() {
+        let tmp = tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::create_dir_all(profile.join(".fingerprint")).unwrap();
+        fs::write(profile.join("deps/libbusy-abc.rlib"), b"artifact").unwrap();
+        let build_lock = profile.join(".cargo-lock");
+        fs::File::create(&build_lock).unwrap();
+        let lock = crate::fs_gate::sys::RegularFile::open_nofollow(&build_lock).unwrap();
+        lock.try_lock().unwrap();
+        let result = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits::default(),
+            &AtomicBool::new(false),
+        );
+        assert!(result.coverage.complete);
+        assert!(result.allocated_bytes > 0);
+        assert!(result.accounting_note.contains("not atomic"));
+        lock.unlock().unwrap();
+        let after = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits::default(),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            after.coverage.complete,
+            "an idle lock file is not an active build: {:?}",
+            after.coverage.limits
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_inspection_never_follows_deps_or_fingerprint_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&profile).unwrap();
+        fs::create_dir_all(outside.join("deps")).unwrap();
+        fs::create_dir_all(outside.join(".fingerprint/opaque-abc")).unwrap();
+        fs::write(outside.join("deps/libsecret-abc.rlib"), vec![1u8; 4096]).unwrap();
+        fs::write(
+            outside.join(".fingerprint/opaque-abc/lib-secret.json"),
+            "{}",
+        )
+        .unwrap();
+        symlink(outside.join("deps"), profile.join("deps")).unwrap();
+        symlink(outside.join(".fingerprint"), profile.join(".fingerprint")).unwrap();
+        let result = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits::default(),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result.allocated_bytes, 0);
+        assert_eq!(result.metadata_bytes_read, 0);
+        assert!(
+            result
+                .coverage
+                .limits
+                .iter()
+                .any(|s| s.contains("not a real directory"))
+        );
+    }
+
+    #[test]
+    fn fingerprint_target_parser_prefers_test_target_prefixes() {
+        assert_eq!(
+            parse_fingerprint_target("test-lib-renamed-with-dash"),
+            Some(("test-lib", "renamed-with-dash"))
+        );
+        assert_eq!(
+            parse_fingerprint_target("test-integration-test-cli"),
+            Some(("test-integration-test", "cli"))
+        );
+    }
+
+    #[test]
+    fn profile_inspection_uses_target_named_fingerprint_not_package_hash_as_identity() {
+        let tmp = tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        fs::create_dir_all(profile.join("deps")).unwrap();
+        fs::create_dir_all(profile.join(".fingerprint/opaque-abc")).unwrap();
+        fs::write(profile.join("deps/librenamed-abc.rlib"), b"artifact").unwrap();
+        fs::write(
+            profile.join(".fingerprint/opaque-abc/lib-renamed.json"),
+            r#"{"features":["fast"],"rustc":"rustc-test"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(profile.join(".fingerprint/other-def")).unwrap();
+        fs::write(profile.join("deps/librenamed-def.rlib"), b"another variant").unwrap();
+        fs::write(
+            profile.join(".fingerprint/other-def/lib-renamed.json"),
+            r#"{"features":["slow"],"rustc":"rustc-other"}"#,
+        )
+        .unwrap();
+        fs::write(profile.join("deps/libstale-zzz.rlib"), b"stale fingerprint").unwrap();
+        let result = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits::default(),
+            &AtomicBool::new(false),
+        );
+        let fast = result
+            .groups
+            .iter()
+            .find(|g| g.variant.features.as_deref() == Some("fast"))
+            .unwrap();
+        let slow = result
+            .groups
+            .iter()
+            .find(|g| g.variant.features.as_deref() == Some("slow"))
+            .unwrap();
+        let residual = result
+            .groups
+            .iter()
+            .find(|g| g.residual_reason.is_some())
+            .unwrap();
+        assert_eq!(fast.target.as_deref(), Some("renamed"));
+        assert_eq!(fast.variant.toolchain.as_deref(), Some("rustc-test"));
+        assert_eq!(fast.package_id, None);
+        assert_ne!(fast.variant.features, slow.variant.features);
+        assert_eq!(residual.target, None);
     }
 
     #[test]

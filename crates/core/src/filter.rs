@@ -1,5 +1,5 @@
-//! Filter grammar shared by the CLI `--filter` flag, the MCP `report`/
-//! `list_worktrees` tools, and (per #35) the TUI. Kept small and pure:
+//! Filter grammar shared by the CLI `--filter` flag (interactive and
+//! `--json`) and (per #35) the TUI. Kept small and pure:
 //! `parse` builds a `Filter`, `matches_worktree`/`matches_artifact`
 //! evaluate it against a report row. No verdict vocabulary lives here;
 //! predicates read facts (`merge-complete`, `idle`, `growth`, `kind`,
@@ -24,7 +24,7 @@
 //! Sizes: `500MB`, `1.5GB` are decimal (×1000, matching the formatter);
 //! `500MiB`, `1.5GiB` are binary (×1024); a bare number is bytes.
 
-use crate::github::{MergedStatus, PrStatus};
+use crate::github::PrStatus;
 use crate::growth::parse_duration_secs;
 use crate::report::{ArtifactKind, ArtifactRow, ProjectRow, WorktreeRow};
 use anyhow::{Result, anyhow};
@@ -76,8 +76,6 @@ pub struct WorktreeFacts<'a> {
     pub merge_complete: bool,
     pub idle_secs: Option<u64>,
     pub pr: &'a PrStatus,
-    #[allow(dead_code)]
-    pub merged: &'a MergedStatus,
 }
 
 /// `500MB` / `1.5GB` decimal (×1000, the same base the formatter prints

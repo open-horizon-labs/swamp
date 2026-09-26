@@ -18,10 +18,7 @@
 //! piece of detail, never the whole report.
 
 use std::collections::HashMap;
-use std::io::Read;
-use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,6 +56,15 @@ pub struct DockerImageFact {
     pub dangling: bool,
 }
 
+/// One BuildKit build-cache record, as the daemon reported it.
+///
+/// Every field is the daemon's own fact, kept in the daemon's terms:
+/// `created_at`/`last_used` are the daemon's records (RFC 3339 strings,
+/// unparsed here), `bytes` is its logical size for this record alone --
+/// a record's parents are separate records with their own sizes, never
+/// included -- and `in_use`/`shared`/`reclaimable` are what the daemon
+/// said, not inferences. `None` means the daemon (or the CLI version
+/// asked) did not report that field, which is different from `false`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DockerCacheFact {
     pub id: String,
@@ -67,6 +73,75 @@ pub struct DockerCacheFact {
     pub usage_count: Option<u64>,
     pub in_use: bool,
     pub shared: bool,
+    /// BuildKit's record type: `regular`, `internal`, `frontend`,
+    /// `source.local`, `source.git.checkout`, `exec.cachemount`, ...
+    #[serde(default)]
+    pub cache_type: Option<String>,
+    /// The daemon's description (`[build 2/5] RUN apt-get ...`,
+    /// `local source for context`). Producer evidence, never parsed for
+    /// identity.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Parent record ids. A child's size never includes a parent's.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// `docker buildx du` only: whether the daemon would reclaim it.
+    #[serde(default)]
+    pub reclaimable: Option<bool>,
+    /// `docker buildx du` only: whether the record is a mutable snapshot.
+    #[serde(default)]
+    pub mutable: Option<bool>,
+    /// The buildx builder whose BuildKit instance holds this record;
+    /// `None` for the daemon's own (default) builder, as `docker system
+    /// df` reports it.
+    #[serde(default)]
+    pub builder: Option<String>,
+}
+
+/// One buildx builder, from `docker buildx ls`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DockerBuilderFact {
+    pub name: String,
+    pub driver: Option<String>,
+    pub status: Option<String>,
+}
+
+/// What this daemon and CLI could answer, stated rather than inferred
+/// from an empty list (#71: "unavailable daemon/version capability
+/// explicit").
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DockerCapabilities {
+    /// The daemon's API version (`docker version`'s `Server.ApiVersion`),
+    /// when it answered.
+    pub api_version: Option<String>,
+    /// Why per-builder BuildKit records are not listed, when they are
+    /// not: buildx missing, `buildx ls` failed, a builder's `du` timed
+    /// out. Empty when every builder answered.
+    pub buildx_limits: Vec<String>,
+}
+
+/// The oldest daemon API that reports build-cache records in `docker
+/// system df -v` (API 1.39, Docker 18.09). An older daemon's records are
+/// listed, if at all, without the detail this layer identifies by.
+pub const MIN_BUILD_CACHE_API: (u32, u32) = (1, 39);
+
+impl DockerCapabilities {
+    /// Whether the daemon's API is known to predate build-cache record
+    /// detail. Unknown (no version reported) is not "unsupported".
+    pub fn build_cache_api_unsupported(&self) -> bool {
+        let Some(v) = &self.api_version else {
+            return false;
+        };
+        let mut parts = v.trim().split('.');
+        let major: Option<u32> = parts.next().and_then(|p| p.parse().ok());
+        let minor: Option<u32> = parts.next().and_then(|p| p.parse().ok());
+        match (major, minor) {
+            (Some(a), Some(b)) => (a, b) < MIN_BUILD_CACHE_API,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -87,6 +162,47 @@ pub struct DockerFacts {
     /// Set when the daemon/file could not be read: the reason text is
     /// surfaced as a report-level coverage note, never an error.
     pub unavailable: Option<String>,
+    /// Builders `docker buildx ls` listed. Empty when buildx is absent or
+    /// was not asked; the daemon's own builder is always implied.
+    #[serde(default)]
+    pub builders: Vec<DockerBuilderFact>,
+    #[serde(default)]
+    pub capabilities: DockerCapabilities,
+    /// When these facts were fetched from the daemon, in seconds. `None`
+    /// for a facts file, whose capture time swamp does not know.
+    #[serde(default)]
+    pub captured_at: Option<u64>,
+}
+
+/// The name `docker system df`'s own build cache is reported under.
+pub const DEFAULT_BUILDER: &str = "default";
+
+impl DockerFacts {
+    /// Every builder a record or `buildx ls` names, the daemon's own
+    /// first. A builder with no records is still a builder: its empty
+    /// cache is a fact, not an absence.
+    pub fn builder_names(&self) -> Vec<String> {
+        let mut out = vec![DEFAULT_BUILDER.to_string()];
+        for name in self
+            .builders
+            .iter()
+            .map(|b| b.name.clone())
+            .chain(self.build_cache.iter().filter_map(|r| r.builder.clone()))
+        {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// The records one builder holds.
+    pub fn records_of(&self, builder: &str) -> Vec<&DockerCacheFact> {
+        self.build_cache
+            .iter()
+            .filter(|r| r.builder.as_deref().unwrap_or(DEFAULT_BUILDER) == builder)
+            .collect()
+    }
 }
 
 /// One container as read from `docker ps -a --format json` plus a
@@ -244,8 +360,52 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
                 usage_count,
                 in_use,
                 shared,
+                cache_type: entry.get("CacheType").and_then(opt_value_str),
+                description: entry.get("Description").and_then(opt_value_str),
+                parents: parents_of(entry),
+                created_at: entry.get("CreatedAt").and_then(opt_value_str),
+                reclaimable: None,
+                mutable: None,
+                builder: None,
             });
         }
+    }
+
+    if let Some(v) = value.get("Version") {
+        facts.capabilities.api_version = api_version_of(v);
+    }
+    if let Some(rows) = value.get("Builders").and_then(|v| v.as_array()) {
+        facts.builders = rows.iter().filter_map(parse_builder).collect();
+    }
+    if let Some(entries) = value.get("BuildxDu").and_then(|v| v.as_array()) {
+        for entry in entries {
+            let builder = entry.get("Builder").map(value_str).unwrap_or_default();
+            if builder.is_empty() {
+                continue;
+            }
+            if let Some(reason) = entry.get("Unavailable").and_then(opt_value_str) {
+                facts
+                    .capabilities
+                    .buildx_limits
+                    .push(format!("builder `{builder}`: {reason}"));
+                continue;
+            }
+            let records = match (entry.get("Verbose"), entry.get("Records")) {
+                (Some(text), _) => parse_buildx_du_verbose(&value_str(text)),
+                (None, Some(rows)) => rows
+                    .as_array()
+                    .map(|a| a.iter().map(parse_buildx_record).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            merge_builder_records(&mut facts, &builder, records);
+        }
+    }
+    if let Some(limits) = value.get("BuildxLimits").and_then(|v| v.as_array()) {
+        facts
+            .capabilities
+            .buildx_limits
+            .extend(limits.iter().filter_map(opt_value_str));
     }
 
     if let Some(entries) = value.get("Volumes").and_then(|v| v.as_array()) {
@@ -302,6 +462,166 @@ fn parse_value(value: &serde_json::Value) -> DockerFacts {
 /// {"Layers": [...]}}, ...]`, the same shape `docker image inspect
 /// --format json` returns) into the df-sourced image facts, matching by
 /// image ID first and falling back to a shared repo:tag.
+/// `Parents` (an array, API >= 1.42) or the deprecated single `Parent`.
+fn parents_of(entry: &serde_json::Value) -> Vec<String> {
+    if let Some(arr) = entry.get("Parents").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect();
+    }
+    match entry.get("Parents").or_else(|| entry.get("Parent")) {
+        Some(v) => value_str(v)
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn api_version_of(v: &serde_json::Value) -> Option<String> {
+    v.get("Server")
+        .and_then(|s| s.get("ApiVersion"))
+        .and_then(opt_value_str)
+}
+
+fn parse_builder(row: &serde_json::Value) -> Option<DockerBuilderFact> {
+    let name = row.get("Name").and_then(opt_value_str)?;
+    let status = row
+        .get("Nodes")
+        .and_then(|n| n.as_array())
+        .and_then(|n| n.first())
+        .and_then(|n| n.get("Status"))
+        .and_then(opt_value_str)
+        .or_else(|| row.get("Status").and_then(opt_value_str));
+    Some(DockerBuilderFact {
+        name,
+        driver: row.get("Driver").and_then(opt_value_str),
+        status,
+    })
+}
+
+fn opt_bool(v: Option<&serde_json::Value>) -> Option<bool> {
+    let v = v?;
+    v.as_bool().or_else(|| match v.as_str()? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    })
+}
+
+/// One record of `docker buildx du --verbose --format json`.
+fn parse_buildx_record(r: &serde_json::Value) -> DockerCacheFact {
+    DockerCacheFact {
+        id: r.get("ID").map(value_str).unwrap_or_default(),
+        bytes: r
+            .get("Size")
+            .map(|v| v.as_u64().unwrap_or_else(|| parse_size(&value_str(v))))
+            .unwrap_or(0),
+        last_used: r.get("LastUsedAt").and_then(opt_value_str),
+        usage_count: r.get("UsageCount").and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        }),
+        in_use: opt_bool(r.get("InUse")).unwrap_or(false),
+        shared: opt_bool(r.get("Shared")).unwrap_or(false),
+        cache_type: r
+            .get("Type")
+            .or_else(|| r.get("CacheType"))
+            .and_then(opt_value_str),
+        description: r.get("Description").and_then(opt_value_str),
+        parents: parents_of(r),
+        created_at: r.get("CreatedAt").and_then(opt_value_str),
+        reclaimable: opt_bool(r.get("Reclaimable")),
+        mutable: opt_bool(r.get("Mutable")),
+        builder: None,
+    }
+}
+
+/// `docker buildx du --verbose`'s documented text shape: one block per
+/// record, `Key:\tvalue` lines, blocks separated by a blank line, and a
+/// trailing `Shared:`/`Private:`/`Reclaimable:`/`Total:` summary that
+/// is not a record.
+pub fn parse_buildx_du_verbose(text: &str) -> Vec<DockerCacheFact> {
+    let mut out = Vec::new();
+    for block in text.split("\n\n") {
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for line in block.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                fields.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        let Some(id) = fields.get("ID").filter(|v| !v.is_empty()).cloned() else {
+            continue;
+        };
+        let flag = |k: &str| fields.get(k).and_then(|v| v.parse::<bool>().ok());
+        out.push(DockerCacheFact {
+            id,
+            bytes: fields.get("Size").map(|s| parse_size(s)).unwrap_or(0),
+            last_used: fields.get("Last used").filter(|v| !v.is_empty()).cloned(),
+            usage_count: fields.get("Usage count").and_then(|v| v.parse().ok()),
+            in_use: flag("In use").unwrap_or(false),
+            shared: flag("Shared").unwrap_or(false),
+            cache_type: fields.get("Type").filter(|v| !v.is_empty()).cloned(),
+            description: fields.get("Description").filter(|v| !v.is_empty()).cloned(),
+            parents: fields
+                .get("Parents")
+                .or_else(|| fields.get("Parent"))
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            created_at: fields.get("Created at").filter(|v| !v.is_empty()).cloned(),
+            reclaimable: flag("Reclaimable"),
+            mutable: flag("Mutable"),
+            builder: None,
+        });
+    }
+    out
+}
+
+/// One builder's records, attributed to it. The daemon's own builder is
+/// already reported by `docker system df`; `buildx du` for it describes
+/// the same records, so its extra fields are merged onto them by id
+/// rather than listed twice.
+fn merge_builder_records(facts: &mut DockerFacts, builder: &str, records: Vec<DockerCacheFact>) {
+    let is_default = builder == DEFAULT_BUILDER
+        || facts
+            .builders
+            .iter()
+            .any(|b| b.name == builder && b.driver.as_deref() == Some("docker"));
+    for mut r in records {
+        if is_default
+            && let Some(existing) = facts
+                .build_cache
+                .iter_mut()
+                .find(|e| e.builder.is_none() && e.id == r.id)
+        {
+            existing.reclaimable = r.reclaimable.or(existing.reclaimable);
+            existing.mutable = r.mutable.or(existing.mutable);
+            if existing.parents.is_empty() {
+                existing.parents = r.parents;
+            }
+            if existing.cache_type.is_none() {
+                existing.cache_type = r.cache_type;
+            }
+            continue;
+        }
+        if !is_default {
+            r.builder = Some(builder.to_string());
+        }
+        facts.build_cache.push(r);
+    }
+}
+
 fn merge_image_inspect(images: &mut [DockerImageFact], inspect_entries: &[serde_json::Value]) {
     for entry in inspect_entries {
         let id = entry
@@ -522,98 +842,33 @@ pub enum Removal {
     Refused(&'static str),
 }
 
-/// Runs a removal. Returns the daemon's own refusal text when it declines
-/// (an image still referenced by a container, a volume still mounted),
-/// because that reason is the fact the human needs.
-pub fn remove(target: &Removal, timeout: Duration) -> Result<(), String> {
-    let args: Vec<&str> = match target {
-        Removal::Image { id } => vec!["image", "rm", id.as_str()],
-        Removal::Volume { name } => vec!["volume", "rm", name.as_str()],
-        Removal::Refused(why) => return Err((*why).to_string()),
-    };
-    let out = Command::new("docker")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("docker: {e}"))?
-        .wait_with_output()
-        .map_err(|e| format!("docker: {e}"))?;
-    let _ = timeout;
-    if out.status.success() {
-        return Ok(());
-    }
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if err.is_empty() {
-        "docker refused the removal without saying why".to_string()
-    } else {
-        err
-    })
+/// Runs a removal, permanently, in the daemon. Returns the daemon's own
+/// refusal text when it declines (an image still referenced by a
+/// container, a volume still mounted), because that reason is the fact
+/// the human needs. The daemon's own answer is the only refusal here:
+/// there is no separate recheck-and-veto step in front of it.
+pub fn remove(target: &Removal) -> Result<(), String> {
+    crate::fs_gate::destroy::docker_remove(target)
 }
 
-/// Is this object still present, and still unused? Re-derived at the sink
-/// immediately before removal, never trusted from the report.
-pub fn still_removable(target: &Removal) -> Result<(), String> {
-    let (kind, id) = match target {
-        Removal::Image { id } => ("image", id.as_str()),
-        Removal::Volume { name } => ("volume", name.as_str()),
-        Removal::Refused(why) => return Err((*why).to_string()),
-    };
-    let out = Command::new("docker")
-        .args([kind, "inspect", id])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("docker: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err("object is no longer present".to_string())
-    }
-}
+/// How many buildx builders besides the daemon's own get a `du` query.
+/// Each is one bounded spawn, cached with the rest of the facts.
+const MAX_BUILDX_BUILDERS: usize = 4;
+
+/// A shorter bound for the buildx queries: an unresponsive builder is a
+/// stated limit, and must not hold the whole observation.
+const BUILDX_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
-    let mut child = Command::new("docker")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Docker, args, timeout)
         .map_err(|e| format!("docker: unavailable ({e})"))?;
-
-    let (tx, rx) = mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stdout.read_to_string(&mut buf);
-            let _ = tx.send(buf);
-        });
-    }
-
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(_) => break None,
-        }
-    };
-
-    let Some(status) = status else {
+    if out.timed_out {
         return Err("docker: unavailable (timed out)".to_string());
-    };
-    if !status.success() {
+    }
+    if !out.success() {
         return Err("docker: unavailable (daemon not responding)".to_string());
     }
-    let stdout = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    let stdout = out.stdout_lossy();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
         return Ok(v);
     }
@@ -626,6 +881,72 @@ fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value
         return Ok(serde_json::Value::Array(lines));
     }
     Err("docker: unavailable (bad output)".to_string())
+}
+
+/// [`run_docker_json`], for a query whose output is `buildx du
+/// --verbose`'s documented text shape rather than JSON.
+fn run_docker_text(args: &[&str], timeout: Duration) -> Result<String, String> {
+    let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Docker, args, timeout)
+        .map_err(|e| format!("docker: unavailable ({e})"))?;
+    if out.timed_out {
+        return Err("docker: unavailable (timed out)".to_string());
+    }
+    if !out.success() {
+        return Err("docker: unavailable (daemon not responding)".to_string());
+    }
+    Ok(out.stdout_lossy())
+}
+
+/// The daemon's API version and the buildx builders' records, after
+/// `docker system df` answered. Each failure is a stated capability
+/// limit on the facts, never an error: an old daemon, a missing buildx,
+/// or one builder that does not answer leaves everything else intact.
+fn load_buildkit_detail(facts: &mut DockerFacts) {
+    match run_docker_json(&["version", "--format", "json"], DOCKER_TIMEOUT) {
+        Ok(v) => facts.capabilities.api_version = api_version_of(&v),
+        Err(e) => facts
+            .capabilities
+            .buildx_limits
+            .push(format!("the daemon's API version is unknown ({e})")),
+    }
+    let builders = match run_docker_json(&["buildx", "ls", "--format", "json"], BUILDX_TIMEOUT) {
+        Ok(serde_json::Value::Array(rows)) => rows.iter().filter_map(parse_builder).collect(),
+        Ok(row) => parse_builder(&row).into_iter().collect(),
+        Err(e) => {
+            facts.capabilities.buildx_limits.push(format!(
+                "buildx builders are not listed ({e}); only the daemon's own build cache is shown"
+            ));
+            Vec::new()
+        }
+    };
+    facts.builders = builders;
+    let others: Vec<String> = facts
+        .builders
+        .iter()
+        .filter(|b| b.driver.as_deref() != Some("docker"))
+        .map(|b| b.name.clone())
+        .collect();
+    if others.len() > MAX_BUILDX_BUILDERS {
+        facts.capabilities.buildx_limits.push(format!(
+            "{} builders listed; the records of only the first {MAX_BUILDX_BUILDERS} are asked for",
+            others.len()
+        ));
+    }
+    for name in others.into_iter().take(MAX_BUILDX_BUILDERS) {
+        match run_docker_text(
+            &["buildx", "du", "--verbose", "--builder", &name],
+            BUILDX_TIMEOUT,
+        ) {
+            Ok(text) => {
+                let records = parse_buildx_du_verbose(&text);
+                merge_builder_records(facts, &name, records);
+            }
+            Err(e) => facts
+                .capabilities
+                .buildx_limits
+                .push(format!("builder `{name}`: records not listed ({e})")),
+        }
+    }
 }
 
 /// Loads Docker facts either from a mocked facts file (tests, or the
@@ -645,6 +966,17 @@ pub fn load(facts_path: Option<&Path>) -> DockerFacts {
 /// the daemon cost ~0.9 s per observation.
 pub const DOCKER_CACHE_TTL_SECS: u64 = 300;
 
+/// How long an *unavailable* answer is reused before the daemon is asked
+/// again.
+///
+/// `load_cached` used to write its cache only when the answer was
+/// successful, so a daemon that is installed and stopped was re-probed
+/// on every single pass with no TTL at all. An unavailable daemon is a
+/// fact with the same shape as any other and deserves the same
+/// treatment; the window is shorter because a daemon that has just been
+/// started should be noticed soon (the 2026-09-22 re-review's CE6).
+pub const DOCKER_UNAVAILABLE_TTL_SECS: u64 = 60;
+
 /// `load`, with the live answer cached under the store
 /// (`docker_facts.json`) for [`DOCKER_CACHE_TTL_SECS`]. `fresh` forces the
 /// daemon (the scheduled `observe`, `--enrich`).
@@ -659,31 +991,301 @@ pub fn load_cached(
     let Some(dir) = store_dir else {
         return load_live();
     };
-    let cache = dir.join("docker_facts.json");
-    if !fresh
-        && let Ok(meta) = std::fs::metadata(&cache)
-        && let Ok(age) = meta
-            .modified()
-            .and_then(|m| m.elapsed().map_err(std::io::Error::other))
-        && age.as_secs() < DOCKER_CACHE_TTL_SECS
-        && let Ok(text) = std::fs::read_to_string(&cache)
-        && let Ok(facts) = serde_json::from_str::<DockerFacts>(&text)
-        && facts.unavailable.is_none()
-    {
-        return facts;
+    let now = crate::entities::now();
+    if !fresh && let Some((facts, cached_at)) = read_cached_facts(dir) {
+        let ttl = if facts.unavailable.is_none() {
+            DOCKER_CACHE_TTL_SECS
+        } else {
+            DOCKER_UNAVAILABLE_TTL_SECS
+        };
+        if now.saturating_sub(cached_at) < ttl {
+            return facts;
+        }
     }
     let facts = load_live();
-    if facts.unavailable.is_none()
-        && let Ok(text) = serde_json::to_string(&facts)
-    {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::write(&cache, text);
-    }
+    // The unavailable answer is cached too. Caching only success meant
+    // an unreachable daemon was re-probed on every pass forever.
+    let _ = write_cached_facts(dir, &facts, now);
     facts
 }
 
+// ---------------------------------------------------------------------
+// The daemon-answer cache (R18b): `docker_meta.parquet` + one table per
+// object kind + `docker_values.parquet` (every list/map field) +
+// `docker_containers.parquet`. Replaces `docker_facts.json`; the TTL is
+// measured from the meta row's `cached_at`, not a file mtime.
+// ---------------------------------------------------------------------
+
+fn docker_table(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("docker_{name}.parquet"))
+}
+
+/// Writes the daemon's answer as tables, replacing the previous cache.
+pub fn write_cached_facts(dir: &Path, facts: &DockerFacts, cached_at: u64) -> anyhow::Result<()> {
+    use crate::growth::columns as c;
+    crate::fs_gate::store::StoreDir::at(dir)?.create()?;
+    let mut values: Vec<c::StoredDockerValueRow> = Vec::new();
+    let mut containers: Vec<c::StoredDockerContainerRow> = Vec::new();
+    fn push_list(
+        values: &mut Vec<c::StoredDockerValueRow>,
+        object_kind: &str,
+        object_id: &str,
+        list_kind: &str,
+        items: &[String],
+    ) {
+        for (seq, v) in items.iter().enumerate() {
+            values.push(c::StoredDockerValueRow {
+                object_kind: object_kind.to_string(),
+                object_id: object_id.to_string(),
+                list_kind: list_kind.to_string(),
+                seq: seq as u32,
+                key: None,
+                value: v.clone(),
+            });
+        }
+    }
+    fn push_labels(
+        values: &mut Vec<c::StoredDockerValueRow>,
+        object_kind: &str,
+        object_id: &str,
+        labels: &HashMap<String, String>,
+    ) {
+        let mut keys: Vec<&String> = labels.keys().collect();
+        keys.sort();
+        for (seq, k) in keys.into_iter().enumerate() {
+            values.push(c::StoredDockerValueRow {
+                object_kind: object_kind.to_string(),
+                object_id: object_id.to_string(),
+                list_kind: "label".to_string(),
+                seq: seq as u32,
+                key: Some(k.clone()),
+                value: labels[k].clone(),
+            });
+        }
+    }
+    fn push_containers(
+        containers: &mut Vec<c::StoredDockerContainerRow>,
+        object_kind: &str,
+        object_id: &str,
+        refs: &[ContainerRef],
+    ) {
+        for (seq, r) in refs.iter().enumerate() {
+            containers.push(c::StoredDockerContainerRow {
+                object_kind: object_kind.to_string(),
+                object_id: object_id.to_string(),
+                seq: seq as u32,
+                name: r.name.clone(),
+                state: r.state.clone(),
+                finished_at: r.finished_at.clone(),
+            });
+        }
+    }
+    let images: Vec<c::StoredDockerImageRow> = facts
+        .images
+        .iter()
+        .map(|i| {
+            push_list(&mut values, "image", &i.id, "repo_tag", &i.repo_tags);
+            push_list(&mut values, "image", &i.id, "layer", &i.layers);
+            push_list(&mut values, "image", &i.id, "shared_with", &i.shared_with);
+            push_labels(&mut values, "image", &i.id, &i.labels);
+            push_containers(&mut containers, "image", &i.id, &i.containers);
+            c::StoredDockerImageRow {
+                id: i.id.clone(),
+                shared_bytes: i.shared_bytes,
+                unique_bytes: i.unique_bytes,
+                created_at: i.created_at.clone(),
+                dangling: i.dangling,
+            }
+        })
+        .collect();
+    let caches: Vec<c::StoredDockerCacheRow> = facts
+        .build_cache
+        .iter()
+        .map(|b| {
+            push_list(&mut values, "cache", &b.id, "parent", &b.parents);
+            c::StoredDockerCacheRow {
+                id: b.id.clone(),
+                bytes: b.bytes,
+                last_used: b.last_used.clone(),
+                usage_count: b.usage_count,
+                in_use: b.in_use,
+                shared: b.shared,
+                cache_type: b.cache_type.clone(),
+                description: b.description.clone(),
+                created_at: b.created_at.clone(),
+                reclaimable: b.reclaimable,
+                mutable: b.mutable,
+                builder: b.builder.clone(),
+            }
+        })
+        .collect();
+    let volumes: Vec<c::StoredDockerVolumeRow> = facts
+        .volumes
+        .iter()
+        .map(|v| {
+            push_labels(&mut values, "volume", &v.name, &v.labels);
+            push_containers(&mut containers, "volume", &v.name, &v.containers);
+            c::StoredDockerVolumeRow {
+                name: v.name.clone(),
+                bytes: v.bytes,
+                created_at: v.created_at.clone(),
+                driver: v.driver.clone(),
+            }
+        })
+        .collect();
+    push_list(
+        &mut values,
+        "meta",
+        "",
+        "buildx_limit",
+        &facts.capabilities.buildx_limits,
+    );
+    let builders: Vec<c::StoredDockerBuilderRow> = facts
+        .builders
+        .iter()
+        .map(|b| c::StoredDockerBuilderRow {
+            name: b.name.clone(),
+            driver: b.driver.clone(),
+            status: b.status.clone(),
+        })
+        .collect();
+    c::write_docker_image_rows(&docker_table(dir, "images"), &images)?;
+    c::write_docker_cache_rows(&docker_table(dir, "build_cache"), &caches)?;
+    c::write_docker_volume_rows(&docker_table(dir, "volumes"), &volumes)?;
+    c::write_docker_builder_rows(&docker_table(dir, "builders"), &builders)?;
+    c::write_docker_value_rows(&docker_table(dir, "values"), &values)?;
+    c::write_docker_container_rows(&docker_table(dir, "containers"), &containers)?;
+    // The meta row last: a reader that finds it can trust the rest.
+    c::write_docker_meta_rows(
+        &docker_table(dir, "meta"),
+        &[c::StoredDockerMetaRow {
+            cached_at,
+            captured_at: facts.captured_at,
+            unavailable: facts.unavailable.clone(),
+            api_version: facts.capabilities.api_version.clone(),
+        }],
+    )?;
+    Ok(())
+}
+
+/// The cached daemon answer and when it was cached, if there is one.
+pub fn read_cached_facts(dir: &Path) -> Option<(DockerFacts, u64)> {
+    use crate::growth::columns as c;
+    let meta = c::read_docker_meta_rows(&docker_table(dir, "meta"))
+        .ok()?
+        .into_iter()
+        .next()?;
+    let values = c::read_docker_value_rows(&docker_table(dir, "values")).ok()?;
+    let containers = c::read_docker_container_rows(&docker_table(dir, "containers")).ok()?;
+    let list = |object_kind: &str, object_id: &str, list_kind: &str| -> Vec<String> {
+        let mut v: Vec<&c::StoredDockerValueRow> = values
+            .iter()
+            .filter(|r| {
+                r.object_kind == object_kind && r.object_id == object_id && r.list_kind == list_kind
+            })
+            .collect();
+        v.sort_by_key(|r| r.seq);
+        v.into_iter().map(|r| r.value.clone()).collect()
+    };
+    let labels = |object_kind: &str, object_id: &str| -> HashMap<String, String> {
+        values
+            .iter()
+            .filter(|r| {
+                r.object_kind == object_kind && r.object_id == object_id && r.list_kind == "label"
+            })
+            .filter_map(|r| r.key.clone().map(|k| (k, r.value.clone())))
+            .collect()
+    };
+    let refs = |object_kind: &str, object_id: &str| -> Vec<ContainerRef> {
+        let mut v: Vec<&c::StoredDockerContainerRow> = containers
+            .iter()
+            .filter(|r| r.object_kind == object_kind && r.object_id == object_id)
+            .collect();
+        v.sort_by_key(|r| r.seq);
+        v.into_iter()
+            .map(|r| ContainerRef {
+                name: r.name.clone(),
+                state: r.state.clone(),
+                finished_at: r.finished_at.clone(),
+            })
+            .collect()
+    };
+    let images = c::read_docker_image_rows(&docker_table(dir, "images"))
+        .ok()?
+        .into_iter()
+        .map(|i| DockerImageFact {
+            repo_tags: list("image", &i.id, "repo_tag"),
+            labels: labels("image", &i.id),
+            layers: list("image", &i.id, "layer"),
+            shared_with: list("image", &i.id, "shared_with"),
+            containers: refs("image", &i.id),
+            id: i.id,
+            shared_bytes: i.shared_bytes,
+            unique_bytes: i.unique_bytes,
+            created_at: i.created_at,
+            dangling: i.dangling,
+        })
+        .collect();
+    let build_cache = c::read_docker_cache_rows(&docker_table(dir, "build_cache"))
+        .ok()?
+        .into_iter()
+        .map(|b| DockerCacheFact {
+            parents: list("cache", &b.id, "parent"),
+            id: b.id,
+            bytes: b.bytes,
+            last_used: b.last_used,
+            usage_count: b.usage_count,
+            in_use: b.in_use,
+            shared: b.shared,
+            cache_type: b.cache_type,
+            description: b.description,
+            created_at: b.created_at,
+            reclaimable: b.reclaimable,
+            mutable: b.mutable,
+            builder: b.builder,
+        })
+        .collect();
+    let volumes = c::read_docker_volume_rows(&docker_table(dir, "volumes"))
+        .ok()?
+        .into_iter()
+        .map(|v| DockerVolumeFact {
+            labels: labels("volume", &v.name),
+            containers: refs("volume", &v.name),
+            name: v.name,
+            bytes: v.bytes,
+            created_at: v.created_at,
+            driver: v.driver,
+        })
+        .collect();
+    let builders = c::read_docker_builder_rows(&docker_table(dir, "builders"))
+        .ok()?
+        .into_iter()
+        .map(|b| DockerBuilderFact {
+            name: b.name,
+            driver: b.driver,
+            status: b.status,
+        })
+        .collect();
+    Some((
+        DockerFacts {
+            images,
+            build_cache,
+            volumes,
+            unavailable: meta.unavailable,
+            builders,
+            capabilities: DockerCapabilities {
+                api_version: meta.api_version,
+                buildx_limits: list("meta", "", "buildx_limit"),
+            },
+            captured_at: meta.captured_at,
+        },
+        meta.cached_at,
+    ))
+}
+
 fn load_from_file(path: &Path) -> DockerFacts {
-    let text = match std::fs::read_to_string(path) {
+    // A facts file the caller named explicitly (`--docker-facts`, tests).
+    let text = match crate::fs_gate::read::read_owned_string(path) {
         Ok(t) => t,
         Err(e) => {
             return DockerFacts {
@@ -730,6 +1332,8 @@ fn load_live() -> DockerFacts {
             }
         };
     let mut facts = parse_value(&df_value);
+    facts.captured_at = Some(crate::entities::now());
+    load_buildkit_detail(&mut facts);
 
     let ids: Vec<&str> = facts
         .images
@@ -883,5 +1487,104 @@ mod tests {
         });
         let facts = parse_value(&value);
         assert_eq!(facts.images[0].containers[0].finished_at, None);
+    }
+
+    /// A facts file in the documented shapes: `docker system df -v
+    /// --format json`'s `BuildCache`, `docker version --format json`,
+    /// `docker buildx ls --format json`, and `docker buildx du --verbose`
+    /// text per builder. Synthetic ids and descriptions.
+    const BUILDKIT_FACTS: &str = r#"{
+      "BuildCache": [
+        {"ID": "r1", "CacheType": "regular", "Description": "[build 2/5] RUN apt-get update",
+         "Size": "120MB", "CreatedAt": "2024-01-15T10:32:00Z", "LastUsedAt": "2024-02-01T08:00:00Z",
+         "UsageCount": 4, "InUse": false, "Shared": true},
+        {"ID": "r2", "CacheType": "exec.cachemount", "Description": "mount / from exec /bin/sh -c pip install",
+         "Size": "300MB", "Parent": "r1", "InUse": true, "Shared": false}
+      ],
+      "Version": {"Client": {"ApiVersion": "1.45"}, "Server": {"ApiVersion": "1.45", "Version": "26.1.0"}},
+      "Builders": [
+        {"Name": "default", "Driver": "docker", "Nodes": [{"Status": "running"}]},
+        {"Name": "ci", "Driver": "docker-container", "Nodes": [{"Status": "running"}]},
+        {"Name": "cold", "Driver": "docker-container", "Nodes": [{"Status": "inactive"}]}
+      ],
+      "BuildxDu": [
+        {"Builder": "ci", "Verbose": "ID:\t\tc1\nParents:\tc0\nCreated at:\t2024-03-01 09:00:00 +0000 UTC\nMutable:\tfalse\nReclaimable:\ttrue\nShared:\t\tfalse\nSize:\t\t50MB\nDescription:\t[stage-1 1/3] COPY . .\nUsage count:\t1\nLast used:\t2024-03-01 09:05:00 +0000 UTC\nType:\t\tregular\n\nID:\t\tc0\nCreated at:\t2024-03-01 08:59:00 +0000 UTC\nReclaimable:\ttrue\nShared:\t\ttrue\nSize:\t\t10MB\nType:\t\tsource.local\n\nShared:\t\t10MB\nPrivate:\t50MB\nReclaimable:\t60MB\nTotal:\t\t60MB\n"},
+        {"Builder": "cold", "Unavailable": "timed out"}
+      ]
+    }"#;
+
+    #[test]
+    fn buildkit_records_keep_every_daemon_field_per_builder() {
+        let v: serde_json::Value = serde_json::from_str(BUILDKIT_FACTS).unwrap();
+        let f = parse_value(&v);
+        assert_eq!(f.capabilities.api_version.as_deref(), Some("1.45"));
+        assert!(!f.capabilities.build_cache_api_unsupported());
+        assert_eq!(f.builder_names(), vec!["default", "ci", "cold"]);
+        let r2 = f.build_cache.iter().find(|r| r.id == "r2").unwrap();
+        assert_eq!(
+            r2.parents,
+            vec!["r1".to_string()],
+            "the deprecated `Parent` is read"
+        );
+        assert!(r2.in_use);
+        assert_eq!(r2.cache_type.as_deref(), Some("exec.cachemount"));
+        let ci = f.records_of("ci");
+        assert_eq!(
+            ci.len(),
+            2,
+            "the verbose text's summary block is not a record"
+        );
+        let c1 = ci.iter().find(|r| r.id == "c1").unwrap();
+        assert_eq!(c1.bytes, 50_000_000);
+        assert_eq!(c1.reclaimable, Some(true));
+        assert_eq!(c1.parents, vec!["c0".to_string()]);
+        assert_eq!(
+            c1.last_used.as_deref(),
+            Some("2024-03-01 09:05:00 +0000 UTC")
+        );
+        assert!(f.records_of("cold").is_empty());
+        assert!(
+            f.capabilities
+                .buildx_limits
+                .iter()
+                .any(|l| l.contains("`cold`") && l.contains("timed out")),
+            "a builder that did not answer is a stated limit: {:?}",
+            f.capabilities.buildx_limits
+        );
+        assert_eq!(f.records_of("default").len(), 2);
+    }
+
+    #[test]
+    fn an_old_daemon_api_is_stated_and_an_unknown_one_is_not_assumed_old() {
+        let old = DockerCapabilities {
+            api_version: Some("1.38".into()),
+            ..Default::default()
+        };
+        assert!(old.build_cache_api_unsupported());
+        assert!(!DockerCapabilities::default().build_cache_api_unsupported());
+    }
+
+    #[test]
+    fn only_allow_listed_observation_queries_may_run() {
+        // The allow-list itself lives in `fs_gate::spawn::shapes` now (its
+        // own tests assert the shapes this module needs are accepted); here
+        // it is enough to prove a mutating command is refused before any
+        // process is spawned, through both entry points this module uses.
+        let (r, counted) = crate::work_counters::measured(|| {
+            run_docker_json(&["builder", "prune", "-f"], DOCKER_TIMEOUT)
+        });
+        assert!(r.is_err());
+        assert_eq!(
+            counted.subprocess_spawns, 0,
+            "refused before any process is spawned"
+        );
+        let (r, counted) = crate::work_counters::measured(|| {
+            run_docker_text(&["buildx", "prune", "--filter", "id=x"], DOCKER_TIMEOUT)
+        });
+        assert!(r.is_err());
+        assert_eq!(
+            counted.subprocess_spawns, 0,
+            "refused before any process is spawned"
+        );
     }
 }

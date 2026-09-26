@@ -9,8 +9,7 @@ async-trait.workspace = true
 futures-util.workspace = true
 anyhow.workspace = true
 libc = "0.2"
-toml = "0.8"
-zstd = "0.13"
+toml.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true
@@ -20,8 +19,44 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
+roxmltree = "0.21.1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# Test-only. `walkdir` is the generic directory walker swamp's own is
+# measured against (#80): one comparison test proves a generic walk
+# cannot reproduce swamp's accounting without swamp's semantics, and one
+# ignored benchmark produces the numbers in docs/platform.md. A
+# dev-dependency ships in nothing -- `cargo tree -e normal` excludes it,
+# which is what scripts/platform-isolation.sh checks.
+[dev-dependencies]
+walkdir = "2"
+swamp-core = { path = ".", features = ["testing"] }
+
+# Linux-only and test-only: the independent freedesktop Trash reader.
+# swamp's own backend (`fs_gate::destroy`) does the move -- `trash::delete`
+# copies across devices and does not say where an item went (see
+# docs/platform.md) -- and these tests list and restore swamp's items
+# through the crate, which is the evidence that a file manager following
+# the same specification can find and restore them. `default-features =
+# false` still keeps `chrono`, which its Linux listing needs.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+trash = { version = "=5.2.9", default-features = false, features = ["chrono"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
 fsevent-sys = "5.2.0"
+
+# Test-fixture API (`fs_events::testing`, the `&str`-actor spellings of
+# `actions::approve`/`add_standing_grant`, `protect_add`/`protect_list`,
+# `recheck::capture`). Enabled only through `[dev-dependencies]` below and
+# in the other crates' dev-dependencies, so no production build graph
+# contains it: the gate audit rejects a `[dependencies]` entry that
+# enables it, and `scripts/check.sh` and the release workflow check the
+# shipped graph (`cargo tree -p swamp -e normal,build,features`). Test
+# builds -- debug or `--release` -- have it on by design.
+[features]
+testing = []
+
+[lints]
+workspace = true

@@ -1,0 +1,301 @@
+name: CI
+
+# Native, non-release CI on both supported targets. Cross-compilation is
+# not acceptance (#87): every job builds and RUNS the workspace tests on
+# the operating system it claims to support.
+#
+#   linux-x86_64 -> ubuntu-24.04, pinned deliberately. Ubuntu 24.04 is the
+#                   selected Linux validation baseline (#77/#79); a newer
+#                   hosted image would test an environment nobody targets.
+#   macos-arm64  -> the org's Apple-silicon builder when
+#                   LOCAL_MACOS_CI_ENABLED is set, otherwise GitHub's hosted
+#                   macOS runner. Same runner selection as release.yml, so a
+#                   green CI run and a green release run mean the same thing.
+#
+# Packaging is exercised here too, on every push, with the same scripts
+# release.yml uses (#88): `linux-x86_64-package` builds the release
+# profile, packages the archives, smoke-tests the *extracted* archive and
+# runs the Linux validation (#89) against it; `linux-newer-smoke` runs
+# that 24.04-built archive on the newest hosted Ubuntu. Nothing is
+# published from this workflow.
+#
+# This is the fast tier only (target: under ~10 minutes per OS on a warm
+# cache). The heavy harnesses (compile-fail, mutation sweep, cost test --
+# `scripts/check-full.sh`) live in `check-full.yml`, which never runs on
+# an ordinary push: only `gh workflow run check-full.yml`, a PR labelled
+# `full-check`, or a `v*` tag push (`release.yml`, gating publish). Every
+# push still gets this workflow (fast tier + the Linux archive smoke) so
+# ordinary iteration stays quick without losing the deep coverage
+# entirely -- that just moves off the push path.
+
+on:
+  push:
+    branches: ['main', 'integration/**', 'stack/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A release default of `target-cpu=native` would make CI results
+  # unusable as evidence for anything but the runner it ran on. The
+  # documented Linux baseline is a generic x86_64 CPU (docs/platform.md).
+  RUSTFLAGS: ""
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64 (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # Floating stable (2026-09-24): a new stable release adding a
+      # lint that trips -D warnings is fixed with lint fixes and
+      # regenerated trybuild snapshots, not a version freeze.
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux-x86_64
+
+      - name: Environment
+        run: |
+          set -euo pipefail
+          uname -a
+          rustc -vV
+          ldd --version | head -1
+          # Recorded, not required: the Linux jobs must not assume any of
+          # these exist, and several tests skip explicitly when they do not.
+          for t in lsof docker gh du; do
+            printf '%s: %s\n' "$t" "$(command -v "$t" || echo '(absent)')"
+          done
+          # #86: which of this user's processes procfs will not show their
+          # open files to this user, and why (credentials, capabilities,
+          # cgroup) -- the evidence the occupancy scope is decided on.
+          me="$(id -u)"
+          for d in /proc/[0-9]*; do
+            pid="${d#/proc/}"
+            uid="$(awk '/^Uid:/{print $3}' "$d/status" 2>/dev/null || true)"
+            [ "$uid" = "$me" ] || continue
+            if ! readlink "$d/cwd" >/dev/null 2>&1; then
+              echo "opaque same-user process $pid ($(cat "$d/comm" 2>/dev/null)):"
+              grep -E '^(Uid|Gid|CapPrm|CapEff|CapAmb|NoNewPrivs|Seccomp):' "$d/status" 2>/dev/null | sed 's/^/    /'
+              sed 's/^/    cgroup: /' "$d/cgroup" 2>/dev/null || true
+            fi
+          done
+          echo "user manager: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-unset}; $(systemctl --user show-environment >/dev/null 2>&1 && echo reachable || echo unreachable)"
+          echo "loginctl linger: $(loginctl show-user "$me" --property=Linger --value 2>/dev/null || echo unknown)"
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Ordered cheapest-and-most-specific first. The workspace suite
+      # takes minutes and one failing test hides every later step, so the
+      # platform-isolation evidence this workflow exists for runs before
+      # it rather than behind it.
+      - name: Platform isolation — dependency graph
+        run: ./scripts/platform-isolation.sh deps x86_64-unknown-linux-gnu
+
+      - name: Platform isolation — linkage
+        run: |
+          set -euo pipefail
+          cargo build --locked -p swamp
+          ./scripts/platform-isolation.sh linkage target/debug/swamp
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Source audit
+        run: cargo run --locked -p swamp-source-audit
+
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+
+      # #80, as its own step rather than buried in the suite: allocated
+      # bytes, hardlink dedup, sparse files, symlink loops and volume
+      # identity, checked against the filesystem and against `du` on the
+      # filesystem this runner actually mounts -- ext4 (or whatever the runner mounts).
+      # The benchmark prints; it gates nothing, because wall time on a
+      # shared runner is not a merge criterion. Its numbers are what
+      # docs/platform.md quotes.
+      - name: Traversal, accounting and volume identity
+        run: |
+          set -euo pipefail
+          cargo test --locked -p swamp-core --test traversal_accounting_and_volume_identity -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --ignored --nocapture
+
+      # `--no-fail-fast`: bringing a second platform up, the useful
+      # signal is every test that fails, not the first binary that does.
+      - name: Test (native Linux)
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Repo gate (scripts/check.sh)
+        run: ./scripts/check.sh
+
+  linux-x86_64-package:
+    name: Linux x86_64 release archive, smoke and validation (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux-x86_64-release
+
+      - name: Build (release, generic x86-64)
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p swamp
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          v="$(./scripts/release-version.sh | cut -d= -f2)"
+          ./scripts/package-release.sh x86_64-unknown-linux-gnu "$v" target/x86_64-unknown-linux-gnu/release/swamp dist
+
+      - name: Smoke, linkage and minimum glibc (extracted archive)
+        run: |
+          set -euo pipefail
+          v="$(./scripts/release-version.sh | cut -d= -f2)"
+          ./scripts/release-smoke.sh "dist/swamp-${v}-x86_64-unknown-linux-gnu.tar.gz" "$v" dist/report
+          ./scripts/platform-isolation.sh linkage target/x86_64-unknown-linux-gnu/release/swamp
+
+      - name: Linux validation (#89)
+        run: |
+          set -euo pipefail
+          v="$(./scripts/release-version.sh | cut -d= -f2)"
+          ./scripts/linux-validation.sh "dist/swamp-${v}-x86_64-unknown-linux-gnu.tar.gz" "$v" dist/report
+
+      - name: Upload archive and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swamp-x86_64-unknown-linux-gnu-ci
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/report/*
+
+  linux-newer-smoke:
+    name: Linux x86_64 archive on the newest hosted Ubuntu (test-only)
+    needs: linux-x86_64-package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Which Ubuntu this is
+        run: |
+          set -euo pipefail
+          . /etc/os-release && echo "$PRETTY_NAME"
+          ldd --version | head -1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: swamp-x86_64-unknown-linux-gnu-ci
+          path: dist
+
+      - name: Smoke and validation of the 24.04-built archive here
+        run: |
+          set -euo pipefail
+          v="$(./scripts/release-version.sh | cut -d= -f2)"
+          ./scripts/release-smoke.sh "dist/swamp-${v}-x86_64-unknown-linux-gnu.tar.gz" "$v" newer
+          ./scripts/linux-validation.sh "dist/swamp-${v}-x86_64-unknown-linux-gnu.tar.gz" "$v" newer
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swamp-linux-newer-validation
+          path: newer/*
+
+  macos-arm64:
+    name: macOS arm64
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+
+      # The fleet runner keeps target/ and ~/.cargo on its own disk, so
+      # routing either through GitHub's cache backend there is waste (see
+      # release.yml). Cache only on the ephemeral hosted fallback.
+      - name: Cargo cache
+        if: vars.LOCAL_MACOS_CI_ENABLED != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-macos-arm64
+
+      - name: Environment
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          rustc -vV
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Ordered cheapest-and-most-specific first. The workspace suite
+      # takes minutes and one failing test hides every later step, so the
+      # platform-isolation evidence this workflow exists for runs before
+      # it rather than behind it.
+      - name: Platform isolation — dependency graph
+        run: ./scripts/platform-isolation.sh deps aarch64-apple-darwin
+
+      - name: Platform isolation — linkage
+        run: |
+          set -euo pipefail
+          cargo build --locked -p swamp
+          ./scripts/platform-isolation.sh linkage target/debug/swamp
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Source audit
+        run: cargo run --locked -p swamp-source-audit
+
+      - name: Build tests
+        run: cargo test --workspace --locked --no-run
+
+      # #80, as its own step rather than buried in the suite: allocated
+      # bytes, hardlink dedup, sparse files, symlink loops and volume
+      # identity, checked against the filesystem and against `du` on the
+      # filesystem this runner actually mounts -- APFS.
+      # The benchmark prints; it gates nothing, because wall time on a
+      # shared runner is not a merge criterion. Its numbers are what
+      # docs/platform.md quotes.
+      - name: Traversal, accounting and volume identity
+        run: |
+          set -euo pipefail
+          cargo test --locked -p swamp-core --test traversal_accounting_and_volume_identity -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --nocapture
+          cargo test --locked -p swamp-core --test walk_library_comparison -- --ignored --nocapture
+
+      # `--no-fail-fast`: bringing a second platform up, the useful
+      # signal is every test that fails, not the first binary that does.
+      - name: Test (native macOS)
+        run: cargo test --workspace --locked --no-fail-fast
+
+      - name: Repo gate (scripts/check.sh)
+        run: ./scripts/check.sh
+

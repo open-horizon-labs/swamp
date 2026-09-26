@@ -1,21 +1,37 @@
 name: Release
 
 # Tag pushes are the single release trigger (`git tag vX.Y.Z && git push --tags`,
-# or `gh release create`, which pushes the tag). One job: an optimized
-# aarch64-apple-darwin build of the CLI/TUI binary and the MCP server,
-# packaged as a tarball with a checksum, attached to the GitHub release.
+# or `gh release create`, which pushes the tag). Two build jobs, one per
+# supported target, each producing its own archives and checksums; a
+# test-only job on a newer Ubuntu; two full-tier jobs (the same
+# `scripts/check-full.sh` `check-full.yml` runs for a PR labelled
+# `full-check`, one per OS); and one publishing job that runs only after
+# every one of those succeeds, so a release is never published half-built,
+# with one target's assets overwriting another's (#88), or with the full
+# tier (compile-fail cases, mutation sweep, cost test) not yet checked on
+# this exact tagged commit.
 #
-# Runner: the org's local Apple-silicon builder when LOCAL_MACOS_CI_ENABLED
-# is set (same toggle unified-hifi-control uses), otherwise GitHub's hosted
-# macOS runner. sccache fronts rustc either way.
+#   macos-arm64              aarch64-apple-darwin, release profile, tests, package, smoke
+#   linux-x86_64             x86_64-unknown-linux-gnu on Ubuntu 24.04 (the baseline),
+#                            generic x86-64 CPU, tests, package, smoke, linkage + glibc
+#   linux-x86_64-newer       test-only: the 24.04-built archive smoke-tested on the
+#                            newest hosted Ubuntu, and the workspace tests run there
+#   linux-x86_64-check-full,
+#   macos-arm64-check-full   scripts/check-full.sh, one per OS -- independent of the
+#                            build jobs (their own toolchain/cache), required by
+#                            `release` alongside them
+#   release                  needs all five; publishes every archive + checksum
 #
-# The fleet runner is a persistent VM: target/ and ~/.cargo already survive
-# between jobs on its own disk (see docs/artium-enrollment.md upstream in
-# homelab-infra), so round-tripping either cache through GitHub's actions-cache
-# backend there is pure waste, and a large enough one to stall the upload
-# outright. Both caches route through GitHub's backend only on the ephemeral
-# macos-latest fallback, where that round trip is the only way to keep
-# anything between jobs at all.
+# Each archive holds the CLI/TUI binary, README.md and the agent skill
+# (skills/swamp/). There is no separate MCP server binary (removed #104):
+# the CLI's --json output plus the packaged skill is the agent interface,
+# and no MCP artifact is built for either target.
+#
+# macOS runner: the org's local Apple-silicon builder when
+# LOCAL_MACOS_CI_ENABLED is set, otherwise GitHub's hosted macOS runner.
+# The fleet runner is a persistent VM whose target/ and ~/.cargo survive
+# between jobs on its own disk, so neither is routed through GitHub's
+# cache there. Caches are keyed per target and profile, never shared.
 
 on:
   push:
@@ -29,6 +45,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+  # Never target-cpu=native: a release binary must run on any machine of
+  # its target, not only on the runner that built it (docs/platform.md).
+  RUSTFLAGS: ""
+
 jobs:
   macos-arm64:
     name: macOS arm64
@@ -36,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rust toolchain
+      - name: Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -52,24 +74,29 @@ jobs:
 
       - name: Version
         id: v
+        run: ./scripts/release-version.sh >> "$GITHUB_OUTPUT"
+
+      # swamp-core's `testing` feature is test-fixture API. Only
+      # `[dev-dependencies]` enable it, and resolver 2 never unifies those
+      # into this build; refuse a graph that says otherwise before
+      # building what ships (the test step below has it on by design).
+      - name: Release graph has no test-fixture API
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if cargo tree -p swamp -e normal,build,features --prefix none --locked --target aarch64-apple-darwin |
+            grep -q 'swamp-core feature "testing"'; then
+            echo 'the swamp binary would enable swamp-core/testing' >&2
+            exit 1
           fi
 
       - name: Build (release, aarch64-apple-darwin)
         env:
           SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
           RUSTC_WRAPPER: sccache
-        run: cargo build --release --locked --target aarch64-apple-darwin -p swamp -p swamp-mcp
+        run: cargo build --release --locked --target aarch64-apple-darwin -p swamp
 
-      # Same profile and target as the build: the library and binary
-      # crates are already compiled above, so only the test harnesses are
+      # Same profile and target as the build: only the test harnesses are
       # new work, and the tests exercise the optimized code that ships.
-      # A plain `cargo test` here recompiled the whole workspace in debug.
       - name: Test (release, aarch64-apple-darwin)
         env:
           SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
@@ -77,44 +104,213 @@ jobs:
         run: cargo test --workspace --locked --release --target aarch64-apple-darwin
 
       - name: Package
-        id: pkg
-        run: |
-          set -euo pipefail
-          v="${{ steps.v.outputs.version }}"
-          out="swamp-${v}-aarch64-apple-darwin"
-          latest_out="swamp-aarch64-apple-darwin"
-          mkdir -p "dist/${out}"
-          cp target/aarch64-apple-darwin/release/swamp target/aarch64-apple-darwin/release/swamp-mcp "dist/${out}/"
-          cp README.md "dist/${out}/"
-          tar -C dist -czf "dist/${out}.tar.gz" "${out}"
-          (cd dist && shasum -a 256 "${out}.tar.gz" > "${out}.tar.gz.sha256")
-          mkdir -p "dist/${latest_out}"
-          cp target/aarch64-apple-darwin/release/swamp target/aarch64-apple-darwin/release/swamp-mcp "dist/${latest_out}/"
-          cp README.md "dist/${latest_out}/"
-          tar -C dist -czf "dist/${latest_out}.tar.gz" "${latest_out}"
-          (cd dist && shasum -a 256 "${latest_out}.tar.gz" > "${latest_out}.tar.gz.sha256")
-          echo "tarball=dist/${out}.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "sha=dist/${out}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
-          ls -l dist
+        run: ./scripts/package-release.sh aarch64-apple-darwin "${{ steps.v.outputs.version }}" target/aarch64-apple-darwin/release/swamp dist
 
-      - name: Smoke
+      - name: Smoke (the extracted archive, not target/)
         run: |
           set -euo pipefail
-          ./target/aarch64-apple-darwin/release/swamp --help | head -3
-          # The binary must report the version being released.
-          test "$(./target/aarch64-apple-darwin/release/swamp --version)" = "swamp ${{ steps.v.outputs.version }}"
-          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | ./target/aarch64-apple-darwin/release/swamp-mcp | grep -q '"report"'
+          ./scripts/release-smoke.sh "dist/swamp-${{ steps.v.outputs.version }}-aarch64-apple-darwin.tar.gz" "${{ steps.v.outputs.version }}" dist/smoke
+          ./scripts/release-smoke.sh dist/swamp-aarch64-apple-darwin.tar.gz "${{ steps.v.outputs.version }}"
+          otool -L target/aarch64-apple-darwin/release/swamp
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: swamp-macos-arm64
-          path: dist/*
+          name: swamp-aarch64-apple-darwin
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/smoke/*
+
+  linux-x86_64:
+    name: Linux x86_64 (Ubuntu 24.04)
+    # The selected validation baseline. The binary built here links the
+    # glibc of this image; the smoke step records the newest glibc symbol
+    # version it requires, which is the documented minimum.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-x86_64
+
+      - name: Version
+        id: v
+        run: ./scripts/release-version.sh >> "$GITHUB_OUTPUT"
+
+      # swamp-core's `testing` feature is test-fixture API. Only
+      # `[dev-dependencies]` enable it, and resolver 2 never unifies those
+      # into this build; refuse a graph that says otherwise before
+      # building what ships (the test step below has it on by design).
+      - name: Release graph has no test-fixture API
+        run: |
+          set -euo pipefail
+          if cargo tree -p swamp -e normal,build,features --prefix none --locked --target x86_64-unknown-linux-gnu |
+            grep -q 'swamp-core feature "testing"'; then
+            echo 'the swamp binary would enable swamp-core/testing' >&2
+            exit 1
+          fi
+
+      - name: Build (release, x86_64-unknown-linux-gnu, generic x86-64)
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p swamp
+
+      - name: Test (release, x86_64-unknown-linux-gnu)
+        run: cargo test --workspace --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: ./scripts/package-release.sh x86_64-unknown-linux-gnu "${{ steps.v.outputs.version }}" target/x86_64-unknown-linux-gnu/release/swamp dist
+
+      - name: Smoke, linkage and minimum glibc (the extracted archive)
+        run: |
+          set -euo pipefail
+          ./scripts/release-smoke.sh "dist/swamp-${{ steps.v.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" "${{ steps.v.outputs.version }}" dist/smoke
+          ./scripts/release-smoke.sh dist/swamp-x86_64-unknown-linux-gnu.tar.gz "${{ steps.v.outputs.version }}"
+          ./scripts/platform-isolation.sh linkage target/x86_64-unknown-linux-gnu/release/swamp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swamp-x86_64-unknown-linux-gnu
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/smoke/*
+
+  linux-x86_64-newer:
+    name: Linux x86_64 (newest hosted Ubuntu, test-only)
+    needs: linux-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Which Ubuntu this is
+        run: |
+          set -euo pipefail
+          . /etc/os-release && echo "$PRETTY_NAME"
+          ldd --version | head -1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: swamp-x86_64-unknown-linux-gnu
+          path: dist
+
+      # The archive built on the 24.04 baseline must run unchanged on a
+      # newer release: that is the forward-compatibility claim the docs
+      # make, and the only one.
+      - name: Smoke the 24.04-built archive here
+        run: |
+          set -euo pipefail
+          v="$(./scripts/release-version.sh | cut -d= -f2)"
+          ./scripts/release-smoke.sh "dist/swamp-${v}-x86_64-unknown-linux-gnu.tar.gz" "$v" dist/smoke-newer
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-x86_64-newer
+
+      - name: Test (native, newest hosted Ubuntu)
+        run: cargo test --workspace --locked --release
+
+      - name: Upload smoke report
+        uses: actions/upload-artifact@v4
+        with:
+          name: swamp-linux-newer-smoke
+          path: dist/smoke-newer/*
+
+  linux-x86_64-check-full:
+    name: Linux x86_64 (check-full)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # Test fixtures make git commits; never let them reach a signing
+      # agent on the runner.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: commit.gpgsign
+      GIT_CONFIG_VALUE_0: "false"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-full-linux-x86_64
+
+      - name: scripts/check-full.sh
+        run: scripts/check-full.sh
+
+  macos-arm64-check-full:
+    name: macOS arm64 (check-full)
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
+    timeout-minutes: 90
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: commit.gpgsign
+      GIT_CONFIG_VALUE_0: "false"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        if: vars.LOCAL_MACOS_CI_ENABLED != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-full-macos-arm64
+
+      - name: scripts/check-full.sh
+        run: scripts/check-full.sh
+
+  release:
+    name: Publish
+    needs:
+      [
+        macos-arm64,
+        linux-x86_64,
+        linux-x86_64-newer,
+        linux-x86_64-check-full,
+        macos-arm64-check-full,
+      ]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
+          find artifacts -name '*.sha256' -exec cp {} dist/ \;
+          (cd dist && ls -l && for f in *.sha256; do sha256sum -c "$f"; done)
+          # One archive name per target and version: two targets can
+          # never write the same asset.
+          test "$(ls dist/*.tar.gz | wc -l)" -eq 4
 
       # Release notes are written by a human in CHANGELOG.md under
-      # `## vX.Y.Z`; the release fails if the tag has no entry. Generated
-      # notes are a commit list and have already misdescribed this project
-      # once (they listed the abandoned first attempt's PRs).
+      # `## vX.Y.Z`; the release fails if the tag has no entry.
       - name: Release notes from CHANGELOG.md
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -136,7 +332,18 @@ jobs:
             echo 'brew install open-horizon-labs/tap/swamp'
             echo 'swamp --version'
             echo '```'
-            echo 'Update with `brew upgrade swamp`. The tap checks for new releases every 15 minutes; GitHub may delay scheduled updates. Versioned archives are also attached below.'
+            echo 'Update with `brew upgrade swamp`.'
+            echo
+            echo "### Install (Linux x86_64, glibc; built and tested on Ubuntu 24.04)"
+            echo '```bash'
+            echo 'curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz'
+            echo 'curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256'
+            echo 'sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256'
+            echo 'tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz'
+            echo 'mkdir -p ~/.local/bin'
+            echo 'install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/'
+            echo '```'
+            echo 'Versioned archives for both targets are also attached below.'
           } >> release-notes.md
 
       - name: Release
@@ -144,6 +351,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ steps.pkg.outputs.tarball }}
-            ${{ steps.pkg.outputs.sha }}
+            dist/*.tar.gz
+            dist/*.sha256
           body_path: release-notes.md

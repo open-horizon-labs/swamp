@@ -2,7 +2,7 @@
 //! video selection, yellow `✗` for marked rows, no other color. See
 //! DESIGN.md.
 
-use crate::app::{App, ViewKind};
+use crate::app::App;
 use crate::model::{
     diverging_bar, human_bytes, human_signed_bytes, is_noise, max_abs_growth, net_change,
     pad_display, spark_deltas, truncate_middle,
@@ -90,7 +90,10 @@ fn human_duration(secs: u64) -> String {
 }
 
 fn header_line(app: &App, width: usize) -> String {
-    let stale = app
+    let stale = app.report.unowned.iter().any(|u| {
+        u.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }) || app
         .report
         .projects
         .iter()
@@ -134,7 +137,11 @@ fn header_line(app: &App, width: usize) -> String {
         format!(
             "observed {}{}",
             app.observed_label,
-            if app.watch.is_some() { " · live" } else { "" }
+            if !app.watches.is_empty() {
+                " · live"
+            } else {
+                ""
+            }
         )
     };
     let since = since_label(app)
@@ -143,16 +150,40 @@ fn header_line(app: &App, width: usize) -> String {
     // Clauses in priority order; the renderer drops trailing clauses that
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
-        if stale {
-            format!("unique totals stale · {}", app.root.display())
+        if stale
+            || app
+                .report
+                .reconciliation
+                .unique_estimate
+                .as_ref()
+                .is_some_and(|u| u.needs_reconciliation)
+        {
+            format!("unique totals not recomputed · {}", app.root.display())
         } else {
             app.root.display().to_string()
         },
         format!("{obs}{since}"),
+        app.report
+            .reconciliation
+            .unique_estimate
+            .as_ref()
+            .map(|u| {
+                format!(
+                    "{} unique{}",
+                    human_bytes(u.bytes),
+                    if u.needs_reconciliation {
+                        " (needs reconciliation)"
+                    } else {
+                        " (reconciled)"
+                    }
+                )
+            })
+            .unwrap_or_default(),
         format!("{projects} projects"),
         format!("{} attributed", human_bytes(attributed)),
         format!("{} unowned", human_bytes(unowned)),
         format!("docker {} unowned", human_bytes(docker_unowned)),
+        app.scope_note.clone().unwrap_or_default(),
     ];
     fit_clauses(&clauses, width)
 }
@@ -296,6 +327,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(p) = &app.picker {
         draw_picker(frame, app, p, size);
     }
+    if let Some(lines) = &app.cargo_inspection {
+        let popup = Rect {
+            x: size.x + 1,
+            y: size.y + 1,
+            width: size.width.saturating_sub(2),
+            height: size.height.saturating_sub(2),
+        };
+        frame.render_widget(Clear, popup);
+        let visible: Vec<Line> = lines
+            .iter()
+            .skip(app.cargo_inspection_scroll as usize)
+            .take(popup.height.saturating_sub(2) as usize)
+            .map(|s| Line::from(s.as_str()))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(
+                " Cargo dependency inspection · ↑↓ scroll · Esc close · no cleanup action ",
+            )),
+            popup,
+        );
+    }
 }
 
 fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
@@ -432,6 +484,27 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
     }
+}
+
+/// Orders a row's decision evidence for the detail area (#60): activity
+/// (with its timestamp meaning/source/freshness), consumers, current-
+/// use, recovery, reclaimability -- the order named in the acceptance
+/// criteria, so a terminal too short to show every line clips the tail
+/// (the least decision-relevant facts), never the front.
+fn ordered_evidence_lines(evidence: &[swamp_core::evidence::Evidence]) -> Vec<String> {
+    use swamp_core::evidence::FactKind;
+    fn priority(k: FactKind) -> u8 {
+        match k {
+            FactKind::Activity => 0,
+            FactKind::Consumer => 1,
+            FactKind::CurrentUse => 2,
+            FactKind::Recovery => 3,
+            FactKind::Reclaimability => 4,
+        }
+    }
+    let mut sorted: Vec<swamp_core::evidence::Evidence> = evidence.to_vec();
+    sorted.sort_by_key(|e| priority(e.kind));
+    swamp_core::render::render_evidence_lines(&sorted)
 }
 
 fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
@@ -645,7 +718,43 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(line);
     }
     // Keep the selection visible even in projects with hundreds of build groups.
-    let detail_height = (if cleanup_view { 3 } else { 2 }).min(area.height.saturating_sub(2));
+    let selected_evidence_lines: Vec<String> = rows
+        .get(app.selected)
+        .map(|r| {
+            let path = r
+                .unit
+                .as_ref()
+                .map(|u| std::path::Path::new(&u.0))
+                .or_else(|| r.worktree.as_ref().map(|w| w.path.as_path()));
+            let mut lines = if let Some(path) = path {
+                swamp_core::render::render_sharing_lines(
+                    app.report.reconciliation.unique_estimate.as_ref(),
+                    Some(path),
+                )
+            } else {
+                Vec::new()
+            };
+            lines.extend(ordered_evidence_lines(&r.evidence));
+            lines
+        })
+        .unwrap_or_default();
+    let base_detail = if cleanup_view { 3 } else { 2 };
+    // Each evidence line can itself wrap to several physical rows at a
+    // narrow width (`Wrap { trim: true }` below), so sizing by logical
+    // fact count alone would silently clip real content -- estimate
+    // wrapped rows instead. Capped at half the body height: a unit with
+    // many facts must not push the row table itself off screen.
+    let content_width = (area.width as usize).max(1);
+    let wrapped_rows =
+        |s: &str| -> u16 { (s.chars().count().max(1)).div_ceil(content_width) as u16 };
+    let evidence_rows: u16 = selected_evidence_lines
+        .iter()
+        .take(6)
+        .map(|l| wrapped_rows(l))
+        .sum();
+    let detail_height = (base_detail + evidence_rows)
+        .min(area.height.saturating_sub(2))
+        .min((area.height / 2).max(base_detail));
     let table_height = area.height.saturating_sub(detail_height);
     let header_count = if cleanup_view { 2 } else { 1 };
     let visible = table_height.saturating_sub(header_count) as usize;
@@ -748,8 +857,21 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     if let Some(row) = rows.get(app.selected) {
+        // #60: the selected row's own decision-evidence lines (activity,
+        // consumers, current-use, recovery, reclaimability), below the
+        // existing git-status signal line. Dimmed so the signal line
+        // (the previously-existing content) stays visually primary.
+        let mut detail_lines: Vec<Line> = Vec::new();
+        if !row.signals.is_empty() {
+            detail_lines.push(Line::raw(row.signals.join(" · ")));
+        }
+        detail_lines.extend(
+            selected_evidence_lines
+                .iter()
+                .map(|l| Line::styled(l.clone(), Style::default().add_modifier(Modifier::DIM))),
+        );
         frame.render_widget(
-            Paragraph::new(row.signals.join(" · ")).wrap(ratatui::widgets::Wrap { trim: true }),
+            Paragraph::new(detail_lines).wrap(ratatui::widgets::Wrap { trim: true }),
             Rect {
                 y: area.y + table_height,
                 height: detail_height,
@@ -761,7 +883,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let w = area.width.min(90);
-    let h = area.height.min(30);
+    let h = area.height.min(48);
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let popup = Rect {
@@ -771,7 +893,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         height: h,
     };
     frame.render_widget(Clear, popup);
-    let text = vec![
+    let mut text = vec![
         Line::from("Keys"),
         Line::from("  ↑↓        move selection"),
         Line::from("  →/←       in / out: open or expand · collapse or go back"),
@@ -788,14 +910,16 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
         Line::from(
-            "  v, 1-8    switch view (projects · tree · builds · deps · docker · kinds · unowned · types)",
+            "  v, 1-9    switch view (projects · tree · builds · deps · docker · kinds · unowned ·",
         ),
+        Line::from("            types · external); v also reaches agents (0 is clear filter)"),
         Line::from(
             "  g/s/n/t/a sort by growth / size / name / type / age · r reverses (remembered)",
         ),
         Line::from(
             "  k         keep executables: copy target/{release,debug} binaries, dist/*.whl to bin/ before trashing",
         ),
+        Line::from("  i         inspect selected Cargo profile dependencies (on demand)"),
         Line::from("  ?         toggle this help"),
         Line::from("  q         quit"),
         Line::from(""),
@@ -819,24 +943,33 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Line::from("        🔨 has build output   ⎇ N  N linked worktrees"),
     ];
+    // The activity-evidence inventory (#54): which domains this pass can
+    // establish a real activity fact for, and which it reports as
+    // unknown. `docs/usage.md` carries the same table, checked against
+    // the constant by `evidence_contract.rs`.
+    text.push(Line::from(""));
+    text.push(Line::from("Activity evidence this pass can establish"));
+    // Wrapped rather than clipped: the clipped tail is where each entry
+    // says what the evidence cannot establish.
+    let room = usize::from(w.saturating_sub(2)).max(20);
+    for (domain, evidence) in swamp_core::activity::ACTIVITY_EVIDENCE_INVENTORY {
+        let mut line = String::from(" ");
+        for word in format!("{domain}: {evidence}").split_whitespace() {
+            if line.chars().count() + 1 + word.chars().count() > room && !line.trim().is_empty() {
+                text.push(Line::from(std::mem::replace(
+                    &mut line,
+                    String::from("   "),
+                )));
+            }
+            line.push(' ');
+            line.push_str(word);
+        }
+        text.push(Line::from(line));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .title("help (? to close)");
     frame.render_widget(Paragraph::new(text).block(block), popup);
-}
-
-#[allow(dead_code)]
-pub fn view_index(v: ViewKind) -> usize {
-    match v {
-        ViewKind::Projects => 1,
-        ViewKind::Tree => 2,
-        ViewKind::Builds => 3,
-        ViewKind::Deps => 4,
-        ViewKind::Docker => 5,
-        ViewKind::Kinds => 6,
-        ViewKind::Unowned => 7,
-        ViewKind::Types => 8,
-    }
 }
 
 /// Chooses up to `n` signals worth a narrow column: anything that is not

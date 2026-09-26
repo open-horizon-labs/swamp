@@ -61,3 +61,39 @@ Updated existing epic #90 and tasks #91–#100/#102 rather than adding duplicate
 Start shared contract #91, prioritize #92/#93/#94, then remaining named adapters. Inspection may progress on completed adapters; full completion of #100/#90 requires the agreed matrix, not just the first three. #101 is planned cleanup implementation, not authorization to execute cleanup now. #102 provides independent validation. Split oversized grouped-tool issues while retaining each adapter and acceptance coverage.
 
 Primary evidence: https://code.claude.com/docs/en/settings ; https://github.com/openai/codex ; https://opencode.ai/docs/troubleshooting/ ; https://github.com/can1357/oh-my-pi/blob/main/docs/session.md and docs/settings.md. Verify supported installed versions and source formats during implementation. No private data is included in issues/fixtures. No application code, dependencies, services or real storage changed during planning.
+
+## Reconciliation, 2026-09-21
+
+#103/#104 landed: `crates/mcp` is removed. Where the #100 table entry and
+elsewhere in this session say "CLI/TUI/MCP", read that as "CLI (interactive
+and `--json`), TUI, and the `skills/swamp/` agent skill" -- no MCP server to
+build or expose this epic's adapters through. Every domain requirement above
+(project linkage, direct/derived relationships, unresolved/moved/deleted
+references, no basename-inferred ownership, no double-counting, no
+history-rewrite on relink) is unchanged; only the transport changed.
+
+## Reconciliation, 2026-09-25
+
+Codex linkage (#93) was not delivering: on the owner's machine all 3,450
+Codex session units were `unresolved`. Cause: the rollout's first
+`session_meta` record is longer than the adapter's 8 KiB read bound
+(current Codex writes `payload.base_instructions.text`, the project's
+instructions file, into that record -- 22 KB median, 48 KB max on a
+structural probe of the 100 most recent rollouts), and the parser
+required the whole line to parse. The `cwd` was at 220-334 bytes in
+every one of them. Fixed by bounded early extraction of exactly the
+supported `session_meta` `payload.cwd` (or `payload.meta.cwd`): the
+record is streamed one byte at a time and the read stops at the `cwd`'s
+closing quote, so nothing past it is fetched from the file (an earlier
+same-day cut read the 8 KiB prefix and parsed only the field out of it,
+which the owner correctly rejected -- the contract is about what is
+read); the 8 KiB ceiling is unchanged, and the >8 KiB canary test
+asserts the counted bytes end exactly at the closing quote. Corroboration candidates
+recorded, none adopted: `payload.git.{branch,commit_hash,
+repository_url}` (92/100 records, 18-48 KB in -- beyond the bound),
+`payload.forked_from_id` (9/100; a session id, not a project),
+`turn_context.cwd` per turn (9/100 within 64 KB; beyond the first
+line). Claude Code linkage gained folder-name inference the same day
+(`2026-09-25-agent-folder-inference.md`): 121 -> 2 unresolved, labelled
+`inferred`, re-derived every pass. Evidence in
+`.oh/sessions/2026-09-25-codex-early-cwd.md`.

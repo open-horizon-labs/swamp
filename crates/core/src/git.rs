@@ -10,9 +10,12 @@
 //! identity used to group worktrees into a project.
 
 use crate::entities::id_for;
+use crate::fs_gate::{
+    self as fs,
+    read::{BoundedCap, bounded_read},
+};
 use crate::report::WorktreeKind;
 use anyhow::{Context, Result};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Directories that are never descended into during discovery: `.git`
@@ -45,7 +48,7 @@ pub struct DiscoveredWorktree {
 /// common dir). Returns `None` if the file is missing, unreadable, or has
 /// no origin remote configured.
 fn read_origin_url(git_dir: &Path) -> Option<String> {
-    let content = fs::read_to_string(git_dir.join("config")).ok()?;
+    let content = small_text(&git_dir.join("config"), BoundedCap::MANIFEST)?;
     let mut in_origin_remote = false;
     for line in content.lines() {
         let trimmed = line.trim();
@@ -72,7 +75,7 @@ fn read_origin_url(git_dir: &Path) -> Option<String> {
 /// symlinks; stays on the device `root` resides on.
 pub fn discover(root: &Path) -> Result<Vec<DiscoveredWorktree>> {
     let mut out = Vec::new();
-    if !root.exists() {
+    if !fs::exists(root) {
         return Ok(out);
     }
     let root_dev = fs::symlink_metadata(root)
@@ -88,7 +91,7 @@ trait DevExt {
 }
 impl DevExt for fs::Metadata {
     fn dev_for_scan(&self) -> u64 {
-        use std::os::unix::fs::MetadataExt;
+        use crate::fs_gate::MetadataExt;
         self.dev()
     }
 }
@@ -184,7 +187,7 @@ pub(crate) fn classify_git_file(
 ) -> Option<DiscoveredWorktree> {
     let gitdir_path = resolve_gitdir(worktree_dir, git_file)?;
     let commondir_file = gitdir_path.join("commondir");
-    if let Ok(commondir_content) = fs::read_to_string(&commondir_file) {
+    if let Some(commondir_content) = small_text(&commondir_file, BoundedCap::POINTER) {
         let common = resolve_common_from_gitdir(&gitdir_path, &commondir_content)?;
         let project_id = id_for(&common.display().to_string());
         // The common dir is `<main checkout>/.git`; the project name is
@@ -214,7 +217,7 @@ pub(crate) fn classify_git_file(
 /// Parses a `.git` file's `gitdir: <path>` line and returns the
 /// canonicalized gitdir it points at.
 fn resolve_gitdir(worktree_dir: &Path, git_file: &Path) -> Option<PathBuf> {
-    let content = fs::read_to_string(git_file).ok()?;
+    let content = small_text(git_file, BoundedCap::POINTER)?;
     let gitdir_line = content.lines().next()?.trim();
     let gitdir_raw = gitdir_line.strip_prefix("gitdir:")?.trim();
     let gitdir_path = PathBuf::from(gitdir_raw);
@@ -239,13 +242,37 @@ fn resolve_common_from_gitdir(gitdir_path: &Path, commondir_content: &str) -> Op
     fs::canonicalize(&common_path).ok()
 }
 
+/// A small git control file (`.git` pointer, `commondir`, `config`),
+/// whole, through the bounded read. `None` when missing, unreadable or
+/// larger than `cap`: git never writes these that large, and a prefix
+/// parsed as a whole would be a wrong answer.
+fn small_text(path: &Path, cap: BoundedCap) -> Option<String> {
+    bounded_read(path, cap).ok()?.complete_utf8()
+}
+
+/// For a linked worktree at `worktree` (whose `.git` is a `gitdir:`
+/// file), the shared common `.git` directory; `None` for a main checkout
+/// or anything unreadable. What `git worktree prune` runs against after
+/// the worktree was moved to the Trash.
+pub fn linked_common_dir(worktree: &Path) -> Option<PathBuf> {
+    let git_file = worktree.join(".git");
+    if !fs::is_real_file(&git_file) {
+        return None;
+    }
+    let gitdir = resolve_gitdir(worktree, &git_file)?;
+    let commondir = small_text(&gitdir.join("commondir"), BoundedCap::POINTER)?;
+    resolve_common_from_gitdir(&gitdir, &commondir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::process::Command;
     use tempfile::tempdir;
 
     fn run_git(dir: &Path, args: &[&str]) {
+        crate::work_counters::record_spawn();
         let out = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -414,6 +441,7 @@ mod tests {
         run_git(&sub_source, &["add", "README.md"]);
         run_git(&sub_source, &["commit", "-q", "-m", "init"]);
 
+        crate::work_counters::record_spawn();
         let out = Command::new("git")
             .arg("-C")
             .arg(&parent)

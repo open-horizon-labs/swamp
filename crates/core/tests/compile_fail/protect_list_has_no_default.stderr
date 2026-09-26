@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `ProtectList: Default` is not satisfied
+ --> $WORKSPACE/crates/core/tests/compile_fail/protect_list_has_no_default.rs
+  |
+  |     requires_default::<swamp_core::protection::ProtectList>();
+  |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Default` is not implemented for `ProtectList`
+  |
+note: required by a bound in `requires_default`
+ --> $WORKSPACE/crates/core/tests/compile_fail/protect_list_has_no_default.rs
+  |
+  | fn requires_default<T: Default>() {}
+  |                        ^^^^^^^ required by this bound in `requires_default`

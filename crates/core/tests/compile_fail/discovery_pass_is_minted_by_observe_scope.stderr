@@ -1,0 +1,5 @@
+error[E0451]: field `_minted_by_observe_scope` of struct `DiscoveryPass` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/discovery_pass_is_minted_by_observe_scope.rs
+  |
+  |     let _a = DiscoveryPass { _minted_by_observe_scope: () };
+  |                              ^^^^^^^^^^^^^^^^^^^^^^^^ private field

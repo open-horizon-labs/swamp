@@ -1,0 +1,15 @@
+error[E0425]: cannot find function `metadata` in module `swamp_core::fs_gate`
+ --> $WORKSPACE/crates/core/tests/compile_fail/metadata_does_not_follow_by_default.rs
+  |
+  |     let _ = swamp_core::fs_gate::metadata("/tmp/link");
+  |                                  ^^^^^^^^ not found in `swamp_core::fs_gate`
+  |
+help: consider importing this function
+  |
+4 + use std::fs::metadata;
+  |
+help: if you import `metadata`, refer to it directly
+  |
+5 -     let _ = swamp_core::fs_gate::metadata("/tmp/link");
+5 +     let _ = metadata("/tmp/link");
+  |

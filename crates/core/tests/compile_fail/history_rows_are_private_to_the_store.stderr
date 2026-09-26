@@ -1,0 +1,11 @@
+error[E0603]: module `columns` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/history_rows_are_private_to_the_store.rs
+  |
+  | use swamp_core::growth::columns::ArtifactHistory;
+  |                         ^^^^^^^ private module
+  |
+note: the module `columns` is defined here
+ --> $WORKSPACE/crates/core/src/growth.rs
+  |
+  | pub(crate) mod columns;
+  | ^^^^^^^^^^^^^^^^^^^^^^

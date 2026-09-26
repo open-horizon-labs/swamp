@@ -28,15 +28,9 @@
 use anyhow::{Context, Result};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::Compression;
-use parquet::file::properties::{WriterProperties, WriterVersion};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -204,42 +198,16 @@ pub trait GithubResponder: Sync {
 pub struct GhCliResponder;
 
 fn bounded_gh(args: &[String]) -> Result<String, String> {
-    let mut child = Command::new("gh")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("gh not runnable: {e}"))?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                use std::io::Read;
-                let mut out = String::new();
-                if let Some(mut o) = child.stdout.take() {
-                    let _ = o.read_to_string(&mut out);
-                }
-                if !status.success() {
-                    let mut err = String::new();
-                    if let Some(mut e) = child.stderr.take() {
-                        let _ = e.read_to_string(&mut err);
-                    }
-                    return Err(format!("gh {args:?} failed: {}", err.trim()));
-                }
-                return Ok(out);
-            }
-            Ok(None) => {
-                if start.elapsed() >= PER_CALL_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("gh {args:?} timed out after {PER_CALL_TIMEOUT:?}"));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => return Err(format!("gh wait failed: {e}")),
-        }
+    let out =
+        crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Gh, args, PER_CALL_TIMEOUT)
+            .map_err(|e| format!("gh not runnable: {e}"))?;
+    if out.timed_out {
+        return Err(format!("gh {args:?} timed out after {PER_CALL_TIMEOUT:?}"));
     }
+    if !out.success() {
+        return Err(format!("gh {args:?} failed: {}", out.stderr_lossy().trim()));
+    }
+    Ok(out.stdout_lossy())
 }
 
 /// Builds the GraphQL query text and `gh api graphql -f ...` argument
@@ -416,12 +384,11 @@ pub fn github_owner_repo(remote_url: &str) -> Option<(String, String)> {
         .unwrap_or(remote_url.trim());
     let rest = if let Some(rest) = url.strip_prefix("git@github.com:") {
         rest
-    } else if let Some(idx) = url.find("://") {
+    } else {
+        let idx = url.find("://")?;
         let after_scheme = &url[idx + 3..];
         let after_scheme = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
         after_scheme.strip_prefix("github.com/")?
-    } else {
-        return None;
     };
     let mut parts = rest.splitn(2, '/');
     let owner = parts.next()?.to_string();
@@ -482,13 +449,16 @@ pub fn current_branch(worktree_dir: &Path) -> Option<String> {
     let head_path = worktree_dir.join(".git").join("HEAD");
     // A linked worktree's `.git` is a file, not a directory; `HEAD` lives
     // in its admin dir instead.
-    let head_content = if head_path.exists() {
-        fs::read_to_string(&head_path).ok()?
+    let pointer = |p: &Path| {
+        crate::fs_gate::read::bounded_string(p, crate::fs_gate::read::BoundedCap::POINTER).ok()
+    };
+    let head_content = if crate::fs_gate::exists(&head_path) {
+        pointer(&head_path)?
     } else {
         let git_file = worktree_dir.join(".git");
-        let contents = fs::read_to_string(&git_file).ok()?;
+        let contents = pointer(&git_file)?;
         let admin = contents.trim().strip_prefix("gitdir:")?.trim();
-        fs::read_to_string(Path::new(admin).join("HEAD")).ok()?
+        pointer(&Path::new(admin).join("HEAD"))?
     };
     let line = head_content.trim();
     line.strip_prefix("ref: refs/heads/").map(String::from)
@@ -548,13 +518,7 @@ fn cache_path(swamp_dir: &Path, volume_id: u64) -> PathBuf {
 }
 
 fn read_cache(path: &Path) -> Vec<CacheRow> {
-    let Ok(file) = File::open(path) else {
-        return Vec::new();
-    };
-    let Ok(builder) = ParquetRecordBatchReaderBuilder::try_new(file) else {
-        return Vec::new();
-    };
-    let Ok(reader) = builder.build() else {
+    let Ok(Some(reader)) = crate::fs_gate::columns::open_parquet(path) else {
         return Vec::new();
     };
     let mut rows = Vec::new();
@@ -662,17 +626,13 @@ fn write_cache(path: &Path, rows: &[CacheRow]) -> Result<()> {
             col!(unavailable_reason),
         ],
     )?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
-    let properties = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(Default::default()))
-        .set_writer_version(WriterVersion::PARQUET_2_0)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
-    writer.write(&batch)?;
-    writer.close()?;
+    crate::fs_gate::columns::write_parquet_atomic(
+        path,
+        schema,
+        std::iter::once(Ok(batch)),
+        crate::fs_gate::columns::DEFAULT_ZSTD_LEVEL,
+    )
+    .with_context(|| format!("create {}", path.display()))?;
     Ok(())
 }
 
@@ -910,7 +870,7 @@ pub fn read_cached(
     let mut notes = Vec::new();
     if stale > 0 {
         notes.push(format!(
-            "github: {stale} worktree(s) have stale cached enrichment (run `swamp observe` to refresh)"
+            "github: {stale} worktree(s) have cached enrichment older than the refresh window (run `swamp observe` to refresh)"
         ));
     }
     if missing > 0 {

@@ -37,9 +37,11 @@ use crate::report::{
 };
 use crate::signals::RawSignals;
 use anyhow::{Result, bail};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+mod registry;
 
 /// Everything a run was asked for. Consumers read it; nobody writes it.
 pub struct Ctx<'a> {
@@ -59,6 +61,40 @@ pub struct Ctx<'a> {
     pub fs_events: &'a dyn crate::fs_events::FsEventsSource,
     pub observed_at: u64,
     pub large_file_min_bytes: u64,
+    /// Subtrees to prune from this walk (#42 --
+    /// `scope::EffectiveScope::pruned_subtrees`, filtered to this root).
+    /// Empty for every pre-#42 caller (a single-root `report`/`observe`
+    /// call with no scope-level exclusion context); populated only by
+    /// `report::report_scope`.
+    pub pruned_subtrees: Vec<PathBuf>,
+    /// Whether this invocation's authorized scope includes Docker at
+    /// all.
+    ///
+    /// The 2026-09-22 re-review's CE6: `consumers::docker` called
+    /// `docker::load_cached` on every `ProjectsGrouped` event and
+    /// consulted the effective scope nowhere, so `docker-desktop` being
+    /// disabled -- or excluded -- did not stop swamp asking the Docker
+    /// daemon to enumerate the user's images, volumes and containers.
+    /// Measured: five `docker` spawns per observation, on every
+    /// `report`, every `propose` and every TUI startup, permanently, for
+    /// a tool the user did not authorize.
+    ///
+    /// `true` for the pre-scope single-root entry points, which have no
+    /// scope to consult and whose behavior must not change; the
+    /// scope-aware path (`report::report_scope_with_parts`) derives it
+    /// from `EffectiveScope::docker_in_scope()`.
+    pub docker_in_scope: bool,
+    /// Where `consumers::walk` leaves this root's trusted event window,
+    /// so the caller can hand it to the unit families as
+    /// `crate::fs_events::EventCoverage`.
+    ///
+    /// `None` means this root produced no trusted window (a full walk,
+    /// any refusal, no store), and the unit families then reuse nothing.
+    /// `Some((changed, since))` is the replay's own change list -- the
+    /// unfiltered one, because a subtree this walk pruned is still a
+    /// subtree the window must be able to speak about -- and the
+    /// observation time it replays from.
+    pub event_window: crate::fs_events::EventWindowSlot,
 }
 
 /// Per-worktree git activity, as one consumer computes it and others read it.
@@ -87,6 +123,16 @@ pub struct Draft {
     pub github_enrichment: Option<GithubEnrichmentSummary>,
     pub schedule_line: Option<String>,
     pub nested_artifacts: Arc<Vec<crate::artifact::NestedArtifact>>,
+    /// The Docker daemon's answers this pass, when it was asked and
+    /// answered: what the build consumer hands the BuildKit adapter
+    /// (`crate::build_stores::daemon_containers`). `None` when Docker
+    /// was out of scope.
+    pub docker_facts: Option<Arc<crate::docker::DockerFacts>>,
+    /// Worktree ids the walk could not confirm gone-vs-inaccessible this
+    /// pass (#42) -- see `growth::compute_unconfirmed_worktrees`. The
+    /// growth store must never tombstone rows for these ids from this
+    /// observation.
+    pub protected_worktree_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,6 +167,11 @@ pub enum Event {
         notes: Vec<String>,
         /// Worktree ids the walk actually visited; `None` = all of them.
         rewalked: Option<Arc<Vec<String>>>,
+        /// Worktree ids this pass could not confirm gone-vs-inaccessible
+        /// (#42): absent from `discovered`, but their path still exists
+        /// and could not be read. Carried to `GrowthAnnotated` so the
+        /// growth store never tombstones their rows from this pass.
+        unconfirmed_worktree_ids: Arc<Vec<String>>,
     },
     ProjectsGrouped {
         projects: Arc<Vec<ProjectRow>>,
@@ -135,6 +186,7 @@ pub enum Event {
         files: Arc<Vec<FileRow>>,
         reconciliation: Reconciliation,
         notes: Vec<String>,
+        unconfirmed_worktree_ids: Arc<Vec<String>>,
     },
     SignalsComputed {
         by_worktree: Arc<HashMap<String, WorktreeSignals>>,
@@ -154,6 +206,9 @@ pub enum Event {
         attributed_bytes: u64,
         unowned_bytes: u64,
         notes: Vec<String>,
+        /// The facts the rows came from, for the BuildKit record
+        /// identification; `None` when the daemon was not asked.
+        facts: Option<Arc<crate::docker::DockerFacts>>,
     },
     RowsAssembled(Arc<Draft>),
     CargoAnnotated(Arc<Draft>),
@@ -207,121 +262,15 @@ pub trait Consumer {
     /// events whose kind appears here.
     fn subscribes_to(&self) -> &[EventKind];
     /// React to an event; return follow-on events to emit.
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>>;
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>>;
 }
 
-pub struct EventBus {
-    consumers: Vec<Box<dyn Consumer>>,
-    sealed: bool,
-}
-
-impl Default for EventBus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl EventBus {
-    pub fn new() -> Self {
-        EventBus {
-            consumers: Vec::new(),
-            sealed: false,
-        }
-    }
-
-    /// Every builtin stage, in registration order. Static: this is the
-    /// one place the pipeline's membership is written down.
-    pub fn with_builtins() -> Self {
-        use crate::consumers::*;
-        let mut bus = EventBus::new();
-        for c in [
-            Box::new(WalkConsumer::default()) as Box<dyn Consumer>,
-            Box::new(ProjectsConsumer),
-            Box::new(SignalsConsumer),
-            Box::new(EcosystemConsumer),
-            Box::new(GithubConsumer::default()),
-            Box::new(DockerConsumer),
-            Box::new(AssemblyGate::default()),
-            Box::new(CargoConsumer::default()),
-            Box::new(GrowthConsumer),
-            Box::new(TrackingConsumer),
-            Box::new(HistoryConsumer),
-            Box::new(ReportAssembler::default()),
-            Box::new(CacheWriter),
-        ] {
-            bus.register(c).expect("builtins register before any run");
-        }
-        bus
-    }
-
-    /// Registers a consumer. Refused once `run` has started: the registry
-    /// is fixed before the first event fires.
-    pub fn register(&mut self, consumer: Box<dyn Consumer>) -> Result<()> {
-        if self.sealed {
-            bail!(
-                "event bus is sealed: `{}` cannot register after run started",
-                consumer.name()
-            );
-        }
-        self.consumers.push(consumer);
-        Ok(())
-    }
-
-    pub fn consumer_names(&self) -> Vec<&str> {
-        self.consumers.iter().map(|c| c.name()).collect()
-    }
-
-    /// Dispatches `seed` and every follow-on until the queue is empty.
-    /// Subscribers of one event run concurrently; their follow-ons are
-    /// queued depth-first (a follow-on is dispatched before anything that
-    /// was already waiting). Returns every event that was dispatched, in
-    /// dispatch order.
-    pub async fn run(&mut self, seed: Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
-        self.sealed = true;
-        let mut queue: VecDeque<Event> = VecDeque::from([seed]);
-        let mut dispatched: Vec<Event> = Vec::new();
-        while let Some(event) = queue.pop_front() {
-            let kind = event.kind();
-            let subscribers: Vec<&dyn Consumer> = self
-                .consumers
-                .iter()
-                .map(|c| c.as_ref())
-                .filter(|c| c.subscribes_to().contains(&kind))
-                .collect();
-            let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
-            let results = futures_util::future::join_all(subscribers.iter().map(|c| async {
-                let t = std::time::Instant::now();
-                let r = c.on_event(&event, ctx).await;
-                if trace {
-                    eprintln!("[trace] {:?} → {}: {:?}", kind, c.name(), t.elapsed());
-                }
-                r
-            }))
-            .await;
-            let mut follow_on: Vec<Event> = Vec::new();
-            for (c, r) in subscribers.iter().zip(results) {
-                let events =
-                    r.map_err(|e| anyhow::anyhow!("consumer `{}` on {:?}: {e}", c.name(), kind))?;
-                follow_on.extend(events);
-            }
-            for e in follow_on.into_iter().rev() {
-                queue.push_front(e);
-            }
-            dispatched.push(event);
-        }
-        Ok(dispatched)
-    }
-
-    /// `run` on a fresh tokio current-thread runtime, for the synchronous
-    /// callers (CLI, MCP, TUI worker thread). Must not be called from
-    /// inside another tokio runtime.
-    pub fn run_blocking(&mut self, seed: Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(self.run(seed, ctx))
-    }
-}
+pub use registry::{EventBus, Stage};
 
 /// Builds a [`Report`] for `ctx` by running the builtin consumers from
 /// `RootRequested`. The one entry point the report module calls.
@@ -330,7 +279,12 @@ pub fn run_report(ctx: &Ctx<'_>) -> Result<Report> {
     let events = bus.run_blocking(Event::RootRequested, ctx)?;
     for e in events.into_iter().rev() {
         if let Event::ReportAssembled(report) = e {
-            return Ok(Arc::try_unwrap(report).unwrap_or_else(|arc| (*arc).clone()));
+            let mut report = Arc::try_unwrap(report).unwrap_or_else(|arc| (*arc).clone());
+            // Decision evidence (#53-#54, #58-#59): a pure post-pass over
+            // facts this report already collected, never a new walk or
+            // byte-history write -- see `report::attach_decision_evidence`.
+            crate::report::attach_decision_evidence(&mut report);
+            return Ok(report);
         }
     }
     bail!("the bus finished without assembling a report")
@@ -350,6 +304,39 @@ pub fn ctx_for<'a>(
     force_full: bool,
     fs_events: &'a dyn crate::fs_events::FsEventsSource,
 ) -> Ctx<'a> {
+    ctx_for_excluding(
+        root,
+        docker_facts,
+        verify_du,
+        store_dir,
+        since_override,
+        observe,
+        include_dirs,
+        enrich,
+        force_full,
+        fs_events,
+        &[],
+    )
+}
+
+/// Same as [`ctx_for`], with `pruned_subtrees` (#42) supplied explicitly.
+/// Used by `report::report_scope`, which has scope-level exclusions to
+/// enforce per root; every other caller goes through [`ctx_for`] with an
+/// empty list.
+#[allow(clippy::too_many_arguments)]
+pub fn ctx_for_excluding<'a>(
+    root: &Path,
+    docker_facts: Option<&Path>,
+    verify_du: bool,
+    store_dir: Option<&Path>,
+    since_override: Option<&str>,
+    observe: bool,
+    include_dirs: bool,
+    enrich: bool,
+    force_full: bool,
+    fs_events: &'a dyn crate::fs_events::FsEventsSource,
+    pruned_subtrees: &[PathBuf],
+) -> Ctx<'a> {
     let large_file_min_bytes = store_dir
         .map(|dir| crate::growth::load_config(dir).large_file_min_bytes)
         .unwrap_or(crate::growth::DEFAULT_LARGE_FILE_MIN_BYTES);
@@ -366,6 +353,9 @@ pub fn ctx_for<'a>(
         fs_events,
         observed_at: crate::entities::now(),
         large_file_min_bytes,
+        pruned_subtrees: pruned_subtrees.to_vec(),
+        docker_in_scope: true,
+        event_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
     }
 }
 
@@ -404,7 +394,12 @@ mod tests {
         fn subscribes_to(&self) -> &[EventKind] {
             &[EventKind::Probe]
         }
-        async fn on_event(&self, event: &Event, _ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+        async fn on_event(
+            &self,
+            event: &Event,
+            _ctx: &Ctx<'_>,
+            _stage: &crate::bus::Stage,
+        ) -> Result<Vec<Event>> {
             let Event::Probe { tag, depth } = event else {
                 return Ok(vec![]);
             };
@@ -431,8 +426,8 @@ mod tests {
     fn follow_on_events_are_routed_to_subscribers() {
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
-        let mut bus = EventBus::new();
-        bus.register(prober("a", 1)).unwrap();
+        let mut bus = EventBus::new_for_test();
+        bus.register_for_test(prober("a", 1)).unwrap();
         let events = bus
             .run_blocking(
                 Event::Probe {
@@ -461,8 +456,8 @@ mod tests {
         // Two seeds queued; a's follow-on from seed1 must run before seed2.
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
-        let mut bus = EventBus::new();
-        bus.register(prober("a", 1)).unwrap();
+        let mut bus = EventBus::new_for_test();
+        bus.register_for_test(prober("a", 1)).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -470,7 +465,7 @@ mod tests {
             .block_on(async {
                 // Seed with a probe whose follow-on itself has a follow-on:
                 // order must be seed, seed>a, (seed>a)>a — never breadth-first.
-                bus.register(prober("b", 2)).unwrap();
+                bus.register_for_test(prober("b", 2)).unwrap();
                 bus.run(
                     Event::Probe {
                         tag: "s".into(),
@@ -499,9 +494,9 @@ mod tests {
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
         for order in [["a", "b"], ["b", "a"]] {
-            let mut bus = EventBus::new();
+            let mut bus = EventBus::new_for_test();
             for n in order {
-                bus.register(prober(n, 0)).unwrap();
+                bus.register_for_test(prober(n, 0)).unwrap();
             }
             let events = bus
                 .run_blocking(
@@ -521,8 +516,8 @@ mod tests {
     fn registration_is_closed_once_run_starts() {
         let src = crate::fs_events::UnsupportedPlatformSource;
         let c = ctx(&src);
-        let mut bus = EventBus::new();
-        bus.register(prober("a", 0)).unwrap();
+        let mut bus = EventBus::new_for_test();
+        bus.register_for_test(prober("a", 0)).unwrap();
         bus.run_blocking(
             Event::Probe {
                 tag: "x".into(),
@@ -531,7 +526,7 @@ mod tests {
             &c,
         )
         .unwrap();
-        let err = bus.register(prober("late", 0)).unwrap_err();
+        let err = bus.register_for_test(prober("late", 0)).unwrap_err();
         assert!(err.to_string().contains("sealed"), "{err}");
     }
 

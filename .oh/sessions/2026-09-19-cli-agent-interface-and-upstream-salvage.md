@@ -77,3 +77,20 @@ Reviewed upstream main with observed commit 2f9f9de1d99b48113a5bffb151c05b98d790
 - https://github.com/clean-dev-dirs/clean-dev-dirs/blob/2f9f9de1d99b48113a5bffb151c05b98d790314b/src/config/file.rs
 - https://github.com/clean-dev-dirs/clean-dev-dirs/blob/2f9f9de1d99b48113a5bffb151c05b98d790314b/src/cleaner.rs
 - https://github.com/clean-dev-dirs/clean-dev-dirs/blob/2f9f9de1d99b48113a5bffb151c05b98d790314b/src/executables.rs
+
+## Reconciliation, 2026-09-21
+
+#103 and #104, planned above as standalone work, are implemented:
+`crates/core/src/agent_json.rs` extracts the MCP tools' JSON-shaping
+logic for CLI reuse; `report --json` now honors `--view`/`--project`/
+`--filter` and gains `--limit`/`--offset` bounding; `skills/swamp/`
+ships the skill plus five references (`commands-and-json.md`,
+`filters.md`, `cleanup-and-recovery.md`, `coverage-and-history.md`,
+`trust-model.md`); `crates/mcp` is deleted along with its workspace
+membership, packaging and CI references. The `human_only_authorization`
+source audit is rewritten exactly as anticipated here -- from "MCP has
+no grant-writing functions" to a transport-independent statement that
+authorization-minting functions are reachable only from named CLI/TUI
+call sites, with `--actor` documented as attribution, never identity
+proof. `<scratchpad>/issue-reconciliation-mcp.md` carries the
+replacement text for other open issues that named MCP.

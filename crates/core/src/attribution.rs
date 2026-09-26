@@ -7,10 +7,12 @@
 //! left over inside a worktree becomes that worktree's single `Source`
 //! row. Anything outside every worktree is an `UnownedRow`.
 
-use crate::report::{ArtifactKind, ArtifactRow, Source, UnownedReason, UnownedRow, WorktreeRow};
+use crate::fs_gate::{self as fs, MetadataExt};
+use crate::report::{ArtifactKind, ArtifactRow, UnownedRow, WorktreeRow};
+#[cfg(test)]
+use crate::report::{Source, UnownedReason};
+#[cfg(test)]
 use std::collections::HashSet;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// One basename -> kind entry. Data-driven so a later slice (R7) can
@@ -127,7 +129,7 @@ const MARKED_ARTIFACT_KINDS: &[(&str, ArtifactKind, &[&str])] = &[
 ];
 
 fn has_marker(parent: &Path, markers: &[&str]) -> bool {
-    let Ok(entries) = std::fs::read_dir(parent) else {
+    let Ok(entries) = crate::fs_gate::read_dir(parent) else {
         return false;
     };
     let names: Vec<String> = entries
@@ -140,6 +142,33 @@ fn has_marker(parent: &Path, markers: &[&str]) -> bool {
         Some(ext) => names.iter().any(|n| n.ends_with(&format!(".{ext}"))),
         None => names.iter().any(|n| n == m),
     })
+}
+
+/// What a fold job carries to prove its directory was classified: only
+/// [`classified_at`] (a name/marker/self-declared-cache match) and
+/// [`Classified::stored`] (a row the store already classified when it
+/// was first walked) make one. `walk::AttrJob::Size` requires it, so
+/// "fold this subtree" cannot be written without the classification --
+/// not under an `if let` whose initializer merely *mentions*
+/// `classify_at`, not anywhere (`.oh/guardrails/folding-only-for-artifacts.md`).
+#[derive(Debug, Clone)]
+pub(crate) struct Classified(ArtifactKind);
+
+impl Classified {
+    /// A kind the store recorded when this path was first walked and
+    /// classified; a re-size never reclassifies.
+    pub(crate) fn stored(kind: ArtifactKind) -> Classified {
+        Classified(kind)
+    }
+
+    pub(crate) fn kind(&self) -> &ArtifactKind {
+        &self.0
+    }
+}
+
+/// [`classify_at`], as the witness a fold job needs.
+pub(crate) fn classified_at(parent: &Path, name: &str) -> Option<Classified> {
+    classify_at(parent, name).map(Classified)
 }
 
 /// Classification with the parent directory available, so marker-gated
@@ -179,14 +208,16 @@ pub(crate) fn self_declared_cache(dir: &Path) -> Option<ArtifactKind> {
     let tag = dir.join("CACHEDIR.TAG");
     // `symlink_metadata`: the spec requires a regular file, and a symlink
     // here would also be a path out of the tree we are sizing.
-    let meta = fs::symlink_metadata(&tag).ok()?;
+    let meta = crate::fs_gate::symlink_metadata(&tag).ok()?;
     if !meta.is_file() || meta.len() < SIGNATURE.len() as u64 {
         return None;
     }
-    let mut head = [0u8; 43];
-    let mut file = fs::File::open(&tag).ok()?;
-    std::io::Read::read_exact(&mut file, &mut head).ok()?;
-    (head == SIGNATURE).then_some(ArtifactKind::Cache)
+    let head = crate::fs_gate::read::bounded_read(
+        &tag,
+        crate::fs_gate::read::BoundedCap::header_at_most(SIGNATURE.len()),
+    )
+    .ok()?;
+    (head.bytes == SIGNATURE).then_some(ArtifactKind::Cache)
 }
 
 /// Basenames that, when found *outside* every checkout/worktree, are a
@@ -224,6 +255,7 @@ pub(crate) fn allocated_bytes(meta: &fs::Metadata) -> u64 {
 
 /// A worktree known to the attribution pass: its path (for nearest-match)
 /// and the id it should attach rows to.
+#[cfg(test)]
 struct KnownWorktree<'a> {
     path: &'a Path,
     worktree_id: &'a str,
@@ -254,6 +286,7 @@ pub struct AttributionResult {
     pub files: Vec<crate::report::FileRow>,
 }
 
+#[cfg(test)]
 struct Ctx<'a> {
     worktrees: Vec<KnownWorktree<'a>>,
     seen_inodes: HashSet<(u64, u64)>,
@@ -266,6 +299,7 @@ struct Ctx<'a> {
     observed_at: u64,
 }
 
+#[cfg(test)]
 /// Finds the id of the worktree whose path is the longest prefix of
 /// `path` (the nearest containing checkout/worktree), if any.
 fn nearest_worktree<'a>(worktrees: &'a [KnownWorktree<'a>], path: &Path) -> Option<&'a str> {
@@ -276,6 +310,7 @@ fn nearest_worktree<'a>(worktrees: &'a [KnownWorktree<'a>], path: &Path) -> Opti
         .map(|w| w.worktree_id)
 }
 
+#[cfg(test)]
 impl<'a> Ctx<'a> {
     fn dedup(&mut self, meta: &fs::Metadata) -> bool {
         // Hardlinks are counted once per report.
@@ -288,11 +323,11 @@ impl<'a> Ctx<'a> {
     /// further.
     fn size_as_unit(&mut self, path: &Path) -> u64 {
         let mut total = 0u64;
-        let Ok(entries) = fs::read_dir(path) else {
+        let Ok(entries) = crate::fs_gate::read_dir(path) else {
             return total;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            let Ok(meta) = crate::fs_gate::symlink_metadata(entry.path()) else {
                 continue;
             };
             if meta.file_type().is_symlink() {
@@ -341,6 +376,7 @@ impl<'a> Ctx<'a> {
                         containers: Vec::new(),
                         shared_with: Vec::new(),
                         dangling: false,
+                        evidence: Vec::new(),
                     });
             }
             None => {
@@ -355,6 +391,7 @@ impl<'a> Ctx<'a> {
                 };
                 self.unowned_total += bytes;
                 self.unowned.push(UnownedRow {
+                    measurement: None,
                     path_or_object: path.display().to_string(),
                     bytes,
                     reason,
@@ -365,6 +402,7 @@ impl<'a> Ctx<'a> {
                     shared_with: Vec::new(),
                     dangling: false,
                     docker_kind: None,
+                    evidence: Vec::new(),
                 });
             }
         }
@@ -372,6 +410,7 @@ impl<'a> Ctx<'a> {
 
     fn record_permission_denied(&mut self, path: &Path) {
         self.unowned.push(UnownedRow {
+            measurement: None,
             path_or_object: path.display().to_string(),
             bytes: 0,
             reason: UnownedReason::PermissionDenied,
@@ -382,6 +421,7 @@ impl<'a> Ctx<'a> {
             shared_with: Vec::new(),
             dangling: false,
             docker_kind: None,
+            evidence: Vec::new(),
         });
     }
 
@@ -411,6 +451,7 @@ impl<'a> Ctx<'a> {
                 };
                 self.unowned_total += bytes;
                 self.unowned.push(UnownedRow {
+                    measurement: None,
                     path_or_object: path.display().to_string(),
                     bytes,
                     reason,
@@ -421,13 +462,14 @@ impl<'a> Ctx<'a> {
                     shared_with: Vec::new(),
                     dangling: false,
                     docker_kind: None,
+                    evidence: Vec::new(),
                 });
             }
         }
     }
 
     fn walk(&mut self, path: &Path) {
-        let Ok(meta) = fs::symlink_metadata(path) else {
+        let Ok(meta) = crate::fs_gate::symlink_metadata(path) else {
             return;
         };
         if meta.file_type().is_symlink() {
@@ -450,7 +492,7 @@ impl<'a> Ctx<'a> {
             return;
         }
 
-        let entries = match fs::read_dir(path) {
+        let entries = match crate::fs_gate::read_dir(path) {
             Ok(e) => e,
             Err(_) => {
                 self.record_permission_denied(path);
@@ -464,7 +506,14 @@ impl<'a> Ctx<'a> {
 }
 
 /// Runs the R3 classification/attribution walk under `root`, given the
-/// worktrees R2 already discovered (path + worktree_id).
+/// worktrees R2 already discovered (path + worktree_id): the serial
+/// reference walk, kept as the oracle this module's tests compare the
+/// parallel pool (`walk::discover_and_attribute`) against.
+///
+/// Test-only (`.oh/guardrails/walk-optimized-parallel-pool.md`): a
+/// production path that reached for it -- directly, through an alias,
+/// or inside a local `macro_rules!` -- does not compile.
+#[cfg(test)]
 pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> AttributionResult {
     let known: Vec<KnownWorktree> = worktrees
         .iter()
@@ -520,6 +569,7 @@ pub fn attribute(root: &Path, worktrees: &[(&Path, &str)], observed_at: u64) -> 
                 containers: Vec::new(),
                 shared_with: Vec::new(),
                 dangling: false,
+                evidence: Vec::new(),
             });
     }
 
@@ -544,15 +594,18 @@ pub fn apply_to_worktree(row: &mut WorktreeRow, result: &mut AttributionResult) 
 /// Runs `du -skPx <root>` and returns bytes (KiB * 1024), or `None` if
 /// the command is unavailable or fails.
 pub fn du_total(root: &Path) -> Option<u64> {
-    let out = std::process::Command::new("du")
-        .arg("-skPx")
-        .arg(root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    // `du` over a whole root is slow by nature; the bound is a hang
+    // guard, not a cost budget (`--verify-du` is an explicit opt-in).
+    let out = crate::fs_gate::spawn::run(
+        crate::fs_gate::spawn::Program::Du,
+        [std::ffi::OsStr::new("-skPx"), root.as_os_str()],
+        std::time::Duration::from_secs(3600),
+    )
+    .ok()?;
+    if !out.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = out.stdout_lossy();
     let kib: u64 = text.split_whitespace().next()?.parse().ok()?;
     Some(kib * 1024)
 }
@@ -610,6 +663,7 @@ mod marker_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 

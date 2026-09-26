@@ -38,11 +38,13 @@ fn artifact(kind: ArtifactKind, path: &str, bytes: u64, growth: Option<i64>) -> 
         containers: Vec::new(),
         shared_with: Vec::new(),
         dangling: false,
+        evidence: Vec::new(),
     }
 }
 
 fn fixture_report() -> Report {
     Report {
+        store_dir: None,
         observed_at: 1_000_000,
         root: PathBuf::from("/src"),
         projects: vec![
@@ -145,6 +147,7 @@ fn fixture_report() -> Report {
         nested_artifacts: Vec::new(),
         unowned: vec![
             UnownedRow {
+                measurement: None,
                 path_or_object: "old-project/build".to_string(),
                 bytes: 300_000_000,
                 reason: UnownedReason::NoContainingRepo,
@@ -155,8 +158,10 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
             UnownedRow {
+                measurement: None,
                 path_or_object: "old-project/tmp".to_string(),
                 bytes: 100_000_000,
                 reason: UnownedReason::NoContainingRepo,
@@ -167,8 +172,10 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
             UnownedRow {
+                measurement: None,
                 path_or_object: "restricted/vault".to_string(),
                 bytes: 0,
                 reason: UnownedReason::PermissionDenied,
@@ -179,8 +186,10 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
             UnownedRow {
+                measurement: None,
                 path_or_object: "/Users/x/.cache".to_string(),
                 bytes: 4_000_000_000,
                 reason: UnownedReason::SharedCache,
@@ -191,9 +200,11 @@ fn fixture_report() -> Report {
                 shared_with: Vec::new(),
                 dangling: false,
                 docker_kind: None,
+                evidence: Vec::new(),
             },
         ],
         reconciliation: Reconciliation {
+            unique_estimate: None,
             attributed: 6_200_000_000,
             unowned: 4_400_000_000,
             walked_total: 10_600_000_000,
@@ -394,6 +405,7 @@ fn view_builds_lists_build_and_cache_rows_sorted_by_bytes() {
 fn view_docker_lists_unowned_name_alike_candidates_as_unattributed() {
     let mut report = fixture_report();
     report.unowned.push(UnownedRow {
+        measurement: None,
         path_or_object: "big-grower-staging:latest".to_string(),
         bytes: 500_000_000,
         reason: UnownedReason::DockerNoJoin,
@@ -404,6 +416,7 @@ fn view_docker_lists_unowned_name_alike_candidates_as_unattributed() {
         shared_with: Vec::new(),
         dangling: false,
         docker_kind: Some("image".to_string()),
+        evidence: Vec::new(),
     });
     let text = render_view_docker(&report, Some("big-grower"));
     assert!(text.contains("unowned, name-alike"));
@@ -438,4 +451,192 @@ fn worktrees_view_shows_removal_hint_only_for_linked() {
     // The Main checkout's own row must never carry the literal removal
     // command -- it isn't a worktree `git worktree remove` can act on.
     assert!(!text.contains("git worktree remove /src/big-grower\n"));
+}
+
+// ---------------------------------------------------------------------
+// `render_view_external`: the CLI text evidence surface DESIGN.md names.
+//
+// The 2026-09-22 re-review found it referenced by no test in the
+// workspace -- so the one place a user reads an external unit's
+// decision evidence in the terminal had no rendering test at all, and
+// the guardrails about *what may be printed* (facts, never verdicts;
+// an unknown always with its reason; a modification age labelled
+// correctly) were unenforced on this surface.
+// ---------------------------------------------------------------------
+
+fn external_unit(
+    path: &str,
+    bytes: u64,
+    mtime_max: u64,
+    evidence: Vec<swamp_core::evidence::Evidence>,
+) -> swamp_core::external::ExternalUnit {
+    use swamp_core::locations::{Provenance, StorageCategory};
+    swamp_core::external::ExternalUnit {
+        detector_id: "cargo-home".into(),
+        detector_name: "Cargo home".into(),
+        category: StorageCategory::Cache,
+        provenance: Provenance::BuiltinConvention,
+        path: PathBuf::from(path),
+        bytes,
+        mtime_max,
+        hardlinked: false,
+        growth_bytes: Some(4_096),
+        regrowth_count: 0,
+        observed_at: 1_000_000,
+        consumers: Vec::new(),
+        note: None,
+        evidence,
+    }
+}
+
+#[test]
+fn external_view_renders_units_largest_first_with_a_total() {
+    let out = swamp_core::render::render_view_external(&[
+        external_unit("/fixture/small", 1_024, 0, Vec::new()),
+        external_unit("/fixture/large", 1_048_576, 0, Vec::new()),
+    ]);
+    let large_at = out.find("/fixture/large").expect("large unit rendered");
+    let small_at = out.find("/fixture/small").expect("small unit rendered");
+    assert!(large_at < small_at, "largest unit first:\n{out}");
+    assert!(
+        out.contains("external storage total:"),
+        "the view must state its own total:\n{out}"
+    );
+    assert!(
+        out.contains("(2 units"),
+        "the total must say what it covers:\n{out}"
+    );
+}
+
+#[test]
+fn an_empty_external_view_says_so_rather_than_rendering_nothing() {
+    let out = swamp_core::render::render_view_external(&[]);
+    assert!(
+        out.contains("no external storage units detected"),
+        "an empty view must say it is empty, never print a blank screen: {out:?}"
+    );
+    // "none detected" is a coverage statement, not a verdict about the
+    // disk: it must not claim there is nothing there.
+    assert!(!out.contains("total:"), "{out:?}");
+}
+
+#[test]
+fn external_view_prints_an_unknown_together_with_its_reason() {
+    use swamp_core::evidence::{Evidence, FactKind};
+    let unit = external_unit(
+        "/fixture/cache",
+        2_048,
+        0,
+        vec![Evidence::unavailable(
+            FactKind::Activity,
+            swamp_core::evidence::FactSubtype::Accessed,
+            swamp_core::evidence::EvidenceSource::FilesystemMetadata {
+                detail: "atime".into(),
+            },
+            1_000,
+            "atime is not recorded on this volume",
+        )],
+    );
+    let out = swamp_core::render::render_view_external(&[unit]);
+    assert!(
+        out.contains("atime is not recorded on this volume"),
+        "an unknown printed without its reason reads as \"nothing there\":\n{out}"
+    );
+}
+
+/// The verdict-vocabulary guardrail, enforced on this surface rather
+/// than only on the source: a rendered external view never tells the
+/// reader what to conclude.
+#[test]
+fn external_view_never_renders_a_verdict_word() {
+    use swamp_core::evidence::{Evidence, FactKind, FactSubtype};
+    let unit = external_unit(
+        "/fixture/cache",
+        2_048,
+        1_000,
+        vec![Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Modified,
+            swamp_core::evidence::FactValue::Timestamp(1_000),
+            swamp_core::evidence::EvidenceSource::FilesystemMetadata {
+                detail: "mtime".into(),
+            },
+            1_000,
+        )],
+    );
+    let out = swamp_core::render::render_view_external(&[unit]).to_lowercase();
+    for verdict in ["safe", "unused", "stale", "can be deleted", "junk"] {
+        assert!(
+            !out.contains(verdict),
+            "the external view rendered the verdict word {verdict:?}:\n{out}"
+        );
+    }
+}
+
+/// Item 3 (2026-09-24 aim review repairs): a rendered evidence line must
+/// never be a `{:?}` derive dump of `EvidenceSource`/`StorageCategory` --
+/// the exact bug the review found, `[source: FilesystemMetadata {
+/// detail: "…" }]` and `Inferred { basis: "…" }` on real output. Every
+/// `EvidenceSource` variant is exercised so a new variant added without a
+/// label arm fails this test (a `{:?}` fallback would pass compilation
+/// silently otherwise).
+#[test]
+fn evidence_lines_never_render_a_debug_struct_literal() {
+    use swamp_core::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+    let sources = vec![
+        EvidenceSource::FilesystemMetadata {
+            detail: "mtime".into(),
+        },
+        EvidenceSource::ToolReported {
+            tool: "docker".into(),
+            detail: "inspect".into(),
+        },
+        EvidenceSource::ProcessQuery {
+            tool: "lsof".into(),
+        },
+        EvidenceSource::ManagerLock {
+            tool: "cargo".into(),
+            path: "/tmp/lock".into(),
+        },
+        EvidenceSource::ConfigDeclaration {
+            path: "/tmp/.tool-versions".into(),
+        },
+        EvidenceSource::Lockfile {
+            ecosystem: "npm".into(),
+            path: "/tmp/package-lock.json".into(),
+        },
+        EvidenceSource::BuildMetadata {
+            path: "/tmp/info.plist".into(),
+        },
+        EvidenceSource::DockerApi {
+            detail: "image inspect".into(),
+        },
+        EvidenceSource::Statvfs,
+        EvidenceSource::Inferred {
+            basis: "encoded project directory name".into(),
+        },
+    ];
+    let evidence: Vec<Evidence> = sources
+        .into_iter()
+        .map(|source| {
+            Evidence::known(
+                FactKind::Activity,
+                FactSubtype::Modified,
+                FactValue::Timestamp(1_000),
+                source,
+                1_000,
+            )
+        })
+        .collect();
+    let lines = swamp_core::render::render_evidence_lines(&evidence);
+    assert_eq!(lines.len(), evidence.len(), "one line per fact");
+    for line in &lines {
+        // The unmistakable shape of a struct's `{:?}` output: a
+        // capitalized-then-space-brace variant name, or a `field: "..."`
+        // pair, neither of which any hand-written label produces.
+        assert!(
+            !line.contains("{ ") && !line.contains(": \""),
+            "an evidence line looks like a Debug struct literal, not a label: {line:?}"
+        );
+    }
 }

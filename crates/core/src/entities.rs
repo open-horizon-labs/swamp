@@ -9,6 +9,27 @@ pub enum Confidence {
     Low,
 }
 
+impl Confidence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+
+    /// The inverse of [`Self::label`]. Exhaustive by construction (R18a
+    /// nested-artifact typed columns): an unrecognized label falls back
+    /// to [`Self::Low`], the least trusting reading, never a panic.
+    pub fn from_label(label: &str) -> Self {
+        match label {
+            "high" => Self::High,
+            "medium" => Self::Medium,
+            _ => Self::Low,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RecoveryContract {
     LocalRebuild,
@@ -97,20 +118,6 @@ pub struct Observation {
     pub observed_at: u64,
     pub source: String,
     pub coverage_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VolumeTruth {
-    pub attributed_bytes: u64,
-    pub reported_bytes: u64,
-    pub residuals: Vec<Residual>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Residual {
-    pub cause: String,
-    pub bytes: Option<u64>,
-    pub explained: bool,
 }
 
 pub fn now() -> u64 {

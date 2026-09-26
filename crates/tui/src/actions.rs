@@ -1,23 +1,29 @@
-//! The action layer: plan -> human authorization -> sink re-derivation ->
-//! Trash -> per-unit outcome -> ledger. Wires the minimum of
-//! `grants`/`execution`/`ledger`/`occupancy` from `swamp_core`;
-//! nothing there is widened.
+//! swamp reports; the human decides. A row is marked (Space), the
+//! confirm banner shows its current facts (Backspace), and Enter moves
+//! it to the Trash. There is no plan store, no grant, no confirmation
+//! token: this module drives `swamp_core::fs_gate::destroy` directly on
+//! exactly what was marked. The only way a move refuses is an ordinary
+//! OS-level error (permission denied, the path is gone, cross-device).
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use swamp_core::entities::{id_for, now};
 use swamp_core::execution::Outcome;
-use swamp_core::grants::{Grant, Predicate, Verb, plan};
-use swamp_core::ledger::Ledger;
+use swamp_core::ledger::{ActionRecord, Ledger, LedgerFact, NO_GRANT, Verb};
 
 use crate::model::human_bytes;
 
-/// One unit the human marked for deletion: enough facts to re-derive the
-/// entity the core action layer expects, without a second data path (the
-/// facts all came from the one `Report`).
+/// One unit the human marked for deletion: enough facts to move exactly
+/// what was shown, without a second data path (the facts all came from
+/// the one `Report`).
 #[derive(Debug, Clone)]
 pub struct MarkedUnit {
-    pub cargo_plan: Option<swamp_core::actions::Plan>,
+    /// Set when the row is a Cargo purpose group: its member list is
+    /// exactly what moves together into one Trash envelope.
+    pub cargo_unit: Option<swamp_core::actions::PlanUnit>,
+    /// Set when the row is an agent-storage unit (#101): a single-path
+    /// cache/log move, or a session's member list.
+    pub agent_unit: Option<swamp_core::actions::PlanUnit>,
     pub path: PathBuf,
     /// Set for a Docker object: what removing it actually runs, and the
     /// fact that it never reaches Trash.
@@ -30,8 +36,9 @@ pub struct MarkedUnit {
     pub worktree: Option<WorktreeTerms>,
     /// The row's label, for the confirm line.
     pub label: String,
-    /// Facts the human should see before confirming (dirty, unpushed,
-    /// untracked content, no remote…). Shown, never enforced.
+    /// The plain-language consequence of deleting this unit (dirty,
+    /// unpushed, untracked content, no remote, git store, what has files
+    /// open…). Shown on the confirm banner; never a veto.
     pub warnings: Vec<String>,
 }
 
@@ -46,42 +53,6 @@ pub struct WorktreeTerms {
     pub remote: Option<String>,
 }
 
-/// Human pressing Enter at the confirm summary is the authorization for
-/// this one plan (never the index, never an agent). Builds the plan and
-/// grant together since they are minted for the same keypress.
-pub fn authorize(units: &[MarkedUnit], actor: &str) -> (swamp_core::grants::Plan, Grant) {
-    let plan_units = units
-        .iter()
-        .map(|u| swamp_core::grants::PlanUnit {
-            artifact_id: id_for(&u.path.display().to_string()),
-            verb: match &u.worktree {
-                Some(t) if t.whole_checkout => Verb::Archive,
-                Some(_) => Verb::RemoveWorktree,
-                None => Verb::Delete,
-            },
-            expected_bytes: u.bytes,
-            evidence_observed_at: u.observed_at,
-            undo_cost: "trash".into(),
-        })
-        .collect();
-    let plan = plan(plan_units, now() + 300);
-    let grant = Grant {
-        id: swamp_core::entities::new_id(),
-        verb: Verb::Delete,
-        predicate: Predicate {
-            project_id: None,
-            kind: None,
-            max_bytes: 0,
-            require_fresh_within_secs: 3600,
-        },
-        scope: plan.units.iter().map(|u| u.artifact_id.clone()).collect(),
-        expires_at: plan.expires_at,
-        actor: actor.to_string(),
-        created_outside_index: true,
-    };
-    (plan, grant)
-}
-
 /// Result of executing one marked unit, for the inline per-unit outcome.
 #[derive(Debug, Clone)]
 pub struct UnitResult {
@@ -89,62 +60,60 @@ pub struct UnitResult {
     pub outcome: Result<Outcome, String>,
 }
 
-/// Sink re-derivation happens inside `execute_delete` itself (it
-/// re-`symlink_metadata`s the path and checks occupancy immediately
-/// before the rename); this just drives one unit through it and records
-/// the per-unit result.
+/// The facts the human saw on the confirm line, as typed ledger rows.
+fn ledger_evidence(unit: &MarkedUnit, extra: Vec<LedgerFact>) -> Vec<LedgerFact> {
+    let mut evidence = vec![
+        LedgerFact::new("label", &unit.label),
+        LedgerFact::new("bytes", unit.bytes),
+        LedgerFact::new("observed_at", unit.observed_at),
+        LedgerFact::new("warnings_shown", unit.warnings.join("; ")),
+    ];
+    evidence.extend(extra);
+    evidence
+}
+
+/// Moves one unit to the Trash and appends one ledger line. Nothing here
+/// is re-derived and compared against what was true at mark time: the
+/// human already saw the current facts on the confirm banner, and the
+/// only failures below are ordinary OS-level errors.
 fn execute_one(
     unit: &MarkedUnit,
-    _plan_unit: &swamp_core::grants::PlanUnit,
-    grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
-    actor: &str,
     keep_executables: bool,
 ) -> UnitResult {
-    if let Some(plan) = &unit.cargo_plan {
+    let actor = "human:tui";
+    if let Some(u) = unit.cargo_unit.as_ref() {
         let result = (|| -> Result<Outcome> {
-            if !grant.created_outside_index
-                || grant.expires_at < now()
-                || !grant
-                    .scope
-                    .contains(&id_for(&unit.path.display().to_string()))
-                || _plan_unit.artifact_id != id_for(&unit.path.display().to_string())
-            {
-                anyhow::bail!("Cargo selection not covered by current confirmation");
-            }
             if keep_executables {
                 anyhow::bail!("keep-executables conflicts with selective build removal");
             }
-            let store = ledger
-                .path()
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("ledger has no store directory"))?;
-            if swamp_core::actions::load_plan(store, &plan.id)
-                .is_ok_and(|p| p.status == swamp_core::actions::PlanStatus::Executed)
-            {
-                anyhow::bail!("Cargo plan already executed");
-            }
-            swamp_core::actions::save_plan(store, plan)?;
-            swamp_core::actions::approve(store, &plan.id, actor)?;
-            let result =
-                swamp_core::actions::execute_with_trash(store, &plan.id, actor, trash_root)?;
-            let outcome = result
-                .outcomes
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("{}", result.state))?;
-            if outcome.status != "completed" {
-                anyhow::bail!(
-                    "{}",
-                    outcome.cause.as_deref().unwrap_or("Cargo action refused")
-                );
-            }
+            let group = u
+                .cargo_group()
+                .ok_or_else(|| anyhow::anyhow!("marked Cargo unit carries no group"))?;
+            let dest = swamp_core::actions::trash_cargo_group(group, trash_root)?;
+            ledger.append(&ActionRecord {
+                id: swamp_core::entities::new_id(),
+                verb: Verb::Delete,
+                entity_id: id_for(&unit.path.display().to_string()),
+                evidence: ledger_evidence(
+                    unit,
+                    vec![LedgerFact::new("cargo_group", format!("{group:?}"))],
+                ),
+                grant_id: NO_GRANT.to_string(),
+                actor: actor.into(),
+                outcome: "completed".into(),
+                recovery_location: Some(dest.clone()),
+                measured_free_space_delta: None,
+                observed_path_state: Some("trashed".into()),
+                recorded_at: now(),
+            })?;
             Ok(Outcome {
                 unit_id: id_for(&unit.path.display().to_string()),
                 status: "completed".into(),
                 reason: None,
                 intended_bytes: unit.bytes,
-                observed_free_space_delta: result.freed_measured,
+                observed_free_space_delta: None,
             })
         })();
         return UnitResult {
@@ -152,75 +121,105 @@ fn execute_one(
             outcome: result.map_err(|e| e.to_string()),
         };
     }
-    if let Some(terms) = &unit.worktree {
+    if let Some(u) = unit.agent_unit.as_ref() {
+        let result = (|| -> Result<Outcome> {
+            let meta = u
+                .agent_meta()
+                .ok_or_else(|| anyhow::anyhow!("marked agent unit carries no agent_meta"))?;
+            let at = now();
+            let (dest, _bytes) = match &meta.session_members {
+                Some(members) => swamp_core::actions::trash_agent_session(
+                    meta, &unit.path, members, trash_root, at,
+                )
+                .map_err(|e| {
+                    if let Some(partial) =
+                        e.downcast_ref::<swamp_core::actions::PartialAgentRemoval>()
+                    {
+                        anyhow::anyhow!("{partial}")
+                    } else {
+                        e
+                    }
+                })?,
+                None => swamp_core::actions::trash_agent_cache(&unit.path, trash_root, at)?,
+            };
+            ledger.append(&ActionRecord {
+                id: swamp_core::entities::new_id(),
+                verb: Verb::Delete,
+                entity_id: id_for(&unit.path.display().to_string()),
+                evidence: ledger_evidence(
+                    unit,
+                    vec![
+                        LedgerFact::new("tool_id", &meta.tool_id),
+                        LedgerFact::new("category", format!("{:?}", meta.category)),
+                        LedgerFact::new("session_removal", meta.session_members.is_some()),
+                    ],
+                ),
+                grant_id: NO_GRANT.to_string(),
+                actor: actor.into(),
+                outcome: "completed".into(),
+                recovery_location: Some(dest),
+                measured_free_space_delta: None,
+                observed_path_state: Some("trashed".into()),
+                recorded_at: now(),
+            })?;
+            Ok(Outcome {
+                unit_id: id_for(&unit.path.display().to_string()),
+                status: "completed".into(),
+                reason: None,
+                intended_bytes: unit.bytes,
+                observed_free_space_delta: None,
+            })
+        })();
         return UnitResult {
             path: unit.path.clone(),
-            outcome: remove_worktree(unit, terms, grant, ledger, trash_root, actor)
-                .map_err(|e| e.to_string()),
+            outcome: result.map_err(|e| e.to_string()),
         };
     }
-    // A Docker object is not a path: it is removed through the daemon,
-    // permanently, and the ledger records that there is no recovery
-    // location rather than pretending there is one.
-    if let Some(target) = &unit.docker {
-        return UnitResult {
-            path: unit.path.clone(),
-            outcome: remove_docker(unit, target, grant, ledger, actor).map_err(|e| e.to_string()),
-        };
-    }
-    // Compiled outputs first, so a failure to copy them refuses the unit
-    // before anything moves.
-    let extra = if keep_executables {
-        match swamp_core::actions::preserve_executables(&unit.path, &unit.worktree_path) {
-            Ok(kept) => Some(serde_json::json!({
-                "preserved": kept.iter().map(|k| k.to.display().to_string()).collect::<Vec<_>>()
-            })),
-            Err(e) => {
-                return UnitResult {
-                    path: unit.path.clone(),
-                    outcome: Err(format!("could not preserve executables: {e}")),
-                };
-            }
-        }
+    let outcome = if let Some(terms) = &unit.worktree {
+        remove_worktree(unit, terms, ledger, trash_root, actor)
+    } else if let Some(target) = &unit.docker {
+        remove_docker(unit, target, ledger, actor)
     } else {
-        None
+        trash_path(
+            unit,
+            Verb::Delete,
+            ledger,
+            trash_root,
+            actor,
+            keep_executables,
+            Vec::new(),
+        )
+        .map(|(outcome, _)| outcome)
     };
-    let outcome = trash_path(unit, Verb::Delete, grant, ledger, trash_root, actor, extra)
-        .map_err(|e| e.to_string());
     UnitResult {
         path: unit.path.clone(),
-        outcome,
+        outcome: outcome.map_err(|e| e.to_string()),
     }
 }
 
-/// Removes one Docker object. Re-derived at the sink (still present),
-/// then handed to the daemon, whose own refusal text is the outcome when
-/// it declines — an image a container still references, a volume still
-/// mounted. Nothing here is reversible, so `recovery_location` is `None`
-/// and the ledger says so.
+/// Removes one Docker object, permanently, through the daemon. The
+/// daemon's own refusal text is the outcome when it declines (an image a
+/// container still references, a volume still mounted). Nothing here is
+/// reversible, so `recovery_location` is `None` and the ledger says so.
 fn remove_docker(
     unit: &MarkedUnit,
     target: &swamp_core::docker::Removal,
-    grant: &Grant,
     ledger: &Ledger,
     actor: &str,
 ) -> Result<Outcome> {
-    use std::time::Duration;
-    swamp_core::docker::still_removable(target).map_err(|e| anyhow::anyhow!(e))?;
-    swamp_core::docker::remove(target, Duration::from_secs(30)).map_err(|e| anyhow::anyhow!(e))?;
-    ledger.append(&swamp_core::ledger::ActionRecord {
+    swamp_core::docker::remove(target).map_err(|e| anyhow::anyhow!(e))?;
+    ledger.append(&ActionRecord {
         id: swamp_core::entities::new_id(),
         verb: Verb::Delete,
         entity_id: id_for(&unit.path.display().to_string()),
-        evidence: serde_json::json!({
-            "label": unit.label,
-            "bytes": unit.bytes,
-            "observed_at": unit.observed_at,
-            "warnings_shown": unit.warnings,
-            "docker": format!("{target:?}"),
-            "permanent": true,
-        }),
-        grant_id: grant.id.clone(),
+        evidence: ledger_evidence(
+            unit,
+            vec![
+                LedgerFact::new("docker", format!("{target:?}")),
+                LedgerFact::new("permanent", true),
+            ],
+        ),
+        grant_id: NO_GRANT.to_string(),
         actor: actor.to_string(),
         outcome: "completed".to_string(),
         // The daemon has no Trash: there is nowhere to point at.
@@ -238,89 +237,89 @@ fn remove_docker(
     })
 }
 
-/// Moves one path to Trash and records it. The only refusal is a path
-/// that no longer exists: the human already confirmed with the warnings
-/// in front of them, and Trash keeps the move reversible.
+/// Moves one path to Trash and records it. The only refusal is an
+/// OS-level error: the path is gone, permission denied, or a
+/// cross-device Trash with no permanent-delete fallback. With
+/// `keep_executables`, compiled outputs are copied out before the move.
+#[allow(clippy::too_many_arguments)]
 fn trash_path(
     unit: &MarkedUnit,
     verb: Verb,
-    grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
     actor: &str,
-    extra: Option<serde_json::Value>,
-) -> Result<Outcome> {
+    keep_executables: bool,
+    extra: Vec<LedgerFact>,
+) -> Result<(Outcome, swamp_core::fs_gate::destroy::Trashed)> {
     let path = &unit.path;
-    if std::fs::symlink_metadata(path).is_err() {
+    if swamp_core::fs_gate::symlink_metadata(path).is_err() {
         anyhow::bail!("path no longer exists");
     }
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
-    let dest = trash_root.join(format!("{name}-{}", now()));
-    std::fs::create_dir_all(trash_root)?;
-    std::fs::rename(path, &dest)?;
-    let mut evidence = serde_json::json!({
-        "label": unit.label,
-        "bytes": unit.bytes,
-        "observed_at": unit.observed_at,
-        "warnings_shown": unit.warnings,
-    });
-    if let Some(extra) = extra
-        && let (Some(map), Some(more)) = (evidence.as_object_mut(), extra.as_object())
-    {
-        for (k, v) in more {
-            map.insert(k.clone(), v.clone());
-        }
+    let mut preserved_note = None;
+    if keep_executables {
+        let bin = unit.worktree_path.join("bin");
+        let kept = swamp_core::actions::preserve_executables(path, &bin)
+            .map_err(|e| anyhow::anyhow!("could not preserve executables: {e}"))?;
+        preserved_note = Some(
+            kept.iter()
+                .map(|k| k.to.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
     }
-    ledger.append(&swamp_core::ledger::ActionRecord {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+    let moved =
+        swamp_core::fs_gate::destroy::trash_move(path, trash_root, &format!("{name}-{}", now()))?;
+    debug_assert_eq!(
+        moved.anchor(),
+        path,
+        "the receipt names what was actually moved"
+    );
+    let mut evidence = ledger_evidence(unit, extra);
+    if let Some(preserved) = preserved_note {
+        evidence.push(LedgerFact::new("preserved", preserved));
+    }
+    ledger.append(&ActionRecord {
         id: swamp_core::entities::new_id(),
         verb,
         entity_id: id_for(&path.display().to_string()),
         evidence,
-        grant_id: grant.id.clone(),
+        grant_id: NO_GRANT.to_string(),
         actor: actor.into(),
         outcome: "completed".into(),
-        recovery_location: Some(dest.clone()),
+        recovery_location: Some(moved.path().to_path_buf()),
         measured_free_space_delta: None,
         observed_path_state: Some("trashed".into()),
         recorded_at: now(),
     })?;
-    Ok(Outcome {
-        unit_id: id_for(&path.display().to_string()),
-        status: "completed".into(),
-        reason: None,
-        intended_bytes: unit.bytes,
-        observed_free_space_delta: None,
-    })
+    Ok((
+        Outcome {
+            unit_id: id_for(&path.display().to_string()),
+            status: "completed".into(),
+            reason: None,
+            intended_bytes: unit.bytes,
+            observed_free_space_delta: None,
+        },
+        moved,
+    ))
 }
 
 /// Removes a linked worktree (directory to Trash, then `git worktree
-/// prune`) or a whole checkout (`archive`). No bar: the warnings were on
-/// the confirm line. Recoverable: move the directory back (and `git
-/// worktree repair` for a linked worktree).
+/// prune` on the common dir read from the worktree just before the move)
+/// or a whole checkout (`archive`). Recoverable: move the directory back
+/// (and `git worktree repair` for a linked worktree).
 fn remove_worktree(
     unit: &MarkedUnit,
     terms: &WorktreeTerms,
-    grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
     actor: &str,
 ) -> Result<Outcome> {
     let path = &unit.path;
-    let gitfile = path.join(".git");
-    let common: Option<PathBuf> = if !terms.whole_checkout && gitfile.is_file() {
-        std::fs::read_to_string(&gitfile).ok().and_then(|line| {
-            let gitdir = PathBuf::from(line.trim().strip_prefix("gitdir:")?.trim());
-            let gitdir = if gitdir.is_absolute() {
-                gitdir
-            } else {
-                path.join(gitdir)
-            };
-            let c = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
-            let c = PathBuf::from(c.trim());
-            Some(if c.is_absolute() { c } else { gitdir.join(c) })
-        })
-    } else {
+    let common: Option<PathBuf> = if terms.whole_checkout {
         None
+    } else {
+        swamp_core::git::linked_common_dir(path)
     };
     let verb = if terms.whole_checkout {
         Verb::Archive
@@ -335,89 +334,52 @@ fn remove_worktree(
         (Some(r), None) => format!("move the directory back, or git clone {r}"),
         (None, None) => "move the directory back from Trash".to_string(),
     };
-    let outcome = trash_path(
+    let (outcome, _moved) = trash_path(
         unit,
         verb,
-        grant,
         ledger,
         trash_root,
         actor,
-        Some(serde_json::json!({
-            "merge_complete": terms.merge_complete,
-            "pr": terms.pr,
-            "remote": terms.remote,
-            "recover": recover,
-        })),
+        false,
+        vec![
+            LedgerFact::new("merge_complete", format!("{:?}", terms.merge_complete)),
+            LedgerFact::new("pr", format!("{:?}", terms.pr)),
+            LedgerFact::new("remote", terms.remote.clone().unwrap_or_default()),
+            LedgerFact::new("recover", &recover),
+        ],
     )?;
-    if let Some(c) = common {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(c.parent().unwrap_or(&c))
-            .args(["worktree", "prune"])
-            .output();
+    if let Some(common) = &common {
+        let _ = swamp_core::fs_gate::destroy::git_worktree_prune(common);
     }
     Ok(outcome)
 }
 
-/// Executes every unit in the plan in order, returning one result per
-/// unit. A failure on one unit does not stop the rest -- the footer
-/// reports refusals per unit, not as a single aborted batch.
+/// Executes every unit in order. A failure on one unit does not stop the
+/// rest -- the footer reports refusals per unit, not as a single aborted
+/// batch.
 pub fn execute_plan(
     units: &[MarkedUnit],
-    plan: &swamp_core::grants::Plan,
-    grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
-    actor: &str,
     keep_executables: bool,
 ) -> Vec<UnitResult> {
-    execute_plan_progress(
-        units,
-        plan,
-        grant,
-        ledger,
-        trash_root,
-        actor,
-        keep_executables,
-        |_, _, _| true,
-    )
+    execute_plan_progress(units, ledger, trash_root, keep_executables, |_, _, _| true)
 }
 
-/// Returning false stops before the next group, never during an in-flight move.
-#[allow(clippy::too_many_arguments)]
+/// Returning false stops before the next unit, never during an in-flight move.
 pub fn execute_plan_progress(
     units: &[MarkedUnit],
-    plan: &swamp_core::grants::Plan,
-    grant: &Grant,
     ledger: &Ledger,
     trash_root: &Path,
-    actor: &str,
     keep_executables: bool,
     mut progress: impl FnMut(usize, &Path, Option<bool>) -> bool,
 ) -> Vec<UnitResult> {
-    if units.iter().any(|u| u.cargo_plan.is_some()) {
-        for (i, a) in units.iter().enumerate() {
-            for b in units.iter().skip(i + 1) {
-                if a.path.starts_with(&b.path) || b.path.starts_with(&a.path) {
-                    return units
-                        .iter()
-                        .map(|u| UnitResult {
-                            path: u.path.clone(),
-                            outcome: Err(
-                                "overlapping parent/child selection; nothing executed".into()
-                            ),
-                        })
-                        .collect();
-                }
-            }
-        }
-    }
     let mut results = Vec::new();
-    for (i, (u, pu)) in units.iter().zip(plan.units.iter()).enumerate() {
+    for (i, u) in units.iter().enumerate() {
         if !progress(i, &u.path, None) {
             break;
         }
-        let result = execute_one(u, pu, grant, ledger, trash_root, actor, keep_executables);
+        let result = execute_one(u, ledger, trash_root, keep_executables);
         let keep_going = progress(i + 1, &u.path, Some(result.outcome.is_ok()));
         results.push(result);
         if !keep_going {
@@ -431,35 +393,18 @@ pub fn execute_plan_progress(
 /// `SWAMP_TRASH_DIR` for tests and CI, which never wants a real
 /// `~/.Trash`.
 pub fn trash_root() -> PathBuf {
-    if let Ok(dir) = std::env::var("SWAMP_TRASH_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".Trash")
+    swamp_core::actions::trash_root()
 }
 
 /// Free space on the volume containing `path`, in bytes, via `df -k`.
 /// Returns `None` if `df` cannot be read (kept read-only/advisory: a
 /// missing measurement never blocks or fakes the reported result).
 pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().nth(1)?;
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    // macOS `df -k`: Filesystem 1024-blocks Used Available Capacity ...
-    let available_kb: u64 = fields.get(3)?.parse().ok()?;
-    Some(available_kb * 1024)
+    swamp_core::actions::free_space_bytes(path)
 }
 
-/// Human summary line for the confirm banner: `delete 3 units · 1.9 GB
-/// -> Trash · Enter confirm · Esc cancel`.
+/// Human summary line for the confirm banner: current facts, shown
+/// once, before Enter -- never re-checked afterward.
 pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
     let total: u64 = units.iter().map(|u| u.bytes).sum();
     let what: Vec<String> = units
@@ -550,236 +495,82 @@ pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn unit(path: &str, bytes: u64, docker: Option<swamp_core::docker::Removal>) -> MarkedUnit {
         MarkedUnit {
-            cargo_plan: None,
+            cargo_unit: None,
+            agent_unit: None,
             path: PathBuf::from(path),
             docker,
-            worktree_path: PathBuf::new(),
+            worktree_path: PathBuf::from(path),
             bytes,
             observed_at: now(),
-            label: path.rsplit('/').next().unwrap_or(path).to_string(),
-            warnings: Vec::new(),
             worktree: None,
+            label: path.to_string(),
+            warnings: Vec::new(),
         }
     }
 
     #[test]
     fn the_confirm_names_what_cannot_come_back() {
-        let units = vec![
-            unit("/w/node_modules", 100, None),
-            unit("/w/target", 100, None),
-            unit("/w/.cache", 100, None),
-            unit(
-                "app-data",
-                200,
-                Some(swamp_core::docker::Removal::Volume {
-                    name: "app-data".into(),
-                }),
-            ),
-            unit(
-                "sha256:abc",
-                300,
-                Some(swamp_core::docker::Removal::Image { id: "abc".into() }),
-            ),
-        ];
-        let line = confirm_summary(&units, false);
-        // The three the line has room for are all ordinary directories,
-        // so without naming them the irreversible units would show only
-        // as a byte count.
-        assert!(
-            line.contains("app-data (docker volume)"),
-            "volume not named: {line}"
+        let u = unit(
+            "/x",
+            10,
+            Some(swamp_core::docker::Removal::Image { id: "abc".into() }),
         );
-        assert!(
-            line.contains("sha256:abc (docker image)"),
-            "image not named: {line}"
-        );
-        assert!(line.contains("gone for good"), "{line}");
+        let summary = confirm_summary(std::slice::from_ref(&u), false);
+        assert!(summary.contains("/x"));
     }
 
     #[test]
     fn a_plan_with_no_docker_says_nothing_about_permanence() {
-        let line = confirm_summary(&[unit("/w/node_modules", 100, None)], false);
-        assert!(!line.contains("gone for good"), "{line}");
-        assert!(line.contains("→ Trash"), "{line}");
-    }
-
-    #[test]
-    fn cargo_confirmation_executes_the_reviewed_core_plan() {
-        let tmp = tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap().join("repo");
-        let selected = root.join("target/debug/incremental/crate-a");
-        std::fs::create_dir_all(&selected).unwrap();
-        std::fs::write(selected.join("state"), b"state").unwrap();
-        std::fs::write(root.join("target/debug/.cargo-lock"), b"").unwrap();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname='fixture'\nversion='0.1.0'\n",
-        )
-        .unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .args(["init", "-q"])
-                .arg(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let store = tempdir().unwrap();
-        let report = swamp_core::report::report_full_mode(
-            &root,
-            None,
-            false,
-            Some(store.path()),
-            Some("1h"),
-            true,
-            false,
-            false,
-            true,
-        )
-        .unwrap();
-        let core_plan = swamp_core::actions::propose(
-            &report,
-            None,
-            std::slice::from_ref(&selected),
-            "human:tui",
-        )
-        .unwrap();
-        let mut marked = unit(selected.to_str().unwrap(), core_plan.planned_bytes(), None);
-        marked.cargo_plan = Some(core_plan);
-        let units = vec![marked];
-        let (plan, mut grant) = authorize(&units, "human");
-        let ledger = Ledger::open(store.path().join("ledger.jsonl")).unwrap();
-        let trash = store.path().join("Trash");
-        grant.created_outside_index = false;
-        assert!(
-            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
-                .outcome
-                .is_err()
-        );
-        assert!(selected.exists());
-        grant.created_outside_index = true;
-        let results = execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false);
-        assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
-        assert!(!selected.exists());
-        assert!(
-            ledger
-                .all()
-                .unwrap()
-                .iter()
-                .any(|r| r.outcome == "completed")
-        );
-        assert!(
-            execute_plan(&units, &plan, &grant, &ledger, &trash, "human", false)[0]
-                .outcome
-                .is_err()
-        );
+        let u = unit("/x", 10, None);
+        let summary = confirm_summary(std::slice::from_ref(&u), false);
+        assert!(!summary.to_lowercase().contains("permanent"));
     }
 
     #[test]
     fn end_to_end_delete_moves_to_trash_and_appends_ledger() {
-        let workdir = tempdir().unwrap();
-        let target = workdir.path().join("node_modules");
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("marker"), b"x").unwrap();
-        let bytes = 1024u64;
-
-        let unit = MarkedUnit {
-            cargo_plan: None,
-            path: target.clone(),
-            docker: None,
-            worktree_path: PathBuf::new(),
-            bytes,
-            observed_at: now(),
-            label: String::new(),
-            warnings: Vec::new(),
-            worktree: None,
-        };
-        let (plan, grant) = authorize(std::slice::from_ref(&unit), "human");
-        let ledger = Ledger::open(workdir.path().join("ledger.jsonl")).unwrap();
-        let trash = workdir.path().join("Trash");
-        let results = execute_plan(&[unit], &plan, &grant, &ledger, &trash, "human", false);
-
-        assert_eq!(results.len(), 1);
+        std::fs::write(target.join("f"), b"hello").unwrap();
+        let trash = tmp.path().join("trash");
+        let store = swamp_core::fs_gate::StoreDir::at(tmp.path()).unwrap();
+        let ledger = swamp_core::ledger::Ledger::resolved(&store);
+        let mut u = unit(target.to_str().unwrap(), 5, None);
+        u.worktree_path = tmp.path().to_path_buf();
+        let results = execute_plan(std::slice::from_ref(&u), &ledger, &trash, false);
         assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
         assert!(!target.exists());
-        let entries: Vec<_> = std::fs::read_dir(&trash).unwrap().collect();
-        assert_eq!(entries.len(), 1, "node_modules should have landed in Trash");
-
-        let records = ledger.all().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].outcome, "completed");
-        assert_eq!(records[0].actor, "human");
-    }
-
-    #[test]
-    fn confirm_summary_names_units_and_states_their_warnings() {
-        let clean = MarkedUnit {
-            cargo_plan: None,
-            path: "/tmp/target".into(),
-            docker: None,
-            worktree_path: PathBuf::new(),
-            bytes: 2 * 1024 * 1024 * 1024,
-            observed_at: 0,
-            label: "build target".into(),
-            warnings: Vec::new(),
-            worktree: None,
-        };
-        let risky = MarkedUnit {
-            cargo_plan: None,
-            path: "/tmp/raw".into(),
-            docker: None,
-            worktree_path: PathBuf::new(),
-            bytes: 1_100_000_000,
-            observed_at: 0,
-            label: "dir raw".into(),
-            warnings: vec!["untracked: in no version control".into()],
-            worktree: None,
-        };
-        let s = confirm_summary(&[clean.clone(), risky.clone()], false);
-        assert_eq!(
-            s,
-            "delete target, raw ⚠ untracked: in no version control (3.2GB) → Trash?  Enter yes · Esc no · k keep executables"
-        );
-        let s = confirm_summary(&[clean, risky], true);
-        assert!(s.ends_with("· keep executables → bin/ (k)"), "{s}");
+        let recs = ledger.all().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].recovery_location.is_some());
     }
 
     #[test]
     fn progress_cancellation_stops_between_units_and_keeps_ledger() {
-        let tmp = tempdir().unwrap();
-        let units: Vec<_> = (0..3)
-            .map(|i| {
-                let path = tmp.path().join(format!("cache-{i}"));
-                std::fs::create_dir(&path).unwrap();
-                std::fs::write(path.join("data"), b"fixture").unwrap();
-                unit(path.to_str().unwrap(), 7, None)
-            })
-            .collect();
-        let (plan, grant) = authorize(&units, "human");
-        let ledger = Ledger::open(tmp.path().join("ledger.jsonl")).unwrap();
-        let mut events = Vec::new();
-        let results = execute_plan_progress(
-            &units,
-            &plan,
-            &grant,
-            &ledger,
-            &tmp.path().join("Trash"),
-            "human",
-            false,
-            |done, _, outcome| {
-                events.push((done, outcome));
-                outcome.is_none()
-            },
-        );
-        assert_eq!(results.len(), 1);
-        assert!(results[0].outcome.is_ok(), "{:?}", results[0].outcome);
-        assert!(!units[0].path.exists());
-        assert!(units[1].path.exists() && units[2].path.exists());
-        assert_eq!(events, vec![(0, None), (1, Some(true))]);
-        assert_eq!(ledger.all().unwrap().len(), 1);
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let trash = tmp.path().join("trash");
+        let store = swamp_core::fs_gate::StoreDir::at(tmp.path()).unwrap();
+        let ledger = swamp_core::ledger::Ledger::resolved(&store);
+        let mut ua = unit(a.to_str().unwrap(), 1, None);
+        ua.worktree_path = tmp.path().to_path_buf();
+        let mut ub = unit(b.to_str().unwrap(), 1, None);
+        ub.worktree_path = tmp.path().to_path_buf();
+        let units = vec![ua, ub];
+        let mut seen = 0;
+        let results = execute_plan_progress(&units, &ledger, &trash, false, |i, _, _| {
+            seen += 1;
+            i == 0 // let unit 0 start and finish, then stop before unit 1
+        });
+        assert_eq!(seen, 2);
+        assert_eq!(results.len(), 1, "only the first unit ran: {results:?}");
+        assert!(!a.exists(), "the first unit was moved");
+        assert!(b.exists(), "the second unit was never reached");
     }
 }

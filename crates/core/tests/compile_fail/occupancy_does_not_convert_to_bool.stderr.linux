@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `bool: From<OccupancyState>` is not satisfied
+ --> $WORKSPACE/crates/core/tests/compile_fail/occupancy_does_not_convert_to_bool.rs
+  |
+  |     state.into()
+  |           ^^^^ the trait `From<OccupancyState>` is not implemented for `bool`
+  |
+help: the trait `From<OccupancyState>` is not implemented for `bool`
+      but trait `From<gix_config_value::types::Boolean>` is implemented for it
+ --> $CARGO/gix-config-value-$VERSION/src/boolean.rs
+  |
+  | impl From<Boolean> for bool {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `gix_config_value::types::Boolean`, found `OccupancyState`
+  = note: required for `OccupancyState` to implement `Into<bool>`

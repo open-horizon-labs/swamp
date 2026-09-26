@@ -135,7 +135,6 @@ DOCKER
   print "  swamp report $root --project $name           # the join"
   print "  swamp report $root --view docker             # joined and unowned together"
   print "  swamp ui $root                               # 5 for docker, Space to mark, A for all"
-  print "  swamp propose $root --filter 'kind:DockerImage project:$name'"
   print ""
   print "The worker image is held by a container: removing it must be refused"
   print "in the daemon's own words. The orphan image belongs to no project."

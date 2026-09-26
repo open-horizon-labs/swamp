@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `for_tests` found for struct `Stage` in the current scope
+ --> $WORKSPACE/crates/core/tests/compile_fail/bus_stage_has_no_production_test_constructor.rs
+  |
+  |     let _ = swamp_core::bus::Stage::for_tests();
+  |                                     ^^^^^^^^^ associated function or constant not found in `Stage`

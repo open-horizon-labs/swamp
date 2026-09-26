@@ -18,7 +18,12 @@ impl Consumer for SignalsConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::ProjectsGrouped]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         let Event::ProjectsGrouped {
             projects, rewalked, ..
         } = event
@@ -37,59 +42,31 @@ impl Consumer for SignalsConsumer {
         // Incremental walk: a worktree FSEvents reported nothing under has
         // the same git state it had last time; age its signals instead of
         // running git on it again. Only the re-walked ones are recomputed.
+        //
+        // The previous pass's signals come from `git_signals.parquet`
+        // (R18a-4), root-keyed and written by this same consumer at the
+        // end of `on_event` below -- never from a scope-keyed table, so
+        // this replay decision works identically for a single-root,
+        // scope-less call and for one root inside a multi-root scope.
         let mut todo: Vec<(String, PathBuf)> = all.clone();
         if let (Some(rewalked), Some(store)) = (rewalked, &ctx.store_dir)
-            && let Some(prev) = crate::report::load_last_report(store, &ctx.root)
+            && let Some((prev_observed_at, prev_by_worktree)) =
+                crate::growth::read_git_signals_table(store, &crate::growth::root_key(&ctx.root))
         {
-            let elapsed = ctx.observed_at.saturating_sub(prev.observed_at);
+            let elapsed = ctx.observed_at.saturating_sub(prev_observed_at);
             let rewalked: std::collections::HashSet<&String> = rewalked.iter().collect();
-            let prev_rows: HashMap<&str, &crate::report::WorktreeRow> = prev
-                .projects
-                .iter()
-                .flat_map(|p| p.worktrees.iter())
-                .map(|w| (w.worktree_id.as_str(), w))
-                .collect();
             todo.retain(|(id, path)| {
                 if rewalked.contains(id) {
                     return true;
                 }
-                let Some(w) = prev_rows.get(id.as_str()) else {
+                let Some(prev) = prev_by_worktree.get(id.as_str()) else {
                     return true;
                 };
-                let raw = crate::signals::RawSignals {
-                    last_commit_age_secs: None,
-                    dirty: w
-                        .signals
-                        .iter()
-                        .find(|s| s.name == "dirty")
-                        .map(|s| s.value == "dirty"),
-                    unpushed: w
-                        .signals
-                        .iter()
-                        .find(|s| s.name == "unpushed")
-                        .and_then(|s| s.value.split(' ').next()?.parse().ok()),
-                    locked: w
-                        .signals
-                        .iter()
-                        .find(|s| s.name == "locked")
-                        .map(|s| s.value == "locked"),
-                    idle_for_secs: w.idle_secs,
-                };
-                // The gate appends `merge_complete` and `pull_request`
-                // from the GitHub facts every run. Carrying a previous
-                // report's rows forward wholesale re-adds them, and the
-                // worktree line printed each one twice.
-                let previous: Vec<crate::report::Signal> = w
-                    .signals
-                    .iter()
-                    .filter(|s| s.name != "merge_complete" && s.name != "pull_request")
-                    .cloned()
-                    .collect();
-                let (rows, raw) = crate::signals::age_signals(&previous, &raw, elapsed);
+                let (rows, raw) = crate::signals::age_signals(&prev.rows, &prev.raw, elapsed);
                 by_worktree.insert(
                     id.clone(),
                     WorktreeSignals {
-                        branch: w.branch.clone(),
+                        branch: prev.branch.clone(),
                         path: path.clone(),
                         rows,
                         raw,
@@ -123,6 +100,22 @@ impl Consumer for SignalsConsumer {
                     raw,
                 },
             );
+        }
+        // Persist this pass's full `by_worktree` (replayed rows aged
+        // forward and freshly walked ones alike) as the next pass's
+        // replay cache. Gated on `ctx.observe` like every other
+        // current-state table write: a `--no-observe`/pure-read call
+        // must never advance what a later real observation replays
+        // from.
+        if ctx.observe
+            && let Some(store) = &ctx.store_dir
+        {
+            crate::growth::write_git_signals_table(
+                store,
+                &crate::growth::root_key(&ctx.root),
+                ctx.observed_at,
+                &by_worktree,
+            )?;
         }
         Ok(vec![Event::SignalsComputed {
             by_worktree: Arc::new(by_worktree),

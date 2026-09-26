@@ -17,7 +17,7 @@ pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
 /// is `Projects` here: one row per project, same aggregation), plus
 /// `Tree`, the per-project drill-down `--project` renders (#33). `v`
 /// cycles this exact order on both surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewKind {
     Projects,
     Tree,
@@ -28,9 +28,20 @@ pub enum ViewKind {
     Unowned,
     /// Per-ecosystem rollup (`Report.summary`).
     Types,
+    /// External/shared storage units (#43), the minimal shape DESIGN.md
+    /// recorded: read-only, one row per detector-resolved unit.
+    External,
+    /// Agent-tool storage (#91/#92/#100): read-only, one row per
+    /// `AgentUnit`. See `model::agent_rows`'s doc comment for why
+    /// marking is not wired up in this chunk.
+    Agents,
 }
 
 impl ViewKind {
+    /// `'0'` is not a view digit here: it is already the global "clear
+    /// filter" key (see `crate::handle_key_mod`), so `ViewKind::Agents`
+    /// has no dedicated digit and is reached only by cycling with `v`
+    /// (`ViewKind::next`) -- documented, not a silent omission.
     pub fn from_digit(d: char) -> Option<Self> {
         Some(match d {
             '1' => ViewKind::Projects,
@@ -41,6 +52,7 @@ impl ViewKind {
             '6' => ViewKind::Kinds,
             '7' => ViewKind::Unowned,
             '8' => ViewKind::Types,
+            '9' => ViewKind::External,
             _ => return None,
         })
     }
@@ -53,7 +65,9 @@ impl ViewKind {
             ViewKind::Docker => ViewKind::Kinds,
             ViewKind::Kinds => ViewKind::Unowned,
             ViewKind::Unowned => ViewKind::Types,
-            ViewKind::Types => ViewKind::Projects,
+            ViewKind::Types => ViewKind::External,
+            ViewKind::External => ViewKind::Agents,
+            ViewKind::Agents => ViewKind::Projects,
         }
     }
     pub fn label(self) -> &'static str {
@@ -66,11 +80,83 @@ impl ViewKind {
             ViewKind::Docker => "docker",
             ViewKind::Unowned => "unowned",
             ViewKind::Types => "types",
+            ViewKind::External => "external",
+            ViewKind::Agents => "agents",
+        }
+    }
+}
+
+/// One background observation's outcome: every `(root, report)` pair it
+/// managed to produce (#51 -- a live/cached refresh can cover more than
+/// one root per worker thread; see `App::pending`'s doc comment).
+/// One background/live observation's whole result. External and agent
+/// units travel with the per-root reports because they come from the
+/// *same* pass (`report::observe_scope`): the review found the TUI's
+/// agent view could go arbitrarily stale while the header said the
+/// report was live, because only startup ever refreshed those vectors.
+pub struct RefreshedObservation {
+    pub per_root: Vec<(PathBuf, Report)>,
+    /// Every root's latest report (the cache the worker was handed, with
+    /// `per_root` folded in) and their merge, computed **on the worker**:
+    /// the merge re-attaches consumer associations from the store's
+    /// declaration caches, which is I/O the event thread must not do
+    /// (`tui_event_thread_has_no_gate_calls`). `None` when nothing was
+    /// re-observed.
+    pub merged: Option<MergedReports>,
+    /// `None` when this refresh did not re-derive units (nothing should
+    /// clear them); `Some` replaces them wholesale.
+    pub external_units: Option<Vec<swamp_core::external::ExternalUnit>>,
+    pub agent_units: Option<Vec<swamp_core::agents::AgentUnit>>,
+    /// The machine-wide build stores' interiors from the same pass;
+    /// `None` exactly when `external_units` is.
+    pub store_interiors: Option<Vec<swamp_core::artifact::NestedArtifact>>,
+}
+
+type PendingObservation = anyhow::Result<RefreshedObservation>;
+
+/// A merged multi-root report and the per-root cache it came from.
+pub struct MergedReports {
+    pub by_root: std::collections::HashMap<PathBuf, Report>,
+    pub report: Report,
+}
+
+impl RefreshedObservation {
+    /// Builds the result a worker sends: folds `per_root` into `cache`
+    /// (the app's per-root cache when the worker started -- only one
+    /// observation is ever pending, so nothing else changed it) and
+    /// merges. Called on worker threads only.
+    pub fn merged_on_worker(
+        roots: &[PathBuf],
+        mut cache: std::collections::HashMap<PathBuf, Report>,
+        per_root: Vec<(PathBuf, Report)>,
+        external_units: Option<Vec<swamp_core::external::ExternalUnit>>,
+        agent_units: Option<Vec<swamp_core::agents::AgentUnit>>,
+        store_interiors: Option<Vec<swamp_core::artifact::NestedArtifact>>,
+    ) -> Self {
+        let merged = (!per_root.is_empty()).then(|| {
+            for (root, r) in &per_root {
+                cache.insert(root.clone(), r.clone());
+            }
+            let report = swamp_core::report::merge_reports(roots, &cache);
+            MergedReports {
+                by_root: cache,
+                report,
+            }
+        });
+        RefreshedObservation {
+            per_root,
+            merged,
+            external_units,
+            agent_units,
+            store_interiors,
         }
     }
 }
 
 pub struct App {
+    /// Ephemeral on-demand details; never persisted in the observation store.
+    pub cargo_inspection: Option<Vec<String>>,
+    pub cargo_inspection_scroll: u16,
     pub operation: Option<Operation>,
     operation_rx: Option<std::sync::mpsc::Receiver<OperationEvent>>,
     review_progress: Option<std::sync::mpsc::Sender<OperationEvent>>,
@@ -78,7 +164,33 @@ pub struct App {
     reviewed: usize,
     review_total: usize,
     pub report: Report,
+    /// Primary root: the first entry of `roots`, kept for every call
+    /// site that only ever needed one representative path (a "resize
+    /// this one thing" worker sub-`App`, a device lookup for an FSEvents
+    /// plan). Never the sole scan target once `roots.len() > 1` --
+    /// `report` and the live-refresh machinery below always operate
+    /// over the whole `roots` list.
     pub root: PathBuf,
+    /// Every root this report covers (#51): a single-root `swamp ui
+    /// <path>` invocation gets exactly one entry; the configured-scope
+    /// invocation (`swamp ui` with no explicit root) gets every present
+    /// root the resolved `EffectiveScope` walked, so project/shared/
+    /// external units from any of them are all in `report` at once --
+    /// including a root with no Git checkout in it at all (only
+    /// external/agent-tool storage), which used to be invisible because
+    /// the CLI picked exactly one present root before the TUI even
+    /// started.
+    pub roots: Vec<PathBuf>,
+    /// Each root's own last-observed single-root report, keyed by its
+    /// walked path -- the input to `report::merge_reports`, which
+    /// rebuilds `report` from this map. A live refresh or cached-startup
+    /// re-observation of one root replaces exactly that root's entry
+    /// and re-merges, so it can never erase or stale-mark any other
+    /// root's rows (#51's "updating one root does not erase/stale-mark
+    /// unrelated measured roots"). Empty for a fixture `App` built
+    /// directly from a `Report` (tests): `replace_report_for_root` still
+    /// works in that case, it just starts from one entry.
+    pub reports_by_root: std::collections::HashMap<PathBuf, Report>,
     pub view: ViewKind,
     pub filter_text: String,
     pub filter: Filter,
@@ -86,8 +198,20 @@ pub struct App {
     pub editing_filter: bool,
     /// Filter text as it was when editing began; restored on Esc.
     pub filter_before_edit: String,
-    /// Background observation result, when one is in flight.
-    pub pending: Option<std::sync::mpsc::Receiver<anyhow::Result<Report>>>,
+    /// Background observation result, when one is in flight: one or more
+    /// `(root, report)` pairs (a live refresh touches whichever one root
+    /// owned the changed paths; a cached-startup refresh re-observes
+    /// every root in one worker thread), each applied via
+    /// `replace_report_for_root` so it updates exactly that root's entry
+    /// in `reports_by_root` regardless of how many roots this `App`
+    /// covers. `Err` is scope-wide (the worker thread itself failed
+    /// before producing any per-root result, e.g. a channel/panic
+    /// issue) rather than naming one root, since a single-root failure
+    /// is instead represented as that root simply being absent from an
+    /// `Ok` vec (its previous `reports_by_root` entry is left as-is,
+    /// same "coverage change is not a storage change" contract as
+    /// `report_scope`'s own per-root `Inaccessible` handling).
+    pub pending: Option<std::sync::mpsc::Receiver<PendingObservation>>,
     /// One-line status shown in the footer slot (errors, notices).
     pub status: Option<String>,
     pub selected: usize,
@@ -124,10 +248,15 @@ pub struct App {
     /// Store dir, when known: the applied filter is persisted there so it
     /// survives relaunch (`ui_filter.txt`).
     pub store_dir: Option<PathBuf>,
-    /// The live FSEvents stream on the root, running for the TUI's
-    /// lifetime. Every change under the root, including our own deletes,
-    /// arrives here; nothing "asks" for a refresh.
-    pub watch: Option<swamp_core::fs_events::Watcher>,
+    /// The live FSEvents streams covering every root in `roots` (#51):
+    /// one `Watcher` per root, all feeding the single `watch_rx` below
+    /// through cloned senders, so a change under *any* included root,
+    /// including our own deletes, arrives here -- nothing "asks" for a
+    /// refresh. Kept as a `Vec` (not one merged stream) because
+    /// `fs_events::watch` is a per-path platform call; two roots on
+    /// different volumes are two independent FSEvents streams no matter
+    /// how this struct stores their handles.
+    pub watches: Vec<swamp_core::fs_events::Watcher>,
     pub watch_rx: Option<std::sync::mpsc::Receiver<swamp_core::fs_events::WatchBatch>>,
     /// Changed directories received and not yet observed.
     pub live_changes: std::collections::HashSet<PathBuf>,
@@ -135,6 +264,45 @@ pub struct App {
     /// When the last batch arrived; observation starts once the stream has
     /// been quiet for `LIVE_QUIET`.
     pub live_last_batch: Option<Instant>,
+    /// Roots whose next live refresh must walk fully, and why: the
+    /// watch lost coverage (Linux: overflow, watch limit, permissions),
+    /// or its epoch opened after the root's last observation, leaving a
+    /// gap nothing covers. Empty on macOS, whose stream reports neither.
+    pub live_full_walk:
+        std::collections::HashMap<PathBuf, (swamp_core::fs_events::RefreshRefusal, String)>,
+    /// Roots whose watch cannot vouch for anything any more (a watch
+    /// limit, a permission gap): live refresh is off for them and the
+    /// status line says why. The background refresh still covers them.
+    pub live_off: std::collections::HashMap<PathBuf, String>,
+    /// External/shared storage units (#43), for `ViewKind::External`.
+    /// Empty until `set_external_units` is called (once, at startup --
+    /// detector resolution is disk I/O and never runs on this struct's
+    /// own event/render path).
+    pub external_units: Vec<swamp_core::external::ExternalUnit>,
+    /// The identified interiors of the machine-wide build stores among
+    /// `external_units` (`ScopeObservation::store_interiors`), set with
+    /// them, from the same pass.
+    pub store_interiors: Vec<swamp_core::artifact::NestedArtifact>,
+    /// Agent-tool storage units (#91/#100), for `ViewKind::Agents`. Same
+    /// startup-only population contract as `external_units`.
+    pub agent_units: Vec<swamp_core::agents::AgentUnit>,
+    /// A short header clause naming how many roots the *configured*
+    /// scope resolves to and the worst non-`Present` status among them
+    /// (e.g. `"3 roots (1 missing)"`), or `None` when the scope is a
+    /// single present root -- the ordinary case, worth no clause at
+    /// all. Derived from `scope::EffectiveScope::roots`
+    /// (`scope::RootStatus`, resolved without walking anything), not
+    /// from `report_scope`'s own per-root `coverage::RegionStatus`
+    /// (that would require making the TUI's own rendered report
+    /// multi-root, #50's still-open job -- see DESIGN.md). Populated
+    /// once at startup, same contract as `external_units`/`agent_units`.
+    pub scope_note: Option<String>,
+    /// The authorized scope this TUI is showing. Every refresh --
+    /// background, live watch, post-action re-observe -- goes through it,
+    /// so exclusions and external pruning survive an update rather than
+    /// applying only to the first render
+    /// (`.oh/guardrails/tui-refresh-preserves-scope.md`).
+    pub scope: Option<swamp_core::scope::EffectiveScope>,
 }
 
 pub struct Operation {
@@ -149,6 +317,7 @@ pub struct Operation {
 }
 
 enum OperationEvent {
+    Inspected(Vec<String>),
     Progress {
         completed: usize,
         total: usize,
@@ -170,10 +339,6 @@ enum OperationEvent {
     Failed(String),
 }
 
-fn ui_state_path(store: &std::path::Path) -> PathBuf {
-    store.join("ui_state.json")
-}
-
 /// What the TUI remembers between sessions: the applied filter and the
 /// sort. Both are choices a human made about how to look at their own
 /// machine; asking again every launch is the tool forgetting on purpose.
@@ -190,10 +355,16 @@ pub struct UiState {
 }
 
 pub fn load_ui_state(store: &std::path::Path) -> UiState {
-    std::fs::read_to_string(ui_state_path(store))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let Ok(store) = swamp_core::fs_gate::StoreDir::at(store) else {
+        return UiState::default();
+    };
+    swamp_core::fs_gate::store::read_json_bytes(swamp_core::fs_gate::store::JsonFile::UiState {
+        store: &store,
+    })
+    .ok()
+    .flatten()
+    .and_then(|t| serde_json::from_slice(&t).ok())
+    .unwrap_or_default()
 }
 
 pub fn sort_from_str(s: &str) -> Sort {
@@ -220,8 +391,24 @@ pub fn sort_to_str(s: Sort) -> &'static str {
 
 impl App {
     pub fn new(report: Report, root: PathBuf) -> Self {
+        Self::new_multi_root(report, vec![root])
+    }
+
+    /// Same as [`App::new`], for a report covering more than one root
+    /// (#51). `roots` must be non-empty; `roots[0]` becomes `self.root`
+    /// (the "one representative path" a handful of call sites still
+    /// need -- see `root`'s doc comment). `reports_by_root` starts
+    /// empty: a caller that already has each root's own report (the
+    /// ordinary startup path, via `report::report_scope_with_parts`)
+    /// should populate it directly on the returned `App` before the
+    /// first live refresh, so that refresh re-merges from real per-root
+    /// data instead of a single placeholder entry.
+    pub fn new_multi_root(report: Report, roots: Vec<PathBuf>) -> Self {
         let filter = filter::default_filter();
+        let root = roots.first().cloned().unwrap_or_default();
         App {
+            cargo_inspection: None,
+            cargo_inspection_scroll: 0,
             operation: None,
             operation_rx: None,
             review_progress: None,
@@ -230,6 +417,8 @@ impl App {
             review_total: 0,
             report,
             root,
+            roots,
+            reports_by_root: std::collections::HashMap::new(),
             view: ViewKind::Projects,
             filter_text: filter::default_filter_text().to_string(),
             filter,
@@ -257,14 +446,100 @@ impl App {
             quit: false,
             width: 0,
             store_dir: None,
-            watch: None,
+            watches: Vec::new(),
             watch_rx: None,
             live_changes: std::collections::HashSet::new(),
             live_last_event_id: 0,
             live_last_batch: None,
+            live_full_walk: std::collections::HashMap::new(),
+            live_off: std::collections::HashMap::new(),
             track: std::collections::HashMap::new(),
             history_secs: None,
+            external_units: Vec::new(),
+            store_interiors: Vec::new(),
+            agent_units: Vec::new(),
+            scope_note: None,
+            scope: None,
         }
+    }
+
+    /// Sets `external_units` for `ViewKind::External` (#43). Called once
+    /// at startup, never from the event/render loop -- detector
+    /// resolution and measurement are disk I/O.
+    pub fn set_external_units(&mut self, units: Vec<swamp_core::external::ExternalUnit>) {
+        self.external_units = units;
+    }
+
+    /// Sets the store interiors shown under `ViewKind::External`. Same
+    /// contract as `set_external_units`, and always from the same pass.
+    pub fn set_store_interiors(&mut self, units: Vec<swamp_core::artifact::NestedArtifact>) {
+        self.store_interiors = units;
+    }
+
+    /// Sets `agent_units` for `ViewKind::Agents` (#91/#100). Same
+    /// startup-only contract as `set_external_units`.
+    pub fn set_agent_units(&mut self, units: Vec<swamp_core::agents::AgentUnit>) {
+        self.agent_units = units;
+    }
+
+    /// Sets `scope_note` from this pass's actual per-root observation
+    /// outcome (#51 -- replaces the pre-walk, `scope::RootStatus`-only
+    /// version #50's chunk shipped): `RegionStatus` reflects what
+    /// `report_scope` actually managed to observe this time (e.g.
+    /// `Partial` when part of a `Present` root could not be read during
+    /// the walk itself), which a resolved `EffectiveScope` alone cannot
+    /// -- that only knows what existed *before* walking. `None` when
+    /// there is exactly one region and it is `Complete` (the ordinary
+    /// case): every other case -- more than one region, or the one
+    /// region not simply `Complete` -- gets one short clause, worst
+    /// status first, e.g. `"3 roots (1 missing)"` or `"2 roots (1
+    /// inaccessible: permission denied)"`. A `SkippedAsNested` root gets
+    /// no `RootCoverage` row at all (`report_scope_with_source` folds it
+    /// into its parent's own region), so it is naturally never counted
+    /// here either.
+    pub fn set_scope_note(&mut self, coverage: &[swamp_core::coverage::RootCoverage]) {
+        use swamp_core::coverage::RegionStatus;
+        if coverage.len() <= 1
+            && coverage
+                .iter()
+                .all(|c| matches!(c.status, RegionStatus::Complete))
+        {
+            self.scope_note = None;
+            return;
+        }
+        let total = coverage.len();
+        let not_complete = coverage
+            .iter()
+            .filter(|c| !matches!(c.status, RegionStatus::Complete))
+            .count();
+        let worst = coverage
+            .iter()
+            .find_map(|c| match &c.status {
+                RegionStatus::Inaccessible { reason } => Some(format!("inaccessible: {reason}")),
+                _ => None,
+            })
+            .or_else(|| {
+                coverage.iter().find_map(|c| match &c.status {
+                    RegionStatus::Partial { reason } => Some(format!("partial: {reason}")),
+                    _ => None,
+                })
+            })
+            .or_else(|| {
+                coverage
+                    .iter()
+                    .any(|c| matches!(c.status, RegionStatus::Excluded))
+                    .then(|| "excluded".to_string())
+            })
+            .or_else(|| {
+                coverage
+                    .iter()
+                    .any(|c| matches!(c.status, RegionStatus::Missing))
+                    .then(|| "missing".to_string())
+            });
+        self.scope_note = Some(match worst {
+            Some(w) if not_complete > 0 => format!("{total} roots ({not_complete} {w})"),
+            _ => format!("{total} roots"),
+        });
     }
 
     /// Annotates every row of one project with its git tracking status:
@@ -312,6 +587,43 @@ impl App {
         self.restore_selection(anchor);
     }
 
+    /// Replaces exactly one root's contribution to `self.report` (#51):
+    /// updates `reports_by_root[root]`, then rebuilds `self.report` from
+    /// every root's latest cached report (`report::merge_reports`).
+    /// Every other root's rows are re-folded unchanged from their own
+    /// cached entry -- a refresh of one root can never erase, stale-mark,
+    /// or duplicate another root's data, because that data is never
+    /// touched, only re-read from `reports_by_root`.
+    #[cfg(test)]
+    pub fn replace_report_for_root(&mut self, root: PathBuf, report: Report) {
+        let anchor = self.selected_row_key();
+        self.reports_by_root.insert(root, report);
+        self.report = swamp_core::report::merge_reports(&self.roots, &self.reports_by_root);
+        self.restore_selection(anchor);
+    }
+
+    /// Installs a worker's result (what the event loop does with every
+    /// finished observation): the merged report and per-root cache the
+    /// worker already computed, and the unit vectors from the same pass.
+    /// No I/O: everything was prepared off the event thread.
+    pub fn install_refreshed(&mut self, fresh: RefreshedObservation) {
+        if let Some(m) = fresh.merged {
+            self.reports_by_root = m.by_root;
+            self.replace_report(m.report);
+        }
+        // External and agent units come from the same pass, so the agent
+        // view is never older than the header.
+        if let Some(units) = fresh.external_units {
+            self.set_external_units(units);
+        }
+        if let Some(units) = fresh.store_interiors {
+            self.set_store_interiors(units);
+        }
+        if let Some(units) = fresh.agent_units {
+            self.set_agent_units(units);
+        }
+    }
+
     /// Identity of the selected row: its unit path when it has one
     /// (stable across re-sorts), otherwise its label.
     fn selected_row_key(&self) -> Option<String> {
@@ -350,12 +662,13 @@ impl App {
                     .clone()
                     .or_else(|| self.report.projects.first().map(|p| p.name.clone()));
                 return match name {
-                    Some(n) => model::tree_rows(
+                    Some(n) => model::tree_rows_with_agents(
                         &self.report,
                         &n,
                         &self.filter,
                         &self.collapsed,
                         &self.track,
+                        &self.agent_units,
                     ),
                     None => Vec::new(),
                 };
@@ -363,9 +676,16 @@ impl App {
             ViewKind::Builds => model::builds_rows(&self.report, &self.filter),
             ViewKind::Deps => model::deps_rows(&self.report, &self.filter),
             ViewKind::Kinds => model::kinds_rows(&self.report, &self.filter),
-            ViewKind::Docker => model::docker_rows(&self.report),
+            ViewKind::Docker => model::docker_rows_with(&self.report, &self.collapsed),
             ViewKind::Unowned => model::unowned_rows(&self.report),
             ViewKind::Types => model::types_rows(&self.report, &self.filter),
+            ViewKind::External => model::external_rows_with(
+                &self.external_units,
+                &self.store_interiors,
+                &self.collapsed,
+                self.report.observed_at,
+            ),
+            ViewKind::Agents => model::agent_rows(&self.agent_units),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
         rows
@@ -518,17 +838,19 @@ impl App {
     }
 
     fn persist_ui_state(&self) {
-        if let Some(store) = &self.store_dir {
+        if let Some(store) = &self.store_dir
+            && let Ok(store) = swamp_core::fs_gate::StoreDir::at(store)
+        {
             let state = UiState {
                 filter: self.filter_text.clone(),
                 sort: sort_to_str(self.sort).to_string(),
                 reverse: self.reverse,
                 keep_executables: self.keep_executables,
             };
-            let _ = std::fs::create_dir_all(store);
-            if let Ok(text) = serde_json::to_string_pretty(&state) {
-                let _ = std::fs::write(ui_state_path(store), text);
-            }
+            let _ = swamp_core::fs_gate::store::write_json(
+                swamp_core::fs_gate::store::JsonFile::UiState { store: &store },
+                &state,
+            );
         }
     }
 
@@ -569,7 +891,13 @@ impl App {
     }
 
     pub fn toggle_expand(&mut self) {
-        if self.view != ViewKind::Tree {
+        // The tree, and the two views whose rows open onto an identified
+        // interior: a machine-wide store (External) and a BuildKit
+        // builder (Docker).
+        if !matches!(
+            self.view,
+            ViewKind::Tree | ViewKind::External | ViewKind::Docker
+        ) {
             return;
         }
         if let Some(key) = self.selected_row().and_then(|r| r.expansion_key) {
@@ -650,8 +978,15 @@ impl App {
     /// names how many and why.
     pub fn mark_all_in_view(&mut self) {
         let rows = self.rows();
-        let mut refused: Option<&'static str> = None;
+        let mut refused: Option<String> = None;
         let mut marked = 0usize;
+        // Agents view (#91/#100/#101): `model::agent_rows` sets `unit`
+        // on every row, protected/unsupported ones included, but never
+        // sets `kind` (there is no `ArtifactKind` for an agent-storage
+        // unit). Counted separately so the footer can say how many were
+        // skipped and why, rather than folding it into the single
+        // static per-kind refusal strings below.
+        let mut agent_skipped = 0usize;
         for row in rows {
             let Some(kind) = row.kind.clone() else {
                 // Projects view: each row stands for a whole project.
@@ -661,9 +996,23 @@ impl App {
                     // checkout under the root behind one Enter.
                     let n = self.mark_project(&project, false);
                     if n == 0 {
-                        refused = refused.or(Some("nothing reclaimable in this project"));
+                        refused = refused.or(Some("nothing reclaimable in this project".into()));
                     }
                     marked += n;
+                } else if row.unit.is_some() {
+                    // `mark_row` already knows how to refuse a
+                    // protected/unsupported/active agent-storage row
+                    // (via `actions::propose_agents`'s own refusal
+                    // text) -- reused here instead of duplicating that
+                    // logic, so Shift+A gives the same reason Backspace
+                    // would on the same row, not a generic one.
+                    let before = self.marked.len();
+                    self.mark_row(&row);
+                    if self.marked.len() > before {
+                        marked += 1;
+                    } else {
+                        agent_skipped += 1;
+                    }
                 }
                 continue;
             };
@@ -674,12 +1023,29 @@ impl App {
                         marked += 1;
                     }
                 }
-                Err(why) => refused = refused.or(Some(why)),
+                Err(why) => refused = refused.or(Some(why.into())),
             }
         }
+        if agent_skipped > 0 {
+            refused = refused.or(Some(format!(
+                "{agent_skipped} agent-storage row{} protected, unsupported, or active; skipped",
+                if agent_skipped == 1 { " is" } else { "s are" }
+            )));
+        }
         if marked == 0 {
-            self.set_refusal(refused.unwrap_or("nothing in this view can be acted on"));
+            self.set_refusal(
+                refused
+                    .as_deref()
+                    .unwrap_or("nothing in this view can be acted on"),
+            );
             return;
+        }
+        // Some rows were left alone (agent-storage skip, or an empty
+        // project) even though at least one row *was* marked: say so,
+        // rather than silently proceeding to a confirm that looks like
+        // it covers everything the human saw on screen.
+        if let Some(msg) = refused {
+            self.set_refusal(&msg);
         }
         self.confirm_open = true;
     }
@@ -886,6 +1252,42 @@ impl App {
         if self.marked.remove(&unit_id.0).is_some() {
             return; // toggle off
         }
+        // Human keep/protect intent, checked for **every** markable row
+        // before anything else.
+        //
+        // This used to be reached only for the two row kinds that
+        // happen to propose through core (`nested_artifacts` and agent
+        // units), so an ordinary artifact or unowned row containing a
+        // protected file marked cleanly and was refused much later, at
+        // execution. The integration owner's 2026-09-21 mutation check
+        // is why this is a gate rather than a side effect of proposing:
+        // a one-directional protection predicate survived every test
+        // precisely because no path exercised "ordinary row *contains* a
+        // protected descendant".
+        //
+        // Both directions, from the one predicate
+        // (`.oh/guardrails/protection-fails-closed.md`); protection
+        // state that cannot be read is *unknown*, so it refuses too.
+        if let Some(store) = self.store_dir.clone() {
+            let candidate = PathBuf::from(&unit_id.0);
+            match swamp_core::agents::load_protect(&store) {
+                Ok(protected) => {
+                    if let Some(reason) = protected.conflict(&candidate) {
+                        self.set_refusal(&format!(
+                            "human-protected path (swamp protect): {reason}; remove protection \
+                             first if this unit should be actionable"
+                        ));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    self.set_refusal(&format!(
+                        "protection state could not be read, so nothing may be marked: {e}"
+                    ));
+                    return;
+                }
+            }
+        }
         let mut warnings: Vec<String> = Vec::new();
         let worktree = row.worktree.clone().map(|wt| {
             let whole_checkout = !wt.linked;
@@ -940,23 +1342,77 @@ impl App {
             }
             _ => {}
         }
+        // #60/#61: consumer/current-use/recovery/reclaimability facts
+        // from the row's own decision evidence (`model::Row::evidence`,
+        // populated from the same `ArtifactRow`/`AgentUnit` every other
+        // row field already comes from) -- distinct from the git-status
+        // warnings above, and covering every markable row uniformly
+        // rather than only the cargo-container-member/agent-storage
+        // cases that separately call `actions::propose`/`propose_agents`
+        // below.
+        warnings.extend(swamp_core::render::evidence_warnings(&row.evidence));
         let label = row.label.trim().to_string();
         let unit_path = PathBuf::from(&unit_id.0);
-        let cargo_plan = if self
+        let cargo_unit = if self
             .report
             .nested_artifacts
             .iter()
             .any(|u| u.path == unit_path)
         {
-            match swamp_core::actions::propose(
+            // `propose_checking_protection`, not `propose`: human
+            // keep/protect intent has to refuse here, at the moment the
+            // human marks the row, not silently at execution.
+            //
+            // The integration owner's 2026-09-21 mutation check is why
+            // this is spelled out: a one-directional protection check
+            // survived every test because nothing exercised an
+            // *ordinary* row that contained a protected descendant, and
+            // this was the path that would have caught it. The live
+            // protect list is reloaded from `self.report.store_dir`
+            // inside that function (one small control file, the same
+            // cost as the `stat`s `propose` already does here), so a
+            // protection added since startup is honoured.
+            match swamp_core::actions::propose_checking_protection(
                 &self.report,
                 None,
                 std::slice::from_ref(&unit_path),
                 "human:tui",
+                &[],
             ) {
-                Ok(plan) => {
-                    warnings.extend(plan.units.iter().flat_map(|u| u.warnings.iter().cloned()));
-                    Some(plan)
+                Ok(units) => {
+                    warnings.extend(units.iter().flat_map(|u| u.warnings().iter().cloned()));
+                    units.into_iter().next()
+                }
+                Err(e) => {
+                    self.set_refusal(&e.to_string());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        // Agent-storage unit (#101's TUI wiring): every `agent_rows` row
+        // carries `unit: Some(...)` regardless of whether it is
+        // protected or has a supported action, so this branch is reached
+        // for a protected/unsupported row too -- `propose_agents`'s own
+        // refusal text (protected category, no supported action for this
+        // category yet, active session...) becomes the footer, never a
+        // generic "nothing to delete on this row" for a unit the human
+        // can plainly see in the Agents view.
+        let agent_unit_observed_at = self
+            .agent_units
+            .iter()
+            .find(|u| u.path == unit_path)
+            .map(|u| u.observed_at);
+        let agent_unit = if agent_unit_observed_at.is_some() {
+            match swamp_core::actions::propose_agents(
+                &self.agent_units,
+                std::slice::from_ref(&unit_path),
+                "human:tui",
+            ) {
+                Ok(units) => {
+                    warnings.extend(units.iter().flat_map(|u| u.warnings().iter().cloned()));
+                    units.into_iter().next()
                 }
                 Err(e) => {
                     self.set_refusal(&e.to_string());
@@ -982,19 +1438,21 @@ impl App {
                     .map(|p| p.to_path_buf())
                     .unwrap_or_default()
             });
-        let selected_bytes = cargo_plan
+        let selected_bytes = cargo_unit
             .as_ref()
-            .map(|p| p.planned_bytes())
+            .or(agent_unit.as_ref())
+            .map(|u| u.bytes())
             .unwrap_or(row.bytes);
         self.marked.insert(
             unit_id.0.clone(),
             MarkedUnit {
-                cargo_plan,
+                cargo_unit: cargo_unit.filter(|u| u.cargo_group().is_some()),
+                agent_unit,
                 path: unit_path,
                 docker,
                 worktree_path,
                 bytes: selected_bytes,
-                observed_at: self.report.observed_at,
+                observed_at: agent_unit_observed_at.unwrap_or(self.report.observed_at),
                 worktree,
                 label,
                 warnings,
@@ -1015,6 +1473,87 @@ impl App {
         if let Some(op) = &self.operation {
             op.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Explicit inspection only: ordinary observation and drawing never call it.
+    pub fn inspect_selected_cargo_profile(&mut self) {
+        if self.operation.is_some() {
+            return;
+        }
+        let path = self.selected_row().and_then(|row| {
+            row.expansion_key
+                .as_deref()
+                .and_then(|key| key.strip_prefix("cargo:"))
+                .map(PathBuf::from)
+                .or_else(|| row.unit.map(|id| PathBuf::from(id.0)))
+        });
+        let profile = path.and_then(|path| {
+            self.report
+                .nested_artifacts
+                .iter()
+                .filter(|u| {
+                    u.present
+                        && u.adapter.as_deref() == Some("cargo")
+                        && u.role == swamp_core::artifact::ArtifactRole::Profile
+                        && path.starts_with(&u.path)
+                })
+                .max_by_key(|u| u.path.components().count())
+                .map(|u| u.path.clone())
+        });
+        let Some(profile) = profile else {
+            self.set_refusal("Select a Cargo profile or an item within it, then press i");
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.operation = Some(Operation {
+            label: "Inspecting",
+            completed: 0,
+            total: 1,
+            succeeded: 0,
+            failed: 0,
+            current: profile.clone(),
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        self.operation_rx = Some(rx);
+        crate::worker::spawn(move || {
+            let inspection =
+                swamp_core::cargo_artifacts::inspect_profile(&profile, Default::default(), &cancel);
+            let mut lines = vec![
+                format!("{}", profile.display()),
+                format!(
+                    "deps: {} allocated / {} unique within inspected files · {} entries · {}ms",
+                    model::human_bytes(inspection.allocated_bytes),
+                    model::human_bytes(inspection.unique_allocated_bytes),
+                    inspection.entries_examined,
+                    inspection.elapsed_ms
+                ),
+                inspection.accounting_note.clone(),
+            ];
+            lines.extend(inspection.coverage.limits.iter().cloned());
+            if !inspection.coverage.complete {
+                lines.push(
+                    "PARTIAL: totals cover inspected entries only, not the whole profile.".into(),
+                );
+                lines.push("For more: swamp inspect-cargo <profile> --max-entries 262144 --max-ms 30000 --json".into());
+            }
+            lines.push("Target / variant (package identity only when evidenced)".into());
+            for group in inspection.groups {
+                lines.push(format!(
+                    "{}  {}  {} · features {} · package {}",
+                    model::human_bytes(group.allocated_bytes),
+                    group.target.as_deref().unwrap_or("unattributed"),
+                    group.target_kind.as_deref().unwrap_or("unknown"),
+                    group.variant.features.as_deref().unwrap_or("unknown"),
+                    group.package_id.as_deref().unwrap_or("unknown")
+                ));
+                if let Some(reason) = group.residual_reason {
+                    lines.push(format!("  {reason}"));
+                }
+            }
+            let _ = tx.send(OperationEvent::Inspected(lines));
+        });
     }
 
     /// UI entry point; synchronous marking helpers run only on the worker.
@@ -1063,7 +1602,7 @@ impl App {
         self.operation_rx = Some(rx);
         self.refusal = None;
         self.last_result = None;
-        std::thread::spawn(move || {
+        crate::worker::spawn(move || {
             if all {
                 worker.mark_all_in_view();
             } else if let Some(row) = row {
@@ -1088,6 +1627,13 @@ impl App {
                 _ => break,
             };
             match event {
+                OperationEvent::Inspected(lines) => {
+                    self.operation = None;
+                    self.operation_rx = None;
+                    self.cargo_inspection = Some(lines);
+                    self.cargo_inspection_scroll = 0;
+                    break;
+                }
                 OperationEvent::Progress {
                     completed,
                     total,
@@ -1197,10 +1743,13 @@ impl App {
     /// human authorization for this one plan. Drives plan -> grant ->
     /// execute -> ledger, then re-observes the affected worktrees only.
     pub fn confirm_delete(&mut self) {
-        self.start_delete(crate::ledger_path(), actions::trash_root());
+        self.start_delete(
+            swamp_core::fs_gate::StoreDir::resolved(),
+            actions::trash_root(),
+        );
     }
 
-    fn start_delete(&mut self, ledger_path: PathBuf, trash: PathBuf) {
+    fn start_delete(&mut self, store: swamp_core::fs_gate::StoreDir, trash: PathBuf) {
         if !self.confirm_open || self.operation.is_some() {
             return;
         }
@@ -1213,10 +1762,11 @@ impl App {
         // A report started before these moves must not resurrect deleted rows.
         self.pending = None;
         self.observing = None;
-        let (plan, grant) = actions::authorize(&units, &self.actor);
-        let total = units.len();
-        let actor = self.actor.clone();
+        // This keypress, on the summary the human just read (current
+        // facts, shown a moment ago) is the human decision. There is no
+        // token to mint: Enter just moves what was listed.
         let keep = self.keep_executables;
+        let total = units.len();
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.operation = Some(Operation {
@@ -1233,24 +1783,13 @@ impl App {
         self.confirm_open = false;
         self.last_result = None;
         self.refusal = None;
-        std::thread::spawn(move || {
-            let ledger = match swamp_core::ledger::Ledger::open(&ledger_path) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = tx.send(OperationEvent::Failed(format!(
-                        "could not open ledger: {e}"
-                    )));
-                    return;
-                }
-            };
+        crate::worker::spawn(move || {
+            let ledger = swamp_core::ledger::Ledger::resolved(&store);
             let free_before = actions::free_space_bytes(&trash);
             let results = actions::execute_plan_progress(
                 &units,
-                &plan,
-                &grant,
                 &ledger,
                 &trash,
-                &actor,
                 keep,
                 |completed, path, outcome| {
                     let _ = tx.send(OperationEvent::Progress {
@@ -1326,7 +1865,7 @@ impl App {
         // The screen is right now; the store follows through the live
         // FSEvents stream, which sees the move to Trash like any change.
         self.prune_removed(&results);
-        if self.watch.is_none() {
+        if self.watches.is_empty() {
             self.observe_in_background();
         }
     }
@@ -1343,6 +1882,9 @@ impl App {
             .collect();
         if removed.is_empty() {
             return;
+        }
+        if let Some(estimate) = self.report.reconciliation.unique_estimate.as_mut() {
+            estimate.needs_reconciliation = true;
         }
         let under = |p: &std::path::Path| removed.iter().any(|r| p == r || p.starts_with(r));
         // Companion paths are part of the exact group, not just the selected
@@ -1396,6 +1938,13 @@ impl App {
         let rec = &mut self.report.reconciliation;
         rec.attributed = rec.attributed.saturating_sub(freed);
         rec.walked_total = rec.walked_total.saturating_sub(freed);
+        // Agent and external unit rows for exactly the successful
+        // outcomes. Without this the agents view kept showing storage
+        // that had just been moved to Trash, until the next full
+        // startup -- one of the review's TUI staleness findings.
+        self.agent_units
+            .retain(|u| !under(&u.path) && !u.members.iter().any(|m| under(&m.path)));
+        self.external_units.retain(|u| !under(&u.path));
         for path in &removed {
             self.track.remove(path);
             self.collapsed.remove(&format!("source:{}", path.display()));
@@ -1410,17 +1959,67 @@ impl App {
     /// build writing thousands of files) land as one observation.
     pub const LIVE_QUIET: Duration = Duration::from_millis(400);
 
-    /// Starts the live FSEvents stream. `None` (no store, or no FSEvents
-    /// on this platform) leaves the TUI on the scheduled observer alone.
+    /// Starts one live FSEvents stream per root in `self.roots` (#51),
+    /// all feeding the same `watch_rx` through cloned senders. A root
+    /// whose stream fails to start (no FSEvents on this platform, or the
+    /// path itself is gone) simply contributes no watcher -- the others
+    /// still run; this is never fatal to the TUI, only to that root's
+    /// live updates (it still gets refreshed by the scheduled/cached
+    /// path). No-op if watches are already running.
     pub fn start_watch(&mut self) {
-        if self.store_dir.is_none() || self.watch.is_some() {
+        self.start_watch_with(swamp_core::fs_events::watch_pending);
+    }
+
+    /// [`Self::start_watch`] with the stream factory supplied.
+    ///
+    /// Every root's thread is spawned **before** any readiness is
+    /// collected. `FSEventStreamStart` is a synchronous, per-process
+    /// serialized request to `fseventsd` that costs seconds (measured on
+    /// two fresh temp directories: 1.4 s and 2.9 s on a quiet machine,
+    /// 4.7 s and 6.6 s on a loaded one), so waiting for each root's
+    /// stream before spawning the next one made the later roots pay the
+    /// sum of those latencies against a fixed per-stream budget. That is
+    /// how this ended up holding one watcher for two roots while both
+    /// streams had in fact started: the second one reported ready 1.6 s
+    /// after the caller had already given up on it. Spawning first
+    /// bounds the wait by the slowest stream rather than by their total,
+    /// and `fs_events::watch_start_budget` is now larger than the cost
+    /// of the call it is bounding.
+    pub(crate) fn start_watch_with(&mut self, factory: swamp_core::fs_events::WatchFactory) {
+        if self.store_dir.is_none() || !self.watches.is_empty() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
-        if let Some(w) = swamp_core::fs_events::watch(&self.root, tx) {
-            self.watch = Some(w);
+        let pending: Vec<_> = self
+            .roots
+            .clone()
+            .iter()
+            .filter_map(|root| factory(root, tx.clone()))
+            .collect();
+        let budget = swamp_core::fs_events::watch_start_budget();
+        for p in pending {
+            if let Some(w) = p.ready(budget) {
+                self.watches.push(w);
+            }
+        }
+        if !self.watches.is_empty() {
             self.watch_rx = Some(rx);
         }
+    }
+
+    /// The root in `self.roots` that owns `path` (the longest matching
+    /// prefix, so a nested root -- were one ever present -- would not be
+    /// shadowed by a shorter ancestor). `None` for a path outside every
+    /// known root, which a stream should not be able to report but is
+    /// handled as "ignore this change" rather than a panic if it ever
+    /// does (a root removed from scope between watch-start and now, for
+    /// instance).
+    fn root_for_path(&self, path: &std::path::Path) -> Option<PathBuf> {
+        self.roots
+            .iter()
+            .filter(|r| path.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+            .cloned()
     }
 
     /// Consumes every batch the stream has delivered so far.
@@ -1428,10 +2027,52 @@ impl App {
         let Some(rx) = &self.watch_rx else {
             return;
         };
+        let mut batches = Vec::new();
         while let Ok(batch) = rx.try_recv() {
-            self.live_changes.extend(batch.changed_dirs);
-            self.live_last_event_id = self.live_last_event_id.max(batch.last_event_id);
-            self.live_last_batch = Some(Instant::now());
+            batches.push(batch);
+        }
+        for batch in batches {
+            self.apply_watch_batch(batch);
+        }
+    }
+
+    /// One batch's effect. Changes accumulate for the next quiet-window
+    /// refresh; a coverage loss or an epoch newer than the root's last
+    /// observation turns that refresh into a full walk with the reason
+    /// named, never an incremental one over an incomplete change list.
+    fn apply_watch_batch(&mut self, batch: swamp_core::fs_events::WatchBatch) {
+        use swamp_core::fs_events::RefreshRefusal;
+        self.live_changes.extend(batch.changed_dirs);
+        self.live_last_event_id = self.live_last_event_id.max(batch.last_event_id);
+        self.live_last_batch = Some(Instant::now());
+        if let Some((reason, detail)) = batch.coverage_lost {
+            let unrecoverable = matches!(
+                reason,
+                RefreshRefusal::WatchLimitReached | RefreshRefusal::WatchPermissionGap
+            );
+            if unrecoverable {
+                self.status = Some(format!(
+                    "live refresh off for {}: {detail} ({})",
+                    batch.root.display(),
+                    reason.as_str()
+                ));
+                self.live_off.insert(batch.root.clone(), detail.clone());
+            }
+            self.live_full_walk
+                .insert(batch.root.clone(), (reason, detail));
+        }
+        if let Some(opened_at) = batch.epoch_opened_at {
+            let observed = self
+                .reports_by_root
+                .get(&batch.root)
+                .map(|r| r.observed_at)
+                .or_else(|| (self.roots.len() == 1).then_some(self.report.observed_at));
+            if observed.is_none_or(|t| t < opened_at) {
+                self.live_full_walk.entry(batch.root.clone()).or_insert((
+                    RefreshRefusal::LiveWatchGap,
+                    "the watch opened after this root's last observation".into(),
+                ));
+            }
         }
     }
 
@@ -1439,7 +2080,7 @@ impl App {
     /// been quiet long enough.
     pub fn live_observe_due(&self) -> bool {
         self.pending.is_none()
-            && !self.live_changes.is_empty()
+            && (!self.live_changes.is_empty() || !self.live_full_walk.is_empty())
             && self
                 .live_last_batch
                 .is_some_and(|t| t.elapsed() >= Self::LIVE_QUIET)
@@ -1449,28 +2090,94 @@ impl App {
     /// thread, through the same pipeline as everything else: the plan is
     /// the live batch, so the store re-walks those subtrees and carries
     /// every other row forward.
+    ///
+    /// A live batch can name changes under more than one root (two
+    /// watchers can both go quiet in the same tick); this call handles
+    /// exactly *one* root per invocation -- the first, in `self.roots`
+    /// order, that has any pending change -- draining only that root's
+    /// changed paths from `live_changes` and leaving any other root's
+    /// changes in place. `live_observe_due` stays true afterward as long
+    /// as changes remain, so `event_loop` simply calls this again on its
+    /// next tick to pick up the next root; no root's changes are ever
+    /// silently dropped, and no two roots are ever re-walked by the same
+    /// worker thread (keeping the existing single-root incremental path
+    /// untouched per root).
     pub fn observe_live(&mut self) {
         let Some(store) = self.store_dir.clone() else {
             return;
         };
-        if self.pending.is_some() || self.live_changes.is_empty() {
+        if self.pending.is_some()
+            || (self.live_changes.is_empty() && self.live_full_walk.is_empty())
+        {
             return;
         }
-        let changed: Vec<PathBuf> = self.live_changes.drain().collect();
-        let device = std::fs::metadata(&self.root)
-            .ok()
-            .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
+        // A root owed a full walk goes first: its changes, if any, are
+        // covered by that walk.
+        let forced = self
+            .roots
+            .iter()
+            .find(|r| self.live_full_walk.contains_key(*r))
+            .cloned();
+        let Some(root) =
+            forced.or_else(|| self.live_changes.iter().find_map(|p| self.root_for_path(p)))
+        else {
+            // Every pending change is outside every known root (a root
+            // was removed from scope since the watcher was started);
+            // drop them rather than looping forever on changes nothing
+            // will ever claim.
+            self.live_changes.clear();
+            return;
+        };
+        let (mine, rest): (HashSet<PathBuf>, HashSet<PathBuf>) = self
+            .live_changes
+            .drain()
+            .partition(|p| p.starts_with(&root));
+        self.live_changes = rest;
+        let changed: Vec<PathBuf> = mine.into_iter().collect();
+        let device = swamp_core::fs_gate::device_of(&root);
         let plan = swamp_core::fs_events::FsEventsPlan::from_live(
             changed,
             self.live_last_event_id,
             device,
         );
+        // A live refresh re-walks one root -- through that root's own
+        // slice of the authorized scope, so its exclusions and external
+        // prune notes still apply. Without a scope there is nothing
+        // authorized to observe, and refusing is the honest answer.
+        let Some(scope) = self.scope.as_ref().map(|s| s.restricted_to(&root)) else {
+            self.status = Some(
+                "live refresh skipped: no resolved scope for this session; reopen swamp ui".into(),
+            );
+            return;
+        };
+        let (roots, cache) = (self.roots.clone(), self.reports_by_root.clone());
         let (tx, rx) = std::sync::mpsc::channel();
-        let root = self.root.clone();
-        std::thread::spawn(move || {
-            let source = swamp_core::fs_events::testing::CannedSource(plan);
-            let res = swamp_core::report::report_full_mode_with_source(
-                &root,
+        crate::worker::spawn(move || {
+            // The watcher's own changes, as a replay plan: a production
+            // source (`fs_events::LivePlanSource`), not a test double.
+            let source = swamp_core::fs_events::LivePlanSource::new(plan);
+            // `ObservationParts::WALK_ONLY`, and `None` for both unit
+            // vectors.
+            //
+            // Narrowing the scope to the one root a watcher fired under
+            // is the right fix for the *scope* half of the earlier
+            // finding. It is the wrong thing to derive unit vectors
+            // from: every tool home outside that root is unauthorized
+            // in the narrowed scope, so `ObservationParts::ALL` came
+            // back with `agent_units: Some(vec![])`, the event loop
+            // applied it unconditionally, and the agent view emptied on
+            // the first file save anywhere in the project (the
+            // 2026-09-22 re-review's CE3).
+            //
+            // A part not asked for is also a part not *swept*
+            // (`growth::ObservationOwnership`), so asking for fewer
+            // parts here cannot invent a disappearance either. The
+            // background refresh, which covers the whole scope, is what
+            // refreshes those vectors.
+            let res = swamp_core::report::observe_scope(
+                &scope,
+                swamp_core::report::ObservationParts::WALK_ONLY,
+                None,
                 None,
                 false,
                 Some(&store),
@@ -1480,16 +2187,35 @@ impl App {
                 false,
                 false,
                 &source,
-            );
+                30,
+                24 * 3600,
+            )
+            .map(|o| {
+                RefreshedObservation::merged_on_worker(
+                    &roots,
+                    cache,
+                    o.per_root.into_iter().collect(),
+                    None,
+                    None,
+                    None,
+                )
+            });
             let _ = tx.send(res);
         });
         self.pending = Some(rx);
         self.observing = Some((0, 0));
     }
 
-    /// Starts an incremental observation of the root on a worker thread;
-    /// `event_loop` swaps the result in when it arrives. No-op without a
-    /// store (fixture apps in tests) or while one is already running.
+    /// Starts an incremental observation of every root in `self.roots`
+    /// on one worker thread (sequentially -- root re-walks already run
+    /// each worker pool to saturation on their own, so parallelizing
+    /// across roots too would only contend with itself); `event_loop`
+    /// applies each root's fresh report as it would any other pending
+    /// result. No-op without a store (fixture apps in tests) or while
+    /// one is already running. A root whose own re-observation fails is
+    /// simply absent from the returned vec -- its last-known entry in
+    /// `reports_by_root` (and therefore its rows in `report`) is left
+    /// exactly as it was, never erased by another root's refresh.
     pub fn observe_in_background(&mut self) {
         let Some(store) = self.store_dir.clone() else {
             return;
@@ -1497,11 +2223,44 @@ impl App {
         if self.pending.is_some() {
             return;
         }
+        let Some(scope) = self.scope.clone() else {
+            self.status =
+                Some("refresh skipped: no resolved scope for this session; reopen swamp ui".into());
+            return;
+        };
+        let (roots, cache) = (self.roots.clone(), self.reports_by_root.clone());
         let (tx, rx) = std::sync::mpsc::channel();
-        let root = self.root.clone();
-        std::thread::spawn(move || {
-            let res =
-                swamp_core::report::report_with_dirs(&root, None, false, Some(&store), None, true);
+        crate::worker::spawn(move || {
+            // The same scope-aware entry point startup uses, with the
+            // same exclusions and external pruning, and returning the
+            // external/agent units from that same pass so the agent view
+            // cannot drift out of date behind a "live" header.
+            let res = swamp_core::report::observe_scope(
+                &scope,
+                swamp_core::report::ObservationParts::ALL,
+                None,
+                None,
+                false,
+                Some(&store),
+                None,
+                true,
+                true,
+                false,
+                false,
+                swamp_core::fs_events::platform_source().as_ref(),
+                30,
+                24 * 3600,
+            )
+            .map(|o| {
+                RefreshedObservation::merged_on_worker(
+                    &roots,
+                    cache,
+                    o.per_root.into_iter().collect(),
+                    Some(o.external_units),
+                    Some(o.agent_units),
+                    Some(o.store_interiors),
+                )
+            });
             let _ = tx.send(res);
         });
         self.pending = Some(rx);
@@ -1567,7 +2326,8 @@ mod tests {
             app.marked.insert(
                 path.display().to_string(),
                 MarkedUnit {
-                    cargo_plan: None,
+                    cargo_unit: None,
+                    agent_unit: None,
                     path,
                     docker: None,
                     worktree_path: PathBuf::new(),
@@ -1623,7 +2383,8 @@ mod tests {
         app.marked.insert(
             path.display().to_string(),
             MarkedUnit {
-                cargo_plan: None,
+                cargo_unit: None,
+                agent_unit: None,
                 path: path.clone(),
                 docker: None,
                 worktree_path: tmp.path().into(),
@@ -1635,7 +2396,10 @@ mod tests {
             },
         );
         app.confirm_open = true;
-        app.start_delete(tmp.path().join("ledger.jsonl"), tmp.path().join("Trash"));
+        app.start_delete(
+            swamp_core::fs_gate::StoreDir::at(tmp.path()).unwrap(),
+            tmp.path().join("Trash"),
+        );
         assert!(app.operation.is_some());
         assert!(!app.confirm_open);
         wait_operation(&mut app);
@@ -1643,7 +2407,7 @@ mod tests {
         assert!(app.marked.is_empty());
         assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
         assert_eq!(
-            swamp_core::ledger::Ledger::open(tmp.path().join("ledger.jsonl"))
+            swamp_core::ledger::Ledger::open(tmp.path().join("ledger.parquet"))
                 .unwrap()
                 .all()
                 .unwrap()
@@ -1665,8 +2429,170 @@ mod tests {
         );
     }
 
+    /// A real (never fixture-literal) Claude Code home under a tempdir:
+    /// one actionable cache category (`shell-snapshots/`) and one
+    /// protected config file (`settings.json`), discovered through the
+    /// same `swamp_core::agents::discover_and_measure` path `swamp
+    /// report --view agents` and the real TUI startup use -- this test
+    /// exercises `App::mark_row`'s new agent-storage branch against real
+    /// identification output, not a hand-built `AgentUnit` literal.
+    fn fixture_agent_units(claude_home: &std::path::Path) -> Vec<swamp_core::agents::AgentUnit> {
+        std::fs::create_dir_all(claude_home.join("shell-snapshots")).unwrap();
+        std::fs::write(
+            claude_home.join("shell-snapshots").join("snap.sh"),
+            b"alias x=y",
+        )
+        .unwrap();
+        std::fs::write(claude_home.join("settings.json"), b"{}").unwrap();
+
+        let mut env_vars = std::collections::HashMap::new();
+        env_vars.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            claude_home.display().to_string(),
+        );
+        let home_dummy = tempfile::tempdir().unwrap();
+        let env = swamp_core::locations::Environment::fixture(
+            home_dummy.path().to_path_buf(),
+            env_vars,
+            swamp_core::locations::Platform::MacOS,
+        );
+        let registry = swamp_core::locations::Registry::with_builtins();
+        let cfg = swamp_core::scope::ScanConfig {
+            defaults: false,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            disabled_detectors: vec![
+                "cargo-home".into(),
+                "rustup".into(),
+                "homebrew".into(),
+                "codex".into(),
+                "codex-desktop".into(),
+                "oh-my-pi".into(),
+                "opencode".into(),
+            ],
+            enabled_detectors: Vec::new(),
+        };
+        let scope = swamp_core::scope::resolve_effective_scope(&env, &cfg, &[], &registry, 1);
+        swamp_core::agents::discover_and_measure(
+            &scope,
+            &[],
+            None,
+            false,
+            1_000,
+            30,
+            3600,
+            &swamp_core::fs_events::EventCoverage::untrusted(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn agents_view_mark_row_builds_an_agent_plan_and_deletes_it_via_the_ordinary_worker_path() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let units = fixture_agent_units(claude_home.path());
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units);
+        let cache_row = model::agent_rows(&app.agent_units)
+            .into_iter()
+            .find(|r| r.label.contains("shell-snapshots"))
+            .expect("cache row present");
+        app.mark_row(&cache_row);
+        let cache_path = claude_home.path().join("shell-snapshots");
+        let marked = app
+            .marked
+            .get(&cache_path.display().to_string())
+            .expect("cache unit marked");
+        assert!(marked.agent_unit.is_some(), "agent_plan must be built");
+        assert!(
+            cache_path.exists(),
+            "marking alone must not delete anything"
+        );
+
+        app.confirm_open = true;
+        app.start_delete(
+            swamp_core::fs_gate::StoreDir::at(claude_home.path()).unwrap(),
+            claude_home.path().join("Trash"),
+        );
+        wait_operation(&mut app);
+        assert!(!cache_path.exists(), "marked cache dir must be trashed");
+        assert!(app.marked.is_empty());
+        assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
+        // Untouched: the protected settings.json survives the same pass.
+        assert!(claude_home.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn agents_view_mark_row_refuses_a_protected_unit_with_the_reason_not_a_generic_message() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let units = fixture_agent_units(claude_home.path());
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units);
+        let settings_row = model::agent_rows(&app.agent_units)
+            .into_iter()
+            .find(|r| r.label.contains("settings.json"))
+            .expect("settings row present");
+        app.mark_row(&settings_row);
+        assert!(
+            app.marked.is_empty(),
+            "a protected unit must never be marked"
+        );
+        assert!(
+            app.refusal_active()
+                .unwrap_or_default()
+                .contains("protected"),
+            "{:?}",
+            app.refusal_active()
+        );
+        assert!(claude_home.path().join("settings.json").exists());
+    }
+
+    /// Shift+A over the Agents view (chunk D follow-up): the actionable
+    /// cache row is marked and the protected config row is left alone,
+    /// with one confirm opened for what *was* marked and a footer that
+    /// names the skip -- never a silent "nothing in this view can be
+    /// acted on" for a screen that plainly has one actionable row, and
+    /// never a false "everything selected" that quietly includes
+    /// `settings.json`.
+    #[test]
+    fn mark_all_in_agents_view_marks_the_cache_and_skips_the_protected_config() {
+        let claude_home = tempfile::tempdir().unwrap();
+        let units = fixture_agent_units(claude_home.path());
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units);
+        app.mark_all_in_view();
+
+        let cache_path = claude_home.path().join("shell-snapshots");
+        assert_eq!(
+            app.marked.len(),
+            1,
+            "only the actionable cache row, not the protected config: {:?}",
+            app.marked.keys().collect::<Vec<_>>()
+        );
+        assert!(app.marked.contains_key(&cache_path.display().to_string()));
+        assert!(
+            !app.marked.contains_key(
+                &claude_home
+                    .path()
+                    .join("settings.json")
+                    .display()
+                    .to_string()
+            ),
+            "the protected unit must never be swept up by bulk marking"
+        );
+        assert!(app.confirm_open, "one confirm for what could be marked");
+        assert!(
+            app.refusal_active().is_some_and(|m| m.contains("skipped")),
+            "the footer must explain the skip, not stay silent: {:?}",
+            app.refusal_active()
+        );
+    }
+
     fn fixture_report() -> Report {
         Report {
+            store_dir: None,
             observed_at: 1000,
             root: "/root".into(),
             projects: vec![ProjectRow {
@@ -1701,6 +2627,7 @@ mod tests {
                             containers: Vec::new(),
                             shared_with: Vec::new(),
                             dangling: false,
+                            evidence: Vec::new(),
                         },
                         ArtifactRow {
                             kind: ArtifactKind::Source,
@@ -1724,6 +2651,7 @@ mod tests {
                             containers: Vec::new(),
                             shared_with: Vec::new(),
                             dangling: false,
+                            evidence: Vec::new(),
                         },
                     ],
                     signals: vec![],
@@ -1735,6 +2663,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
@@ -1892,6 +2821,91 @@ mod tests {
         );
     }
 
+    /// A watch that lost coverage (Linux: an inotify queue overflow)
+    /// never lets its partial change list drive an incremental refresh:
+    /// the next live refresh of that root is a full walk naming the loss.
+    #[test]
+    fn a_coverage_loss_turns_the_next_live_refresh_into_a_named_full_walk() {
+        use swamp_core::fs_events::RefreshRefusal;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.store_dir = Some(std::env::temp_dir());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.watch_rx = Some(rx);
+        tx.send(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            changed_dirs: vec![PathBuf::from("/root/mole")],
+            last_event_id: 3,
+            coverage_lost: Some((RefreshRefusal::WatchQueueOverflow, "overflowed".into())),
+            epoch_opened_at: None,
+        })
+        .unwrap();
+        app.drain_watch();
+        assert_eq!(
+            app.live_full_walk
+                .get(&PathBuf::from("/root"))
+                .map(|(r, _)| *r),
+            Some(RefreshRefusal::WatchQueueOverflow)
+        );
+        app.live_last_batch = Some(Instant::now() - Duration::from_secs(1));
+        assert!(app.live_observe_due());
+        assert!(
+            app.live_off.is_empty(),
+            "an overflow is recoverable: live refresh stays on"
+        );
+
+        // A watch limit is not recoverable: live refresh goes off for the
+        // root, and the status line says why.
+        tx.send(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            coverage_lost: Some((RefreshRefusal::WatchLimitReached, "no watches left".into())),
+            ..Default::default()
+        })
+        .unwrap();
+        app.drain_watch();
+        assert!(app.live_off.contains_key(&PathBuf::from("/root")));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("watch_limit_reached")
+        );
+    }
+
+    /// A watch whose epoch opened after the root's last observation
+    /// cannot vouch for the gap in between: one full walk first.
+    #[test]
+    fn an_epoch_newer_than_the_last_observation_owes_a_full_walk() {
+        use swamp_core::fs_events::RefreshRefusal;
+        let mut report = fixture_report();
+        report.observed_at = 1_000;
+        let mut app = App::new(report, "/root".into());
+        app.store_dir = Some(std::env::temp_dir());
+        app.apply_watch_batch(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            epoch_opened_at: Some(2_000),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.live_full_walk
+                .get(&PathBuf::from("/root"))
+                .map(|(r, _)| *r),
+            Some(RefreshRefusal::LiveWatchGap)
+        );
+
+        let mut report = fixture_report();
+        report.observed_at = 3_000;
+        let mut app = App::new(report, "/root".into());
+        app.apply_watch_batch(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
+            epoch_opened_at: Some(2_000),
+            ..Default::default()
+        });
+        assert!(
+            app.live_full_walk.is_empty(),
+            "an observation inside the epoch is covered"
+        );
+    }
+
     #[test]
     fn live_changes_are_observed_after_the_stream_goes_quiet() {
         let mut app = App::new(fixture_report(), "/root".into());
@@ -1899,8 +2913,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.watch_rx = Some(rx);
         tx.send(swamp_core::fs_events::WatchBatch {
+            root: PathBuf::from("/root"),
             changed_dirs: vec![PathBuf::from("/root/mole/node_modules")],
             last_event_id: 42,
+            ..Default::default()
         })
         .unwrap();
         app.drain_watch();
@@ -1984,6 +3000,102 @@ mod tests {
         assert_eq!(app.selected, 0);
     }
 
+    fn report_with_reconciled_unique_estimate() -> Report {
+        let mut report = fixture_report();
+        report.reconciliation.unique_estimate = Some(swamp_core::report::UniqueEstimate {
+            sharing: Some(expected_sharing_summary()),
+            bytes: 123_456,
+            reconciled_at: 987_654,
+            needs_reconciliation: false,
+        });
+        report
+    }
+
+    fn expected_sharing_summary() -> swamp_core::sharing::SharingSummary {
+        swamp_core::sharing::SharingSummary {
+            groups: vec![swamp_core::sharing::SharingGroup {
+                containers: vec![PathBuf::from("/fixture/a"), PathBuf::from("/fixture/b")],
+                bytes: 4096,
+                unresolved_links: false,
+            }],
+            omitted_groups: 2,
+            omitted_bytes: 8192,
+        }
+    }
+
+    fn synthetic_unit_result(path: &str, succeeded: bool) -> actions::UnitResult {
+        actions::UnitResult {
+            path: PathBuf::from(path),
+            outcome: if succeeded {
+                Ok(swamp_core::execution::Outcome {
+                    unit_id: "synthetic".into(),
+                    status: "ok".into(),
+                    reason: None,
+                    intended_bytes: 10,
+                    observed_free_space_delta: None,
+                })
+            } else {
+                Err("synthetic failure".into())
+            },
+        }
+    }
+
+    #[test]
+    fn successful_local_mutation_marks_unique_estimate_stale_without_changing_its_facts() {
+        let mut app = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+
+        app.prune_removed(&[synthetic_unit_result("/outside/scope/removed", true)]);
+
+        let estimate = app.report.reconciliation.unique_estimate.as_ref().unwrap();
+        assert!(estimate.needs_reconciliation);
+        assert_eq!(estimate.bytes, 123_456);
+        assert_eq!(estimate.reconciled_at, 987_654);
+        assert_eq!(estimate.sharing, Some(expected_sharing_summary()));
+    }
+
+    #[test]
+    fn failed_only_and_empty_local_mutations_leave_unique_estimate_current() {
+        let mut failed = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+        failed.prune_removed(&[synthetic_unit_result("/outside/scope/failed", false)]);
+        assert!(
+            !failed
+                .report
+                .reconciliation
+                .unique_estimate
+                .as_ref()
+                .unwrap()
+                .needs_reconciliation
+        );
+
+        let mut empty = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+        empty.prune_removed(&[]);
+        assert!(
+            !empty
+                .report
+                .reconciliation
+                .unique_estimate
+                .as_ref()
+                .unwrap()
+                .needs_reconciliation
+        );
+    }
+
+    #[test]
+    fn mixed_local_mutation_invalidates_estimate_when_any_unit_succeeded() {
+        let mut app = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+
+        app.prune_removed(&[
+            synthetic_unit_result("/outside/scope/removed", true),
+            synthetic_unit_result("/outside/scope/refused", false),
+        ]);
+
+        let estimate = app.report.reconciliation.unique_estimate.as_ref().unwrap();
+        assert!(estimate.needs_reconciliation);
+        assert_eq!(estimate.bytes, 123_456);
+        assert_eq!(estimate.reconciled_at, 987_654);
+        assert_eq!(estimate.sharing, Some(expected_sharing_summary()));
+    }
+
     #[test]
     fn backspace_marks_the_current_row_and_asks_once() {
         let mut app = App::new(fixture_report(), "/root".into());
@@ -2038,19 +3150,480 @@ mod tests {
         assert!(app.filter_error.is_some());
     }
 
+    fn region(
+        path: &str,
+        status: swamp_core::coverage::RegionStatus,
+    ) -> swamp_core::coverage::RootCoverage {
+        swamp_core::coverage::RootCoverage {
+            path: path.into(),
+            status,
+            walked_total: 0,
+            projects: 0,
+            mode: String::new(),
+        }
+    }
+
+    #[test]
+    fn scope_note_is_none_for_one_complete_region() {
+        use swamp_core::coverage::RegionStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&[region("/root", RegionStatus::Complete)]);
+        assert_eq!(app.scope_note, None);
+    }
+
+    #[test]
+    fn scope_note_names_count_and_worst_status_for_a_missing_root() {
+        use swamp_core::coverage::RegionStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region("/gone", RegionStatus::Missing),
+        ]);
+        assert_eq!(app.scope_note.as_deref(), Some("2 roots (1 missing)"));
+    }
+
+    #[test]
+    fn scope_note_prioritizes_inaccessible_over_missing_and_names_the_reason() {
+        use swamp_core::coverage::RegionStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region("/gone", RegionStatus::Missing),
+            region(
+                "/denied",
+                RegionStatus::Inaccessible {
+                    reason: "permission denied".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            app.scope_note.as_deref(),
+            Some("3 roots (2 inaccessible: permission denied)")
+        );
+    }
+
+    /// `RegionStatus::Partial` (part of a `Present` root was unreadable
+    /// *during this walk*) is a real outcome `scope::RootStatus` alone
+    /// never had -- the whole reason `set_scope_note` moved from
+    /// `EffectiveScope` to post-walk `RootCoverage` (#51).
+    #[test]
+    fn scope_note_reports_a_partial_region_with_its_reason() {
+        use swamp_core::coverage::RegionStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region(
+                "/flaky",
+                RegionStatus::Partial {
+                    reason: "2 path(s) unreadable during this walk".into(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            app.scope_note.as_deref(),
+            Some("2 roots (1 partial: 2 path(s) unreadable during this walk)")
+        );
+    }
+
+    /// A root a config `exclude` pruned still gets its own coverage
+    /// row (`RootCoverage::excluded`) -- never silently absent, and
+    /// never labelled "deleted".
+    #[test]
+    fn scope_note_names_an_excluded_region() {
+        use swamp_core::coverage::RegionStatus;
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_scope_note(&[
+            region("/root", RegionStatus::Complete),
+            region("/scratch", RegionStatus::Excluded),
+        ]);
+        assert_eq!(app.scope_note.as_deref(), Some("2 roots (1 excluded)"));
+    }
+
     #[test]
     fn view_cycles_and_digit_keys() {
         assert_eq!(ViewKind::Projects.next(), ViewKind::Tree);
         assert_eq!(ViewKind::from_digit('3'), Some(ViewKind::Builds));
         assert_eq!(ViewKind::from_digit('6'), Some(ViewKind::Kinds));
-        assert_eq!(ViewKind::from_digit('9'), None);
-        // Full cycle returns to Projects, matching the CLI's view order:
-        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/types.
         assert_eq!(ViewKind::from_digit('8'), Some(ViewKind::Types));
+        assert_eq!(ViewKind::from_digit('9'), Some(ViewKind::External));
+        // '0' is reserved for "clear filter" (crate::handle_key_mod);
+        // Agents has no dedicated digit and must not silently claim '0'.
+        assert_eq!(ViewKind::from_digit('0'), None);
+        // Full cycle returns to Projects, matching the CLI's view order:
+        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/
+        // types/external/agents.
         let mut v = ViewKind::Projects;
-        for _ in 0..8 {
+        for _ in 0..10 {
             v = v.next();
         }
         assert_eq!(v, ViewKind::Projects);
+        // Agents is reachable by cycling even without its own digit.
+        let mut seen = std::collections::HashSet::new();
+        let mut v = ViewKind::Projects;
+        for _ in 0..10 {
+            seen.insert(v);
+            v = v.next();
+        }
+        assert!(seen.contains(&ViewKind::Agents));
+    }
+
+    // -----------------------------------------------------------------
+    // #51: multi-root reports, coverage inspection, and live refresh.
+    // -----------------------------------------------------------------
+
+    fn minimal_report(root: &str, project_name: &str, worktree_path: &str) -> Report {
+        Report {
+            store_dir: None,
+            observed_at: 1000,
+            root: root.into(),
+            projects: vec![ProjectRow {
+                project_id: format!("{project_name}-id"),
+                name: project_name.into(),
+                remote: None,
+                ecosystems: Vec::new(),
+                worktrees: vec![WorktreeRow {
+                    worktree_id: format!("{project_name}-wt"),
+                    path: worktree_path.into(),
+                    kind: WorktreeKind::Main,
+                    artifacts: Vec::new(),
+                    signals: Vec::new(),
+                    branch: None,
+                    github: None,
+                    merge_complete: None,
+                    idle_secs: None,
+                }],
+            }],
+            unowned: vec![],
+            reconciliation: Reconciliation {
+                unique_estimate: None,
+                attributed: 0,
+                unowned: 0,
+                walked_total: 0,
+                du_total: None,
+                docker_attributed: 0,
+                docker_unowned: 0,
+            },
+            notes: vec![],
+            series_by_key: Default::default(),
+            total_series: Vec::new(),
+            series_window_secs: 0,
+            summary: Default::default(),
+            dirs_by_worktree: None,
+            files_by_worktree: None,
+            schedule_line: None,
+            github_enrichment: None,
+            nested_artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn new_multi_root_covers_every_root_and_picks_the_first_as_primary() {
+        let a = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let app = App::new_multi_root(a, vec!["/roots/a".into(), "/roots/b".into()]);
+        assert_eq!(app.root, PathBuf::from("/roots/a"));
+        assert_eq!(
+            app.roots,
+            vec![PathBuf::from("/roots/a"), PathBuf::from("/roots/b")]
+        );
+    }
+
+    /// The core #51 guarantee: refreshing one root's report must not
+    /// erase, stale-mark, or duplicate another root's rows. This is the
+    /// adversarial case a naive "just replace `self.report` wholesale"
+    /// implementation would fail immediately.
+    #[test]
+    fn replacing_one_roots_report_leaves_every_other_root_untouched() {
+        let a = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let b = minimal_report("/roots/b", "proj-b", "/roots/b/proj-b");
+        let mut app = App::new_multi_root(a.clone(), vec!["/roots/a".into(), "/roots/b".into()]);
+        app.reports_by_root
+            .insert(PathBuf::from("/roots/a"), a.clone());
+        app.reports_by_root.insert(PathBuf::from("/roots/b"), b);
+        app.report = swamp_core::report::merge_reports(&app.roots, &app.reports_by_root);
+        assert_eq!(app.report.projects.len(), 2, "{:?}", app.report.projects);
+
+        // A fresh observation of root A only -- root B's cached entry is
+        // never read or written by this call.
+        let mut a2 = a;
+        a2.projects[0].worktrees[0].artifacts = Vec::new();
+        a2.reconciliation.walked_total = 999;
+        app.replace_report_for_root(PathBuf::from("/roots/a"), a2);
+
+        assert_eq!(
+            app.report.projects.len(),
+            2,
+            "root B's project must still be present after only root A refreshed: {:?}",
+            app.report.projects
+        );
+        assert!(
+            app.report.projects.iter().any(|p| p.name == "proj-b"),
+            "{:?}",
+            app.report.projects
+        );
+        assert!(app.report.projects.iter().any(|p| p.name == "proj-a"));
+    }
+
+    /// A root that stops being observable (removed from scope, access
+    /// lost) simply keeps its last entry in `reports_by_root` -- nothing
+    /// ever deletes an entry on its own, so its rows survive in `report`
+    /// until a caller deliberately narrows `roots`/`reports_by_root`.
+    /// This mirrors `coverage-changes-are-not-storage-changes`: losing
+    /// *coverage* of a root is never treated as that root's data having
+    /// been deleted.
+    #[test]
+    fn a_root_no_longer_refreshed_keeps_its_last_known_rows() {
+        let a = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let b = minimal_report("/roots/b", "proj-b", "/roots/b/proj-b");
+        let mut app = App::new_multi_root(a.clone(), vec!["/roots/a".into(), "/roots/b".into()]);
+        app.reports_by_root.insert(PathBuf::from("/roots/a"), a);
+        app.reports_by_root
+            .insert(PathBuf::from("/roots/b"), b.clone());
+        app.report = swamp_core::report::merge_reports(&app.roots, &app.reports_by_root);
+
+        // Root B "loses access" (its watcher/observer never fires again,
+        // e.g. an unmounted volume) -- only root A ever refreshes again.
+        let mut a2 = app.reports_by_root[&PathBuf::from("/roots/a")].clone();
+        a2.reconciliation.walked_total = 42;
+        app.replace_report_for_root(PathBuf::from("/roots/a"), a2);
+        assert!(app.report.projects.iter().any(|p| p.name == "proj-b"));
+        assert_eq!(
+            app.reports_by_root[&PathBuf::from("/roots/b")]
+                .projects
+                .len(),
+            b.projects.len(),
+            "root B's cached entry itself must be untouched"
+        );
+    }
+
+    /// A report with zero projects (no Git checkout anywhere in scope)
+    /// still renders and still carries external/agent units -- the
+    /// concrete #51 acceptance case "project/shared/external units
+    /// available even when no Git checkout exists". Rendering must not
+    /// panic on an all-unowned, project-free report.
+    #[test]
+    fn external_only_report_with_no_projects_still_renders() {
+        let mut report = minimal_report("/roots/a", "unused", "/roots/a/unused");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        app.set_external_units(vec![swamp_core::external::ExternalUnit {
+            detector_id: "homebrew".into(),
+            detector_name: "Homebrew".into(),
+            category: swamp_core::locations::StorageCategory::Downloads,
+            provenance: swamp_core::locations::Provenance::BuiltinConvention,
+            path: "/roots/a/.brew-cache".into(),
+            bytes: 12_345,
+            mtime_max: 0,
+            hardlinked: false,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1000,
+            consumers: Vec::new(),
+            note: None,
+            evidence: Vec::new(),
+        }]);
+        assert!(app.rows().is_empty(), "no projects, no project rows");
+        app.set_view(ViewKind::External);
+        assert_eq!(app.external_units.len(), 1);
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+    }
+
+    /// A machine-wide store's identified interior opens under its row in
+    /// the External view, in the same family groups a project container
+    /// uses -- closed until opened, every row blocked, and nothing
+    /// selectable -- at both a narrow and a wide terminal.
+    #[test]
+    fn a_store_interior_opens_under_its_external_row_and_stays_inspection_only() {
+        use swamp_core::artifact::{AccountingBasis, ArtifactRole, TimeSource};
+        use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        let repo = std::path::PathBuf::from("/fixture/.m2/repository");
+        app.set_external_units(vec![swamp_core::external::ExternalUnit {
+            detector_id: "maven".into(),
+            detector_name: "Maven".into(),
+            category: swamp_core::locations::StorageCategory::Unclassified,
+            provenance: swamp_core::locations::Provenance::BuiltinConvention,
+            path: repo.clone(),
+            bytes: 100_000,
+            mtime_max: 0,
+            hardlinked: false,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1000,
+            consumers: Vec::new(),
+            note: None,
+            evidence: Vec::new(),
+        }]);
+        let c = BuildContainer::shared_store_of(
+            "maven",
+            repo.clone(),
+            swamp_core::locations::BuildStoreKind::MavenRepository,
+        );
+        let root = NestedUnitBuilder::new(&c, ArtifactRole::SharedStoreEntry, repo.clone())
+            .is_dir(true)
+            .bytes_on_basis(100_000, AccountingBasis::Allocated)
+            .supported_with_reason("fixture repository")
+            .build();
+        let entry = NestedUnitBuilder::new(
+            &c,
+            ArtifactRole::SharedStoreEntry,
+            repo.join("org/example/lib/1.0"),
+        )
+        .is_dir(true)
+        .bytes_on_basis(60_000, AccountingBasis::Allocated)
+        .modified(500, TimeSource::FoldedDirectoryModification)
+        .supported_with_reason("fixture artifact")
+        .consequence("downloaded again on the next build")
+        .no_action_because("shared")
+        .build();
+        app.set_store_interiors(vec![root, entry]);
+        app.set_view(ViewKind::External);
+        let closed = app.rows();
+        assert_eq!(closed.len(), 1, "closed until opened");
+        assert!(closed[0].expandable);
+        app.selected = 0;
+        app.enter_row();
+        let open = app.rows();
+        assert!(
+            open.iter()
+                .any(|r| r.label == swamp_core::artifact::RoleFamily::SharedStore.title()),
+            "the family group appears: {:?}",
+            open.iter().map(|r| r.label.clone()).collect::<Vec<_>>()
+        );
+        for r in open.iter().skip(1) {
+            assert!(
+                r.unit.is_none(),
+                "{}: an interior row is never selectable",
+                r.label
+            );
+            assert!(r.signals.iter().any(|s| s == "blocked"), "{}", r.label);
+        }
+        for width in [80u16, 160] {
+            let backend = ratatui::backend::TestBackend::new(width, 24);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        }
+    }
+
+    /// `start_watch` opens one FSEvents stream per root in `self.roots`
+    /// (#51), not just the primary one -- the concrete "multiple
+    /// watchers" acceptance case.
+    ///
+    /// Driven through the injected stream factory rather than real
+    /// FSEvents. The previous version opened two real streams and could
+    /// only skip itself when it got *zero*; it got one often enough to
+    /// be recorded as a flake, and the cause was not the assertion but
+    /// `start_watch` itself (`fs_events::PendingWatch` documents the
+    /// measurement). With the factory the assertion is about the loop --
+    /// every root gets its own stream, none is shared, none is dropped
+    /// -- and nothing in it depends on how fast `fseventsd` answers, so
+    /// there is no sleep and no bound to lose a race against.
+    #[test]
+    fn start_watch_opens_one_stream_per_root() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let report = minimal_report(
+            dir_a.path().to_str().unwrap(),
+            "proj-a",
+            dir_a.path().join("proj-a").to_str().unwrap(),
+        );
+        let mut app = App::new_multi_root(
+            report,
+            vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+        );
+        app.store_dir = Some(store.path().to_path_buf());
+        app.start_watch_with(swamp_core::fs_events::testing::inert_watch_factory);
+        assert_eq!(
+            app.watches.len(),
+            2,
+            "one watcher per root, not one shared watcher for the whole App"
+        );
+        assert!(app.watch_rx.is_some());
+        // Already running: a second call must not double the streams.
+        app.start_watch_with(swamp_core::fs_events::testing::inert_watch_factory);
+        assert_eq!(app.watches.len(), 2, "start_watch is idempotent");
+    }
+
+    /// A root whose stream never reports ready contributes no watcher,
+    /// and the roots whose streams did start still do -- the partial
+    /// case `start_watch`'s own doc comment promises. Asserted through a
+    /// factory that fails for exactly one root, so "the other roots
+    /// still run" is a property of the loop rather than of which stream
+    /// `fseventsd` happened to be slow about.
+    #[test]
+    fn a_root_whose_stream_fails_does_not_stop_the_others() {
+        fn only_the_first_starts(
+            root: &std::path::Path,
+            tx: std::sync::mpsc::Sender<swamp_core::fs_events::WatchBatch>,
+        ) -> Option<swamp_core::fs_events::PendingWatch> {
+            if root.to_string_lossy().contains("swamp-watch-refuses") {
+                return None;
+            }
+            swamp_core::fs_events::testing::inert_watch_factory(root, tx)
+        }
+        let store = tempfile::tempdir().unwrap();
+        let report = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
+        let mut app = App::new_multi_root(
+            report,
+            vec![
+                PathBuf::from("/roots/a"),
+                PathBuf::from("/roots/swamp-watch-refuses"),
+                PathBuf::from("/roots/c"),
+            ],
+        );
+        app.store_dir = Some(store.path().to_path_buf());
+        app.start_watch_with(only_the_first_starts);
+        assert_eq!(app.watches.len(), 2, "two of three roots opened a stream");
+        assert!(app.watch_rx.is_some());
+    }
+
+    /// A live batch naming changes under two different roots is handled
+    /// one root at a time: `observe_live` drains only the changed paths
+    /// under the root it picks, leaving the other root's changes intact
+    /// for the next call -- never silently dropped, never merged into
+    /// the wrong root's re-walk.
+    #[test]
+    fn observe_live_handles_one_roots_changes_at_a_time() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let report = minimal_report(
+            dir_a.path().to_str().unwrap(),
+            "proj-a",
+            dir_a.path().join("proj-a").to_str().unwrap(),
+        );
+        let mut app = App::new_multi_root(
+            report,
+            vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+        );
+        app.store_dir = Some(store.path().to_path_buf());
+        // A refresh without an authorized scope is refused by design
+        // (`.oh/guardrails/tui-refresh-preserves-scope.md`), so the
+        // fixture supplies the one this App is showing -- exactly what
+        // `tui::run`/`run_scope` do at startup.
+        app.scope = Some(swamp_core::scope::resolve_effective_scope(
+            &swamp_core::locations::Environment::fixture(
+                dir_a.path().to_path_buf(),
+                std::collections::HashMap::new(),
+                swamp_core::locations::Platform::MacOS,
+            ),
+            &swamp_core::scope::ScanConfig::default(),
+            &[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
+            &swamp_core::locations::Registry::with_builtins(),
+            1_000,
+        ));
+        app.live_changes.insert(dir_a.path().join("changed-a"));
+        app.live_changes.insert(dir_b.path().join("changed-b"));
+        app.live_last_batch = Some(Instant::now() - App::LIVE_QUIET - Duration::from_millis(10));
+        assert!(app.live_observe_due());
+        app.observe_live();
+        assert!(app.pending.is_some(), "one root's re-walk was started");
+        // Exactly one root's change was drained; the other is still
+        // pending for a subsequent call.
+        assert_eq!(app.live_changes.len(), 1, "{:?}", app.live_changes);
     }
 }

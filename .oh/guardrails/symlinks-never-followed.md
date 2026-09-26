@@ -3,16 +3,27 @@ id: symlinks-never-followed
 severity: hard
 statement: "The walk never follows a symlink: every directory listing that descends checks is_symlink first and discards the entry."
 outcome: disk-growth-by-project
-audit: symlinks_never_followed
+audit: gate_paths_only_inside_gates
+compile_fail:
+  - metadata_does_not_follow_by_default
+runtime_tests:
+  - crates/core/src/walk.rs::shallow_parallel_measurement_counts_allocations_without_following_links_or_children
+  - crates/core/src/compose.rs::tests::never_follows_a_symlinked_compose_file
 ---
 
 ## Rationale
 Following symlinks double-counts bytes and can loop. Symlinks are either optimized (counted once by inode) or discarded; they are never traversed.
 
 ## Detection
-AST audit `symlinks_never_followed`, over `walk.rs` and `attribution.rs`:
-1. no call to `fs::metadata` (follows links; `symlink_metadata` does not);
-2. no `is_dir()` / `is_file()` / `exists()` on a path expression (`entry.path().is_dir()`, `x.join(y).exists()` stat through the link);
-3. in every directory loop, a discard guard (an `if` naming `is_symlink` that ends in `continue`/`return`) is a top-level statement at or before the first statement that descends on `is_dir`.
 
-Proven by `scripts/audit-mutants.sh`: replacing `symlink_metadata` with `metadata`, deleting the loop guard, deciding `is_dir` on `entry.path()`, and moving the descent above the guard each fail this audit.
+Mechanism: type, gate audit, clippy, runtime test.
+
+**Type.** The gate names its two stat calls `symlink_metadata` and `metadata_following`; there is no plain `metadata`.
+
+**Gate audit.** `std::fs` and the `Path` I/O methods are gate paths.
+
+**Clippy.** `Path::{metadata, exists, is_dir, is_file, canonicalize}` and `std::fs::metadata` are disallowed methods outside the gate.
+
+Retired 2026-09-22: the `symlinks_never_followed` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+Compile-fail cases (`crates/core/tests/compile_fail/`, run by `crates/source-audit/tests/compile_fail.rs` against the production API): `metadata_does_not_follow_by_default`.

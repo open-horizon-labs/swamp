@@ -1,0 +1,13 @@
+warning: unused variable: `locations`
+ --> $WORKSPACE/crates/core/tests/compile_fail/detector_candidates_cannot_be_destructured.rs
+  |
+  |     let DetectorSummary { locations, .. } = s;
+  |                           ^^^^^^^^^ help: try ignoring the field: `locations: _`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: field `locations` of struct `DetectorSummary` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/detector_candidates_cannot_be_destructured.rs
+  |
+  |     let DetectorSummary { locations, .. } = s;
+  |                           ^^^^^^^^^ private field

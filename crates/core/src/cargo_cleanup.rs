@@ -2,17 +2,10 @@
 //! Supports the tested legacy profile layout only. Locks are advisory: manual
 //! writers that ignore Cargo's locks must be stopped by the user.
 use crate::artifact::{ArtifactRole, NestedArtifact};
+use crate::fs_gate::{self as fs, MetadataExt, sys::RegularFile};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::Read,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt},
-    },
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Member {
@@ -55,16 +48,39 @@ pub struct CargoGroup {
 }
 
 /// Derived from existing facts only. Never performs I/O or implies authorization.
-#[derive(Debug, Serialize)]
+///
+/// R18a: computed exactly once per observe pass, from the report's own
+/// fixed `observed_at` (`report::attach_cargo_guidance`), and stored as
+/// typed columns on `nested_artifacts.parquet`
+/// (`NestedArtifact::guidance`) -- never recomputed from a live clock at
+/// serialization time. Before this, `Report.nested_artifacts`'s
+/// `#[serde(serialize_with = "serialize_units")]` hook called
+/// `guidance(unit)` (i.e. `guidance_at(unit, entities::now())`) at
+/// serialize time, so serializing the same `Report` twice a wall-clock
+/// second apart produced two different `modified_age_secs` values --
+/// the flaky
+/// `project_worktree_tables::report_reads_projects_worktrees_and_artifact_facts_from_the_tables_not_the_snapshot_json`
+/// (a `swamp report --json` run had the identical non-reproducibility
+/// bug). `guidance`/`guidance_at` below are still used for on-demand,
+/// intentionally-live computations (`swamp cargo check`'s human-
+/// initiated review, the TUI's live rendering) -- only the report JSON
+/// serialization path stopped calling them at read time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct Guidance {
     pub recommendation: String,
     pub modified_age_secs: Option<u64>,
-    pub consequence: &'static str,
-    pub scope: &'static str,
-    pub check_status: &'static str,
-    pub reason_code: &'static str,
-    pub message: &'static str,
-    pub next_action: &'static str,
+    /// Owned (not `&'static str`, unlike [`recommendation`]'s own return
+    /// type) so a rebuilt `Guidance` -- read back from
+    /// `nested_artifacts.parquet`'s typed `guidance_*` columns rather
+    /// than recomputed from a live clock -- can be constructed from a
+    /// stored `String` without leaking memory or guessing which static
+    /// constant it came from (R18a).
+    pub consequence: String,
+    pub scope: String,
+    pub check_status: String,
+    pub reason_code: String,
+    pub message: String,
+    pub next_action: String,
 }
 
 pub fn guidance(unit: &NestedArtifact) -> Guidance {
@@ -122,12 +138,12 @@ pub fn guidance_at(unit: &NestedArtifact, now: u64) -> Guidance {
     Guidance {
         recommendation: advice,
         modified_age_secs: age,
-        consequence: recommendation(unit).1,
-        scope,
-        check_status: status,
-        reason_code: code,
-        message,
-        next_action: next,
+        consequence: recommendation(unit).1.to_string(),
+        scope: scope.to_string(),
+        check_status: status.to_string(),
+        reason_code: code.to_string(),
+        message: message.to_string(),
+        next_action: next.to_string(),
     }
 }
 
@@ -181,39 +197,17 @@ pub fn recommendation(unit: &NestedArtifact) -> (&'static str, &'static str) {
     }
 }
 
-/// Add derived guidance to report JSON without persisting a second action model.
-pub fn serialize_units<S: serde::Serializer>(
-    units: &[NestedArtifact],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    use serde::ser::SerializeSeq;
-    #[derive(Serialize)]
-    struct View<'a> {
-        #[serde(flatten)]
-        unit: &'a NestedArtifact,
-        cleanup: Guidance,
-    }
-    let mut seq = serializer.serialize_seq(Some(units.len()))?;
-    for unit in units {
-        seq.serialize_element(&View {
-            unit,
-            cleanup: guidance(unit),
-        })?;
-    }
-    seq.end()
-}
-
 #[derive(Debug, Serialize)]
 pub struct CheckResult {
     pub recommendation: String,
-    pub consequence: &'static str,
+    pub consequence: String,
     pub modified_age_secs: Option<u64>,
     pub path: PathBuf,
     pub allocated_bytes: u64,
-    pub check_status: &'static str,
-    pub reason_code: &'static str,
+    pub check_status: String,
+    pub reason_code: String,
     pub message: String,
-    pub next_action: &'static str,
+    pub next_action: String,
     pub plan_id: Option<String>,
     /// Argument vector, never shell-interpolated. Caller must retain its store.
     pub next_command: Vec<String>,
@@ -228,7 +222,7 @@ pub struct CheckResult {
 /// Explicit bounded review; no approval, execution, or automatic scope expansion.
 pub fn check(
     report: &crate::report::Report,
-    store: &Path,
+    _store: &Path,
     paths: &[PathBuf],
     role: Option<&str>,
     limit: usize,
@@ -267,6 +261,7 @@ pub fn check(
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
         let g = guidance(unit);
+        let check_status_is_unchecked = g.check_status == "unchecked";
         let mut result = CheckResult {
             recommendation: g.recommendation,
             consequence: g.consequence,
@@ -275,7 +270,7 @@ pub fn check(
             allocated_bytes: unit.bytes,
             check_status: g.check_status,
             reason_code: g.reason_code,
-            message: g.message.into(),
+            message: g.message,
             next_action: g.next_action,
             plan_id: None,
             next_command: vec![
@@ -292,50 +287,46 @@ pub fn check(
             checked_at,
             elapsed_ms: 0,
         };
-        if g.check_status == "unchecked" {
+        if check_status_is_unchecked {
             match crate::actions::propose(
                 report,
                 None,
                 std::slice::from_ref(&unit.path),
                 "cleanup-check",
             ) {
-                Ok(plan) => {
-                    crate::actions::save_plan(store, &plan)?;
-                    result.members = plan
-                        .units
+                Ok(units) => {
+                    result.members = units
                         .iter()
-                        .filter_map(|u| u.cargo_group.as_ref())
+                        .filter_map(|u| u.cargo_group())
                         .flat_map(|g| g.members.iter().map(|m| m.path.clone()))
                         .collect();
-                    result.recovery = plan.units.first().map(|u| u.recovery.clone());
-                    result.warnings = plan
-                        .units
+                    result.recovery = units.first().map(|u| u.recovery().to_string());
+                    result.warnings = units
                         .iter()
-                        .flat_map(|u| u.warnings.iter().cloned())
+                        .flat_map(|u| u.warnings().iter().cloned())
                         .collect();
-                    result.check_status = "ready_for_review";
-                    result.reason_code = "checks_passed";
-                    result.message = "Unapproved plan created. Checked layout, Cargo lock, member contents and fingerprint evidence. Not confirmed unused. Review exact members and rebuilding consequences; execution rechecks the selection and occupancy. Trash does not promise immediate free space.".into();
-                    result.next_action = "review_plan";
-                    result.next_command = vec!["swamp".into(), "plans".into(), "--json".into()];
-                    result.plan_id = Some(plan.id);
-                    result.allocated_bytes = plan.units.iter().map(|u| u.bytes).sum();
+                    result.check_status = "ready_for_review".to_string();
+                    result.reason_code = "checks_passed".to_string();
+                    result.message = "Checked layout, Cargo lock, member contents and fingerprint evidence. Nothing here establishes that nothing needs it. Review exact members and rebuilding consequences before deleting; swamp does not delete anything itself.".into();
+                    result.next_action = "review_members".to_string();
+                    result.allocated_bytes = units.iter().map(|u| u.bytes()).sum();
                 }
                 Err(error) => {
-                    result.check_status = "blocked";
+                    result.check_status = "blocked".to_string();
                     let message = error.to_string();
-                    result.reason_code = if message.contains("Cargo build busy or lock unavailable")
-                    {
-                        "lock_unavailable"
-                    } else if message.contains("no established Cargo build lock") {
-                        "missing_lock"
-                    } else {
-                        "review_refused"
-                    };
+                    result.reason_code =
+                        if message.contains("Cargo build busy or lock unavailable") {
+                            "lock_unavailable"
+                        } else if message.contains("no established Cargo build lock") {
+                            "missing_lock"
+                        } else {
+                            "review_refused"
+                        }
+                        .to_string();
                     result.message = message;
                     if result.reason_code == "lock_unavailable" {
                         result.message.push_str(" A build may hold the lock, or locking may be unavailable. Wait for builds to finish, then retry this exact selection. Nothing changed.");
-                        result.next_action = "retry_after_builds";
+                        result.next_action = "retry_after_builds".to_string();
                         result.next_command = vec![
                             "swamp".into(),
                             "cleanup-check".into(),
@@ -344,7 +335,7 @@ pub fn check(
                             unit.path.display().to_string(),
                         ];
                     } else {
-                        result.next_action = "inspect";
+                        result.next_action = "inspect".to_string();
                     }
                 }
             }
@@ -353,6 +344,30 @@ pub fn check(
         results.push(result);
     }
     Ok(results)
+}
+
+/// Whether this module's guidance and cleanup groups speak for a unit
+/// in `role` -- the Cargo layout vocabulary this module was written
+/// against (`Profile`, `Incremental`, `TestExecutable`, ...).
+///
+/// Views decide how to present a container by the *roles* its units
+/// carry, never by comparing an adapter id: a container whose units use
+/// the ecosystem-neutral roles (`Output`, `InstalledDependencies`,
+/// `SharedStoreEntry`, ...) is presented as neutral family groups, and
+/// this module's vocabulary ("rebuild before rerunning") is not applied
+/// to it.
+pub fn speaks_for(role: &ArtifactRole) -> bool {
+    matches!(
+        role,
+        ArtifactRole::Profile
+            | ArtifactRole::Dependency
+            | ArtifactRole::TestExecutable
+            | ArtifactRole::Example
+            | ArtifactRole::BuildScriptOutput
+            | ArtifactRole::Incremental
+            | ArtifactRole::FinalOutput
+            | ArtifactRole::CompanionMetadata
+    )
 }
 
 pub fn candidate(unit: &NestedArtifact) -> bool {
@@ -378,15 +393,8 @@ pub fn candidate(unit: &NestedArtifact) -> bool {
     }
 }
 
-fn regular(path: &Path) -> Result<fs::File> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        bail!("not a regular file: {}", path.display());
-    }
-    Ok(file)
+fn regular(path: &Path) -> Result<RegularFile> {
+    Ok(RegularFile::open_nofollow(path)?)
 }
 
 fn snapshot(path: &Path) -> Result<Member> {
@@ -396,10 +404,6 @@ fn snapshot(path: &Path) -> Result<Member> {
 /// Authorization identity for a selected path. Link counts and allocation
 /// accounting are observations, not safety facts: aliases outside the
 /// selection may change without changing the selected content or membership.
-fn same_safety(a: &Member, b: &Member) -> bool {
-    a.path == b.path && a.device == b.device && a.inode == b.inode && a.digest == b.digest
-}
-
 fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member> {
     *visited += 1;
     if depth > 128 || *visited > 100_000 {
@@ -443,15 +447,7 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
     }
     let mut file = regular(path)?;
     let before = file.metadata()?;
-    let mut hash = blake3::Hasher::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buf[..n]);
-    }
+    let digest = file.digest()?;
     let after = file.metadata()?;
     if (
         before.len(),
@@ -475,27 +471,12 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
         nlink: before.nlink(),
         hardlink_members: u64::from(before.nlink() > 1),
         bytes: before.blocks() * 512,
-        digest: hash.finalize().to_hex().to_string(),
+        digest,
     })
 }
 
 fn local_filesystem(path: &Path) -> Result<()> {
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::statfs(c.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let stat = unsafe { stat.assume_init() };
-    #[cfg(target_os = "macos")]
-    let local = stat.f_flags & libc::MNT_LOCAL as u32 != 0;
-    #[cfg(target_os = "linux")]
-    let local = matches!(
-        stat.f_type as u64,
-        0xef53 | 0x9123683e | 0x58465342 | 0x01021994
-    );
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let local = false;
-    if !local {
+    if !fs::sys::volume_info(path)?.is_local() {
         bail!(
             "Cargo cleanup requires a supported local filesystem; network/unknown mounts are inspection-only"
         );
@@ -521,7 +502,7 @@ fn locks(profile: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-struct HeldLocks(Vec<fs::File>);
+struct HeldLocks(Vec<RegularFile>);
 
 impl Drop for HeldLocks {
     fn drop(&mut self) {
@@ -558,7 +539,7 @@ fn acquire(paths: &[PathBuf]) -> Result<HeldLocks> {
 fn explicit_unlock_releases_even_with_a_duplicated_description() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join(".cargo-lock");
-    fs::write(&path, b"").unwrap();
+    std::fs::write(&path, b"").unwrap();
     let held = acquire(std::slice::from_ref(&path)).unwrap();
     let duplicate = held.0[0].try_clone().unwrap();
     assert!(
@@ -584,7 +565,7 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     }
     if !candidate(unit) {
         bail!(
-            "{} Nothing changed. Use report --view rust to inspect individual groups, then cleanup-check --path with an exact group path.",
+            "{} Nothing changed. Run `swamp ui` to inspect cleanup groups and review supported actions.",
             guidance(unit).message
         );
     }
@@ -601,7 +582,8 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     {
         bail!("this Cargo role is inspection-only; select a test or example executable");
     }
-    let relative = selected.strip_prefix(container)?;
+    let relative = crate::scope::relative_to(selected, container)
+        .context("selection is not inside its container")?;
     let canonical_container = fs::canonicalize(container)?;
     let canonical_selected = fs::canonicalize(selected)?;
     if canonical_container.join(relative) != canonical_selected
@@ -611,7 +593,8 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     }
     let container = canonical_container;
     let selected = canonical_selected;
-    let rel = selected.strip_prefix(&container)?;
+    let rel = crate::scope::relative_to(&selected, &container)
+        .context("selection is not inside its container")?;
     let count = rel.components().count();
     if !(count == 3 || count == 4) {
         bail!("unsupported Cargo executable layout");
@@ -643,11 +626,11 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     }
     let mut paths = vec![selected.clone()];
     let dep = selected.with_extension("d");
-    if !directory_group && dep != selected && dep.exists() {
+    if !directory_group && dep != selected && fs::exists(&dep) {
         paths.push(dep);
     }
     let dsym = selected.with_extension("dSYM");
-    if !directory_group && dsym.exists() {
+    if !directory_group && fs::exists(&dsym) {
         paths.push(dsym);
     }
     let members: Vec<_> = paths.iter().map(|p| snapshot(p)).collect::<Result<_>>()?;
@@ -668,117 +651,41 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     })
 }
 
-/// Execute only behind the caller's existing explicit authorization. All group
-/// members are checked before the first move. Failure rolls back completed
-/// moves where possible, with the recovery envelope retained on disk.
-pub(crate) fn move_reviewed(group: &CargoGroup, trash: &Path) -> Result<PathBuf> {
-    if locks(&group.profile)? != group.lock_paths {
-        bail!("Cargo lock set changed; propose again");
-    }
+/// Moves a Cargo group's exact member list into one Trash envelope. Holds
+/// the group's advisory Cargo lock for the duration of the move so a
+/// concurrent `cargo build` does not write into a directory mid-rename;
+/// this is a mutual-exclusion measure, not a "did anything change"
+/// refusal -- swamp reports the group, the human decided to trash it, and
+/// the only way this refuses is an OS-level rename failure (a member
+/// already gone, a name collision). Failure rolls back completed moves
+/// where possible, with the recovery envelope retained on disk.
+pub(crate) fn move_group(group: &CargoGroup, trash: &Path) -> Result<PathBuf> {
     let _held = acquire(&group.lock_paths)?;
-    for evidence in &group.evidence {
-        if !same_safety(&snapshot(&evidence.path)?, evidence) {
-            bail!("Cargo role/evidence changed; propose again");
-        }
-    }
-    let paths: Vec<_> = group.evidence.iter().map(|e| e.path.clone()).collect();
-    let (role, is_dir) =
-        crate::cargo_artifacts::reviewed_role(&group.container, &group.selected, &paths)?;
-    if role != group.role {
-        bail!("Cargo role/evidence changed; propose again");
-    }
-    let mut expected = vec![group.selected.clone()];
-    let dep = group.selected.with_extension("d");
-    if !is_dir && dep.exists() && dep != group.selected {
-        expected.push(dep);
-    }
-    if !is_dir && group.selected.with_extension("dSYM").exists() {
-        expected.push(group.selected.with_extension("dSYM"));
-    }
-    if expected
-        != group
-            .members
-            .iter()
-            .map(|m| m.path.clone())
-            .collect::<Vec<_>>()
-    {
-        bail!("companion membership changed; propose again");
-    }
-    for m in &group.members {
-        if !same_safety(&snapshot(&m.path)?, m) {
-            bail!("stale Cargo member {}; propose again", m.path.display());
-        }
-        if occupied(&m.path) {
-            bail!("occupied or occupancy unavailable: {}", m.path.display());
-        }
-    }
-    fs::create_dir_all(trash)?;
-    if fs::metadata(trash)?.dev() != group.members[0].device {
-        bail!("cross-device Trash unsupported; no permanent fallback");
-    }
-    let dest = trash.join(format!("swamp-cargo-{}", crate::entities::new_id()));
-    fs::create_dir(&dest)?;
-    fs::write(dest.join("restore.json"), serde_json::to_vec_pretty(group)?)?;
-    fs::File::open(dest.join("restore.json"))?.sync_all()?;
-    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut envelope = fs::destroy::Envelope::open(
+        &group.selected,
+        trash,
+        &format!("swamp-cargo-{}", crate::entities::new_id()),
+        Some(group.members[0].device),
+    )?;
+    envelope.write_manifest(group)?;
     for (i, member) in group.members.iter().enumerate() {
-        let to = dest.join(format!(
+        let name = format!(
             "{i}-{}",
-            member.path.file_name().unwrap().to_string_lossy()
-        ));
-        if let Err(e) = fs::rename(&member.path, &to) {
-            let mut failures = Vec::new();
-            for (from, to) in moved.iter().rev() {
-                if from.exists() {
-                    failures.push(format!("{} reappeared", from.display()));
-                } else if let Err(e) = fs::rename(to, from) {
-                    failures.push(e.to_string());
-                }
-            }
+            member
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "member".to_string())
+        );
+        if let Err(e) = envelope.move_member(&member.path, &name) {
+            let failures = envelope.roll_back();
             bail!(
                 "Cargo move failed: {e}; recovery manifest {}; rollback errors: {:?}",
-                dest.display(),
+                envelope.path().display(),
                 failures
             );
         }
-        moved.push((member.path.clone(), to));
     }
+    let dest = envelope.path().to_path_buf();
     Ok(dest)
-}
-
-fn occupied(path: &Path) -> bool {
-    let mut cmd = std::process::Command::new("lsof");
-    if path.is_dir() {
-        cmd.arg("+D").arg(path);
-    } else {
-        cmd.arg("--").arg(path);
-    }
-    // Bound the occupancy probe and avoid pipe backpressure. Any diagnostic,
-    // timeout, or launch failure refuses cleanup.
-    let Ok(output) = tempfile::tempfile() else {
-        return true;
-    };
-    let (Ok(stdout), Ok(stderr)) = (output.try_clone(), output.try_clone()) else {
-        return true;
-    };
-    let Ok(mut child) = cmd.stdout(stdout).stderr(stderr).spawn() else {
-        return true;
-    };
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                return !(status.code() == Some(1)
-                    && output.metadata().map(|m| m.len() == 0).unwrap_or(false));
-            }
-            Ok(None) if started.elapsed() < std::time::Duration::from_secs(10) => {
-                std::thread::sleep(std::time::Duration::from_millis(20))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return true;
-            }
-        }
-    }
 }

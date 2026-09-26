@@ -1,10 +1,9 @@
 use crate::entities::*;
+use crate::fs_gate::MetadataExt;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashSet},
-    fs,
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -20,7 +19,8 @@ impl ScanOptions {
         self.roots
             .iter()
             .map(|root| {
-                fs::canonicalize(root).with_context(|| format!("canonicalize {}", root.display()))
+                crate::fs_gate::canonicalize(root)
+                    .with_context(|| format!("canonicalize {}", root.display()))
             })
             .collect()
     }
@@ -40,7 +40,7 @@ pub fn scan(options: &ScanOptions) -> Result<Vec<ScanRow>> {
     let mut rows = Vec::new();
     let mut seen = HashSet::new();
     for root in options.canonical_roots()? {
-        let device = fs::metadata(&root)
+        let device = crate::fs_gate::metadata_following(&root)
             .with_context(|| format!("stat {}", root.display()))?
             .dev();
         walk(&root, device, options, 0, None, &mut seen, &mut rows)?;
@@ -58,7 +58,7 @@ fn walk(
     seen: &mut HashSet<(u64, u64)>,
     rows: &mut Vec<ScanRow>,
 ) -> Result<u64> {
-    let meta = fs::symlink_metadata(path)?;
+    let meta = crate::fs_gate::symlink_metadata(path)?;
     if !options.cross_device && meta.dev() != device {
         return Ok(0);
     }
@@ -73,7 +73,7 @@ fn walk(
         return Ok(0);
     }
     let repo = repo_identity(path).or(inherited_repo);
-    let entries = match fs::read_dir(path) {
+    let entries = match crate::fs_gate::read_dir(path) {
         Ok(e) => e,
         Err(_) => {
             rows.push(ScanRow {
@@ -123,11 +123,11 @@ fn walk(
 
 pub fn repo_identity(path: &Path) -> Option<String> {
     let git = path.join(".git");
-    let text = if git.is_dir() {
-        let meta = fs::metadata(&git).ok()?;
+    let text = if crate::fs_gate::is_dir(&git) {
+        let meta = crate::fs_gate::metadata_following(&git).ok()?;
         format!("git-object-store:{}:{}", meta.dev(), meta.ino())
-    } else if git.is_file() {
-        fs::read_to_string(&git)
+    } else if crate::fs_gate::is_file(&git) {
+        crate::fs_gate::read::bounded_string(&git, crate::fs_gate::read::BoundedCap::POINTER)
             .ok()?
             .trim()
             .strip_prefix("gitdir:")?
@@ -209,7 +209,10 @@ pub fn observation(options: &ScanOptions) -> Result<Observation> {
         })
         .collect();
     Ok(Observation {
-        volume_id: fs::metadata(options.roots.first().context("at least one root")?)?.dev(),
+        volume_id: crate::fs_gate::metadata_following(
+            options.roots.first().context("at least one root")?,
+        )?
+        .dev(),
         roots,
         artifacts,
         projects,
@@ -224,6 +227,7 @@ pub fn observation(options: &ScanOptions) -> Result<Observation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
     #[test]
     fn repo_identity_survives_path_rename() {

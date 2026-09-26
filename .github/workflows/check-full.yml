@@ -1,0 +1,98 @@
+name: check-full
+
+# The full tier (`scripts/check-full.sh`): `scripts/check.sh` plus the
+# heavy harnesses -- the compile-fail cases (trybuild against the
+# production API), the mutation sweep (every corpus, re-review and
+# operator mutation applied to a copy of the workspace) and the cost
+# test (process-global work counters and a PATH spawn shim,
+# single-threaded and alone). Split out of `ci.yml` (2026-09-24): these
+# jobs are 60-90 minutes each and add nothing `ci.yml`'s fast tier
+# doesn't already cover on every push -- they exist to catch drift
+# between pushes, not to gate one.
+#
+# Never runs on an ordinary push, an unlabelled PR, or on a schedule.
+# Two ways to run it here: `gh workflow run check-full.yml`, or adding
+# the `full-check` label to a PR (removing and re-adding the label
+# re-triggers it; a `synchronize` push to an already-labelled PR does
+# not, by design -- ask for it explicitly if a later push needs another
+# full-tier run before merge). A third way is `release.yml`'s own
+# `check-full` job, which runs the same `scripts/check-full.sh` (not
+# this workflow -- a separate job definition, since `workflow_call`
+# would need this file restructured into reusable-workflow shape for no
+# benefit) on every `v*` tag push, gating `publish`.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-full-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: ""
+
+jobs:
+  linux-x86_64-check-full:
+    name: Linux x86_64 (check-full)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'full-check'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # Test fixtures make git commits; never let them reach a signing
+      # agent on the runner.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: commit.gpgsign
+      GIT_CONFIG_VALUE_0: "false"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-full-linux-x86_64
+
+      # scripts/check-full.sh runs scripts/check.sh, then the compile-fail
+      # cases, the mutation sweep and the cost test once each. The cost
+      # test's own Linux contract (`reviewer_cost_measurement_stack3`'s
+      # `linux_contract`) only runs where this job runs it.
+      - name: scripts/check-full.sh
+        run: scripts/check-full.sh
+
+  macos-arm64-check-full:
+    name: macOS arm64 (check-full)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'full-check'
+    runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
+    timeout-minutes: 90
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: commit.gpgsign
+      GIT_CONFIG_VALUE_0: "false"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        if: vars.LOCAL_MACOS_CI_ENABLED != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check-full-macos-arm64
+
+      - name: scripts/check-full.sh
+        run: scripts/check-full.sh

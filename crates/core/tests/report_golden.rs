@@ -102,11 +102,13 @@ fn report_matches_fixture_and_reconciles() {
         .expect("shared cache unowned row");
     assert_eq!(shared_cache_row.bytes, fx.shared_cache_bytes);
 
+    // #R10 item 1: unowned rows fold per directory, never per file, so
+    // the loose file's row is keyed by its containing directory.
     let loose_row = r
         .unowned
         .iter()
-        .find(|u| u.path_or_object == fx.loose_file.display().to_string())
-        .expect("loose file unowned row");
+        .find(|u| u.path_or_object == fx.loose_dir.display().to_string())
+        .expect("loose file's directory unowned row");
     assert_eq!(loose_row.bytes, fx.loose_file_bytes);
 
     // aaaa: compose-project label matches the checkout name -> joined,

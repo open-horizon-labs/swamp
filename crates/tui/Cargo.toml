@@ -14,4 +14,8 @@ unicode-width = "0.2"
 unicode-segmentation = "1.13"
 
 [dev-dependencies]
+swamp-core = { path = "../core", features = ["testing"] }
 tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+error[E0425]: cannot find function `read_to_end` in module `swamp_core::fs_gate::read`
+ --> $WORKSPACE/crates/core/tests/compile_fail/no_unbounded_read_in_the_gate.rs
+  |
+  |     let _ = swamp_core::fs_gate::read::read_to_end("/tmp/transcript.jsonl");
+  |                                        ^^^^^^^^^^^ not found in `swamp_core::fs_gate::read`

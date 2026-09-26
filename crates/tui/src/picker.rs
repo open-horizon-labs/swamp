@@ -658,11 +658,13 @@ mod tests {
     #[test]
     fn seeds_from_current_text() {
         let report = swamp_core::Report {
+            store_dir: None,
             observed_at: 0,
             root: "/r".into(),
             projects: vec![],
             unowned: vec![],
             reconciliation: swamp_core::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

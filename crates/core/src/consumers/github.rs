@@ -24,7 +24,12 @@ impl Consumer for GithubConsumer {
     fn subscribes_to(&self) -> &[EventKind] {
         &[EventKind::ProjectsGrouped, EventKind::SignalsComputed]
     }
-    async fn on_event(&self, event: &Event, ctx: &Ctx<'_>) -> Result<Vec<Event>> {
+    async fn on_event(
+        &self,
+        event: &Event,
+        ctx: &Ctx<'_>,
+        _stage: &crate::bus::Stage,
+    ) -> Result<Vec<Event>> {
         match event {
             Event::ProjectsGrouped {
                 worktree_remotes, ..
@@ -45,8 +50,8 @@ impl Consumer for GithubConsumer {
                         notes: Vec::new(),
                     }]);
                 };
-                let volume_id = std::fs::metadata(&ctx.root)
-                    .map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+                let volume_id = crate::fs_gate::metadata_following(&ctx.root)
+                    .map(|m| crate::fs_gate::MetadataExt::dev(&m))
                     .unwrap_or(0);
                 // Only worktrees whose remote resolves to a github.com owner/repo.
                 let mut owned: Vec<(String, String, String, Option<String>, String)> = Vec::new();
@@ -101,8 +106,9 @@ impl Consumer for GithubConsumer {
                         ctx.observed_at,
                         crate::github::DEFAULT_GITHUB_TTL_SECS,
                     );
-                    read_notes
-                        .retain(|n| !n.contains("not enriched") && !n.contains("stale cached"));
+                    read_notes.retain(|n| {
+                        !n.contains("not enriched") && !n.contains("older than the refresh window")
+                    });
                     read_notes.extend(summary.notes);
                     (
                         facts,

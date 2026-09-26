@@ -25,8 +25,8 @@ use swamp_core::actions;
 use swamp_core::fs_events::{
     FsEventsPlan, FsEventsRequest, FsEventsSource, RefreshRefusal, testing::CannedSource,
 };
-use swamp_core::growth::volume_store_dir;
-use swamp_core::report::{ArtifactKind, load_last_report, report_full_mode_with_source};
+use swamp_core::growth::{root_key, volume_store_dir};
+use swamp_core::report::{ArtifactKind, report_full_mode_with_source};
 
 /// Disables the `TooSoon` floor for this process. Idempotent and safe to
 /// call from every test regardless of thread-parallel execution: every
@@ -61,6 +61,7 @@ impl FsEventsSource for RefusingSource {
             current_event_id: 999,
             device: Some(1),
             live: false,
+            consume: None,
         }
     }
 }
@@ -80,6 +81,7 @@ fn incremental_plan(changed: Vec<PathBuf>, event_id: u64) -> FsEventsPlan {
         current_event_id: event_id,
         device: Some(1),
         live: false,
+        consume: None,
     }
 }
 
@@ -457,6 +459,7 @@ fn every_refusal_reason_falls_back_to_a_full_walk() {
         RefreshRefusal::HelperInconclusive,
         RefreshRefusal::TooManyChanges,
         RefreshRefusal::UnsupportedPlatform,
+        RefreshRefusal::NoPersistedChangeHistory,
     ] {
         let store = tempfile::tempdir().expect("tmp store");
 
@@ -541,12 +544,11 @@ fn stored_event_id_is_recorded_after_an_observation() {
     )
     .expect("report");
 
-    let sidecar = volume_store_dir(store.path(), &fx.root).join("fsevents.json");
-    let text =
-        fs::read_to_string(&sidecar).unwrap_or_else(|e| panic!("read {}: {e}", sidecar.display()));
+    let anchor =
+        swamp_core::growth::read_fsevents_anchor(&volume_store_dir(store.path(), &fx.root));
     assert!(
-        text.contains("event_id"),
-        "fsevents.json must record the observed event id: {text}"
+        anchor.event_id.is_some(),
+        "cursors.parquet must record the observed event id: {anchor:?}"
     );
 }
 
@@ -569,20 +571,20 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         &no_op_source(),
     )
     .expect("baseline");
-    let sidecar = volume_store_dir(store.path(), &fx.root).join("fsevents.json");
-    let before = fs::read(&sidecar).unwrap();
-    let cache = fs::read_dir(store.path())
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("last_report-")
-        })
-        .unwrap();
-    let blocker = cache.with_extension("tmp");
+    let volume = volume_store_dir(store.path(), &fx.root);
+    let before = swamp_core::growth::read_fsevents_anchor(&volume);
+    // `git_signals.parquet` is `consumers::signals`'s per-root replay
+    // cache (R18a-4's replacement for `last_report-<key>.json.zst`):
+    // written, like every table, every pass this call observes.
+    let cache = store.path().join("git_signals.parquet");
+    assert!(cache.exists(), "baseline observe must write {cache:?}");
+    // The cache write publishes by renaming a sibling temp file over the
+    // cache path; a non-empty directory sitting at that path makes the
+    // rename fail, which is the failure this test needs.
+    fs::remove_file(&cache).unwrap();
+    let blocker = cache.clone();
     fs::create_dir(&blocker).unwrap();
+    fs::write(blocker.join("occupied"), b"x").unwrap();
     let source = CannedSource(incremental_plan(vec![], 77));
     let result = report_full_mode_with_source(
         &fx.root,
@@ -600,8 +602,8 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         result.is_err(),
         "cache failure must propagate rather than advance replay past uncached evidence"
     );
-    assert_eq!(fs::read(&sidecar).unwrap(), before);
-    fs::remove_dir(blocker).unwrap();
+    assert_eq!(swamp_core::growth::read_fsevents_anchor(&volume), before);
+    fs::remove_dir_all(blocker).unwrap();
     report_full_mode_with_source(
         &fx.root,
         None,
@@ -615,8 +617,8 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
         &source,
     )
     .expect("retry");
-    let after: serde_json::Value = serde_json::from_slice(&fs::read(sidecar).unwrap()).unwrap();
-    assert_eq!(after["event_id"], 77);
+    let after = swamp_core::growth::read_fsevents_anchor(&volume);
+    assert_eq!(after.event_id, Some(77));
 }
 
 #[test]
@@ -648,9 +650,14 @@ fn switching_roots_preserves_history_and_alias_replay_namespace() {
     )
     .expect("parent baseline");
     assert_eq!(parent.root, std::fs::canonicalize(&fx.root).unwrap());
+    // R18a-4: there is no single whole-`Report` cache left to load: the
+    // per-root replay tables are keyed by `growth::root_key`, which
+    // canonicalizes before hashing, so the alias and the canonical root
+    // must resolve to the same key and the same stored replay cache.
+    assert_eq!(root_key(&alias), root_key(&fx.root));
     assert!(
-        load_last_report(store.path(), &alias).is_some(),
-        "alias and canonical root must load the same cached report"
+        swamp_core::growth::read_cargo_replay_cache(store.path(), &root_key(&alias)).is_some(),
+        "alias and canonical root must load the same cached replay state"
     );
 
     // A child/root switch uses the same physical store but must select a
@@ -723,13 +730,13 @@ fn switching_roots_preserves_history_and_alias_replay_namespace() {
     )
     .expect("visible linked worktree should produce a proposal");
     assert_eq!(
-        proposal.units.len(),
+        proposal.len(),
         1,
         "proposal must contain exactly the selected worktree"
     );
-    assert_eq!(proposal.units[0].path, canonical_linked);
-    assert_eq!(proposal.units[0].worktree_path, canonical_linked);
-    assert_eq!(proposal.units[0].verb, "remove-worktree");
+    assert_eq!(proposal[0].path(), canonical_linked);
+    assert_eq!(proposal[0].worktree_path(), canonical_linked);
+    assert_eq!(proposal[0].verb(), "remove-worktree");
     let main = parent_checkout
         .worktrees
         .iter()

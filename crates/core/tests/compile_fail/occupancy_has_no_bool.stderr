@@ -1,0 +1,5 @@
+error[E0599]: no method named `is_free` found for reference `&OccupancyState` in the current scope
+ --> $WORKSPACE/crates/core/tests/compile_fail/occupancy_has_no_bool.rs
+  |
+  |     state.is_free()
+  |           ^^^^^^^ method not found in `&OccupancyState`

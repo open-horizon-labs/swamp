@@ -1,0 +1,13 @@
+# Floating on `stable` (owner decision, 2026-09-24, supersedes the
+# 1.98.1 pin from 2026-09-22): the machine this ships from keeps only
+# `stable` installed, and CI now resolves `stable` the same way
+# (`dtolnay/rust-toolchain@stable`). A new stable release adding a lint
+# that trips `-D warnings` is fixed by regenerating trybuild snapshots
+# (`TRYBUILD=overwrite`) and lint fixes in their own commit, same as
+# before -- the trade the original pin was protecting against, just
+# handled when it happens instead of frozen against ever happening.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+profile = "minimal"

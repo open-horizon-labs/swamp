@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> $WORKSPACE/crates/core/tests/compile_fail/content_reads_need_a_cap.rs
+  |
+  |     let _ = bounded_read("/tmp/transcript.jsonl");
+  |             ^^^^^^^^^^^^------------------------- argument #2 of type `BoundedCap` is missing
+  |
+note: function defined here
+ --> $WORKSPACE/crates/core/src/fs_gate/read.rs
+  |
+  | pub fn bounded_read(path: impl AsRef<Path>, cap: BoundedCap) -> io::Result<BoundedBytes> {
+  |        ^^^^^^^^^^^^
+help: provide the argument
+  |
+6 |     let _ = bounded_read("/tmp/transcript.jsonl", /* BoundedCap */);
+  |                                                 ++++++++++++++++++

@@ -39,13 +39,32 @@ as indispensable. Existing observation history provides a foundation, but the
 current separate-root observation loop with volume-keyed state leaves multi-root
 correctness unresolved. This record does not claim that capability is implemented.
 
+**2026-09-21 update (#42):** `report::report_scope` now orchestrates every
+in-scope root through one coherent call, with per-root physical stores kept
+independent (device + canonical-path keyed, unchanged) and a
+`coverage::RootCoverage` region per root. The multi-root correctness gap this
+paragraph named is addressed for the root- and worktree-access-loss cases the
+acceptance criteria describe; see the acceptance signal below and
+`.oh/sessions/2026-09-21-multi-root-coverage-and-external-units.md` for what
+was and was not covered, including the residual #41/#43 detector-location
+double-measurement overlap this record does not close.
+
 ## Acceptance signal
 
 Representative overlapping-root, added-root, excluded-root, partial-scan, and
 unreadable-root cases distinguish actual filesystem changes from changed coverage.
 Reordering roots must not change the interpretation of the same observation.
 Users can explain a total's scope without inspecting the implementation.
-Executable validation for this full contract has not yet been established.
+
+**2026-09-21 (#42):** executable validation now exists for these cases:
+`crates/core/tests/multi_root_coverage.rs` (two disjoint roots, root-order
+independence, nested-root folding, root-level and worktree-level access loss
+without fabricated deletion/regrowth, scope removal as a coverage change,
+pruned-subtree exclusion, real delete-then-regrow, new-root unknown baseline,
+missing-root as its own region) and `crates/cli/tests/report_multi_root.rs`
+(end to end through the built binary). Concurrent-writer/crash-window limits
+remain documented, not eliminated -- see `docs/architecture.md`'s "Limits of
+the current implementation".
 
 ## Lineage and collective sufficiency
 

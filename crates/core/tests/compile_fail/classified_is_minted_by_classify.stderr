@@ -1,0 +1,11 @@
+error[E0603]: struct `Classified` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/classified_is_minted_by_classify.rs
+  |
+  | use swamp_core::attribution::Classified;
+  |                              ^^^^^^^^^^ private struct
+  |
+note: the struct `Classified` is defined here
+ --> $WORKSPACE/crates/core/src/attribution.rs
+  |
+  | pub(crate) struct Classified(ArtifactKind);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

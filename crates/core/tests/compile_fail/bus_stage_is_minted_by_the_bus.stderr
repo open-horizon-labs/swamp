@@ -1,0 +1,5 @@
+error[E0451]: field `_minted_by_the_bus` of struct `Stage` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/bus_stage_is_minted_by_the_bus.rs
+  |
+  |     let stage = Stage { _minted_by_the_bus: () };
+  |                         ^^^^^^^^^^^^^^^^^^ private field

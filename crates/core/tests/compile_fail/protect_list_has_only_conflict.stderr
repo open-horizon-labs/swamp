@@ -1,0 +1,5 @@
+error[E0616]: field `paths` of struct `ProtectList` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/protect_list_has_only_conflict.rs
+  |
+  |     list.paths.iter().any(|p| candidate.starts_with(p))
+  |          ^^^^^ private field

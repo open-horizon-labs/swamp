@@ -1,0 +1,494 @@
+# Vendored upstream citations for `crates/core/src/agents/matrix.rs`.
+#
+# Every `Supported` row in the matrix has to be backed by a source that
+# *establishes* its claim, not merely by a string longer than thirty
+# characters. The 2026-09-22 independent re-review fetched all fourteen
+# rows' citations and found six that did not -- four of them
+# consequential in the adapter. This file is what replaced the length
+# check.
+#
+# One `[[citation]]` block per upstream file:
+#
+#   tool     the matrix row it backs (`AgentToolId::slug`)
+#   repo     the upstream repository, or the docs host for a doc page
+#   commit   a 40-hex commit SHA, or `retrieved <date>` for a doc page
+#            that has no commit (a docs site is not a git tree)
+#   path     the upstream path, exactly as `MatrixEntry::verification`'s
+#            `source` names it -- the two are matched by string
+#   symbols  strings the row's claim depends on, checked verbatim
+#            against the excerpt by
+#            `crates/core/tests/upstream_citations_are_checked.rs`
+#   excerpt  the vendored minimal excerpt, relative to this directory
+#   blake3   its digest, so an excerpt edited to make a claim fit stops
+#            matching
+#   upstream_blake3
+#            the digest of the whole upstream file at `commit`, recorded
+#            when the excerpt was vendored (2026-09-22, by
+#            `SWAMP_RECORD_UPSTREAM=1 cargo test --test
+#            upstream_citations_are_checked`), so a re-fetch
+#            (`SWAMP_FETCH_UPSTREAM=1`) proves the excerpt's lines are the
+#            file's; `doc-page` for a docs page, which has no commit and
+#            whose excerpt is author-supplied
+#
+# Excerpts are a few lines each, carry a provenance header naming the
+# repository, commit and path, and are kept only for verification.
+# Licences: Apache-2.0 (codex, gemini-cli, cline, roo-code, continue,
+# aider), MIT (opencode, pi, oh-my-pi), CC-BY-4.0 (github/docs); doc
+# pages are quoted at the few lines the claim rests on.
+#
+# NOT vendored, deliberately: `github/copilot-cli`'s changelog is under a
+# proprietary licence that permits unmodified redistribution only, so it
+# is recorded as line numbers plus exact symbol strings at
+# `copilot-cli/c13b3dcae4/NO-VENDOR-changelog.md` and is *not* listed
+# here -- a note of what was read, which is weaker than a citation and
+# is not used to back a claim.
+
+[[citation]]
+tool = "claude-code"
+repo = "code.claude.com/docs"
+commit = "retrieved 2026-09-22"
+path = "docs/en/claude-directory"
+symbols = ['CLAUDE_CONFIG_DIR', 'Legacy directories from older versions', 'No longer written', 'statsig', 'todos']
+excerpt = "claude-code/2026-09-22/claude-directory.md"
+blake3 = "a0ae7b9d47e2452e3a3ef1d2143cb0ffa41191c28b7c05ed6105b064924c440f"
+upstream_blake3 = "doc-page"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/state/src/sqlite.rs"
+symbols = ['RUNTIME_DBS: [RuntimeDbSpec; 7]', 'memories_v2_1.sqlite', 'state_5.sqlite', 'logs_2.sqlite', 'goals_1.sqlite', 'memories_1.sqlite', 'queue_1.sqlite', 'thread_history_1.sqlite', 'codex_home.join(self.filename)']
+excerpt = "codex/ac7634b9f7/sqlite.rs"
+blake3 = "f33c1939ccaa62f795da15c9576456e4a5787736d2c0e5c7681e7cc2aa4b6ae2"
+upstream_blake3 = "b2ac8cf7a78f7aa8b7c5a41e42316804c53dee2cab8eda59c1e1c26ad985f7c7"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/state/src/lib.rs"
+symbols = ['SQLITE_HOME_ENV', 'CODEX_SQLITE_HOME']
+excerpt = "codex/ac7634b9f7/state-lib.rs"
+blake3 = "1cd05597545d1889b2369ad2d058608cbd274b78e4122788c99f48dcb2c6528f"
+upstream_blake3 = "e077949db3b62e53a70b6d5f22dd71232dd296af2a846b25edf1073736e9200e"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/ext/skills/src/host_roots.rs"
+symbols = ['Deprecated user skills location', 'AGENTS_DIR_NAME', 'SKILLS_DIR_NAME', '.agents']
+excerpt = "codex/ac7634b9f7/skills-host_roots.rs"
+blake3 = "8c529fa9fad4d68d0690b08419d0040b411c508dbafd04cf3c43630952d2dbe9"
+upstream_blake3 = "cac16dddced1a41fab6c5b2f0ee3c8a94724523b2be1f4210a0e722e66e78d3a"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/config/src/config_toml.rs"
+symbols = ['log_dir', 'sqlite_home', '$CODEX_HOME/log']
+excerpt = "codex/ac7634b9f7/config_toml.rs"
+blake3 = "67b63b2fb13c9ee7c59c1283821739b60109eac179454654e7f9cee56ccbb075"
+upstream_blake3 = "7c1d55141c05c8624535b2cd328c80b8422a7c1874f78227e07fad318c7ba5f8"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/core/src/config/mod.rs"
+symbols = ['codex_home.join("log")', 'SQLITE_HOME_ENV', 'log_dir']
+excerpt = "codex/ac7634b9f7/core-config-mod.rs"
+blake3 = "d05f600a7626b5e63347651dfb57d358b029775ce5a4a57cf60f489609c31195"
+upstream_blake3 = "781f3998664ba58be6fea712495ca7e6df817c2efb15e625cd4a52033f96bc65"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/utils/home-dir/src/lib.rs"
+symbols = ['CODEX_HOME', 'find_codex_home']
+excerpt = "codex/ac7634b9f7/home-dir-lib.rs"
+blake3 = "57383912d557da6e2798607bceba36d7ecab4ec90a5e86f1569f8e1a96eb6aab"
+upstream_blake3 = "5f4b3bf739cde0ff8b0b36de275c9a77a75a129131c17ff6d30b2739f110aa13"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/rollout/src/lib.rs"
+symbols = ['SESSIONS_SUBDIR', 'ARCHIVED_SESSIONS_SUBDIR']
+excerpt = "codex/ac7634b9f7/rollout-lib.rs"
+blake3 = "39a941e968183576dd80dd68d1a21a886d8f117e13fde02c8fdb371b66e08fda"
+upstream_blake3 = "40587a86ab5653daf3d44ea8146961719f6b339728f7c3756a325acf76dbdad3"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/rollout/src/list.rs"
+symbols = ['SESSIONS_SUBDIR', 'year_dirs', 'month_dirs', 'day_dirs']
+excerpt = "codex/ac7634b9f7/rollout-list.rs"
+blake3 = "d24db9f59069be076ad830ed3cd6ebced5fa961cb1308548d86a62c925934aeb"
+upstream_blake3 = "100549be3337b4fb7bf8153bd78662cbfad67db162808804f74f19902e270b99"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/rollout/src/rollout_file_name.rs"
+symbols = ['rollout-{timestamp}']
+excerpt = "codex/ac7634b9f7/rollout_file_name.rs"
+blake3 = "ff3419dce1f1096af107d12e80803d3c8a84e511e7f0b63aa059619a58985f38"
+upstream_blake3 = "1d4001d79797c5416bc18fbde56bc55226c0e5b7d5c6e7f3381003b4b31be5f1"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/rollout/src/metadata.rs"
+symbols = ['session_meta.meta.cwd', 'SESSIONS_SUBDIR', 'ARCHIVED_SESSIONS_SUBDIR']
+excerpt = "codex/ac7634b9f7/rollout-metadata.rs"
+blake3 = "97080ea457222a0ec6dd07d0f33059f5fd267399b802eb3888fc85616fb39e0b"
+upstream_blake3 = "1e0f65a5956697d7dda369b50999a3ceaae5a96d5620189e2e180e016d192836"
+
+[[citation]]
+tool = "codex"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/protocol/src/protocol.rs"
+symbols = ['SessionMeta', 'cwd']
+excerpt = "codex/ac7634b9f7/protocol-SessionMeta.rs"
+blake3 = "573dc3bef4f80f55f7ffa67d3201ebc6977a6ff64ff3493c60f2fed3e5f13276"
+upstream_blake3 = "75a107eca6ad14d511cd317d67a3cac2950144a628f0b2fa2554e7700cb22732"
+
+[[citation]]
+tool = "codex-desktop"
+repo = "github.com/openai/codex"
+commit = "ac7634b9f73ec1bf96466be7a5869f0949d20b30"
+path = "codex-rs/cli/src/doctor/desktop.rs"
+symbols = ['desktop_log_root', 'Library/Logs', 'Codex/Logs', 'LOCALAPPDATA', '"macos" =>', '"windows" =>']
+excerpt = "codex/ac7634b9f7/doctor-desktop.rs"
+blake3 = "abb1ffa3d1a7d9ef18f7223426fb3842ef1a670ca9adee6d20f4cadcf218a8c8"
+upstream_blake3 = "ec33977ed7e9fcea32283a010ae079d2b917674cab44526420f54d75fa328811"
+
+[[citation]]
+tool = "opencode"
+repo = "github.com/sst/opencode"
+commit = "fe3f3a41f79ad292cc3c7c629567385a20ec5130"
+path = "packages/opencode/src/storage/storage.ts"
+symbols = ['session_diff', 'path.join(dir, ...key) + ".json"', 'storage']
+excerpt = "opencode/fe3f3a41f7/storage.ts"
+blake3 = "16b4de8d1f64b4e9c37f6978714d3d0ea6ef7cfa0fd58b0432a041c1b728a5bb"
+upstream_blake3 = "90d5acb8d3119749b06b6736933086b4f7d7fad788b2ddc6e28351dfc478774a"
+
+[[citation]]
+tool = "opencode"
+repo = "github.com/sst/opencode"
+commit = "fe3f3a41f79ad292cc3c7c629567385a20ec5130"
+path = "packages/core/src/global.ts"
+symbols = ['xdgState', 'xdgData', 'xdgCache', 'xdgConfig', 'const state = path.join(xdgState!, app)']
+excerpt = "opencode/fe3f3a41f7/global.ts"
+blake3 = "8df46df6f8d2d466f16b303734d012c6f30e38ef6227f0ef89df91196d13479b"
+upstream_blake3 = "138cdaa8ea689d01cb31541b8a4e041d0a09c47d23dd8f001c1458578b3b82ca"
+
+[[citation]]
+tool = "opencode"
+repo = "github.com/sst/opencode"
+commit = "fe3f3a41f79ad292cc3c7c629567385a20ec5130"
+path = "packages/opencode/src/session/revert.ts"
+symbols = ['session_diff']
+excerpt = "opencode/fe3f3a41f7/revert.ts"
+blake3 = "a2b36b8ac6022a244bd39c8686ae09a17a1313d7e433cb700b94168b9dab9c9c"
+upstream_blake3 = "59c8583b56bdee6531ee8691c147d60c421d378b03a146f7cf1051971d574c9e"
+
+[[citation]]
+tool = "opencode"
+repo = "github.com/sst/opencode"
+commit = "fe3f3a41f79ad292cc3c7c629567385a20ec5130"
+path = "packages/core/src/database/database.ts"
+symbols = ['opencode.db']
+excerpt = "opencode/fe3f3a41f7/database.ts"
+blake3 = "8a8a57fcbb92e75e21917add0468dddf0af2adb1291967521085114ba32d52f7"
+upstream_blake3 = "c5ab3d1f9eece7a3540d7601fe01b51703945f1fb4a9e25e32e2b7348e7630e3"
+
+[[citation]]
+tool = "gemini-cli"
+repo = "github.com/google-gemini/gemini-cli"
+commit = "d5b3e3accb26000d273abf16e0f1dd83aa5428a9"
+path = "packages/core/src/config/storage.ts"
+symbols = ['getGlobalBinDir', 'getGlobalTempDir', 'TMP_DIR_NAME', 'BIN_DIR_NAME', 'sandbox-exec', ''.cache'', 'getGlobalRuntimeDir', 'getProjectTempDir']
+excerpt = "gemini-cli/d5b3e3accb/storage.ts"
+blake3 = "f19f69653095d011f333e1bc9f701ab6bb3e81fb19c34815fba0ce228c66bb09"
+upstream_blake3 = "d70909f0b99a2b78d46a66d334da89402d95f85aa3f54becd0fb4badd8143093"
+
+[[citation]]
+tool = "gemini-cli"
+repo = "github.com/google-gemini/gemini-cli"
+commit = "d5b3e3accb26000d273abf16e0f1dd83aa5428a9"
+path = "packages/core/src/utils/paths.ts"
+symbols = ['GEMINI_DIR']
+excerpt = "gemini-cli/d5b3e3accb/paths.ts"
+blake3 = "ac22a6a0ccec5b0674177442c75a533c4cda98ad15d158b3763cbb951d285252"
+upstream_blake3 = "cf898755017ddc2d9f4127fe2ee56945ad4a7f4aec79b25f367eb45c4fba39ec"
+
+[[citation]]
+tool = "gemini-cli"
+repo = "github.com/google-gemini/gemini-cli"
+commit = "d5b3e3accb26000d273abf16e0f1dd83aa5428a9"
+path = "packages/core/src/config/projectRegistry.ts"
+symbols = ['slugify']
+excerpt = "gemini-cli/d5b3e3accb/projectRegistry.ts"
+blake3 = "41d77386ac0d34b4b6f75be2701ed96a70c41b6921775490f4286e49c98042d8"
+upstream_blake3 = "ada3f637a4b0e95c9300ecdf4bf659a82be0f153f752923d5091fd826ba6da71"
+
+[[citation]]
+tool = "cline"
+repo = "github.com/cline/cline"
+commit = "254f40c4b592d1e662b84f2ba06fe45dca77cab3"
+path = "apps/vscode/src/hosts/vscode/vscode-to-file-migration.ts"
+symbols = ['taskHistory is NOT migrated here', '{globalStorageFsPath}/state/taskHistory.json', 'tasks/taskHistory.json']
+excerpt = "cline/254f40c4b5/vscode-to-file-migration.ts"
+blake3 = "69804f85d175a75ef34a180c5d141fa97690c7d728e754b4d562d8a2d07eca73"
+upstream_blake3 = "e91cfd7ddce12cd4eef9c9c8ea011ef177f2c47ece4cb0728824f196a84e70d4"
+
+[[citation]]
+tool = "cline"
+repo = "github.com/cline/cline"
+commit = "254f40c4b592d1e662b84f2ba06fe45dca77cab3"
+path = "apps/vscode/src/sdk/legacy-state-reader.ts"
+symbols = ['"state", "taskHistory.json"', 'api_conversation_history.json', 'ui_messages.json', 'task_metadata.json']
+excerpt = "cline/254f40c4b5/legacy-state-reader.ts"
+blake3 = "1024e913f86f55c1f3ec721e612a5a4ffe906c2a85d9f4a0e7503e540f6810b9"
+upstream_blake3 = "ee58c32de48abf116d965f2c18ff0ae0c160f89de5e11ff1b2445ac04f916330"
+
+[[citation]]
+tool = "cline"
+repo = "github.com/cline/cline"
+commit = "254f40c4b592d1e662b84f2ba06fe45dca77cab3"
+path = "apps/vscode/src/shared/HistoryItem.ts"
+symbols = ['cwdOnTaskInitialization']
+excerpt = "cline/254f40c4b5/HistoryItem.ts"
+blake3 = "840aa01f6434b7ed4ab75d649ec17c67b7ab19c90ed848e579ecbf76b1891a12"
+upstream_blake3 = "ae5799ec5d2a8a58c22fa5e5018586482c990c6023fc970812314d1bf2a1fa8b"
+
+[[citation]]
+tool = "cline"
+repo = "github.com/cline/cline"
+commit = "254f40c4b592d1e662b84f2ba06fe45dca77cab3"
+path = "apps/vscode/src/shared/storage/storage-context.ts"
+symbols = ['CLINE_DATA_DIR', 'CLINE_DIR']
+excerpt = "cline/254f40c4b5/storage-context.ts"
+blake3 = "81b496b5488a7252e425fdcd1dad93527bcd5d9422d9ce24a89fa43aaceba6a1"
+upstream_blake3 = "4546c9d1daf7007bcc9cde190f2898ed47744a8c8781bdb76696845a0ee48447"
+
+[[citation]]
+tool = "cline"
+repo = "github.com/cline/cline"
+commit = "254f40c4b592d1e662b84f2ba06fe45dca77cab3"
+path = "sdk/packages/shared/src/storage/paths.ts"
+symbols = ['resolveClineDataDir', 'resolveClineDir', 'CLINE_CONFIG_DIR']
+excerpt = "cline/254f40c4b5/paths.ts"
+blake3 = "34d43f88460eaf75f247784c6d15606171e967b94da438d5ab81d521b454f138"
+upstream_blake3 = "833bdfc2ade7b27c6b5c6c8784d102adf3828ed4e31269db01bb435b583d5440"
+
+[[citation]]
+tool = "cline"
+repo = "github.com/cline/cline"
+commit = "254f40c4b592d1e662b84f2ba06fe45dca77cab3"
+path = ".clinerules/storage.md"
+symbols = ['taskHistory.json', 'tasks/', 'globalState.json']
+excerpt = "cline/254f40c4b5/storage.md"
+blake3 = "f1567c4e45872fa8309a548b95b98a5f914cd5f2274f35dd07cf1e49ed2acebd"
+upstream_blake3 = "9f2c50923f725ab815a9d5287d6e8bc361f86d38c5c79584a43e3dc7deb21752"
+
+[[citation]]
+tool = "roo-code"
+repo = "github.com/RooCodeInc/Roo-Code"
+commit = "b867ec9145750d0ae1ff7f02d35406e9bf2a0b16"
+path = "src/utils/storage.ts"
+symbols = ['getTaskDirectoryPath', 'getStorageBasePath', '"tasks"']
+excerpt = "roo-code/b867ec9145/storage.ts"
+blake3 = "ce57f834a61290effc86e86bbca5578105dc478761e5b9ff62820d487a50d9a1"
+upstream_blake3 = "f545b00e6f579dad6fd2213a370aae289d5c3714e8e8c597d78026002d5790ab"
+
+[[citation]]
+tool = "roo-code"
+repo = "github.com/RooCodeInc/Roo-Code"
+commit = "b867ec9145750d0ae1ff7f02d35406e9bf2a0b16"
+path = "src/shared/globalFileNames.ts"
+symbols = ['api_conversation_history.json', 'ui_messages.json', 'task_metadata.json']
+excerpt = "roo-code/b867ec9145/globalFileNames.ts"
+blake3 = "66a24d1e4067de9bec3ef6c7e9646b743e5cbe07fa35c9381832e4f68e0a649b"
+upstream_blake3 = "af88ff39edcf484a81025b1442a99222850006dcaee1ea1544eb2af751f9e7d9"
+
+[[citation]]
+tool = "roo-code"
+repo = "github.com/RooCodeInc/Roo-Code"
+commit = "b867ec9145750d0ae1ff7f02d35406e9bf2a0b16"
+path = "packages/types/src/history.ts"
+symbols = ['workspace']
+excerpt = "roo-code/b867ec9145/history.ts"
+blake3 = "6a813178bdffd66218d4142050b0bba20e225df7e61f8e3801a2e5ff8e65cb4c"
+upstream_blake3 = "42499d6573e4fe69d7330141a36d83c2843d8e9ec53e126c67ff618464af4854"
+
+[[citation]]
+tool = "roo-code"
+repo = "github.com/RooCodeInc/Roo-Code"
+commit = "b867ec9145750d0ae1ff7f02d35406e9bf2a0b16"
+path = "src/core/task-persistence/TaskHistoryStore.ts"
+symbols = ['history_item.json', 'getByWorkspace']
+excerpt = "roo-code/b867ec9145/TaskHistoryStore.ts"
+blake3 = "6ec40b685fda8b427a658746a3bac1613c8d0512baf2b3076b693f6deb2a9ffd"
+upstream_blake3 = "ce01d29e6f3e797b02cb86893d0791e9dc0c55983c386061cea4fc0c15e22a65"
+
+[[citation]]
+tool = "continue"
+repo = "github.com/continuedev/continue"
+commit = "5522c6f44ca0ac3528b37244818fbfa39b5af470"
+path = "core/index.d.ts"
+symbols = ['workspaceDirectory: string']
+excerpt = "continue/5522c6f44c/index.d.ts"
+blake3 = "487174b494d74c2adf31d1e1bbfe1690fc9fdedd587a8c1cde4505e4e9b8536d"
+upstream_blake3 = "80573b7312975b98b75c25f285efd3202595c78de5a1213150b852dcaa698648"
+
+[[citation]]
+tool = "continue"
+repo = "github.com/continuedev/continue"
+commit = "5522c6f44ca0ac3528b37244818fbfa39b5af470"
+path = "core/util/history.ts"
+symbols = ['workspaceDirectory: ""']
+excerpt = "continue/5522c6f44c/history.ts"
+blake3 = "f87fa76f52a8f3a84961dd7c2f675efd5584b91d8d732013b7923ace1a236324"
+upstream_blake3 = "b3df0a60390abc959657c5a49f7907b30d6c025fd60ba0ed9baa116ba3179faa"
+
+[[citation]]
+tool = "continue"
+repo = "github.com/continuedev/continue"
+commit = "5522c6f44ca0ac3528b37244818fbfa39b5af470"
+path = "core/util/paths.ts"
+symbols = ['getSessionsFolderPath', 'CONTINUE_GLOBAL_DIR']
+excerpt = "continue/5522c6f44c/paths.ts"
+blake3 = "21b05e8ce7fc79c96cccabcaaecb5e0443820f2e340c96aafdb8034f06f31ac3"
+upstream_blake3 = "e76711efcd089bf334f89f9a935a84d729f7b4cd78b8f42453d7cac25127f2ac"
+
+[[citation]]
+tool = "github-copilot-cli"
+repo = "github.com/github/docs"
+commit = "72e940d15a9aff06b6e84216f3c97dac25c47d9b"
+path = "content/copilot/reference/copilot-cli-reference/cli-config-dir-reference.md"
+symbols = ['session-state/', 'command-history-state/', '`~/.copilot`', 'events.jsonl']
+excerpt = "copilot-cli/72e940d15a/cli-config-dir-reference.md"
+blake3 = "1e51ff80d6968ed9f26c521ae827c2ae5ab83fa5aa61c5b5ca4f72d8cfb677fb"
+upstream_blake3 = "820618af7fde1492407cda1f9fc59a68b10a326735591f3168626d9273aee150"
+
+[[citation]]
+tool = "pi"
+repo = "github.com/earendil-works/pi"
+commit = "d201760ffee16564aa8d9a759e0c85b70db33674"
+path = "packages/coding-agent/docs/environment-variables.md"
+symbols = ['PI_CODING_AGENT_DIR']
+excerpt = "pi/d201760ffe/environment-variables.md"
+blake3 = "c411123fd3d9cc38ae7288aa7a3333febbb0cfc0346174ca3fcfbb8862df7a30"
+upstream_blake3 = "49d967213e52fb220933904fc715d7b0f137719a9c7710c5365297aaeb674380"
+
+[[citation]]
+tool = "pi"
+repo = "github.com/earendil-works/pi"
+commit = "d201760ffee16564aa8d9a759e0c85b70db33674"
+path = "packages/coding-agent/src/config.ts"
+symbols = ['getAgentDir', 'CONFIG_DIR_NAME', 'getSessionsDir']
+excerpt = "pi/d201760ffe/config.ts"
+blake3 = "6d6098144ad2b3f6f4af217f86da7142725a82f2b70dd10f354360bf62ca2a8c"
+upstream_blake3 = "d4c3f50b3c809b30bd17fb71078325819839d1d0a603cbde6ba02a153f509e82"
+
+[[citation]]
+tool = "pi"
+repo = "github.com/earendil-works/pi"
+commit = "d201760ffee16564aa8d9a759e0c85b70db33674"
+path = "packages/coding-agent/docs/sessions.md"
+symbols = ['sessions']
+excerpt = "pi/d201760ffe/sessions.md"
+blake3 = "b6bc1fda4217600372d36aea4c0b726c273115bb648b7514e05902df722334de"
+upstream_blake3 = "35ec42935c1beb04492c02c098e0026095a1b00afc6d12222a04044324f68bf8"
+
+[[citation]]
+tool = "oh-my-pi"
+repo = "github.com/can1357/oh-my-pi"
+commit = "fd3f8e3c569b511611081e16b181b740a4c98599"
+path = "packages/utils/src/dirs.ts"
+symbols = ['getAgentDir', 'getSessionsDir', 'getBlobsDir', 'CONFIG_DIR_NAME']
+excerpt = "oh-my-pi/fd3f8e3c56/dirs.ts"
+blake3 = "f5857ecd4dbd221c37dc8d24646853a2c78c2236aee71159364895484235ed1e"
+upstream_blake3 = "24d516dae98d44462f6eff21b146104fb97e480738fb6e3fb8939181297aef60"
+
+[[citation]]
+tool = "oh-my-pi"
+repo = "github.com/can1357/oh-my-pi"
+commit = "fd3f8e3c569b511611081e16b181b740a4c98599"
+path = "docs/config-usage.md"
+symbols = ['PI_CODING_AGENT_DIR']
+excerpt = "oh-my-pi/fd3f8e3c56/config-usage.md"
+blake3 = "b98cfb2c04bde68c6b3eb7c64bbb29da0c95b95748aacbfae36a2d99c188d39a"
+upstream_blake3 = "2e00ed7f307c841bc12496bb7c4fd4b9065e1adb00bb14595edf055b90bd3309"
+
+[[citation]]
+tool = "aider"
+repo = "github.com/Aider-AI/aider"
+commit = "5dc9490bb35f9729ef2c95d00a19ccd30c26339c"
+path = "aider/args.py"
+symbols = ['.aider.chat.history.md', '.aider.input.history', '.aider.llm.history']
+excerpt = "aider/5dc9490bb3/args.py"
+blake3 = "eb6e69648dd482d8a5501e841028b016f95a199d60a14ed4e507cbe7df3d73cd"
+upstream_blake3 = "4cad0efe5c63982282e58f1169bccf963ab9ce962f8e42b46c8244b62b3e1d1e"
+
+[[citation]]
+tool = "aider"
+repo = "github.com/Aider-AI/aider"
+commit = "5dc9490bb35f9729ef2c95d00a19ccd30c26339c"
+path = "aider/repomap.py"
+symbols = ['TAGS_CACHE_DIR', '.aider.tags.cache.v']
+excerpt = "aider/5dc9490bb3/repomap.py"
+blake3 = "0929b01f9bf24c597ff0ee8628114ba52b98bc45f9b4585980878820a7111249"
+upstream_blake3 = "da163d9b0a47f946041d9866c83d3b54a9ab8157e5b8286fa56933a1f308ec5f"
+
+[[citation]]
+tool = "aider"
+repo = "github.com/Aider-AI/aider"
+commit = "5dc9490bb35f9729ef2c95d00a19ccd30c26339c"
+path = "aider/models.py"
+symbols = ['model_prices_and_context_window.json', '.aider']
+excerpt = "aider/5dc9490bb3/models.py"
+blake3 = "4ed45e4a84be6f5970ad35affbd96e9f402995a6d3fafd582321826e62367a06"
+upstream_blake3 = "75cf8ffe8457ddab8b19003cb057d4535a91d943970d148e0aaea42aac7b300e"
+
+[[citation]]
+tool = "aider"
+repo = "github.com/Aider-AI/aider"
+commit = "5dc9490bb35f9729ef2c95d00a19ccd30c26339c"
+path = "aider/main.py"
+symbols = ['.aider.conf.yml']
+excerpt = "aider/5dc9490bb3/main.py"
+blake3 = "77350e392d4fce828fc6bac6b6d3698bdeb99a825c44884b2701255c4e94fbe0"
+upstream_blake3 = "7bb0a6e393cdf23f4cf6cfd55315261d84f832d56f28a7b0206d0accf8b9a3e4"
+
+[[citation]]
+tool = "windsurf"
+repo = "docs.devin.ai"
+commit = "retrieved 2026-09-22"
+path = "desktop/devin-desktop-faq"
+symbols = ['Application Support/Devin', 'Application Support/Windsurf', 'globalStorage']
+excerpt = "windsurf-devin/2026-09-22/devin-desktop-faq.md"
+blake3 = "cee1c7019f4294b22759ae7b105ed96b276d696aee9816cb9e7d98d6a5c07fde"
+upstream_blake3 = "doc-page"
+
+[[citation]]
+tool = "cursor"
+repo = "cursor.com/docs"
+commit = "retrieved 2026-09-22"
+path = "cli/reference/configuration"
+symbols = ['cli-config.json']
+excerpt = "cursor/2026-09-22/cli-configuration.md"
+blake3 = "6c66d8e78182f495fd650ccd74fe59bb44f58232a6d5f97bdf299db44ba76f1d"
+upstream_blake3 = "doc-page"

@@ -1,15 +1,8 @@
 use crate::entities::*;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::{WriterProperties, WriterVersion};
-use std::{
-    fs::{self, File},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -19,7 +12,7 @@ pub struct Store {
 impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        fs::create_dir_all(&root)?;
+        crate::fs_gate::store::StoreDir::at(&root)?.create()?;
         Ok(Self { root })
     }
     fn path(&self, volume: u64) -> PathBuf {
@@ -60,23 +53,12 @@ impl Store {
                 Arc::new(UInt64Array::from(observed)),
             ],
         )?;
-        let file = File::create(self.path(observation.volume_id))?;
-        let properties = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(Default::default()))
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .build();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(properties))?;
-        writer.write(&batch)?;
-        writer.close()?;
-        Ok(())
-    }
-    pub fn read_observation(&self, volume: u64) -> Result<Vec<Artifact>> {
-        let path = self.path(volume);
-        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        if bytes.len() < 4 || &bytes[bytes.len() - 4..] != b"PAR1" {
-            anyhow::bail!("store is not a Parquet file")
-        }
-        Ok(Vec::new())
+        crate::fs_gate::columns::write_parquet_atomic(
+            &self.path(observation.volume_id),
+            schema,
+            std::iter::once(Ok(batch)),
+            crate::fs_gate::columns::DEFAULT_ZSTD_LEVEL,
+        )
     }
     pub fn volume_path(&self, volume: u64) -> PathBuf {
         self.path(volume)
@@ -87,6 +69,7 @@ impl Store {
 mod tests {
     use super::*;
     use crate::scan::{ScanOptions, observation};
+    use std::fs;
     use tempfile::tempdir;
     #[test]
     fn writes_real_parquet() {

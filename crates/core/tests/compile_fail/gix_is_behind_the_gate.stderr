@@ -1,0 +1,5 @@
+error[E0616]: field `0` of struct `Repo` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/gix_is_behind_the_gate.rs
+  |
+  |     let _inner = &repo.0;
+  |                        ^ private field

@@ -1,0 +1,5 @@
+error[E0425]: cannot find function `command` in module `swamp_core::fs_gate::spawn`
+ --> $WORKSPACE/crates/core/tests/compile_fail/no_command_escapes_the_gate.rs
+  |
+  |     let _ = swamp_core::fs_gate::spawn::command("lsof");
+  |                                         ^^^^^^^ not found in `swamp_core::fs_gate::spawn`

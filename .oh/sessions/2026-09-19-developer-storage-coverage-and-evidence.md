@@ -202,3 +202,15 @@ Added native sub-issues #64–#73 and updated #40, #43, #53, #57–#63 without r
 #40 now tracks the higher-level W0 outcome, not one indivisible delivery. #74 owns the complete cross-ecosystem build-artifact understanding, history, inspection and selective-cleanup capability. Its canonical selected S&T, dependency table and acceptance signals are in [build-artifact-understanding](2026-09-19-build-artifact-understanding.md). Existing W-step lineage is preserved as contribution to W0; local BA steps describe the independently sufficient epic. Native hierarchy is #40 → #74 → #64–#73/#75/#76. No original coverage/evidence commitments were dropped.
 
 Removed artificial cross-epic blocking links: #64 no longer waits on #43/#53; build adapters use existing/explicit roots without waiting for global discovery; #72 does not wait for multi-root rollout; #73 reuses/implements the needed existing action protections without waiting for catalog-wide #58–#61. The sister issues now describe explicit shared-contract coordination. #62 validates coverage/evidence; #75/#76 validate the independent build epic; #63 later reviews combined outcome usefulness and depends on #62/#76. Missing safety behavior remains implementation work, never a permission to omit safeguards.
+
+## Reconciliation, 2026-09-21
+
+#103/#104 landed: `crates/mcp` is removed. #52 ("Expose configured
+multi-root coverage and shared storage consistently over MCP") and #60
+("Present activity, consumers, recovery and evidence gaps in CLI, TUI
+and MCP") name a transport that no longer exists; see
+`<scratchpad>/issue-reconciliation-mcp.md` for the proposed replacement
+text (CLI JSON + `skills/swamp/` in place of an MCP surface, same
+domain requirements otherwise). W1/W2's coverage/evidence requirements
+above (multi-root scope, shared storage, activity/consumer/recovery
+gaps) are unchanged.

@@ -3,7 +3,9 @@ id: tui-actions-off-event-thread
 severity: hard
 statement: "Cleanup review and execution must not run synchronously on the TUI event/render path; workers report progress and stop between groups."
 outcome: disk-growth-by-project
-audit: tui_actions_off_event_thread
+audit: tui_event_thread_has_no_gate_calls
+runtime_tests:
+  - crates/tui/src/app.rs::tests::background_delete_finishes_and_worker_failure_is_visible
 ---
 
 ## Rationale
@@ -14,18 +16,13 @@ expensive checks too; both review and execution belong on background workers.
 
 ## Detection
 
-The `syn` AST audit starts at `event_loop`, key dispatchers and `draw`, follows
-local free functions and methods across TUI source files, and rejects synchronous
-marking, proposal, execution, free-space probes, sleep and blocking channel waits.
-Ordinary closures remain in scope. Only a literal `std::thread::spawn` closure
-is excluded; expressions constructing its argument are still checked. Renamed
-imports and function-path references are followed. Missing entry points fail.
+Mechanism: type, gate audit, runtime test.
 
-Run `cargo run -p swamp-source-audit -- tui_actions_off_event_thread`.
-The same repository check runs under `cargo test -p swamp-source-audit`, so the
-existing workspace test/release workflow executes it. Negative fixtures cover
-direct calls, helper indirection, ordinary closures, renamed imports, function
-references, blocking receives, eager spawn arguments and immediate handle joins.
+**Gate audit.** `tui_event_thread_has_no_gate_calls`: from the TUI's `event_loop` (and every workspace impl of a trait the compiler calls implicitly -- `Drop`, `Display`, `Deref`, operators), over every path, UFCS and method-name edge except those inside `worker::spawn` closures, nothing reaches a blocking gate capability (`destroy`, `spawn`, bounded reads, `read_dir`); a call whose callee is not a path is rejected.
+
+Retired 2026-09-22: the `tui_actions_off_event_thread` source audit (a `syn` call-graph rule, which four review rounds showed cannot be made mutation-proof without type resolution; `docs/architecture.md`, "Capability gates"). Its mutation fixtures, and the sweep-3 and sweep-4 mutations aimed at it, now run in `crates/source-audit/tests/mutation_sweep.rs`, compiled: each must fail compilation (or clippy) or a gate audit.
+
+(2026-09-23: this section's `Type.` line and its `human_confirmation_is_not_a_struct_literal` compile-fail case described `HumanConfirmed`, which is deleted along with the rest of the CLI action path -- see `.oh/guardrails/human-only-authorization.md`. What this guardrail is actually about, the TUI's worker/event-thread boundary, is unaffected: `execute_one`/`execute_plan_progress` still run only inside `worker::spawn`, never on the render/event thread.)
 
 ## Limits and runtime checks
 

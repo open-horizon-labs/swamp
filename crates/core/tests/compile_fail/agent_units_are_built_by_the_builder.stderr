@@ -1,0 +1,5 @@
+error[E0616]: field `protected` of struct `CandidateAgentUnit` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/agent_units_are_built_by_the_builder.rs
+  |
+  |     u.protected = false;
+  |       ^^^^^^^^^ private field

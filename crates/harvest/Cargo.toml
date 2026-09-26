@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 swamp-core = { path = "../core" }
+
+[lints]
+workspace = true

@@ -2,8 +2,8 @@
 //! verdict. Every signal carries the value observed; a timeout, missing
 //! upstream, or parse failure records `Unknown`, never a guess.
 //!
-//! Computed with `gix` (gitoxide) directly against the on-disk object
-//! store during discovery, in the same thread pool as the rest of the
+//! Computed with `gix` (gitoxide, through the read-only `fs_gate::git`)
+//! directly against the on-disk object store during discovery, in the same thread pool as the rest of the
 //! walk (see `walk.rs`). No `git` subprocess is spawned here, except for
 //! `idle_for`'s newest-mtime scan, which is plain filesystem I/O with no
 //! git object access at all.
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::fs_gate::git::{Repo, Unpushed};
 use crate::report::Signal;
 
 /// Bound on the `status` (dirty) walk: if a repo's status has more
@@ -75,17 +76,14 @@ fn human_duration(secs: u64) -> String {
 /// HEAD commit time, read straight from the commit object. `Unknown` on
 /// an unborn HEAD, a corrupt object, or a commit timestamp we cannot
 /// trust (negative/unparsable).
-fn last_commit_age(repo: &gix::Repository, observed_at: u64) -> SignalValue {
-    let Ok(commit) = repo.head_commit() else {
+fn last_commit_age(repo: &Repo, observed_at: u64) -> SignalValue {
+    let Some(seconds) = repo.head_commit_seconds() else {
         return SignalValue::Unknown;
     };
-    let Ok(time) = commit.time() else {
-        return SignalValue::Unknown;
-    };
-    if time.seconds < 0 {
+    if seconds < 0 {
         return SignalValue::Unknown;
     }
-    let commit_ts = time.seconds as u64;
+    let commit_ts = seconds as u64;
     if commit_ts <= observed_at {
         SignalValue::LastCommitAgeSecs(observed_at - commit_ts)
     } else {
@@ -98,32 +96,11 @@ fn last_commit_age(repo: &gix::Repository, observed_at: u64) -> SignalValue {
 /// Bounded by both an entry cap and a wall-clock timeout: a pathological
 /// worktree (huge untracked tree, slow filesystem) degrades to `Unknown`
 /// instead of blocking the report.
-fn dirty(repo: &gix::Repository) -> SignalValue {
-    let start = Instant::now();
-    let platform = match repo.status(gix::progress::Discard) {
-        Ok(p) => p,
-        Err(_) => return SignalValue::Unknown,
-    };
-    let iter = match platform.into_iter(None) {
-        Ok(iter) => iter,
-        Err(_) => return SignalValue::Unknown,
-    };
-    let mut count = 0usize;
-    let mut any = false;
-    for item in iter {
-        if start.elapsed() >= STATUS_TIMEOUT {
-            return SignalValue::Unknown;
-        }
-        count += 1;
-        if count > STATUS_ENTRY_CAP {
-            return SignalValue::Unknown;
-        }
-        match item {
-            Ok(_) => any = true,
-            Err(_) => return SignalValue::Unknown,
-        }
+fn dirty(repo: &Repo) -> SignalValue {
+    match repo.any_status_change(STATUS_ENTRY_CAP, STATUS_TIMEOUT) {
+        Some(any) => SignalValue::Dirty(any),
+        None => SignalValue::Unknown,
     }
-    SignalValue::Dirty(any)
 }
 
 /// Ahead-of-upstream commit count, via a revwalk from HEAD hidden behind
@@ -131,60 +108,20 @@ fn dirty(repo: &gix::Repository) -> SignalValue {
 /// when no upstream is configured for the current branch -- this is a
 /// normal, expected state, not a failure, and the renderer labels it
 /// distinctly (`unpushed: unknown (no upstream)`).
-fn unpushed(repo: &gix::Repository) -> SignalValue {
-    let Ok(head) = repo.head() else {
-        return SignalValue::Unknown;
-    };
-    let Some(branch_name) = head.referent_name().map(|n| n.to_owned()) else {
-        // Detached HEAD: no branch, so no upstream concept applies.
-        return SignalValue::UnpushedUnknownNoUpstream;
-    };
-    let tracking_name = match repo
-        .branch_remote_tracking_ref_name(branch_name.as_ref(), gix::remote::Direction::Fetch)
-    {
-        Some(Ok(name)) => name,
-        Some(Err(_)) | None => return SignalValue::UnpushedUnknownNoUpstream,
-    };
-    let Ok(mut tracking_ref) = repo.find_reference(tracking_name.as_ref()) else {
-        return SignalValue::UnpushedUnknownNoUpstream;
-    };
-    let Ok(tracking_id) = tracking_ref.peel_to_id() else {
-        return SignalValue::Unknown;
-    };
-    let Ok(head_id) = repo.head_id() else {
-        return SignalValue::Unknown;
-    };
-    let walk = repo
-        .rev_walk([head_id.detach()])
-        .with_hidden([tracking_id.detach()])
-        .all();
-    match walk {
-        Ok(iter) => {
-            let mut n: u32 = 0;
-            for item in iter {
-                if item.is_err() {
-                    return SignalValue::Unknown;
-                }
-                n += 1;
-                if n == u32::MAX {
-                    break;
-                }
-            }
-            SignalValue::UnpushedCount(n)
-        }
-        Err(_) => SignalValue::Unknown,
+fn unpushed(repo: &Repo) -> SignalValue {
+    match repo.unpushed() {
+        Unpushed::Count(n) => SignalValue::UnpushedCount(n),
+        Unpushed::NoUpstream => SignalValue::UnpushedUnknownNoUpstream,
+        Unpushed::Unknown => SignalValue::Unknown,
     }
 }
 
 /// A worktree is locked when its administrative `<gitdir>/locked` file
 /// exists (linked worktrees only; a main checkout is never locked this
-/// way). Pure filesystem check via `gix`'s worktree proxy -- no object
-/// database access, so it never depends on `repo` having opened cleanly.
-fn locked(repo: &gix::Repository) -> SignalValue {
-    match repo.worktree() {
-        Some(wt) => SignalValue::Locked(wt.is_locked()),
-        None => SignalValue::Locked(false),
-    }
+/// way). No object database access, so it never depends on `repo`
+/// having opened cleanly.
+fn locked(repo: &Repo) -> SignalValue {
+    SignalValue::Locked(repo.worktree_locked())
 }
 
 /// Directories never descended into while looking for the newest mtime
@@ -211,7 +148,7 @@ fn newest_mtime_secs(dir: &Path) -> Option<u64> {
         if Instant::now() >= deadline {
             break;
         }
-        let Ok(entries) = std::fs::read_dir(&d) else {
+        let Ok(entries) = crate::fs_gate::read_dir(&d) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -301,7 +238,7 @@ pub fn age_signals(rows: &[Signal], raw: &RawSignals, elapsed: u64) -> (Vec<Sign
 }
 
 pub fn compute_signals_raw(dir: &Path, observed_at: u64) -> (Vec<Signal>, RawSignals) {
-    let Ok(repo) = gix::open(dir) else {
+    let Some(repo) = Repo::open(dir) else {
         let unknown = SignalValue::Unknown.render();
         let idle_v = idle_for(dir, observed_at, None);
         return (
@@ -401,54 +338,7 @@ pub fn compute_signals_raw(dir: &Path, observed_at: u64) -> (Vec<Signal>, RawSig
 /// key for GitHub enrichment (`github.rs`). `None` on any failure
 /// (unborn HEAD, corrupt object, `gix` couldn't open the repo).
 pub fn tip_sha(dir: &Path) -> Option<String> {
-    let repo = gix::open(dir).ok()?;
-    let id = repo.head_id().ok()?;
-    Some(id.to_string())
-}
-
-/// Parallel equivalent of calling [`compute_signals`] once per path,
-/// preserving input order. Each worktree's git signals are independent
-/// (own `gix::open`, own object store access), so this fans them out
-/// across a small worker pool instead of computing them one at a time in
-/// the report's hot path -- the same rationale `walk.rs` documents for
-/// discovery/attribution, applied to signals.
-pub fn compute_signals_parallel(
-    paths: &[std::path::PathBuf],
-    observed_at: u64,
-) -> Vec<Vec<Signal>> {
-    let n = paths.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let workers = std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(4)
-        .min(n)
-        .max(1);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<std::sync::Mutex<Vec<Signal>>> =
-        (0..n).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let next = &next;
-            let results = &results;
-            let paths = &paths;
-            scope.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if i >= n {
-                        break;
-                    }
-                    let sigs = compute_signals(&paths[i], observed_at);
-                    *results[i].lock().unwrap() = sigs;
-                }
-            });
-        }
-    });
-    results
-        .into_iter()
-        .map(|m| m.into_inner().unwrap())
-        .collect()
+    Repo::open(dir)?.head_id_hex()
 }
 
 /// Parallel equivalent of [`compute_signals_raw`], preserving input
@@ -508,6 +398,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn git(dir: &Path, args: &[&str]) {
+        crate::work_counters::record_spawn();
         let status = PCommand::new("git")
             .args(args)
             .current_dir(dir)
@@ -642,6 +533,7 @@ mod tests {
         git(dir.path(), &["add", "."]);
         git(dir.path(), &["commit", "-q", "-m", "init"]);
 
+        crate::work_counters::record_spawn();
         let out = PCommand::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir.path())

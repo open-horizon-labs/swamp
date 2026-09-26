@@ -1,0 +1,15 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+ --> $WORKSPACE/crates/core/tests/compile_fail/caps_are_named_constants.rs
+  |
+  |     let _ = BoundedCap(usize::MAX);
+  |             ^^^^^^^^^^
+  |
+note: constructor is not visible here due to private fields
+ --> $WORKSPACE/crates/core/src/fs_gate/read.rs
+  |
+  | pub struct BoundedCap(usize);
+  |                       ^^^^^ private field
+help: you might have meant to use the `header_at_most` associated function
+  |
+7 |     let _ = BoundedCap::header_at_most(usize::MAX);
+  |                       ++++++++++++++++

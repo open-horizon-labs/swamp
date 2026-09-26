@@ -15,7 +15,7 @@ use std::path::Path;
 pub struct Ecosystem {
     /// Short tag shown in brackets: `rs`, `js`, `py`, …
     pub tag: &'static str,
-    /// Human name for help text and MCP output.
+    /// Human name for help text and JSON output.
     pub name: &'static str,
     /// Root markers. `*.ext` matches by extension; anything else is an
     /// exact file or directory name.
@@ -185,7 +185,9 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
         tag: "go",
         name: "Go",
         markers: &["go.mod"],
-        cleans: &[("vendor", Deps)],
+        // `bin/` beside go.mod is where `go build -o bin/` writes; the Go
+        // build adapter identifies each binary in it (#69).
+        cleans: &[("vendor", Deps), ("bin", Build)],
         glyph: "🐹",
         name_source: Some(("go.mod", NameField::GoModule)),
     },
@@ -517,8 +519,8 @@ pub const ECOSYSTEMS: &[Ecosystem] = &[
     },
 ];
 
-fn dir_names(root: &Path) -> Vec<String> {
-    std::fs::read_dir(root)
+pub fn dir_names(root: &Path) -> Vec<String> {
+    crate::fs_gate::read_dir(root)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -563,7 +565,7 @@ pub fn by_tag(tag: &str) -> Option<&'static Ecosystem> {
     ECOSYSTEMS.iter().find(|e| e.tag == tag)
 }
 
-/// Human name for a tag, for help text and MCP output.
+/// Human name for a tag, for help text and JSON output.
 pub fn name_for(tag: &str) -> Option<&'static str> {
     by_tag(tag).map(|e| e.name)
 }
@@ -616,11 +618,26 @@ pub fn artifact_ecosystem(tags: &[String], name: &str) -> Option<&'static str> {
 /// root is a Node monorepo), then the project's own tags, then a name
 /// only one ecosystem generates.
 pub fn artifact_ecosystem_at(parent: &Path, tags: &[String], name: &str) -> Option<&'static str> {
+    let names = dir_names(parent);
+    artifact_ecosystem_among(parent, &names, tags, name)
+}
+
+/// [`artifact_ecosystem_at`] with the parent's entry names already
+/// listed -- so a caller annotating many artifacts under one parent
+/// lists it once (R19: the growth consumer annotated every artifact row,
+/// each with its own `read_dir` of the parent, and a `target/` with
+/// thousands of identified interiors listed `target/debug/deps` thousands
+/// of times per pass -- 138 s of an unchanged `observe`).
+pub fn artifact_ecosystem_among(
+    parent: &Path,
+    names: &[String],
+    tags: &[String],
+    name: &str,
+) -> Option<&'static str> {
     if ruby_vendor_bundle(parent, name) {
         return Some("rb");
     }
-    let names = dir_names(parent);
-    if let Some(e) = detect_in(&names)
+    if let Some(e) = detect_in(names)
         .into_iter()
         .find(|e| e.cleans.iter().any(|(p, _)| cleans_name(p, name)))
     {
@@ -669,7 +686,10 @@ pub fn manifest_name(root: &Path) -> Option<String> {
                 }
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(root.join(&file_name)) else {
+            let Ok(text) = crate::fs_gate::read::bounded_string(
+                root.join(&file_name),
+                crate::fs_gate::read::BoundedCap::MANIFEST,
+            ) else {
                 continue;
             };
             if let Some(n) = extract_name(&text, field) {

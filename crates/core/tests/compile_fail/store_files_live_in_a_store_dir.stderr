@@ -1,0 +1,14 @@
+error[E0425]: cannot find function `list_owned` in module `store`
+ --> $WORKSPACE/crates/core/tests/compile_fail/store_files_live_in_a_store_dir.rs
+  |
+  |     let _ = store::list_owned(Path::new("/Users/me"));
+  |                    ^^^^^^^^^^ not found in `store`
+
+error[E0308]: mismatched types
+ --> $WORKSPACE/crates/core/tests/compile_fail/store_files_live_in_a_store_dir.rs
+  |
+  |             store: Path::new("/Users/me/project"),
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `&StoreDir`, found `&Path`
+  |
+  = note: expected reference `&StoreDir`
+             found reference `&Path`

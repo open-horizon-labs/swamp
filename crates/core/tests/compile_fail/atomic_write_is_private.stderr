@@ -1,0 +1,11 @@
+error[E0603]: function `write_atomic` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/atomic_write_is_private.rs
+  |
+  |     let _ = swamp_core::fs_gate::store::write_atomic(Path::new("/tmp/unit-sidecar.json"), b"{}");
+  |                                         ^^^^^^^^^^^^ private function
+  |
+note: the function `write_atomic` is defined here
+ --> $WORKSPACE/crates/core/src/fs_gate/store.rs
+  |
+  | fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

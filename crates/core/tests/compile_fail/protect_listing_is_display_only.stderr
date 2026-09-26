@@ -1,0 +1,28 @@
+error[E0425]: cannot find function `protect_list` in module `swamp_core::agents`
+  --> $WORKSPACE/crates/core/tests/compile_fail/protect_listing_is_display_only.rs
+   |
+   |     let _raw = swamp_core::agents::protect_list(Path::new("/tmp/store"));
+   |                                    ^^^^^^^^^^^^
+   |
+  ::: $WORKSPACE/crates/core/src/protection.rs
+   |
+   | pub fn protect_listing(swamp_dir: &Path) -> Result<ProtectListing> {
+   | ------------------------------------------------------------------ similarly named function `protect_listing` defined here
+   |
+note: found an item that was configured out
+  --> $WORKSPACE/crates/core/src/agents/mod.rs
+   |
+   | #[cfg(feature = "testing")]
+   |       ------------------- the item is gated behind the `testing` feature
+   | pub use crate::protection::protect_list;
+   |                            ^^^^^^^^^^^^
+help: a function with a similar name exists
+   |
+11 |     let _raw = swamp_core::agents::protect_listing(Path::new("/tmp/store"));
+   |                                                +++
+
+error[E0599]: no method named `iter` found for struct `ProtectListing` in the current scope
+ --> $WORKSPACE/crates/core/tests/compile_fail/protect_listing_is_display_only.rs
+  |
+  |     let _hit = listing.iter().any(|p| Path::new("/w/x").starts_with(p));
+  |                        ^^^^ method not found in `ProtectListing`

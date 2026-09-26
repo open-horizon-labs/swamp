@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> $WORKSPACE/crates/core/tests/compile_fail/spawn_takes_a_program_not_a_string.rs
+  |
+  |     let _ = swamp_core::fs_gate::spawn::run("rm", ["-rf", "/"], Duration::from_secs(1));
+  |             ------------------------------- ^^^^ expected `Program`, found `&str`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: function defined here
+ --> $WORKSPACE/crates/core/src/fs_gate/spawn.rs
+  |
+  | pub fn run<I, S>(program: Program, args: I, timeout: Duration) -> io::Result<RunOutput>
+  |        ^^^

@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: an evidence reason must say why the fact is not known
+ --> $WORKSPACE/crates/core/tests/compile_fail/blank_reason_does_not_compile.rs
+  |
+  |     let _ = swamp_core::reason!("   ");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::_` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `swamp_core::reason` (in Nightly builds, run with -Z macro-backtrace for more info)

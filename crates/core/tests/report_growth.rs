@@ -318,11 +318,13 @@ fn observed_report_covers_every_worktree_and_leaves_unowned_rows_untouched() {
         .expect("shared cache stays unowned");
     assert_eq!(shared_cache_row.bytes, fx.shared_cache_bytes);
 
+    // #R10 item 1: unowned rows fold per directory, never per file, so
+    // the loose file's row is keyed by its containing directory.
     let loose_row = second
         .unowned
         .iter()
-        .find(|u| u.path_or_object == fx.loose_file.display().to_string())
-        .expect("loose file stays unowned");
+        .find(|u| u.path_or_object == fx.loose_dir.display().to_string())
+        .expect("loose file's directory stays unowned");
     assert_eq!(loose_row.bytes, fx.loose_file_bytes);
 }
 

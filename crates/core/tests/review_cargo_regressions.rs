@@ -17,9 +17,29 @@ fn nested_growth_uses_same_key_for_write_and_annotation() {
             }]
         }]))
         .unwrap();
-    swamp_core::growth::observe_and_annotate(tmp.path(), 1, &mut projects, 1000, 30, 100).unwrap();
+    swamp_core::growth::observe_and_annotate(
+        &swamp_core::bus::Stage::for_tests(),
+        tmp.path(),
+        1,
+        &mut projects,
+        1000,
+        30,
+        100,
+        &Default::default(),
+    )
+    .unwrap();
     projects[0].worktrees[0].artifacts[0].bytes = 8192;
-    swamp_core::growth::observe_and_annotate(tmp.path(), 1, &mut projects, 1100, 30, 100).unwrap();
+    swamp_core::growth::observe_and_annotate(
+        &swamp_core::bus::Stage::for_tests(),
+        tmp.path(),
+        1,
+        &mut projects,
+        1100,
+        30,
+        100,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(
         projects[0].worktrees[0].artifacts[0].growth_bytes,
         Some(4096)

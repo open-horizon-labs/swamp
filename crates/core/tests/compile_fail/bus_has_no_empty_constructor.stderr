@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/bus_has_no_empty_constructor.rs
+  |
+  |     let _ = swamp_core::bus::EventBus::new();
+  |                                        ^^^ private associated function
+  |
+ ::: $WORKSPACE/crates/core/src/bus/registry.rs
+  |
+  |     fn new() -> Self {
+  |     ---------------- private associated function defined here

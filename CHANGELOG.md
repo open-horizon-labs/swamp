@@ -1,6 +1,82 @@
 # Changelog
 
-Release notes describe behavior at the named version. See the [README](README.md) and [usage reference](docs/usage.md) for current behavior. Timings below are historical observations from one developer's machine, not a benchmark suite.
+Release notes describe behavior at the named version. Older timings are individual
+observations, not general performance guarantees. See the README for current use.
+
+## v0.7.0
+
+Swamp now connects more of the storage produced by development back to the
+projects that use it, then helps you choose what to keep or remove. This release
+extends that workflow beyond checkouts and makes build details useful for
+cleanup decisions—not just a list of large directories.
+
+### Find growth across your development environment
+
+- One effective scope combines defaults, enabled developer-tool detectors, and
+  configured additions/exclusions. Inspect it with `swamp scope`, or pass explicit
+  roots consistently to observation, reporting, and the TUI.
+- External tool homes and agent storage have their own units and project links.
+  Claude Code, Codex, Oh My Pi, OpenCode, and the wider agent catalog have
+  adapter-specific coverage; missing or ambiguous ownership remains visible.
+- Codex attribution reads its own thread-state database read-only rather than
+  scanning conversation JSONL. Swamp's observation store remains Parquet.
+- Multi-root reports preserve root coverage and observation-time history.
+  Missing roots and newly added scope are not reported as ordinary storage changes.
+
+### Understand the cleanup trade-off
+
+- Building on 0.6's Cargo cleanup groups, shared role families extend build
+  identification and consequences to other ecosystems. Cargo group/profile
+  selection still expands to supported members, not the entire profile.
+- Shared build-role families carry identification, age, accounting, and removal
+  consequences into other ecosystem adapters. Project-local cleanup and
+  shared-store inspection remain distinct capabilities.
+- Age prioritizes review without claiming a build is obsolete. Shared hardlinks
+  do not automatically prohibit removal or justify a promise about freed space.
+- The TUI retains background observation, selection review, deletion progress,
+  and cancellation between groups while extending the storage it can explain.
+- On-demand Cargo inspection provides deeper bounded detail without making
+  every ordinary refresh index individual dependency files.
+
+### Keep repeated observation practical
+
+- Folded directory measurements reuse unchanged containers. Current typed facts
+  and reverse-delta history stay in compressed Parquet, without a separate JSON
+  artifact cache or permanent inode inventory.
+- Fast refresh retains explicitly stale unique-byte estimates instead of
+  rewalking unchanged roots for hardlink accounting. `swamp observe --full`
+  reconciles the observed scope and bounded container-sharing summaries.
+- Report reads do not rescan directories or spawn enrichment processes.
+  JSON build-unit pagination bounds detail while preserving full family summaries.
+- Project/worktree deduplication, scope exclusions through path aliases, growth
+  coverage, and text/JSON project filtering received regression fixes.
+
+### Use the same workflow on macOS and Linux
+
+- Release archives support Apple silicon macOS and generic Linux x86_64 with
+  glibc, built on Ubuntu 24.04.
+- macOS uses persisted FSEvents. Linux uses inotify while the TUI or opt-in
+  collector is running; uncovered intervals trigger a full walk.
+- Scheduling uses LaunchAgent or systemd user timers. Neither performs cleanup.
+- The agent interface is the CLI plus an installable skill. Install it through
+  `npx skills add open-horizon-labs/swamp --skill swamp`;
+  a bundled reference covers platform-appropriate binary installation.
+  The MCP server and CLI deletion/approval commands are removed; removal is confirmed
+  by a human in the TUI.
+
+### Know the boundaries
+
+History begins with observation. Ownership and cleanup coverage vary by adapter;
+see the checked [build](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/build-artifacts.md) and
+[agent-storage](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/agent-storage.md) matrices. Homebrew discovery is opt-in.
+
+Filesystem cleanup moves paths to Trash, which must be emptied to reclaim space.
+Docker image/volume removal has no Trash recovery. Allocated row sizes are not
+guaranteed freed bytes, and cleanup does not re-check every fact after marking.
+
+The [usage guide](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/usage.md) covers the workflow and controls. The rewritten
+[architecture guide](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/architecture.md) explains folding, history, adapters,
+enrichment, and the costs that remain.
 
 ## v0.6.3
 

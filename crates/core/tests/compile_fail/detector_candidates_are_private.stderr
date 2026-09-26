@@ -1,0 +1,5 @@
+error[E0616]: field `locations` of struct `DetectorSummary` is private
+ --> $WORKSPACE/crates/core/tests/compile_fail/detector_candidates_are_private.rs
+  |
+  |     let _ = &s.locations;
+  |                ^^^^^^^^^ private field

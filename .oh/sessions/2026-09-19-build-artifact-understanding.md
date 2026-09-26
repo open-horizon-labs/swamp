@@ -90,3 +90,13 @@ Start #64 independently. #65 and domain adapters follow; #70 reuses JVM/Gradle s
 Coordinate #43/#53 shared contracts, #45–#49 root/manager facts, #57 relationships and #58–#61 recovery/presentation/actions. Reuse existing implementation or supply the minimum shared seam this epic needs; do not introduce duplicate stores or wait for unrelated catalog completion. If a missing shared prerequisite is truly substantial, split it explicitly under this epic and retain acceptance scope instead of silently removing it.
 
 No action grants, cleanup or implementation are performed by planning. Human verification: Muness reviews explanation and decision usefulness; fixtures cannot substitute for that judgment. Full epic completion requires all adapters and its own validation; independently useful delivery is not permission to mark a Rust-only MVP complete.
+
+## Reconciliation, 2026-09-21
+
+#103/#104 landed: `crates/mcp` is removed. Where #72's linked table entry
+and BA1 say "CLI, TUI and MCP", read that as "CLI (interactive and
+`--json`), TUI, and the `skills/swamp/` agent skill" -- there is no MCP
+server for #72's read-only views or #73's cleanup actions to expose
+through. The domain requirement (collapsed-category usefulness,
+allocated-vs-reclaimable accounting, unchanged/changed-group cost) is
+unchanged.
