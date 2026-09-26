@@ -11,7 +11,6 @@
 //! module together with `render.rs`): nothing here renders "safe",
 //! "stale" or "can be deleted".
 
-use crate::entities::now;
 use crate::filter::{Filter, Predicate, WorktreeFacts};
 use crate::github::{GithubFacts, MergeComplete, PrStatus, TriState};
 use crate::growth::{DEFAULT_SINCE, history_span_for_root, load_config, parse_duration_secs};
@@ -20,15 +19,72 @@ use crate::report::{ArtifactKind, ArtifactRow, Report, UnownedReason};
 use serde_json::{Value, json};
 use std::path::Path;
 
-/// History the store holds for `root`'s volume, and the growth window a
-/// call can honestly honor: the asked window, or the history if shorter.
-pub fn history_block(store_dir: &Path, root: &Path, since: Option<&str>) -> Value {
-    let n = now();
-    let history = history_span_for_root(store_dir, root, n);
+/// History available for the report's frozen observation, bounded by its
+/// timestamp rather than the time the report is rendered. Callers must pass
+/// the same `observed_at` used in the report envelope, not the wall clock.
+pub fn history_block(
+    store_dir: &Path,
+    root: &Path,
+    since: Option<&str>,
+    observed_at: u64,
+) -> Value {
+    let history = history_span_for_root(store_dir, root, observed_at);
+    history_block_from_span(history, since)
+}
+
+/// Coverage for a merged scope must use its actual stored roots, not the
+/// report's display/synthetic root. The common span is the shortest known
+/// span; an unobserved root makes it unknown. Excluded/detector-only roots
+/// do not contribute to ordinary project history. Per-root spans remain
+/// visible so callers can distinguish uneven history from no history.
+pub fn history_block_for_scope(
+    store_dir: &Path,
+    root: &Path,
+    coverage: &[crate::coverage::RootCoverage],
+    since: Option<&str>,
+    observed_at: u64,
+) -> Value {
+    use crate::coverage::RegionStatus;
+
+    // The CLI omits coverage only for an explicit single-root report.
+    if coverage.is_empty() {
+        return history_block(store_dir, root, since, observed_at);
+    }
+    let mut spans = Vec::new();
+    let mut roots = Vec::new();
+    for region in coverage {
+        let span = match region.status {
+            RegionStatus::Excluded | RegionStatus::DetectorOnly => continue,
+            RegionStatus::Complete | RegionStatus::Partial { .. } => {
+                history_span_for_root(store_dir, &region.path, observed_at)
+            }
+            RegionStatus::Missing | RegionStatus::Inaccessible { .. } => None,
+        };
+        spans.push(span);
+        roots.push(json!({
+            "path": region.path,
+            "history_secs": span,
+        }));
+    }
+    let common = spans
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .and_then(|known| known.into_iter().min());
+    let mut block = history_block_from_span(common, since);
+    if common.is_none() {
+        block["note"] = json!(
+            "common history unavailable: one or more roots lack measured history, or no project roots were observed; see roots and scope_coverage"
+        );
+    }
+    block["roots"] = json!(roots);
+    block
+}
+
+fn history_block_from_span(history: Option<u64>, since: Option<&str>) -> Value {
     let asked = since.and_then(parse_duration_secs);
     let effective = match (asked, history) {
         (Some(a), Some(h)) => Some(a.min(h)),
-        (Some(a), None) => Some(a),
+        (_, None) => None,
         (None, h) => h,
     };
     json!({
@@ -741,6 +797,140 @@ mod tests {
             dangling: false,
             evidence: Vec::new(),
         }
+    }
+
+    fn record_history_fixture(store: &Path, root: &Path, observed_at: u64, bytes: u64) {
+        let mut report = fixture_report();
+        let worktree = &mut report.projects[0].worktrees[0];
+        worktree.path = root.to_path_buf();
+        let artifact = &mut worktree.artifacts[0];
+        artifact.kind = ArtifactKind::BuildOutput;
+        artifact.path = root.join("target");
+        artifact.bytes = bytes;
+        artifact.observed_at = observed_at;
+        crate::growth::observe_and_annotate(
+            &crate::bus::Stage::for_tests(),
+            store,
+            crate::growth::root_scoped_volume_id(root),
+            &mut report.projects,
+            observed_at,
+            30,
+            86400,
+            &Default::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn history_block_single_frozen_observation_has_zero_span() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // Deliberately long before wall-clock now: rendering must not turn
+        // elapsed time since this one observation into measured history.
+        let observed_at = 1_000_000;
+        record_history_fixture(store.path(), root.path(), observed_at, 100);
+        let first = history_block(store.path(), root.path(), Some("24h"), observed_at);
+        assert_eq!(first["history_secs"], 0);
+        assert_eq!(first["effective_window_secs"], 0);
+        assert_eq!(first["asked_window_secs"], 86400);
+        assert!(
+            first["note"]
+                .as_str()
+                .unwrap()
+                .contains("0s of observations")
+        );
+        assert_eq!(
+            first,
+            history_block(store.path(), root.path(), Some("24h"), observed_at)
+        );
+    }
+
+    #[test]
+    fn history_block_frozen_snapshot_uses_measured_span_and_clamps_request() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        record_history_fixture(store.path(), root.path(), 1_000_000, 100);
+        record_history_fixture(store.path(), root.path(), 1_000_120, 200);
+        let frozen = history_block(store.path(), root.path(), Some("24h"), 1_000_120);
+        assert_eq!(frozen["history_secs"], 120);
+        assert_eq!(frozen["effective_window_secs"], 120);
+        assert!(
+            frozen["note"]
+                .as_str()
+                .unwrap()
+                .contains("120s of observations")
+        );
+        assert_eq!(
+            frozen,
+            history_block(store.path(), root.path(), Some("24h"), 1_000_120)
+        );
+        let shorter = history_block(store.path(), root.path(), Some("1m"), 1_000_120);
+        assert_eq!(shorter["history_secs"], 120);
+        assert_eq!(shorter["effective_window_secs"], 60);
+        assert!(shorter["note"].is_null());
+    }
+
+    #[test]
+    fn history_block_without_observations_has_no_effective_window() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let block = history_block(store.path(), root.path(), Some("24h"), 1_000_000);
+        assert!(block["history_secs"].is_null());
+        assert!(block["effective_window_secs"].is_null());
+        assert_eq!(block["asked_window_secs"], 86400);
+        assert_eq!(
+            block["note"],
+            "no observations yet: growth cannot be reported"
+        );
+    }
+
+    #[test]
+    fn history_block_multi_root_uses_common_frozen_span_not_display_root() {
+        use crate::coverage::{RegionStatus, RootCoverage};
+        let store = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        record_history_fixture(store.path(), first.path(), 1_000_000, 100);
+        record_history_fixture(store.path(), first.path(), 1_000_120, 200);
+        record_history_fixture(store.path(), second.path(), 1_000_060, 100);
+        record_history_fixture(store.path(), second.path(), 1_000_120, 200);
+        let mut coverage: Vec<_> = [first.path(), second.path()]
+            .into_iter()
+            .map(|path| RootCoverage {
+                path: path.to_path_buf(),
+                status: RegionStatus::Complete,
+                walked_total: 200,
+                projects: 1,
+                mode: "full".into(),
+            })
+            .collect();
+        let render = |coverage: &[RootCoverage]| {
+            history_block_for_scope(
+                store.path(),
+                Path::new("synthetic-scope"),
+                coverage,
+                Some("24h"),
+                1_000_120,
+            )
+        };
+        let frozen = render(&coverage);
+        assert_eq!(frozen["history_secs"], 60);
+        assert_eq!(frozen["effective_window_secs"], 60);
+        assert_eq!(frozen["roots"][0]["history_secs"], 120);
+        assert_eq!(frozen["roots"][1]["history_secs"], 60);
+        assert_eq!(render(&coverage), frozen);
+        coverage.reverse();
+        assert_eq!(render(&coverage)["history_secs"], 60);
+
+        let missing = tempfile::tempdir().unwrap();
+        coverage.push(RootCoverage::missing(missing.path().to_path_buf()));
+        let unavailable = render(&coverage);
+        assert!(unavailable["history_secs"].is_null());
+        assert!(unavailable["effective_window_secs"].is_null());
+        assert_eq!(unavailable["roots"][1]["history_secs"], 120);
+        coverage.pop();
+        coverage.push(RootCoverage::excluded(missing.path().to_path_buf()));
+        assert_eq!(render(&coverage)["history_secs"], 60);
     }
 
     fn fixture_report() -> Report {

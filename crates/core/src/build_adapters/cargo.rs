@@ -545,6 +545,48 @@ mod tests {
     }
 
     #[test]
+    fn cargo_identified_profile_children_fill_generic_build_families() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let debug = target.join("debug");
+        fs::create_dir_all(debug.join("deps")).unwrap();
+        fs::create_dir_all(debug.join("incremental")).unwrap();
+        fs::create_dir_all(debug.join("unrecognized")).unwrap();
+        let index = folded(&[
+            (target.clone(), 30_000_000_000, 500),
+            (debug.clone(), 29_999_991_808, 500),
+            (debug.join("deps"), 28_000_000_000, 500),
+            (debug.join("incremental"), 1_500_000_000, 500),
+            (debug.join("unrecognized"), 8_192, 500),
+        ]);
+        let c = BuildContainer::project("cargo", target.clone(), tmp.path().to_path_buf());
+        let units = run(&c, &index);
+        let summary = crate::build_adapters::summarize_container(&target, &units);
+
+        let dependencies = summary
+            .families
+            .iter()
+            .find(|f| f.family == crate::artifact::RoleFamily::Dependencies)
+            .expect("Cargo's deps directory should be visible in the generic summary");
+        let intermediates = summary
+            .families
+            .iter()
+            .find(|f| f.family == crate::artifact::RoleFamily::Intermediates)
+            .expect("Cargo's incremental directory should be visible in the generic summary");
+        let residual = summary
+            .families
+            .iter()
+            .find(|f| f.family == crate::artifact::RoleFamily::Residual)
+            .expect("unclassified but supported Cargo directories remain Not identified");
+        assert_eq!(dependencies.bytes, 28_000_000_000);
+        assert_eq!(dependencies.recommendation, "Review: rebuild dependencies");
+        assert_eq!(intermediates.bytes, 1_500_000_000);
+        assert_eq!(residual.bytes, 8_192);
+        assert_eq!(summary.unsupported_count, 0);
+        assert_eq!(summary.unaccounted_bytes, Some(499_991_808));
+    }
+
+    #[test]
     fn identification_reads_no_more_than_manifest_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("target");

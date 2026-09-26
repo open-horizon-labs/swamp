@@ -157,15 +157,16 @@ enum Command {
     },
     /// Project x worktree x artifact growth report -- a pure read of
     /// what `swamp observe` last wrote (R12): never walks a directory,
-    /// stats a file, or spawns a subprocess. Exits 2 (JSON:
+    /// scans artifact metadata, or spawns a subprocess. Root presence
+    /// is checked to resolve scope. Exits 2 (JSON:
     /// `{"error":"no_observation", ...}`) when the scope has never been
     /// observed; run `swamp observe` first.
     Report {
-        /// Defaults to the configured effective scope's first present
-        /// root when omitted (see `swamp scope`); an explicit root
-        /// still replaces the configured scope for this invocation,
-        /// though configured exclusions still apply.
-        root: Option<PathBuf>,
+        /// Roots of the stored observation. Pass the same roots as
+        /// `observe`; omitted roots use the configured effective scope
+        /// (see `swamp scope`). Explicit roots replace that scope,
+        /// while configured exclusions still apply.
+        roots: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
         /// Print the `du -skPx` total the last `swamp observe
@@ -174,18 +175,19 @@ enum Command {
         #[arg(long)]
         verify_du: bool,
         /// Drill into one project: worktree -> kind -> path -> bytes ->
-        /// growth -> regrowth -> signals. Text output only.
+        /// growth -> regrowth -> signals. Applies to text and JSON.
         #[arg(long)]
         project: Option<String>,
-        /// Bytes and count per artifact kind across the root. Text output
-        /// only. Deprecated alias for `--view kinds`.
+        /// Bytes and count per artifact kind across the scope.
+        /// Deprecated alias for `--view kinds` (text or JSON).
         #[arg(long)]
         kinds: bool,
         /// Named view, at root or narrowed with `--project`: worktrees
         /// (git-enriched one-line-per-worktree listing at root, the tree
         /// drill with `--project`), builds, deps, docker, kinds, unowned,
         /// reconciliation, rust. Every question the issue lists is exactly one
-        /// command through this flag. Text output only.
+        /// command through this flag. Supports text and JSON;
+        /// projects and grown views require JSON.
         #[arg(long, value_enum)]
         view: Option<View>,
         /// Signals for one worktree (matched by exact or root-relative
@@ -198,8 +200,8 @@ enum Command {
         /// by `--view worktrees` at root.
         #[arg(long)]
         filter: Option<String>,
-        /// Show every project row instead of the default top-N. Text
-        /// output only.
+        /// Show all text rows: projects, agent units, or Rust units
+        /// (Rust defaults to 30 per container). JSON uses --limit/--offset.
         #[arg(long)]
         all: bool,
         /// List every unjoined Docker object individually instead of the
@@ -230,6 +232,14 @@ enum Command {
         /// and `truncated` fields say whether this is a partial page.
         #[arg(long)]
         limit: Option<usize>,
+        /// Bound units within each build/dependency JSON interior.
+        /// Family totals remain complete; units_total/units_truncated
+        /// describe the page. Independent of top-level --limit.
+        #[arg(long, default_value_t = 30)]
+        unit_limit: usize,
+        /// Offset within each JSON interior's unit list.
+        #[arg(long, default_value_t = 0)]
+        unit_offset: usize,
         /// Skip this many rows of a JSON array-shaped result before
         /// applying `--limit`. Only consulted with `--json`.
         #[arg(long, default_value_t = 0)]
@@ -719,6 +729,31 @@ fn agent_unit_matches_project(u: &swamp_core::agents::AgentUnit, project: Option
 /// through it so `--view`/`--project`/`--filter` can never again be
 /// silently ignored in JSON mode the way the whole-report dump used to
 /// ignore them.
+fn bound_interior_units(value: &mut serde_json::Value, limit: usize, offset: usize) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(interior) = map.get_mut("interior")
+                && let Some(page) = interior
+                    .get_mut("units")
+                    .and_then(|units| swamp_core::agent_json::paginate(units, Some(limit), offset))
+            {
+                interior["units_total"] = serde_json::json!(page.total);
+                interior["units_truncated"] = serde_json::json!(page.truncated);
+                interior["units_offset"] = serde_json::json!(offset);
+            }
+            for child in map.values_mut() {
+                bound_interior_units(child, limit, offset);
+            }
+        }
+        serde_json::Value::Array(rows) => {
+            for row in rows {
+                bound_interior_units(row, limit, offset);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn report_json_envelope(
     r: &Report,
@@ -825,7 +860,7 @@ fn report_json_envelope(
                 "observed_at": observed_at,
                 "since": since_str,
                 "index_refreshed": index_refreshed,
-                "history": swamp_core::agent_json::history_block(&store_dir, root, Some(&since_str)),
+                "history": swamp_core::agent_json::history_block_for_scope(&store_dir, root, scope_coverage, Some(&since_str), observed_at),
             });
         }
         return Ok(envelope);
@@ -957,7 +992,7 @@ fn main() -> Result<()> {
             safe_println!("{}", serde_json::to_string_pretty(&obs)?);
         }
         Command::Report {
-            root,
+            roots,
             json,
             verify_du,
             project,
@@ -972,10 +1007,12 @@ fn main() -> Result<()> {
             sort,
             reverse,
             limit,
+            unit_limit,
+            unit_offset,
             offset,
             unowned_only,
         } => {
-            let explicit_root = root.clone();
+            let single_explicit_root = roots.len() == 1;
             // `--kinds`/`--docker` are deprecated aliases folded under
             // `--view` (#33); an explicit `--view` wins if somehow both
             // are given.
@@ -996,8 +1033,7 @@ fn main() -> Result<()> {
             // stats each candidate root for presence but never walks
             // one, so this is not the "no filesystem walk" the pipeline
             // otherwise avoids.
-            let scope_roots: Vec<PathBuf> = explicit_root.clone().into_iter().collect();
-            let scope = resolve_scope(&scope_roots)?;
+            let scope = resolve_scope(&roots)?;
             if scope.scan_paths().is_empty() {
                 if scope.is_empty_scope() {
                     anyhow::bail!(
@@ -1017,10 +1053,14 @@ fn main() -> Result<()> {
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "error": "no_observation",
                                 "scope": e.scope_description,
+                                "hint": "Pass the same roots to report as to observe; snapshots are scoped to that root set.",
                             }))?
                         );
                     } else {
                         eprintln!("{e}");
+                        eprintln!(
+                            "Pass the same roots to report as to observe; snapshots are scoped to that root set."
+                        );
                     }
                     std::process::exit(2);
                 }
@@ -1030,7 +1070,7 @@ fn main() -> Result<()> {
             // scope-level coverage noise even when the underlying pass
             // is now the same coherent scope pipeline the catalog uses,
             // so that contract is preserved here rather than in storage.
-            let coverage = if explicit_root.is_some() {
+            let coverage = if single_explicit_root {
                 Vec::new()
             } else {
                 snapshot.coverage
@@ -1062,25 +1102,24 @@ fn main() -> Result<()> {
                 None => None,
             };
             if json {
-                safe_println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report_json_envelope(
-                        &r,
-                        &root,
-                        view,
-                        project.as_deref(),
-                        parsed_filter.as_ref(),
-                        None,
-                        false,
-                        unowned_only,
-                        limit,
-                        offset,
-                        &coverage,
-                        &external_units,
-                        &agent_units,
-                        &store_interiors,
-                    )?)?
-                );
+                let mut value = report_json_envelope(
+                    &r,
+                    &root,
+                    view,
+                    project.as_deref(),
+                    parsed_filter.as_ref(),
+                    None,
+                    false,
+                    unowned_only,
+                    limit,
+                    offset,
+                    &coverage,
+                    &external_units,
+                    &agent_units,
+                    &store_interiors,
+                )?;
+                bound_interior_units(&mut value, unit_limit, unit_offset);
+                safe_println!("{}", serde_json::to_string_pretty(&value)?);
             } else if let Some(wt_path) = worktree {
                 match render_worktree_signals(&r, &wt_path) {
                     Some(text) => safe_print!("{text}"),

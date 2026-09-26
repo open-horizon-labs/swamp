@@ -476,7 +476,7 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_by_worktree: Option<std::collections::HashMap<String, Vec<FileRow>>>,
     /// Scheduled-observation status line for the report header (item 5 of
-    /// #31): "last scheduled run 12m ago (full, 4.2 s)" when a schedule
+    /// #31): "last observation 12m ago (full, 4.2 s)" when a schedule
     /// exists, or a "no schedule (...)" suggestion when it does not. Only
     /// populated when a store directory was supplied.
     #[serde(default)]
@@ -2927,12 +2927,56 @@ pub fn merge_root_report_into(merged: &mut Report, r: Report) {
         estimate.needs_reconciliation = true;
         merged.reconciliation.unique_estimate = Some(estimate);
     }
-    merge_summary_into(&mut merged.summary, &r.summary);
 
     if merged.root.as_os_str().is_empty() {
         merged.root = path.clone();
     }
-    merged.projects.extend(r.projects);
+    for project in r.projects {
+        if let Some(existing) = merged
+            .projects
+            .iter_mut()
+            .find(|p| p.project_id == project.project_id)
+        {
+            for tag in project.ecosystems {
+                if !existing.ecosystems.contains(&tag) {
+                    existing.ecosystems.push(tag);
+                }
+            }
+            for wt in project.worktrees {
+                if let Some(old) = existing
+                    .worktrees
+                    .iter_mut()
+                    .find(|w| w.worktree_id == wt.worktree_id)
+                {
+                    // Discovery names linked worktrees outside this root too.
+                    // Prefer its measured row over an empty discovery placeholder.
+                    if old.artifacts.is_empty() && !wt.artifacts.is_empty() {
+                        *old = wt;
+                    } else {
+                        for artifact in wt.artifacts {
+                            if !old
+                                .artifacts
+                                .iter()
+                                .any(|a| a.path == artifact.path && a.kind == artifact.kind)
+                            {
+                                old.artifacts.push(artifact);
+                            }
+                        }
+                    }
+                } else {
+                    existing.worktrees.push(wt);
+                }
+            }
+        } else {
+            merged.projects.push(project);
+        }
+    }
+    for project in &mut merged.projects {
+        normalize_checkout_kinds(project);
+    }
+    // Aggregate the already-produced artifact facts after coalescing identities;
+    // no discovery, measurement, or bus stages are run again here.
+    merged.summary = summarize(&merged.projects);
     merged.unowned.extend(r.unowned);
     merged.reconciliation.attributed += r.reconciliation.attributed;
     merged.reconciliation.unowned += r.reconciliation.unowned;
@@ -3064,12 +3108,6 @@ pub fn merge_reports(
     merged
 }
 
-/// Merges one root's already-bus-computed `Summary` into a running total.
-/// Deliberately *not* a call to `summarize` (which stays a bus-pipeline
-/// stage per `all_report_paths_through_bus`/`event_bus_pluggable_consumers`
-/// -- see `docs/ADRs/001-event-bus-report-pipeline.md`): `report_scope`
-/// combines already-fully-formed single-root reports, it does not reach
-/// into the bus's own stages to recompute one from scratch.
 /// Folds one root's sparkline history into a running multi-root total:
 /// per-key series are simply unioned (keys are per-entity); the total is
 /// summed bucket by bucket when the windows line up, otherwise the first
@@ -3150,24 +3188,6 @@ pub(crate) fn sort_drill_down(
     }
 }
 
-fn merge_summary_into(acc: &mut Summary, add: &Summary) {
-    acc.projects += add.projects;
-    acc.worktrees += add.worktrees;
-    acc.artifacts += add.artifacts;
-    for (tag, t) in &add.by_type {
-        let e = acc.by_type.entry(tag.clone()).or_default();
-        if e.name.is_empty() {
-            e.name = t.name.clone();
-        }
-        e.projects += t.projects;
-        e.artifacts += t.artifacts;
-        e.bytes += t.bytes;
-        if let Some(g) = t.growth_bytes {
-            e.growth_bytes = Some(e.growth_bytes.unwrap_or(0) + g);
-        }
-    }
-}
-
 // ---------------------------------------------------------------------
 // R12: `swamp report` is a pure read of stored Parquet rows; `swamp
 // observe` is the only scanner. `crate::growth::ReportSnapshot` is
@@ -3237,6 +3257,59 @@ fn describe_scope_for_error(scope: &crate::scope::EffectiveScope) -> String {
     }
 }
 
+fn normalize_checkout_kinds(project: &mut ProjectRow) {
+    let main = project
+        .worktrees
+        .iter()
+        .filter(|w| w.kind != WorktreeKind::Linked)
+        .min_by(|a, b| a.path.cmp(&b.path))
+        .map(|w| w.worktree_id.clone());
+    for wt in &mut project.worktrees {
+        if wt.kind != WorktreeKind::Linked {
+            wt.kind = if Some(&wt.worktree_id) == main.as_ref() {
+                WorktreeKind::Main
+            } else {
+                WorktreeKind::Clone
+            };
+        }
+    }
+}
+
+fn dedup_worktree_facts(wt: &mut WorktreeRow) {
+    let mut signals = std::collections::HashSet::new();
+    wt.signals
+        .retain(|s| signals.insert((s.name.clone(), s.value.clone())));
+    if let Some(mc) = &mut wt.merge_complete {
+        let mut terms = std::collections::HashSet::new();
+        mc.terms.retain(|term| terms.insert(term.clone()));
+    }
+}
+
+// The stored scalar rows have no measurement provenance. Fill absent
+// facts, but do not mistake artifact membership (already unioned by id)
+// or a smaller idle time for evidence that one scalar row was measured.
+// Return whether retaining the first value needs an explicit limitation.
+fn merge_stored_worktree_metadata(old: &mut WorktreeRow, incoming: WorktreeRow) -> bool {
+    fn fill<T: PartialEq>(old: &mut Option<T>, incoming: Option<T>) -> bool {
+        match (old.as_ref(), incoming) {
+            (None, value) => {
+                *old = value;
+                false
+            }
+            (Some(a), Some(b)) => a != &b,
+            _ => false,
+        }
+    }
+    // A missing branch is detached HEAD, not an absent measurement.
+    let mut conflict = old.branch != incoming.branch || old.kind != incoming.kind;
+    conflict |= fill(&mut old.idle_secs, incoming.idle_secs);
+    conflict |= fill(&mut old.github, incoming.github);
+    conflict |= fill(&mut old.merge_complete, incoming.merge_complete);
+    old.signals.extend(incoming.signals);
+    dedup_worktree_facts(old);
+    conflict
+}
+
 /// R15 item 4 / R18a-3b: overwrites `snapshot.report.projects` with the
 /// tree [`crate::growth::write_project_worktree_tables`] wrote for `key`
 /// -- `projects.parquet`/`worktrees.parquet`/`worktree_facts.parquet`
@@ -3271,15 +3344,56 @@ fn rebuild_projects_from_tables(
     let facts = crate::growth::artifact_table_facts_for_roots(store_dir, &roots);
 
     let mut new_projects = Vec::with_capacity(tables.projects.len());
+    let mut seen_projects = std::collections::HashSet::new();
     for stored_project in &tables.projects {
+        if !seen_projects.insert(&stored_project.project_id) {
+            continue;
+        }
         let mut project = crate::growth::project_row_from_stored(stored_project);
+        for duplicate in tables
+            .projects
+            .iter()
+            .filter(|p| p.project_id == project.project_id)
+        {
+            for tag in duplicate
+                .ecosystems
+                .split('|')
+                .filter(|tag| !tag.is_empty())
+            {
+                if !project.ecosystems.iter().any(|existing| existing == tag) {
+                    project.ecosystems.push(tag.to_string());
+                }
+            }
+        }
         let mut worktrees = Vec::new();
+        let mut seen_worktrees = std::collections::HashSet::new();
         for stored_wt in tables
             .worktrees
             .iter()
             .filter(|w| w.project_id == stored_project.project_id)
         {
+            if !seen_worktrees.insert(&stored_wt.worktree_id) {
+                continue;
+            }
             let mut wt = crate::growth::worktree_row_from_stored(stored_wt, &tables.worktree_facts);
+            dedup_worktree_facts(&mut wt);
+            let mut duplicates = tables.worktrees.iter().filter(|w| {
+                w.project_id == stored_project.project_id && w.worktree_id == stored_wt.worktree_id
+            });
+            duplicates.next();
+            let mut conflict = false;
+            for duplicate in duplicates {
+                let mut incoming =
+                    crate::growth::worktree_row_from_stored(duplicate, &tables.worktree_facts);
+                dedup_worktree_facts(&mut incoming);
+                conflict |= merge_stored_worktree_metadata(&mut wt, incoming);
+            }
+            if conflict {
+                snapshot.report.notes.push(format!(
+                    "{}: duplicate stored worktree metadata conflicts; measurement provenance is unavailable, so the first conflicting scalar value is retained",
+                    wt.path.display(),
+                ));
+            }
             let worktree_path = wt.path.clone();
             let mut artifacts = shape_by_worktree
                 .remove(&stored_wt.worktree_id)
@@ -3322,9 +3436,21 @@ fn rebuild_projects_from_tables(
             worktrees.push(wt);
         }
         project.worktrees = worktrees;
+        // Preserve stored checkout facts unless an old multi-root merge
+        // left multiple mains. A lone stored Clone is not ours to relabel.
+        if project
+            .worktrees
+            .iter()
+            .filter(|w| w.kind == WorktreeKind::Main)
+            .count()
+            > 1
+        {
+            normalize_checkout_kinds(&mut project);
+        }
         new_projects.push(project);
     }
     snapshot.report.projects = new_projects;
+    snapshot.report.summary = summarize(&snapshot.report.projects);
 }
 
 /// `swamp report`'s only read path: loads the stored snapshot for
@@ -3543,11 +3669,11 @@ pub fn report_scope_from_store(
         agent_units: Vec::new(),
         store_interiors: Vec::new(),
     };
+    crate::growth::rebuild_coverage_and_notes_from_tables(store_dir, &key, &mut snapshot);
     rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
     rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);
-    crate::growth::rebuild_coverage_and_notes_from_tables(store_dir, &key, &mut snapshot);
     // R20: last -- every derived field (summary, series, unowned, the
     // drill-down, an artifact's growth/allocation) is computed from the
     // facts rebuilt above and the volumes' history, never read from a
@@ -3558,3 +3684,6 @@ pub fn report_scope_from_store(
 
 mod pass;
 pub use pass::DiscoveryPass;
+
+#[cfg(test)]
+mod report_merge_tests;

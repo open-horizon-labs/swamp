@@ -4,17 +4,19 @@ Every command in this reference is noninteractive: it reads (and, for
 `observe`, writes) the growth store under `$SWAMP_DIR`
 (default `~/.local/share/swamp`), prints exactly one JSON document to
 stdout when `--json` is given, and never prompts. Diagnostics, progress
-lines, and parse errors go to stderr only -- stdout is safe to pipe
-straight into `jq` or a JSON parser, and a nonzero exit means stdout is
-empty (no partial/malformed JSON document is ever printed).
+lines, and clap argument errors go to stderr. Structured JSON errors go
+to stdout even with a nonzero exit; inspect both the status and body.
 
-`swamp observe` is the *only* command that scans a filesystem, stats a
-header, or shells out (`du`, `gh`, `docker`): `swamp observe [--full] &&
+`swamp observe` scans and persists report facts (`du`, `gh`, and Docker
+inspection may be involved): `swamp observe [--full] &&
 swamp report ...` is the shape every recipe below assumes. `swamp
-report` is a pure read of whatever the last `observe` wrote; on a scope
+report` reads whatever the last `observe` wrote. It checks candidate-root
+presence and the comparison namespace, but does not recursively walk
+roots, inspect artifacts, or spawn subprocesses. On a scope
 that has never been observed it prints `no observation yet for <scope>;
 run swamp observe` (`--json`: `{"error":"no_observation","scope":...}`)
-and exits 2, rather than scanning to produce one.
+and exits 2, rather than scanning to produce one. `inspect-cargo` is a
+separate bounded filesystem inspection; it does not persist an observation.
 
 This table replaces the MCP server that shipped through v0.6.x
 (`crates/mcp`, removed in favor of this CLI + skill). Every MCP tool
@@ -36,15 +38,25 @@ used (its own `--since`, else `config.toml`'s `since`, else the
 hard-coded default). `report` has no `--since` of its own any more.
 
 There is no `propose`/`execute`/`plans`/`grant` command any more (removed
-2026-09-23, "swamp reports; the human removes"): the CLI's only
-side-effecting command is `swamp protect add|remove` (a human keep-list).
-Nothing deletes anything except the TUI's own Trash flow, or a human's
-own shell command. See `trust-model.md`.
+2026-09-23, "swamp reports; the human removes"). `report` reads the store;
+`observe` writes observations/history/enrichment; `protect add|remove`
+writes a keep-list. Configuration and scheduling commands can also write
+state. Removal is a separate TUI operation, or a human's own shell command.
+See `trust-model.md`.
 
 `<root>` is now optional on `report`/`observe`/`ui`/`schedule`: omit it
 and the command resolves swamp's configured effective scope (built-in
 defaults, detected tool locations, and `config.toml`'s `[scan]` table)
-instead of one explicit path. `swamp scope --json` (below) is the one
+instead of explicit paths. For an ad-hoc multi-root scope, repeat the same
+explicit roots on `report` that you supplied to `observe`:
+
+```sh
+swamp observe /path/to/main /path/to/checkout --since 24h
+swamp report /path/to/main /path/to/checkout --view projects --json --limit 10
+```
+
+Omitting roots selects configured scope, not the last ad-hoc scope.
+`swamp scope --json` (below) is the one
 place every one of those commands' root resolution is inspectable.
 
 ## `swamp scope [<root>...] --json`
@@ -112,7 +124,7 @@ directory. See [coverage-and-history.md](coverage-and-history.md) for
 the coverage-change notes `report`/`observe` print when the resolved
 scope differs from the last observation.
 
-## `swamp report <root> --json`
+## `swamp report [<root>...] --json`
 
 Always applies `--filter` (if given) to the whole report before
 computing any view -- a filtered view and a filtered whole-report
@@ -137,7 +149,7 @@ Every view returns the envelope:
   "result": [ /* view-specific: array or object */ ],
   "observed_at": 1234567890,
   "since": "24h",
-  "index_refreshed": true,
+  "index_refreshed": false,
   "total": 12,
   "truncated": false
 }
@@ -182,7 +194,7 @@ Views:
 ```json
 "coverage": {
   "walked_total": 123, "du_total": null, "unowned_total": 0, "attributed_total": 123,
-  "observed_at": 1234567890, "since": "24h", "index_refreshed": true,
+  "observed_at": 1234567890, "since": "24h", "index_refreshed": false,
   "history": {
     "history_secs": 0, "asked_window_secs": 3600, "effective_window_secs": 0,
     "note": "asked for 3600s of growth but the store holds 0s of observations; growth is reported over 0s"
@@ -200,7 +212,23 @@ than you asked for. See `coverage-and-history.md`.
 `--json`) they exit nonzero with a stderr message instead of silently
 falling back to a different view.
 
+`--view agents` and `--view external` support both text and JSON output.
+The Rust text view defaults to the largest 30 units per container;
+`--all` shows every unit. JSON pagination uses `--limit`/`--offset`.
+
 ### Pagination
+
+Build/dependency `interior.units` arrays are separately bounded to 30 units
+per container by default. Use `--unit-limit N --unit-offset N` to page them
+without changing the outer container page. Each interior has `units_total`,
+`units_truncated`, and `units_offset`; its family summaries still cover the
+complete container. For example:
+
+```sh
+swamp report <root> --view builds --json --limit 1 --unit-limit 10 --unit-offset 10
+```
+
+Cargo's flat `--view rust --json` uses ordinary `--limit`/`--offset` instead.
 
 `--limit N` / `--offset N` bound the array in `result` (or the
 top-level `projects` array with no `--view`). Both are only consulted
@@ -223,13 +251,18 @@ it, and `trust-model.md` for the full statement of what changed.
 
 - `0`: the command ran and, in JSON mode, printed exactly one JSON
   document to stdout.
-- Nonzero (currently always `1`): something failed before any JSON was
-  printed -- a bad `--filter` expression, an unreadable root, a missing
-  plan id, an I/O error. Diagnostics are on stderr; stdout is always
-  empty in this case. Never parse stdout on a nonzero exit.
-- A *refused* or *awaiting-authorization* outcome (a plan with no
-  grant, a unit whose activity changed since proposal, an execute on an
-  expired plan) is not an error: the command exits `0` and the refusal
-  is a fact inside the JSON body (`state`, `outcomes[].status`,
-  `outcomes[].cause`). Check the body, not just the exit code, before
-  assuming an action happened.
+- `report --json` with no observation: exit `2`, with a structured
+  `{"error":"no_observation","scope":...}` document on stdout.
+  Text mode prints the missing-observation diagnostic on stderr.
+- Clap argument errors (for example an unknown flag): exit `2`, usage
+  and error text on stderr, no JSON result on stdout. `--json` does not
+  turn command-line parsing failures into JSON.
+- Other failures: inspect stderr and any structured stdout error;
+  do not assume every nonzero status has an empty stdout stream.
+- `inspect-cargo --json` can exit `0` with `coverage.supported: false`
+  for an unavailable profile, or `coverage.complete: false` when a
+  budget is exhausted. Check coverage and limits before using its totals.
+
+Capture stdout and stderr separately. Parse a nonempty JSON stdout body
+even on failure, and check its `error` field as well as the exit status.
+There are no CLI plan/grant/execute outcomes to interpret.

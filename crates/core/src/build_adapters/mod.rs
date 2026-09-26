@@ -1032,7 +1032,12 @@ fn outermost<'a>(container: &Path, units: &'a [NestedArtifact]) -> Vec<&'a Neste
         .iter()
         .filter(|u| u.present)
         .filter(|u| u.path != container && u.path.starts_with(container))
-        .filter(|u| u.role != ArtifactRole::Container)
+        // Cargo profiles (for example `target/debug`) are organizational
+        // directories, not a reportable family. Treat them like transparent
+        // containers so their classified children contribute to the summary;
+        // otherwise the profile masks every dependency/output below it and its
+        // Container family is omitted from RoleFamily::ALL.
+        .filter(|u| !matches!(u.role, ArtifactRole::Container | ArtifactRole::Profile))
         .collect();
     let dirs: std::collections::HashSet<&Path> = inside
         .iter()
@@ -1126,7 +1131,13 @@ pub fn summarize_container(container: &Path, units: &[NestedArtifact]) -> Contai
             complete: members.iter().all(|u| u.coverage.complete),
             other_consequences: distinct.len().saturating_sub(1),
             consequence,
-            recommendation: family_guidance(*family),
+            recommendation: if *family == RoleFamily::Dependencies
+                && members.iter().all(|u| u.role == ArtifactRole::Dependency)
+            {
+                "Review: rebuild dependencies"
+            } else {
+                family_guidance(*family)
+            },
         });
     }
     // Reconciliation against the container's own measured row.
@@ -1306,6 +1317,78 @@ mod tests {
         assert_eq!(
             outputs.bytes, 1000,
             "a descendant's bytes are already inside its ancestor's total"
+        );
+    }
+
+    #[test]
+    fn cargo_profile_is_transparent_to_generic_build_family_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = container(tmp.path());
+        let root = supported(&c, ArtifactRole::Container, tmp.path().to_path_buf())
+            .is_dir(true)
+            .bytes_on_basis(30_000_000_000, AccountingBasis::Allocated)
+            .build();
+        let profile = supported(&c, ArtifactRole::Profile, tmp.path().join("debug"))
+            .is_dir(true)
+            .bytes_on_basis(29_999_991_808, AccountingBasis::Allocated)
+            .build();
+        let deps = supported(&c, ArtifactRole::Dependency, tmp.path().join("debug/deps"))
+            .is_dir(true)
+            .bytes_on_basis(28_000_000_000, AccountingBasis::Allocated)
+            .build();
+        let dep_file = supported(
+            &c,
+            ArtifactRole::Dependency,
+            tmp.path().join("debug/deps/libexample.rlib"),
+        )
+        .bytes_on_basis(27_999_000_000, AccountingBasis::Allocated)
+        .build();
+        let incremental = supported(
+            &c,
+            ArtifactRole::Incremental,
+            tmp.path().join("debug/incremental"),
+        )
+        .is_dir(true)
+        .bytes_on_basis(1_500_000_000, AccountingBasis::Allocated)
+        .build();
+        let unknown = NestedUnitBuilder::new(
+            &c,
+            ArtifactRole::Residual,
+            tmp.path().join("debug/unrecognized"),
+        )
+        .is_dir(true)
+        .bytes_on_basis(8_192, AccountingBasis::Allocated)
+        .unsupported_layout("Cargo subtree not classified by this adapter")
+        .build();
+
+        let summary = summarize_container(
+            tmp.path(),
+            &[root, profile, deps, dep_file, incremental, unknown],
+        );
+        let dependencies = summary
+            .families
+            .iter()
+            .find(|f| f.family == RoleFamily::Dependencies)
+            .expect("the profile must not hide Cargo dependencies");
+        let intermediates = summary
+            .families
+            .iter()
+            .find(|f| f.family == RoleFamily::Intermediates)
+            .expect("the profile must not hide Cargo intermediates");
+        assert_eq!(dependencies.bytes, 28_000_000_000);
+        assert_eq!(
+            dependencies.count, 1,
+            "nested dependency file is already in deps/"
+        );
+        assert_eq!(intermediates.bytes, 1_500_000_000);
+        assert_eq!(summary.unsupported_count, 1);
+        assert_eq!(summary.unsupported_bytes, Some(8_192));
+        assert_eq!(summary.unaccounted_bytes, Some(499_991_808));
+        assert!(
+            summary
+                .families
+                .iter()
+                .all(|f| f.family != RoleFamily::Container)
         );
     }
 

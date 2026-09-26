@@ -583,7 +583,7 @@ pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String 
     match read_last_run(store_dir) {
         Some(run) if run.outcome == "ok" => {
             format!(
-                "last scheduled run {} ({}, {:.1} s)",
+                "last observation {} ({}, {:.1} s)",
                 format_ago(now, run.observed_at),
                 run.mode,
                 run.wall_ms as f64 / 1000.0
@@ -591,7 +591,7 @@ pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String 
         }
         Some(run) => {
             format!(
-                "last scheduled run {} ({})",
+                "last observation {} ({})",
                 format_ago(now, run.observed_at),
                 run.outcome
             )

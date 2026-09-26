@@ -419,19 +419,21 @@ Before this, running them in sequence over an unchanged filesystem had
 each tombstoning the other's rows, and the next pass reported the
 resurrection as regrowth. Coverage changes are not storage changes.
 
-### `swamp report` is a pure read; `swamp observe` is the only scanner (R12, 2026-09-24)
+### `swamp report` reads stored observations; `swamp observe` refreshes them (R12, 2026-09-24)
 
-Two entry points, one direction of data flow: `swamp observe` is the
-only command that walks a filesystem, stats a header, or spawns a
-subprocess (`du`, `gh`, `docker`). It runs the full pipeline above --
+Two report-pipeline entry points, one direction of data flow:
+`swamp observe` walks the filesystem and can spawn inspection
+subprocesses (`du`, `gh`, `docker`). Separate commands such as
+`inspect-cargo` can also inspect filesystem metadata. Observation runs the full pipeline above --
 walk, project grouping, signals, evidence, external + agent discovery,
 GitHub/Docker enrichment -- through `report::observe_scope` with
 `ObservationParts::ALL`, and, on a pass that observed and persisted both
 unit families successfully, writes the scope-wide fact tables below
 under `report::scope_snapshot_key`. `swamp report`
 (`report::report_scope_from_store`) does the reverse: resolve the scope
-(a config read plus one presence `stat` per candidate root, never a
-recursive walk), compute its key, rebuild the facts from the tables,
+(including config reads, candidate-root presence checks and comparison
+namespace checks, never a recursive walk or artifact inspection), compute
+its key, rebuild the facts from the tables,
 and *derive* every view from them. No walk, no unit discovery, no
 subprocess -- CLI rendering (`render.rs`, `agent_json.rs`) runs
 unchanged over the result. A scope with no `runs.parquet` row is not an

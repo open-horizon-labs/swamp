@@ -94,6 +94,108 @@ fn make_checkout(root: &Path, name: &str, seed_bytes: usize) -> PathBuf {
     dir
 }
 
+#[test]
+fn explicit_multi_root_report_reads_the_observed_scope_without_broadening() {
+    let fixture = tempfile::tempdir().unwrap();
+    let first = make_checkout(fixture.path(), "first", 4096);
+    let second = make_checkout(fixture.path(), "second", 8192);
+    let store = tempfile::tempdir().unwrap();
+    let a = first.to_str().unwrap();
+    let b = second.to_str().unwrap();
+    let observed = run(store.path(), &["observe", a, b]);
+    assert!(observed.status.success(), "{:?}", observed);
+    let combined = run_json(store.path(), &["report", a, b, "--json"]);
+    assert_eq!(combined["projects"].as_array().unwrap().len(), 2);
+    assert!(combined["scope_coverage"].as_array().is_some());
+    // Root order must not create a different snapshot identity.
+    let reversed = run_json(store.path(), &["report", b, a, "--json"]);
+    assert_eq!(combined, reversed);
+    let text = run(store.path(), &["report", a, b]);
+    assert!(text.status.success(), "{:?}", text);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("first") && text.contains("second"), "{text}");
+    // A constituent root is not silently answered with the wider scope.
+    let missing = run(store.path(), &["report", a, "--json"]);
+    assert_eq!(missing.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(error["error"], "no_observation");
+    observe(store.path(), &first, &[]);
+    let single = run_json(store.path(), &["report", a, "--json"]);
+    assert_eq!(single["projects"].as_array().unwrap().len(), 1);
+    assert!(single.get("scope_coverage").is_none());
+    // Writing a narrower snapshot must not replace the combined report.
+    let combined_after = run_json(store.path(), &["report", a, b, "--json"]);
+    assert_eq!(combined_after, combined);
+}
+
+#[test]
+fn explicit_multi_root_reporting_keeps_configured_exclusions() {
+    let fixture = tempfile::tempdir().unwrap();
+    let first = make_checkout(fixture.path(), "kept", 4096);
+    let second = make_checkout(fixture.path(), "excluded", 8192);
+    let alias = fixture.path().join("excluded-alias");
+    std::os::unix::fs::symlink(&second, &alias).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    fs::write(
+        store.path().join("config.toml"),
+        format!(
+            "[scan]\nexclude = [{:?}]\n",
+            second.canonicalize().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let a = first.to_str().unwrap();
+    let b = alias.to_str().unwrap();
+    let observed = run(store.path(), &["observe", a, b]);
+    assert!(observed.status.success(), "{:?}", observed);
+    let combined = run_json(store.path(), &["report", a, b, "--json"]);
+    let projects = combined["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1, "{combined}");
+    assert!(projects[0].to_string().contains("kept"));
+    assert!(!projects[0].to_string().contains("excluded"));
+}
+
+#[test]
+fn linked_worktrees_in_separate_roots_are_reported_once() {
+    let fixture = tempfile::tempdir().unwrap();
+    let main = make_checkout(fixture.path(), "main", 4096);
+    let linked = fixture.path().join("linked");
+    run_git(
+        &main,
+        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+    );
+    fs::create_dir_all(linked.join("node_modules")).unwrap();
+    fs::write(linked.join("node_modules/seed"), vec![b'x'; 8192]).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let a = main.to_str().unwrap();
+    let b = linked.to_str().unwrap();
+    let observed = run(store.path(), &["observe", a, b]);
+    assert!(observed.status.success(), "{:?}", observed);
+    let report = run_json(store.path(), &["report", a, b, "--json"]);
+    let projects = report["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1, "{report}");
+    let worktrees = projects[0]["worktrees"].as_array().unwrap();
+    assert_eq!(worktrees.len(), 2, "{report}");
+    assert_ne!(worktrees[0]["worktree_id"], worktrees[1]["worktree_id"]);
+    for wt in worktrees {
+        assert!(
+            wt["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["bytes"].as_u64().unwrap() > 0)
+        );
+    }
+    let sum: u64 = worktrees
+        .iter()
+        .flat_map(|w| w["artifacts"].as_array().unwrap())
+        .map(|a| a["bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(Some(sum), report["reconciliation"]["attributed"].as_u64());
+    assert_eq!(report["summary"]["projects"], 1);
+    assert_eq!(report["summary"]["worktrees"], 2);
+}
+
 /// #53/#54/#60: the default `report --json` (no `--view`) carries each
 /// artifact row's decision evidence -- populated by
 /// `report::attach_decision_evidence` and passed straight through by
@@ -201,6 +303,72 @@ fn bespoke_json_views_carry_evidence_on_their_rows() {
         ],
     );
     assert!(v["result"].as_array().is_some());
+}
+
+#[test]
+fn build_interiors_have_independent_explicit_pages() {
+    let root = tempfile::tempdir().unwrap();
+    let repo = make_checkout(root.path(), "repo", 4096);
+    fs::write(repo.join("Cargo.toml"), b"[package]\nname = \"repo\"\n").unwrap();
+    fs::create_dir_all(repo.join("target/debug")).unwrap();
+    for i in 0..40 {
+        fs::create_dir_all(repo.join(format!("target/debug/incremental/unit-{i}"))).unwrap();
+        fs::write(
+            repo.join(format!("target/debug/incremental/unit-{i}/cache")),
+            vec![1u8; 4096],
+        )
+        .unwrap();
+    }
+    let store = tempfile::tempdir().unwrap();
+    observe(store.path(), root.path(), &[]);
+    let page = |offset: &str| {
+        run_json(
+            store.path(),
+            &[
+                "report",
+                root.path().to_str().unwrap(),
+                "--view",
+                "builds",
+                "--json",
+                "--limit",
+                "1",
+                "--unit-limit",
+                "2",
+                "--unit-offset",
+                offset,
+            ],
+        )
+    };
+    let first = page("0");
+    let second = page("2");
+    let a = &first["result"][0]["interior"];
+    let b = &second["result"][0]["interior"];
+    assert_eq!(a["units"].as_array().unwrap().len(), 2);
+    assert_eq!(b["units"].as_array().unwrap().len(), 2);
+    assert_ne!(a["units"][0]["id"], b["units"][0]["id"]);
+    assert!(a["units_total"].as_u64().unwrap() > 30);
+    assert_eq!(a["units_truncated"], true);
+    assert_eq!(a["families"], b["families"]);
+    assert_eq!(first["total"], second["total"]);
+    let default = run_json(
+        store.path(),
+        &[
+            "report",
+            root.path().to_str().unwrap(),
+            "--view",
+            "builds",
+            "--json",
+            "--limit",
+            "1",
+        ],
+    );
+    assert_eq!(
+        default["result"][0]["interior"]["units"]
+            .as_array()
+            .unwrap()
+            .len(),
+        30
+    );
 }
 
 /// `--view rust --project` must apply the same worktree ownership filter

@@ -82,13 +82,17 @@ neither figure promises how much deletion will free.
 Uniqueness here means hardlink deduplication by inode, not detection of shared
 APFS clone/snapshot extents.
 
-`swamp observe` is the only command that scans: it walks the filesystem,
+`swamp observe` refreshes report data: it walks the filesystem,
 groups projects, computes signals, discovers external/agent-tool
 storage, and persists all of it. `swamp report` is a pure read of what
-the last `observe` wrote -- it never walks a directory, stats a file, or
-spawns a subprocess. Run `observe` first; `report` on a scope that has
+the last `observe` wrote. It checks candidate-root presence and the
+comparison namespace, but does not recursively walk roots, inspect
+artifacts, or spawn a subprocess. Run `observe` first; `report` on a scope that has
 never been observed prints `no observation yet for <scope>; run swamp
 observe` (JSON: `{"error":"no_observation", ...}`) and exits 2.
+
+`inspect-cargo` separately performs bounded, read-only inspection of an
+existing Cargo profile. It does not run Cargo or persist an observation.
 
 What `report` reads is Parquet, and only facts. Rows that an
 observation produced: the project, worktree and artifact rows
@@ -144,10 +148,20 @@ Use `observe --full` to force a full filesystem walk. A normal observation can a
 
 Observations are stored separately for each canonical scan root. You can switch between a project and its parent directory using the same `SWAMP_DIR`; each root keeps its own history and incremental checkpoint. Overlapping roots are separate views, not totals to add together.
 
+For an ad-hoc multi-root scope, pass the same explicit roots to `report`
+as to `observe`:
+
+```bash
+swamp observe /path/to/main /path/to/checkout --since 24h
+swamp report /path/to/main /path/to/checkout --view projects --json --limit 10
+```
+
+Omitting roots selects the configured scope, not the last ad-hoc scope.
+
 ## Scope and coverage
 
-`report`, `observe`, `ui`, and `schedule` all take an explicit root. Omit
-it and they resolve the same **effective scope**, computed by one shared
+`report` and `observe` accept explicit roots. With roots omitted, scope-aware
+commands resolve the same **effective scope**, computed by one shared
 function so no command can silently disagree with another:
 
 ```bash
@@ -705,9 +719,9 @@ and does not delete anything. Ctrl-C exits when no operation is running.
 
 ### Reviewing Cargo build groups
 
-The Rust text view shows the largest 30 rows by default; add `--all` for the full list. Category totals include their children: do not sum them. A category is not an individual cleanup selection. Report JSON includes the same guidance under each nested row's `cleanup` field.
+The Rust text view shows the largest 30 units per container by default; add `--all` for the full list. Category totals include their children: do not sum them. A category is not an individual cleanup selection. Report JSON includes the same guidance under each nested row's `cleanup` field.
 
-There is no `swamp cleanup-check` command any more: the CLI is entirely read-only. To act on a Cargo purpose group, open the TUI's Rust view, mark the group (Space), read its current facts on the confirm banner (Backspace), and press Enter -- the group's exact member list (selected build output plus its `.d`/`.dSYM` companions) moves together into one Trash envelope with a restore manifest. Cargo's advisory lock is held for the duration of the move (so a concurrent `cargo build` does not race it), not as a "did anything change" check.
+There is no `swamp cleanup-check` command any more. Report and inspection commands do not remove scanned data; `observe` writes report state. To act on a Cargo purpose group, open the TUI's Rust view, mark the group (Space), read its current facts on the confirm banner (Backspace), and press Enter -- the group's exact member list (selected build output plus its `.d`/`.dSYM` companions) moves together into one Trash envelope with a restore manifest. Cargo's advisory lock is held for the duration of the move (so a concurrent `cargo build` does not race it), not as a "did anything change" check.
 
 The CLI's *text* rendering applies `--filter` only to the root `--view worktrees` output; it does not filter the builds view, project drill-down, or overview text. For a filter that narrows every row, add `--json`: see below and [the agent interface](#agent-interface).
 
@@ -764,7 +778,7 @@ Images, volumes, and build-cache records join to projects using Compose metadata
 
 ## Cleanup and recovery
 
-**Swamp reports; the human removes.** The CLI (`swamp report`/its views, and `swamp protect`) is entirely read-only. The only thing that deletes anything is the TUI: Space marks a row, Backspace shows its current facts, Enter moves it to the Trash. Checkouts and linked worktrees can be selected as well as artifacts and Cargo groups. Dirty, unpushed, and untracked facts are shown on the confirm banner for judgment; they do not block removal.
+**Swamp reports; the human removes.** `swamp report` and its views read stored facts. `observe` writes observations, history, and enrichment; `protect add/remove` writes a keep-list, while `protect list` reads it. Configuration and scheduling commands can also write state. Removal is a separate TUI flow: Space marks a row, Backspace shows its current facts, Enter moves filesystem selections to the Trash. Docker image/volume removal uses Docker and has no Trash recovery. Checkouts and linked worktrees can be selected as well as artifacts and Cargo groups. Dirty, unpushed, and untracked facts are shown on the confirm banner for judgment; they do not block removal.
 
 A project action expands to its actionable artifact rows. If it has none, a direct project action can offer the checkout. Bulk marking with `A` skips that fallback. The `ignored` and `untracked` remainder totals cover scattered files, so those summary buckets are not themselves deletion units.
 
@@ -878,11 +892,10 @@ the table.
 | external location detectors (version managers, package caches, SDKs) | modification age of the measured directory only; no per-tool invocation history is read |
 <!-- END ACTIVITY_EVIDENCE_INVENTORY -->
 
-`swamp protect add/remove/list` (previously effective only for
-agent-storage units) now also refuses a plan proposal that names a
-protected path for an ordinary filesystem artifact row: the path is
-named in the plan's `refused` list, never silently dropped or silently
-included. Only this explicit, human-issued command can add or remove a
+`swamp protect add/remove` changes the keep-list; `protect list` reads it.
+The TUI's mark step refuses protected paths for ordinary filesystem
+artifacts as well as agent-storage units, showing a refusal reason.
+Only an explicit, human-authorized command can add or remove a
 protection; a scanned project file or an agent's own observation
 cannot.
 
@@ -919,9 +932,18 @@ both ship together.
 
 ### The JSON contract
 
-Every command below is noninteractive: it prints exactly one JSON
-document to stdout (with `--json`), diagnostics on stderr, a
-deterministic schema, and documented exit codes. Full schemas, the
+Build/dependency interiors include at most 30 detailed units per container
+by default. Use `--unit-limit` and `--unit-offset` for those lists; their
+`units_total` and `units_truncated` fields disclose omitted units. Family
+summaries still cover the whole container. Ordinary `--limit`/`--offset`
+control the outer result rows, or the flat Cargo `--view rust` list.
+
+Every command below is noninteractive. With `--json`, results and
+structured errors go to stdout; diagnostics go to stderr. A missing
+observation returns `{"error":"no_observation","scope":...}` on
+stdout with exit `2`. Clap argument errors instead return exit `2`
+with usage/error text on stderr and no JSON stdout. Check both status
+and body; nonzero does not imply empty stdout. Full schemas, the
 historical MCP-tool-to-CLI mapping, pagination, and the exit-code
 contract: `skills/swamp/references/commands-and-json.md`.
 

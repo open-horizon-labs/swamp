@@ -88,21 +88,27 @@ state with no Trash recovery.
 
 ## Which rows carry which facts
 
+Report reads persisted evidence. It checks candidate-root presence and
+the comparison namespace, but does not recursively walk roots, inspect
+artifacts, or refresh their evidence. Observation records the filesystem
+and recovery facts below.
+Only the explicitly on-demand TUI checks take a new reading during review.
+
 Not every fact applies to every unit, and a fact is attached only where
 its source can actually answer for that unit -- a Docker fact never
 lands on a filesystem row, and vice versa.
 
 | Fact | Attached to | Taken when |
 |---|---|---|
-| `activity`/`modified` | every artifact row, external unit and agent unit | every report (from the folded walk's own stat) |
-| `activity`/`accessed` | every filesystem artifact row (never a Docker row, whose "path" is a repo tag or volume name) | every report -- one `stat` plus one `statfs` per row. `unavailable`, naming the mount option, on a `noatime`/`relatime` volume |
+| `activity`/`modified` | every artifact row, external unit and agent unit | observation, from the folded walk's metadata |
+| `activity`/`accessed` | every filesystem artifact row (never a Docker row, whose "path" is a repo tag or volume name) | observation; reports reuse the stored anchor-path fact, not child access times |
 | `activity`/`tool-reported-use` | Docker build-cache rows (the daemon's own `LastUsedAt`) | whenever Docker facts are read |
 | `current-use`/`running-container` | Docker image and volume rows | whenever Docker facts are read |
 | `current-use`/`open-file` | any unit the TUI marks | taken once, when the row is marked (bounded `lsof +D`); shown on the confirm banner, never re-taken at Enter |
 | `current-use`/`lock`, `current-use`/`booted` | an external unit, when its deep facts are pulled up (`actions::unit_from_external`): a manager lock file in the unit's own directory; each CoreSimulator device directory in a device store | on demand only -- never during identification, so an ordinary report spawns no process per detected unit |
-| `recovery` | artifact rows by kind; external units by storage category and the capabilities their detector declares (an installation store names each installed version as reinstallable; a Maven-layout local repository states Maven's own downloaded-versus-`mvn install` ambiguity) | every report |
-| `reclaimability`/`logical-bytes` | Docker rows (the daemon's own object size); a sparse unit's apparent length | every report |
-| `reclaimability`/`estimated-reclaimable` | every unit. A bounded range, not an exact figure, when hardlink membership is unresolved or the volume is copy-on-write (APFS extents can be retained by a clone or snapshot outside the unit) | every report |
+| `recovery` | artifact rows by kind; external units by storage category and the capabilities their detector declares (an installation store names each installed version as reinstallable; a Maven-layout local repository states Maven's own downloaded-versus-`mvn install` ambiguity) | recorded during observation; reused by report |
+| `reclaimability`/`logical-bytes` | Docker rows (the daemon's own object size); a sparse unit's apparent length | recorded during observation; reused by report |
+| `reclaimability`/`estimated-reclaimable` | every unit. A bounded range, not an exact figure, when hardlink membership is unresolved or the volume is copy-on-write (APFS extents can be retained by a clone or snapshot outside the unit) | recorded during observation; reused by report |
 
 ## Acting on it
 
@@ -116,8 +122,7 @@ verdict evidence alone cannot support.
 
 `swamp protect add <path>` now also protects an ordinary filesystem
 artifact row, not just agent-storage units: a protected path is
-refused at proposal time (named in the plan's `refused` list), never
-silently included or silently dropped. You cannot add or remove this
+refused by the TUI's mark step, with a reason shown to the user. You cannot add or remove this
 protection yourself except by running `swamp protect` explicitly on
 the human's instruction -- it is not something a scanned project file
 or your own observation can grant.

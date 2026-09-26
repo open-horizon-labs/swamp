@@ -311,3 +311,103 @@ Bohr has a separate public-CLI-only, no-deletion trial of actual Swamp checkouts
 Final native full/mutation CI must use the repair commit; previous-head native
 passes are not a substitute. Release remains conditional on that gate and the
 installed-trial result; no tag or publication is authorized or performed.
+
+## Execute — installed-trial repair loop
+
+Aim: the public CLI must let a developer observe several checkouts, read
+that same scope, and understand Cargo storage without private command guidance.
+Fix explicit report roots symmetrically with observe; preserve exact-scope reads,
+configured exclusions, read-only reporting, existing storage and folded scans.
+Fix Cargo aggregation at its organizational-profile boundary, not by suppressing
+unknown rows. Correct verified help/skill contradictions. No release or deletion.
+
+Risk checks: multi-root roundtrip with reversed root order; reject silently
+answering a constituent-root query from the combined snapshot; preserve combined
+snapshot after individual observation; exclusions through a symlink alias;
+Cargo classified descendants survive profile grouping without double charging
+their nested files; unsupported units remain visible. Alias exclusion check
+exposed a preexisting lexical-only root comparison, repaired using the existing
+comparison namespace (no recursive traversal). Empty exclusions do no extra I/O.
+
+Completion gates: focused regressions, routine gate, optimized installation,
+independent public-interface usage trial, review, exact-head native mutation CI.
+Native CI for prior head af42025 has passed macOS and is still running on Linux;
+it cannot validate this repair. Human TUI judgment and release authorization
+remain separate from automated CLI readiness.
+
+### Second independent trial and repairs
+
+McClintock observed both real Swamp checkouts in 3.03s; reported bytes matched
+the stored du verification (24,562,663,424 bytes). No deletion occurred. It
+confirmed combined reporting works and identified duplicate linked-worktree
+discovery rows, wall-clock-derived history duration, and oversized nested JSON.
+
+Repairs combine projects/worktrees by identity before persistence and while
+reading previously duplicated tables; a real Git linked-worktree CLI fixture
+asserts unique identities, measured artifacts, counts and reconciled bytes.
+History uses the report's observation timestamp, with per-root spans and the
+shortest common scope span. Unknown history does not become an invented window.
+Build/dependency interiors default to 30 units with independent unit-limit/
+unit-offset pagination and explicit total/truncation; family summaries remain
+complete. The pagination regression tests distinct pages and unchanged totals.
+Cargo dependency advice says rebuild rather than registry reinstall.
+
+Sagan's review additionally caught canonical descendant exclusions bypassing
+lexical prune construction. Prunes now compare canonical paths and translate
+back to traversal spelling; a symlink-root fixture grows excluded data by MBs
+and asserts observed bytes do not change. No-exclusion resolution skips this
+extra canonicalization. Full prior-head native mutation CI passed both OSes.
+Routine gate passed before these second-trial changes; rerun on final state.
+
+## Review — repair-loop completion gate
+
+Aim remains usable, fast developer-storage decisions rather than forensic
+certainty. Review status: Adjust until frozen-build checks and installed trial
+finish. Scope additions were concrete counterexamples from the independent
+trial/review, not new adapters or storage architecture. Existing typed Parquet,
+folded scan, event paths, and human cleanup boundary are preserved.
+
+The second review found clone labels and duplicate stored metadata. Checkout
+kind normalization follows path order and preserves Linked; old duplicate facts
+are deduplicated, missing metadata filled, and conflicting scalar provenance
+reported explicitly rather than guessed. Three focused merge tests passed.
+The static audit rejected a test-only #[path] module; tests were moved to the
+normal module directory without weakening the capability-gate rule.
+
+Model-checkable risks have dedicated regressions for scope identity/exclusions,
+profile masking, nested double counts, duplicate worktrees and clone order,
+stored metadata conflicts, frozen multi-root history, and independent nested
+JSON pages. No real cleanup was performed. Candidate allocations are not a
+promise of reclaimed APFS space. Human TUI judgment and final release approval
+remain external checkpoints; native mutation results must reference final HEAD.
+
+Installed retrial evidence: /private/tmp/swamp-storage-retrial.m8v7D6.
+McClintock found no remaining scoped CLI blocker: two unique projects/three
+unique worktrees, root-order-independent JSON, frozen zero history across three
+reads, correct Cargo recompilation advice, and independent interior pages.
+Default Builds JSON fell from 3.97MB to 181,408 bytes (30/679 units), with family
+totals unchanged. Observe with du took 5.18s under concurrent tests; reads took
+0.04–0.07s. Walked/attributed/du all matched 25,364,549,632 bytes.
+Recommendation was to retain the actively built target during this work, then
+review it or the narrower incremental caches; no deletion was done.
+
+Final routine caught a stored-fact contract regression: normalization relabelled
+a lone persisted Clone as Main. Restrict read-time repair to multiple mains;
+all four project_worktree_tables tests then passed without weakening assertions.
+Rerun routine and rebuild after that correction. Remaining estimate uncertainty,
+last-page truncation meaning, and current-use/rebuild availability are documented
+limitations, not claims of guaranteed savings or obsolescence.
+
+Final installed SHA256: 2cf5524e13faf07bfc16ec21e2b901435764d01aad171c537e400d1ef9037720
+at ~/.local/bin/swamp, matching target/release/swamp (optimized, version 0.6.3).
+McClintock rechecked this exact binary against its saved trial: projects,
+worktrees, reconciliation, builds and offset-page JSON match the successful
+trial byte-for-byte; frozen history and dependency advice still correct.
+First read 0.27s, subsequent reads 0.04–0.06s. No remaining scoped CLI blocker.
+Review route: Continue to exact-head native full/mutation CI, not publication.
+
+Final routine scripts/check.sh passed at 16:29:12, including formatting,
+Clippy, source audits, workspace tests, doc tests and named-target checks.
+Log: /tmp/swamp-loop-verified-routine.log. Optimized build log:
+/tmp/swamp-loop-verified-release.log. Native full CI is dispatched after push;
+its pending status is not replaced by the previous head's green results.

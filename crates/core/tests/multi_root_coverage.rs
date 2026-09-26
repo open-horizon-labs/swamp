@@ -372,6 +372,55 @@ fn excluded_subtree_inside_a_kept_root_is_pruned_not_measured() {
     );
 }
 
+/// A configured exclusion and an explicit root can name the same tree
+/// through different symlink spellings. The prune path must be translated
+/// back to the root spelling the walker traverses, or the excluded data is
+/// measured despite passing the root-level exclusion check.
+#[test]
+fn excluded_descendant_with_canonical_alias_is_not_measured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real_root = tmp.path().join("src-real");
+    fs::create_dir_all(&real_root).unwrap();
+    let alias_root = tmp.path().join("src-alias");
+    std::os::unix::fs::symlink(&real_root, &alias_root).unwrap();
+
+    make_project(&real_root, "kept", 4_000);
+    let excluded = make_project(&real_root, "excluded-me", 1_000_000);
+    let excluded_canonical = fs::canonicalize(&excluded).unwrap();
+    let store = tempfile::tempdir().unwrap();
+
+    let (first, coverage) = observe_scope(
+        store.path(),
+        std::slice::from_ref(&alias_root),
+        &[excluded_canonical.display().to_string()],
+    );
+    assert!(matches!(coverage[0].status, RegionStatus::Complete));
+    assert_eq!(first.projects.len(), 1);
+    assert_eq!(first.projects[0].name, "kept");
+    assert!(
+        first
+            .unowned
+            .iter()
+            .all(|u| !u.path_or_object.contains("excluded-me"))
+    );
+
+    // A full pass after a large change inside the excluded project must
+    // measure exactly the same bytes if the subtree was actually pruned.
+    fs::write(excluded.join("target/a.bin"), vec![3u8; 8_000_000]).unwrap();
+    let (second, coverage) = observe_scope(
+        store.path(),
+        std::slice::from_ref(&alias_root),
+        &[excluded_canonical.display().to_string()],
+    );
+    assert!(matches!(coverage[0].status, RegionStatus::Complete));
+    assert_eq!(second.projects.len(), 1);
+    assert_eq!(second.projects[0].name, "kept");
+    assert_eq!(
+        second.reconciliation.walked_total, first.reconciliation.walked_total,
+        "excluded descendant contents must not contribute to measured bytes"
+    );
+}
+
 /// An actual deletion (the project directory is genuinely removed, not
 /// just made unreadable) must still tombstone correctly and count real
 /// regrowth when it comes back -- the protection added for lost access

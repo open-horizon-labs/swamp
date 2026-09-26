@@ -7,7 +7,8 @@ Maven repository, a Gradle home, npm/pnpm stores, Go's module and build
 caches, pip/uv caches, DerivedData, CoreSimulator, the Android SDK,
 BuildKit's cache) -- and what removing a piece of it would cost.
 
-**The CLI is read-only.** The TUI supports exact-path Trash for identified
+**Report and Cargo inspection do not delete data.** Observation writes
+the report store. The TUI supports exact-path Trash for identified
 project-local outputs, test output and intermediates. Shared stores,
 installations and unknown layouts remain inspection-only. Cargo's
 fingerprint-aware purpose groups use their separate membership plan

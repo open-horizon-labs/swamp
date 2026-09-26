@@ -925,9 +925,15 @@ pub fn overlapping(a: &Path, b: &Path) -> bool {
 }
 
 fn is_excluded(path: &Path, excludes: &[PathBuf]) -> Option<PathBuf> {
+    if excludes.is_empty() {
+        return None;
+    }
+    // Compare explicit roots in the same namespace as agent/external
+    // exclusions: /var and /private/var must not bypass an exclusion.
+    let path = comparable(path);
     excludes
         .iter()
-        .find(|ex| path == ex.as_path() || path.starts_with(ex))
+        .find(|ex| under(&path, &comparable(ex)))
         .cloned()
 }
 
@@ -1079,12 +1085,26 @@ pub fn resolve_effective_scope(
     // Exclusion patterns that fall *inside* a kept root: exposed as
     // pruned subtrees for the future walker integration, per #41's
     // "exclusions prune matching subtrees".
-    for ex in &excludes {
-        for root in &kept {
-            if ex != root && ex.starts_with(root) {
+    if !excludes.is_empty() {
+        let comparable_roots: Vec<(&PathBuf, PathBuf)> =
+            kept.iter().map(|root| (root, comparable(root))).collect();
+        for ex in &excludes {
+            let comparable_ex = comparable(ex);
+            for (root, comparable_root) in &comparable_roots {
+                let Ok(relative) = comparable_ex.strip_prefix(comparable_root) else {
+                    continue;
+                };
+                if relative.as_os_str().is_empty() {
+                    continue;
+                }
+                // The walker receives paths in the spelling of its root. The
+                // exclusion may use another spelling of the same location (for
+                // example /private/var/... while the explicit root is /var/...);
+                // compare canonically, then translate the suffix back under the
+                // traversal root so the prune actually matches emitted paths.
                 pruned_subtrees.push(PruneNote {
-                    root: root.clone(),
-                    pattern: ex.display().to_string(),
+                    root: (*root).clone(),
+                    pattern: root.join(relative).display().to_string(),
                 });
             }
         }

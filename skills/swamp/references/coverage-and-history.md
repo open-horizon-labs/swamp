@@ -7,12 +7,12 @@ a single snapshot.
 
 ## `since` resolution
 
-Every command that reports growth resolves `since` in this order: the
+`observe` resolves `since` in this order: the
 explicit `--since` you passed, else `config.toml`'s configured
 `since`, else the hard-coded default (`24h`). `report --json`'s
 envelope always echoes the *effective* value back as `"since"` --
 never assume your raw argument is what was actually used; read the
-field.
+field. `report` has no `--since` flag and reads the stored comparison.
 
 ## History span vs. asked window
 
@@ -36,6 +36,11 @@ field.
   before quoting a growth figure to a human as if it covered the window
   they expect.
 
+History ends at the report's stored `observed_at`, not the current wall clock.
+Reading the same observation later does not create more history. Multi-root
+reports include per-root spans and use the shortest common measured span;
+a root with unavailable history makes common history unknown.
+
 A brand-new store's very first observation has `history_secs: 0` --
 this is correct, not a bug: there is nothing yet to diff against. A
 "no growth" result under these conditions describes an absence of
@@ -52,8 +57,8 @@ that is a defect to investigate, not an expected refresh artifact.
 This also covers *scope* changes: adding a root to `config.toml`'s
 `[scan]` table, a detector newly resolving a location, or excluding a
 path are changes in what swamp *looks at*, never a change in what
-exists on disk. `report`/`observe` persist the resolved scope
-(`scope.json` under `$SWAMP_DIR`) and print a one-line note on stderr
+exists on disk. `observe` persists the resolved scope under `$SWAMP_DIR`
+and prints a one-line note on stderr
 when it differs from the last one:
 
 ```
@@ -70,8 +75,17 @@ another command's idea of "the roots" without checking `swamp scope`.
 
 ## Multi-root observation and per-root coverage
 
-With no explicit root, `report`/`observe`/`ui` observe the *whole*
-resolved scope in one call, not just one root: `report --json` sums
+With no explicit roots, `observe` observes the whole configured scope;
+`report` reads its stored observation without scanning. For an ad-hoc
+multi-root scope, supply the same roots to both commands:
+
+```sh
+swamp observe /path/to/main /path/to/checkout --since 24h
+swamp report /path/to/main /path/to/checkout --view grown --json
+```
+
+A rootless report selects configured scope, not the last ad-hoc scope.
+`report --json` sums
 every present root's bytes into one report (order-independent, each
 root counted exactly once) and adds a `scope_coverage` array whenever
 any root is not simply, cleanly observed. Each entry:
@@ -95,7 +109,8 @@ non-`complete` row as "not fully known this pass", never as "gone".
 
 `--view reconciliation --json`: `{attributed, unowned, walked_total,
 du_total, docker_attributed, docker_unowned}`. `du_total` is `null`
-unless `--verify-du` (CLI-only; slow, runs a real `du -skPx`) was used.
+unless `observe --verify-du` (slow, runs a real `du -skPx`) was used.
+`report --verify-du` only displays the stored verification total.
 `walked_total` not matching `attributed + unowned` closely is itself
 useful evidence, not a failure to hide -- it usually means permission
 denials or an in-progress walk.

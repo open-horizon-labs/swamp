@@ -18,7 +18,12 @@ links -- never contents.
 
 ## Inspect
 
+These commands use configured scope; observe that same scope first.
+For an ad-hoc scope, pass the same explicit roots to observation and
+both reports instead. Agent units outside that scope are not included.
+
 ```sh
+swamp observe                                      # refresh configured scope
 swamp report --view agents --json                    # every identified unit
 swamp report --view agents --project my-repo --json  # narrowed to one project's linked units
 ```
