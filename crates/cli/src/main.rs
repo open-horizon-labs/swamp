@@ -253,7 +253,8 @@ enum Command {
         /// configured exclusions still apply.
         roots: Vec<PathBuf>,
         /// Skip the FSEvents-driven incremental attempt and force a full
-        /// walk (also re-anchors the stored event id for next time).
+        /// walk (on macOS, stages a pre-scan event anchor for the next run;
+        /// published only after the observation succeeds).
         #[arg(long)]
         full: bool,
         #[arg(long)]

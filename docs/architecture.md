@@ -1222,6 +1222,14 @@ The assembly gate waits for local signals, GitHub results, ecosystem tags, and D
 
 The walk stages its replay checkpoint. Observing runs publish it only after history and report-cache writes succeed. A later consumer or cache failure leaves the prior replay anchor in place so the next run can retry that interval. This ordering is not a transaction across the legacy history tables; already-written tables may need reconciliation after a failed run.
 
+On macOS, explicit `observe --full` obtains a cheap event-ID/device baseline
+before measurement, without replaying history or starting a replay stream.
+The walk and unit-family checkpoints publish their own baselines only after
+their measurement/persistence succeeds. An event after that baseline remains
+eligible for the next replay, including writes during the full scan. The replay
+lag floor still applies. Unsupported or live-only sources do not invent a
+persistent anchor; Linux retains its existing continuity contract.
+
 The bus uses a Tokio current-thread runtime and `join_all` for subscribers of one event. Follow-on events are dispatched depth-first in registration order. An `async` consumer is not automatically nonblocking: several call synchronous filesystem and subprocess code. Filesystem traversal and some enrichment work have their own concurrency. The bus's main benefit is explicit dependencies and separate stages, not a guarantee of parallel execution.
 
 See [ADR 001](ADRs/001-event-bus-report-pipeline.md) for the decision and [consumers](../crates/core/src/consumers/) for the stages.

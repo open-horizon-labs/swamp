@@ -765,11 +765,10 @@ fn a_failed_pass_does_not_advance_the_cursor() {
     assert_ne!(unit_cursor(&fx), anchored);
 }
 
-/// `--full` never touches the FSEvents source at all, for unit roots as
-/// for the walk: a forced full pass has promised not to pay for a
-/// replay, and "call it and discard the answer" is not that promise.
+/// `--full` never replays history. A source without pre-walk baseline
+/// support cannot manufacture a persistent anchor.
 #[test]
-fn a_forced_full_pass_asks_no_source_and_stores_no_cursor() {
+fn a_forced_full_pass_skips_replay_and_keeps_no_cursor_without_anchor_support() {
     let _serial = serial();
     let _floor = NoFloor::set();
     struct Exploding;

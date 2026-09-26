@@ -1883,6 +1883,9 @@ impl App {
         if removed.is_empty() {
             return;
         }
+        if let Some(estimate) = self.report.reconciliation.unique_estimate.as_mut() {
+            estimate.needs_reconciliation = true;
+        }
         let under = |p: &std::path::Path| removed.iter().any(|r| p == r || p.starts_with(r));
         // Companion paths are part of the exact group, not just the selected
         // executable. Suppress stale nested facts until the observer refreshes.
@@ -2995,6 +2998,102 @@ mod tests {
         }]);
         assert!(app.report.projects.is_empty());
         assert_eq!(app.selected, 0);
+    }
+
+    fn report_with_reconciled_unique_estimate() -> Report {
+        let mut report = fixture_report();
+        report.reconciliation.unique_estimate = Some(swamp_core::report::UniqueEstimate {
+            sharing: Some(expected_sharing_summary()),
+            bytes: 123_456,
+            reconciled_at: 987_654,
+            needs_reconciliation: false,
+        });
+        report
+    }
+
+    fn expected_sharing_summary() -> swamp_core::sharing::SharingSummary {
+        swamp_core::sharing::SharingSummary {
+            groups: vec![swamp_core::sharing::SharingGroup {
+                containers: vec![PathBuf::from("/fixture/a"), PathBuf::from("/fixture/b")],
+                bytes: 4096,
+                unresolved_links: false,
+            }],
+            omitted_groups: 2,
+            omitted_bytes: 8192,
+        }
+    }
+
+    fn synthetic_unit_result(path: &str, succeeded: bool) -> actions::UnitResult {
+        actions::UnitResult {
+            path: PathBuf::from(path),
+            outcome: if succeeded {
+                Ok(swamp_core::execution::Outcome {
+                    unit_id: "synthetic".into(),
+                    status: "ok".into(),
+                    reason: None,
+                    intended_bytes: 10,
+                    observed_free_space_delta: None,
+                })
+            } else {
+                Err("synthetic failure".into())
+            },
+        }
+    }
+
+    #[test]
+    fn successful_local_mutation_marks_unique_estimate_stale_without_changing_its_facts() {
+        let mut app = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+
+        app.prune_removed(&[synthetic_unit_result("/outside/scope/removed", true)]);
+
+        let estimate = app.report.reconciliation.unique_estimate.as_ref().unwrap();
+        assert!(estimate.needs_reconciliation);
+        assert_eq!(estimate.bytes, 123_456);
+        assert_eq!(estimate.reconciled_at, 987_654);
+        assert_eq!(estimate.sharing, Some(expected_sharing_summary()));
+    }
+
+    #[test]
+    fn failed_only_and_empty_local_mutations_leave_unique_estimate_current() {
+        let mut failed = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+        failed.prune_removed(&[synthetic_unit_result("/outside/scope/failed", false)]);
+        assert!(
+            !failed
+                .report
+                .reconciliation
+                .unique_estimate
+                .as_ref()
+                .unwrap()
+                .needs_reconciliation
+        );
+
+        let mut empty = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+        empty.prune_removed(&[]);
+        assert!(
+            !empty
+                .report
+                .reconciliation
+                .unique_estimate
+                .as_ref()
+                .unwrap()
+                .needs_reconciliation
+        );
+    }
+
+    #[test]
+    fn mixed_local_mutation_invalidates_estimate_when_any_unit_succeeded() {
+        let mut app = App::new(report_with_reconciled_unique_estimate(), "/root".into());
+
+        app.prune_removed(&[
+            synthetic_unit_result("/outside/scope/removed", true),
+            synthetic_unit_result("/outside/scope/refused", false),
+        ]);
+
+        let estimate = app.report.reconciliation.unique_estimate.as_ref().unwrap();
+        assert!(estimate.needs_reconciliation);
+        assert_eq!(estimate.bytes, 123_456);
+        assert_eq!(estimate.reconciled_at, 987_654);
+        assert_eq!(estimate.sharing, Some(expected_sharing_summary()));
     }
 
     #[test]

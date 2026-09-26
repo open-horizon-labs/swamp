@@ -263,3 +263,51 @@ completion is not inferred from this targeted pass. Human checkpoint remains
 whether real selected-row guidance is clear; reproduced freshness defects must
 be fixed before asking the owner to validate the UI. No release/tag/install or
 production repair was performed in this review-only step.
+
+## Execute — release-review P2 repairs and installed trial
+
+Owner authorized both P2 fixes, local installation, a subagent usage trial and
+native mutation CI. No release publication or real cleanup is authorized here.
+Success: successful local removal immediately invalidates reconciliation facts;
+failed-only/empty actions do not. macOS full observation leaves a pre-measurement
+baseline without replaying history, only after persistence succeeds. Unsupported
+platforms do not invent journal continuity. Install the optimized build, then
+test the public interface independently and report release gates honestly.
+
+Risk checklist: reject flagging only the next observer (immediate cleanup test),
+clearing useful last-measured facts (value/time/group retention assertions),
+invalidating failed-only actions (negative and mixed-result tests), capturing an
+end-of-walk cursor (anchor hook writes a fixture that the walk must measure),
+publishing on failure (dropped checkpoint), forcing expensive replay (source
+panics if replay is called), or advancing the wrong cursor (unit/walk separation).
+Existing unsupported-platform tests retain the no-persistent-history contract.
+
+Repairs: TUI invalidates the in-memory estimate after finding any successful
+outcome. FsEventsSource gains an optional cheap pre-full baseline hook; the
+macOS source queries current ID/device, while other sources default to none.
+Both walk and unit-family paths stage it before measurement. CLI help and
+architecture explain publication and platform limits. No new persistent fields,
+scanner, global refresh, cleanup policy or data model.
+
+Focused checks passed: two new full-anchor lifecycle tests, twelve unit-root
+cursor tests, and Sagan's 73 TUI library tests. Parent reviewed Sagan's one-file
+change; it preserves bytes/time/sharing and handles success/failure/mixed results.
+Routine gate, optimized installed usage and final native full CI follow; do not
+treat these focused results as a release sign-off.
+
+Routine `scripts/check.sh` passed at 15:27:25; log `/tmp/swamp-p2-routine.log`.
+Optimized build installed at ~/.local/bin/swamp with SHA256
+672e8cc18e770274b82a177071bcab300753cac12ba36c69d1ec3abb3a0475a8,
+matching target/release/swamp. Previous executable is recoverable at
+/tmp/swamp-pre-p2-install.LlgGUk/swamp. Version remains 0.6.3, a local development
+build, not a new published release.
+
+Installed real-source uv probe: full_forced 1,152ms followed, after the lag floor,
+by incremental/no-change 453ms, both 1,744,928,768 measured bytes. Separate
+temporary store /tmp/swamp-p2-anchor-probe.6KUaQO; no user data deletion.
+Logs `/tmp/swamp-p2-live-{full,incremental}.log`. This directly rejects the prior
+missing-anchor behavior; it is a single-machine observation, not a guarantee.
+Bohr has a separate public-CLI-only, no-deletion trial of actual Swamp checkouts.
+Final native full/mutation CI must use the repair commit; previous-head native
+passes are not a substitute. Release remains conditional on that gate and the
+installed-trial result; no tag or publication is authorized or performed.

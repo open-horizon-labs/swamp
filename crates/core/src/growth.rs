@@ -5103,9 +5103,8 @@ impl UnitRootReplay {
 /// Three things make the result safe to reuse a measurement on, and all
 /// three are here rather than in the caller:
 ///
-/// * `force_full` never touches the source at all, exactly as the walk's
-///   own path does not -- a forced full pass has promised not to pay for
-///   a replay, and "call it and discard the answer" is not that promise.
+/// * `force_full` never replays history. A supported source supplies only a
+///   cheap pre-measurement anchor, published after successful persistence.
 /// * The `TooSoon` floor applies unchanged: FSEvents' persisted log can
 ///   lag a write by longer than a whole second, so two passes in quick
 ///   succession get no window and honestly re-measure.
@@ -5136,6 +5135,19 @@ pub fn replay_unit_roots(
     if force_full {
         for r in roots {
             out.outcomes.push((r.clone(), "full_forced".to_string()));
+            let canonical = crate::fs_gate::canonicalize(r).unwrap_or_else(|_| r.clone());
+            if let Some((event_id, device)) = source.anchor_before_full(&canonical)
+                && event_id != 0
+            {
+                out.staged.push((
+                    volume_dir(swamp_dir, root_scoped_volume_id(&canonical)),
+                    UnitRootCursor {
+                        event_id: Some(event_id),
+                        device: Some(device),
+                        observed_at: Some(observed_at),
+                    },
+                ));
+            }
         }
         return out;
     }
@@ -5352,17 +5364,8 @@ pub fn stage_tracked_with_source(
     // FSEvents and persisted topology use the canonical root namespace.
     let prev_state = read_fsevents_state(&dir);
 
-    // `force_full` (`--full`, and every pre-#29 caller: `report_full`,
-    // `report_with*`, every test that predates this feature) must never
-    // touch the FSEvents source at all -- not the
-    // real one (this crate runs alongside dozens of other concurrent
-    // test/CLI processes on a shared machine, where `fseventsd` itself
-    // can become the bottleneck under combined load; a `source.replay`
-    // call that is merely slow under contention still burns wall time
-    // this path has promised never to pay), and not even a canned one in
-    // tests (there is nothing to answer). Skipping the call entirely,
-    // rather than calling it and discarding the answer, is what actually
-    // keeps this path load-free instead of just "load but ignore".
+    // Forced full measurements skip replay entirely. A supported source can
+    // supply a cheap event-ID baseline before the walk; no stream is opened.
     // Classification rules changed since the store was walked: rows that
     // no longer count (or newly count) as artifacts only get fixed by a
     // walk that visits them, so take the one full walk now.
@@ -5394,6 +5397,12 @@ pub fn stage_tracked_with_source(
     // "worktree confirmed gone" from "worktree access lost" (#42).
     let prev_topology_for_check = read_topology(&dir);
     if force_full || rules_changed {
+        // Capture BEFORE measurement. Querying after the walk could skip writes
+        // that occurred while a directory was being measured. Never replay here.
+        let anchor = observe
+            .then(|| source.anchor_before_full(&root))
+            .flatten()
+            .filter(|(event_id, _)| *event_id != 0);
         let reason = if force_full {
             "full_forced"
         } else {
@@ -5415,16 +5424,20 @@ pub fn stage_tracked_with_source(
             _lock: lock,
             topology: to_stored_worktrees(&result.discovered),
             unowned: result.attribution.unowned.clone(),
-            // The stored FSEvents id/device is deliberately left as-is: a
-            // forced full walk has nothing new to report there (no
-            // replay ran), and an older stored id just means the next
-            // real incremental attempt replays a larger, still-correct
-            // window rather than a wrong one. The rules version is
-            // stamped so the next call goes incremental again.
-            state: rules_changed.then(|| FsEventsState {
-                rules_version: crate::ecosystem::RULES_VERSION,
-                ..prev_state.clone()
-            }),
+            state: anchor
+                .map(|(event_id, device)| FsEventsState {
+                    event_id: Some(event_id),
+                    device: Some(device),
+                    last_observed_at: Some(observed_at),
+                    rules_version: crate::ecosystem::RULES_VERSION,
+                    unit_root: None,
+                })
+                .or_else(|| {
+                    rules_changed.then(|| FsEventsState {
+                        rules_version: crate::ecosystem::RULES_VERSION,
+                        ..prev_state.clone()
+                    })
+                }),
         });
         return Ok((result, checkpoint));
     }

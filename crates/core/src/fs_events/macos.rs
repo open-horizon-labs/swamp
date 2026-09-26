@@ -255,6 +255,14 @@ pub fn watch_pending(
 pub struct MacOsFsEventsSource;
 
 impl FsEventsSource for MacOsFsEventsSource {
+    fn anchor_before_full(&self, root: &Path) -> Option<(u64, u64)> {
+        // Capture before walking, never after: later events must remain replayable.
+        // SAFETY: a read-only query with no arguments.
+        let event_id = unsafe { fs::FSEventsGetCurrentEventId() };
+        let device = std::fs::metadata(root).ok()?.dev();
+        (event_id != 0).then_some((event_id, device))
+    }
+
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan {
         self.replay_roots(std::slice::from_ref(request))
             .pop()

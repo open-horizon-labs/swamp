@@ -384,6 +384,13 @@ impl FsEventsPlan {
 pub trait FsEventsSource: Send + Sync {
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan;
 
+    /// Cheap pre-walk baseline, without replaying history. Returns
+    /// (event ID, device). Persist only after the full measurement succeeds.
+    /// Unsupported/live-only sources have no persistent baseline to offer.
+    fn anchor_before_full(&self, _root: &Path) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Replays several roots in one go, returning one plan per request
     /// in the same order.
     ///
