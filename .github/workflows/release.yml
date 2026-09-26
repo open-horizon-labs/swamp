@@ -336,10 +336,11 @@ jobs:
             echo
             echo "### Install (Linux x86_64, glibc; built and tested on Ubuntu 24.04)"
             echo '```bash'
-            echo 'curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz'
-            echo 'curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256'
+            echo 'curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz'
+            echo 'curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256'
             echo 'sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256'
             echo 'tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz'
+            echo 'mkdir -p ~/.local/bin'
             echo 'install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/'
             echo '```'
             echo 'Versioned archives for both targets are also attached below.'

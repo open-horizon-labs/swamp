@@ -4,7 +4,7 @@ For the product overview, start with the [README](../README.md). For which
 platform can do what, and where swamp keeps its files on each, see the
 [platform guide](platform.md). The one real difference between the two:
 macOS keeps a change history swamp replays, so an observation there is
-small whenever nothing much changed; Linux keeps none, so an observation
+able to reuse unchanged measurements when event coverage is valid; Linux keeps none, so an observation
 walks fully unless a live watch (the TUI, or the opt-in `swamp collect`)
 has been running since the last one -- and swamp says which it did.
 
@@ -34,10 +34,11 @@ checksum, verify, and install the binary (and, if you use an agent, the
 skill):
 
 ```bash
-curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
 sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
 tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz
+mkdir -p ~/.local/bin
 install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/
 swamp --version
 ```
@@ -66,8 +67,9 @@ observed project roots, external units, and agent units. It counts a shared
 device/inode once, respects exclusions, and does not follow symlinks. This
 extra traversal is explicit, never part of an ordinary incremental refresh.
 
-Only the resulting byte total and reconciliation timestamp are stored, in the
-existing Parquet run row. No inode inventory is retained. Later observations
+The resulting byte total and reconciliation timestamp are stored in the
+existing Parquet run row, alongside bounded container-sharing summaries in the
+store. No inode inventory is retained. Later observations
 keep that last result with `needs_reconciliation: true`; an incomplete full
 observation cannot certify it as current. Before the first reconciliation the
 JSON value is `null`, not zero. The estimate covers the observed paths: known
@@ -912,8 +914,20 @@ as an installable agent skill. Use absolute root paths in commands.
 
 ### Installing the skill
 
-Copy or symlink the skill directory into your agent client's skills
-location, without editing any other client configuration:
+Install with the [skills package](https://github.com/vercel-labs/skills):
+
+```bash
+npx skills add open-horizon-labs/swamp --skill swamp
+```
+
+Choose your agent in the installer. Installation is project-local by default;
+add `--global` to make the skill available across projects. The package discovers
+`skills/swamp/SKILL.md` and includes its references. This installs instructions,
+not the binary: the skill's [installation reference](../skills/swamp/references/install.md)
+explains platform detection, binary installation, and PATH verification.
+
+Without Node/npm, copy or symlink the complete skill directory into your
+agent client's skills location:
 
 ```bash
 # Claude Code project-scoped skill, from a checkout of this repo:

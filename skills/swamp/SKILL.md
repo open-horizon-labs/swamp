@@ -23,6 +23,13 @@ the Trash) or a human running a shell command themselves. There is no
 `propose`/`approve`/`execute`/`grant` command any more; do not invent
 one.
 
+## Binary setup
+
+Check `command -v swamp` and `swamp --version` before using it. If it is
+missing or the user wants to install/update it, read `references/install.md`
+for platform detection, Homebrew or checksum-verified release installation,
+and PATH verification. Installing this skill does not install the binary.
+
 ## Inspect first, always
 
 Start with inspection. Observation writes the report store, not cleanup:
@@ -108,6 +115,7 @@ enough for read-only investigation.
 
 | Reference | Load it for | Measured size (`wc -c`) |
 |---|---|---|
+| `references/install.md` | Install or update the platform-appropriate binary; verify version and PATH | See file |
 | `references/commands-and-json.md` | Full command/flag/JSON-schema reference including `swamp scope`, the historical MCP-tool-to-CLI-command mapping, exit codes | 11.4 KB |
 | `references/cleanup-and-recovery.md` | Where a TUI Trash move went (ledger, envelope/`restore.json`) and how to restore it -- no CLI command deletes anything | 5.1 KB |
 | `references/trust-model.md` | Report reads, observation/state writes, and the separate TUI removal flow | 4.6 KB |

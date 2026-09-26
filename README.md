@@ -2,76 +2,53 @@
 
 Disk growth, by project.
 
-Swamp keeps a history of disk usage across your Git projects. It groups checkouts, linked worktrees, build output, dependencies, and Docker objects so you can trace a change in disk space back to the project and artifact that grew. Git status and pull-request information give you context before you remove anything.
+Coding agents can fill a disk with worktrees, builds, dependencies, and session data before you notice. Swamp helps you answer three questions: **what grew, which project owns it, and what would removing it cost?**
 
-It is built for developers working across several projects and branches, including people running coding agents that build and install dependencies throughout the day.
+It groups separate clones and linked worktrees by Git remote, keeps observation history, and explains development-specific storage. You can inspect a project's compiler caches and test builds without treating its source files the same way.
 
-## Start with what changed
+## Start with the decision
 
-A large directory may have been large for months. When your disk fills up this afternoon, the useful question is what grew since this morning.
+A large directory may have been large for months. Swamp shows size alongside growth so you can find what changed, open the affected project, and inspect the responsible checkout, worktree, or artifact.
 
-Swamp records observations and compares sizes over a chosen window. Open a project to see which checkout or worktree changed, then inspect its build output, dependencies, caches, and remaining files. Separate clones with the same normalized Git remote appear under one project.
+Build details group things by their use and removal consequences:
 
-For example, a project might contain this mix of storage. This is an illustration of the model, not captured output:
+- **Compiler caches:** a place to start if you accept a slower next build.
+- **Compiled tests and examples:** rebuild before running them again.
+- **Build-script output:** scripts run again; their tools and inputs may be needed.
+- **Dependencies and shared stores:** distinguish project-local output from storage used by other projects.
 
-```text
-acme/api
-├─ main checkout
-│  ├─ target/          build output
-│  ├─ .git/            repository data
-│  └─ remaining files tracked, ignored, or untracked
-├─ feature worktree
-│  ├─ target/          its own build output and growth
-│  └─ remaining files
-└─ Docker objects     joined through labels or a matching source remote
-```
+Age helps prioritize review. It does not prove that a build is obsolete. Allocated bytes do not promise how much space deletion will free.
 
-The same model supports questions at different levels:
-
-- Which project grew in the last day?
-- Is the growth in a worktree's build output, its dependencies, or its other files?
-- Which worktrees have merged branches, no unpushed commits, and no recent activity?
-- Did an artifact reappear after being removed?
-
-History begins with the first observation. Swamp records sizes and metadata; it does not back up file contents or identify the process that wrote them.
-
-## Platforms
-
-macOS on Apple silicon (`aarch64-apple-darwin`) and Linux on x86_64
-(`x86_64-unknown-linux-gnu`, validated on Ubuntu 24.04). CI builds and runs the
-whole test suite natively on both on every push.
-
-On Linux, a release archive is published alongside the macOS one (glibc,
-generic x86-64, built on Ubuntu 24.04). Linux has no persisted change history,
-so an observation there walks fully unless a live watch -- the TUI, or the
-opt-in `swamp collect` -- has been running since the last one; scheduling uses
-`systemd --user`, and Trash is the freedesktop one your file manager shows. The
-[platform guide](docs/platform.md) has the whole table and the reasons.
+Storage outside a checkout matters too. Swamp discovers developer-tool homes and agent storage, including Claude Code, Codex, Oh My Pi, and OpenCode. Where evidence supports it, these units link back to projects. Missing or ambiguous ownership stays visible rather than becoming a guessed assignment. See the checked [agent-storage](docs/agent-storage.md) and [build-artifact](docs/build-artifacts.md) coverage tables.
 
 ## Install
 
-On Apple silicon macOS, install with [Homebrew](https://brew.sh):
+On Apple silicon macOS:
 
 ```bash
 brew install open-horizon-labs/tap/swamp
 swamp --version
 ```
 
-Update with `brew upgrade swamp`. See the [installation guide](docs/usage.md#installing-a-release) if you previously installed manually.
+Update with `brew upgrade swamp`. If you have a manual installation too, check `type -a swamp` to see which copy runs.
 
-On Linux x86_64, install the release archive after checking its checksum:
+On Linux x86_64, download and verify the latest release:
 
 ```bash
-curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
-sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-x86_64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c swamp-x86_64-unknown-linux-gnu.tar.gz.sha256 &&
+tar -xzf swamp-x86_64-unknown-linux-gnu.tar.gz &&
+mkdir -p ~/.local/bin &&
 install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/
+~/.local/bin/swamp --version
 ```
+
+Linux releases target generic x86-64 with glibc, built on Ubuntu 24.04. See [platform requirements](docs/platform.md#release-archives-and-what-they-require) and the [installation guide](docs/usage.md#installing-a-release).
 
 ### Build from source
 
-Build the current `swamp` version from source with a recent stable Rust toolchain:
+Use the repository's pinned Rust toolchain:
 
 ```bash
 git clone https://github.com/open-horizon-labs/swamp
@@ -84,60 +61,78 @@ install -m 755 target/release/swamp ~/.local/bin/
 
 ## Use it
 
-```bash
-swamp ui ~/src
-swamp observe ~/src --since 24h
-swamp report ~/src --project api
-```
-
-In the terminal UI, use the arrow keys to navigate and open a project. `/` opens the filter form; `0` clears the filter. The initial filter is `growth > 100MB in 7d`, so clear it if you want to see projects that have not grown. Filter and sort choices are saved between sessions.
-
-To collect history while the UI is closed:
+Check the scope first, then collect an observation and open the UI:
 
 ```bash
-swamp schedule --every 15m ~/src
+swamp scope
+swamp observe --since 24h
+swamp ui
 ```
 
-This installs a per-user LaunchAgent (macOS) or `systemd --user` timer (Linux; add `--collector` to keep a live change list between runs) that observes the root and refreshes GitHub information through `gh` when available. It performs no cleanup. `swamp schedule` shows its status; `swamp schedule --off` removes it.
+Without explicit roots, Swamp uses built-in locations, enabled tool-location detectors, and your configured additions and exclusions. Homebrew discovery is opt-in. `swamp scope` explains what is included, missing, excluded, or disabled; [scope configuration](docs/usage.md#scope-and-coverage) controls it.
 
-Every root above is explicit. Omit it and `report`/`observe`/`ui`/`schedule` resolve swamp's **effective scope** instead: built-in roots (`~/src`, `~/Library/Developer`, `~/Library/Caches`), plus detected developer-tool locations (Cargo, rustup, Homebrew, and more), plus anything you add or exclude in `config.toml`. Run `swamp scope` to see exactly what's in scope, why, and what's missing or excluded -- see [Scope and coverage](docs/usage.md#scope-and-coverage).
+To work with a specific set of directories, pass the same roots to observation and reporting:
 
-## Decide with context
+```bash
+swamp observe ~/src ~/work --since 24h
+swamp report ~/src ~/work --view grown --json
+swamp ui ~/src ~/work
+```
 
-Swamp shows artifact types, Git tracking status, dirty files, unpushed commits, worktree activity, and cached GitHub PR and merge information. An ignored file may hold private data. A tracked file may have uncommitted edits. Neither label establishes that a copy exists elsewhere.
+In the UI, arrow keys navigate and open projects. Press `0` to clear the initial `growth > 100MB in 7d` filter and see projects that have not grown. Saved filter and sort choices take precedence on later runs.
 
-Space marks rows in the UI. Backspace opens a confirmation for the selected row or marked set; Enter confirms. Read the paths and warnings: whole checkouts and linked worktrees can also be selected. Project-level actions expand into artifact rows, with a checkout fallback when no actionable artifacts exist. Bulk marking with `A` does not take that checkout fallback.
+History starts with your first observation. To collect it while the UI is closed:
 
-Filesystem removals move paths to Trash. Docker images and volumes are removed through Docker and have no Trash recovery; swamp does not make a backup. Build-cache entries are reported but cannot be removed individually through swamp. Moving files to Trash does not itself reclaim their disk space.
+```bash
+swamp schedule --every 15m
+```
 
-Swamp reports; the human removes. There is no CLI command for propose/approve/execute/grant any more -- the TUI's Space/Backspace/Enter is the only removal path, and there is no re-check between marking a row and pressing Enter. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery) for where a Trash move went and how to get it back.
+This uses a per-user LaunchAgent on macOS or a systemd user timer on Linux. It observes storage and can refresh GitHub context; it does not clean anything. On Linux, `--collector` also enables continuous change tracking between scheduled observations. `swamp schedule` shows status; `swamp schedule --off` removes the schedule.
+
+## Review before removing
+
+Git status, unpushed commits, cached PR information, modification age, and removal consequences sit alongside usage. These are evidence for a decision, not a universal “safe to delete” verdict.
+
+Space marks supported rows in the TUI. Backspace opens confirmation; Enter confirms. A build profile selects its supported cleanup groups, not the entire profile directory. Other views can select whole checkouts or worktrees: read the actual paths and warnings.
+
+Filesystem removals move paths to Trash. **Space is not reclaimed until Trash is emptied.** Docker image and volume removals use the daemon and are not recoverable through Trash. Shared stores and unsupported units remain inspection-only. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery).
+
+There is no CLI deletion command or MCP server. Cleanup is a human-confirmed TUI action; it does not re-check every fact between marking and confirmation.
 
 ## Use it from an agent
 
-There is no separate server process, and no CLI command that deletes anything. `swamp observe` is the only command that scans; `swamp report --json` and `--view <name> --json` are a pure read of what it last wrote, printing one bounded JSON document to stdout with diagnostics on stderr -- safe for an agent to call directly and parse:
+The CLI and [installable skill](skills/swamp/SKILL.md) let an agent gather evidence and recommend cleanup without loading a separate tool server.
 
 ```bash
-swamp observe ~/src --since 24h
-swamp report ~/src --view grown --json
+npx skills add open-horizon-labs/swamp --skill swamp
 ```
 
-Install the skill at `skills/swamp/` into your agent client's skills directory (copy or symlink it; see [installing the skill](docs/usage.md#agent-interface)) so the agent knows the exact commands and JSON schema. The skill and the CLI are entirely read-only: an agent can gather evidence and explain what removing something would cost, but there is no command left for it (or anyone) to run that would delete anything -- only a human, in the TUI or at a shell, does that. See [the trust model](skills/swamp/references/trust-model.md).
+Choose your agent; add `--global` for use across projects. This installs the skill,
+not the executable. Its [installation reference](skills/swamp/references/install.md)
+helps the agent install the right binary for macOS or Linux when needed.
+
+```bash
+swamp observe --since 24h
+swamp report --view grown --json
+```
+
+`observe` scans and writes the store. `report` reads stored observations without recursively walking directories or launching subprocesses. JSON views expose pagination and coverage; bounded build-unit pages retain full family summaries. `inspect-cargo` provides separate, on-demand inspection when you need more detail about an existing Cargo profile.
+
+The whole CLI is not read-only: observation, scheduling, configuration, and protection commands change their respective state. It has no command that deletes the reported storage. See the [agent interface](docs/usage.md#agent-interface) and [trust model](skills/swamp/references/trust-model.md).
 
 ## How updates stay small
 
-After the initial walk, swamp asks the platform what changed and reuses the stored measurements elsewhere. It retains directory detail inside grouped artifacts so a small change can often be measured without walking the whole artifact again. Hardlinks and incomplete event history require broader walks.
+Swamp folds large artifacts into directory summaries instead of keeping a permanent row for every file. After the initial walk, filesystem events identify changed containers; unchanged measurements are reused. History stores previous values as reverse deltas in compressed Parquet.
 
-On macOS that question is answered by FSEvents, which replays a log the kernel kept while swamp was not running. Linux has no equivalent: inotify reports only what happens while a watch is open, so an observation there walks fully and reports `reason=no_persisted_change_history` rather than treating an unwatched period as a quiet one. [#81](https://github.com/open-horizon-labs/swamp/issues/81) adds a live watcher, which narrows that gap for a running swamp and does not close it. See [Platforms](docs/platform.md).
+macOS FSEvents can replay changes while Swamp was closed. Linux inotify requires a live TUI watch or collector; an uncovered interval or lost events triggers a full walk. Ordinary refreshes do not revisit every root to deduplicate hardlinks. They retain the last unique-byte estimate, explicitly marked for reconciliation; `swamp observe --full` refreshes it.
 
-The history store uses zstd-compressed Parquet, directory summaries, selected large-file rows, and reverse deltas containing previous values. These choices reduce repeated traversal and history storage. Actual work depends on the changed directories, hardlinks, and enrichment caches; the repository does not establish a general latency or storage-size guarantee.
-
-The [architecture guide](docs/architecture.md) explains observation, history, enrichment, the project model, and extension points.
+These choices make repeated observation practical without promising a fixed latency or a forensic inventory. The [architecture guide](docs/architecture.md) explains the storage model, adapter boundaries, enrichment, and remaining costs.
 
 ## Documentation
 
-- [Usage](docs/usage.md): installation, keys, commands, filters, configuration, the agent interface, and recovery.
-- [Platforms](docs/platform.md): supported targets, what each platform can and cannot do, where swamp keeps its files on each, and the library reuse decisions behind that.
-- [Architecture](docs/architecture.md): data flow, incremental updates, storage, and implementation limits.
-- [Contributing](CONTRIBUTING.md): code map, checks, and documentation maintenance.
-- [Changelog](CHANGELOG.md): behavior introduced in each release.
-- [Product](PRODUCT.md) and [terminal design](DESIGN.md): the current product and UI contracts.
+- [Usage](docs/usage.md): commands, keys, configuration, build details, and recovery.
+- [Architecture](docs/architecture.md): observation, folded measurement, history, and extension contracts.
+- [Platforms](docs/platform.md): macOS and Linux support and limitations.
+- [Build artifacts](docs/build-artifacts.md) and [agent storage](docs/agent-storage.md): checked adapter coverage.
+- [Changelog](CHANGELOG.md): release changes.
+- [Product](PRODUCT.md), [terminal design](DESIGN.md), and [contributing](CONTRIBUTING.md): intent and development contracts.

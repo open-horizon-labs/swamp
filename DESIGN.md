@@ -51,9 +51,10 @@ modification; the adapter's own consequence, the accounting basis and
 "inspection only" are the row's details. That order is the point: an 80-column
 advice column shows the guidance whole and gives up the numbers first. An opened
 group lists its members oldest first (unknown ages last), each leading with its
-consequence in that ecosystem's words. None of these rows is selectable -- Space
-is refused as inspection-only -- because no neutral-vocabulary adapter has an
-action. Which presentation a container gets follows the roles its units carry,
+consequence in that ecosystem's words. Supported project-local output units can
+be selected for Trash; shared stores and unsupported units remain inspection-only.
+Action support comes from the adapter contract, not the role label alone. Which
+presentation a container gets follows the roles its units carry,
 never a comparison with an adapter id; Cargo containers keep the purpose groups
 above.
 
