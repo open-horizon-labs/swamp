@@ -61,6 +61,7 @@ for t in \
   core/tests/nested_artifact_evidence_is_delivered \
   core/tests/upstream_citations_are_checked \
   core/tests/shared_history_ownership \
+  core/tests/scope_unique_accounting \
   core/tests/store_contents_are_allowlisted \
   core/tests/incremental_external_and_agent_measurement \
   core/tests/agent_matrix_matches_docs \

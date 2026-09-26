@@ -56,13 +56,12 @@ pub struct MatrixEntry {
     /// The granularity at which an operation could ever be offered --
     /// separate from whether one is offered, which is `actions` below.
     pub operation_granularity: &'static str,
-    /// Always `"inspection only"` in this chunk. #73 implements adapter
-    /// actions; until then any other value would be a promise with no
-    /// executor.
+    /// Supported operation and its limits; identification alone is not an action.
     pub actions: &'static str,
 }
 
 const INSPECTION_ONLY: &str = "inspection only";
+const PROJECT_TRASH: &str = "TUI Trash for project-local outputs, test output and intermediates; shared stores and installations inspection only";
 
 pub const MATRIX: &[MatrixEntry] = &[
     MatrixEntry {
@@ -86,11 +85,11 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         attribution_limits: &[
             "Cargo's intermediate layout is an implementation detail and version-dependent",
-            "per-crate dependency sizing is not attempted (#107)",
+            "ordinary scans fold dependencies; explicit inspect-cargo reports evidenced targets/variants, not inferred package identities",
             "a command-line --target-dir override is invisible to an observer",
         ],
         operation_granularity: "profile directory, or one target's executable plus its fingerprint",
-        actions: INSPECTION_ONLY,
+        actions: "TUI Cargo cleanup groups with fingerprint-aware membership",
     },
     MatrixEntry {
         id: "node",
@@ -124,7 +123,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "no build generation is inferred -- npm records none",
         ],
         operation_granularity: "one output directory, one cache directory, or one installed tree",
-        actions: INSPECTION_ONLY,
+        actions: PROJECT_TRASH,
     },
     MatrixEntry {
         id: "gradle",
@@ -155,7 +154,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "which project last wrote a shared cache entry is not recorded on disk",
         ],
         operation_granularity: "one project build directory, or one cache category directory",
-        actions: INSPECTION_ONLY,
+        actions: PROJECT_TRASH,
     },
     MatrixEntry {
         id: "maven",
@@ -186,7 +185,7 @@ pub const MATRIX: &[MatrixEntry] = &[
              unidentified residual",
         ],
         operation_granularity: "one project target directory, or one repository artifact version",
-        actions: INSPECTION_ONLY,
+        actions: PROJECT_TRASH,
     },
     MatrixEntry {
         id: "android",
@@ -220,7 +219,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         operation_granularity: "one module build directory, one native variant/ABI, one SDK \
                                 package, or one AVD",
-        actions: INSPECTION_ONLY,
+        actions: PROJECT_TRASH,
     },
     MatrixEntry {
         id: "python",
@@ -261,7 +260,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         operation_granularity: "one output or cache directory, one distribution file, one \
                                 environment, or one cache bucket",
-        actions: INSPECTION_ONLY,
+        actions: PROJECT_TRASH,
     },
     MatrixEntry {
         id: "go",
@@ -293,7 +292,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         operation_granularity: "one output directory or binary, one module version, one \
                                 build-cache bucket",
-        actions: INSPECTION_ONLY,
+        actions: PROJECT_TRASH,
     },
     MatrixEntry {
         id: "xcode-swift",
@@ -331,7 +330,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         operation_granularity: "one DerivedData project folder, one products configuration, \
                                 one archive, one runtime, or one simulator device",
-        actions: INSPECTION_ONLY,
+        actions: PROJECT_TRASH,
     },
     MatrixEntry {
         id: "docker-buildkit",
@@ -383,13 +382,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_row_claims_an_action() {
+    fn action_matrix_matches_adapter_contracts() {
+        let registry = crate::build_adapters::registry::Registry::with_builtins();
         for e in MATRIX {
             assert_eq!(
-                e.actions, INSPECTION_ONLY,
-                "{} claims `{}`: no build adapter implements an action, so any other value is a \
-                 promise with no executor (#73 is where actions land)",
-                e.id, e.actions
+                e.actions == PROJECT_TRASH,
+                registry
+                    .get(e.id)
+                    .is_some_and(|a| !a.trash_roles().is_empty()),
+                "{} action documentation differs from its contract",
+                e.id
             );
         }
     }

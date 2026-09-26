@@ -90,7 +90,10 @@ fn human_duration(secs: u64) -> String {
 }
 
 fn header_line(app: &App, width: usize) -> String {
-    let stale = app
+    let stale = app.report.unowned.iter().any(|u| {
+        u.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }) || app
         .report
         .projects
         .iter()
@@ -147,12 +150,35 @@ fn header_line(app: &App, width: usize) -> String {
     // Clauses in priority order; the renderer drops trailing clauses that
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
-        if stale {
+        if stale
+            || app
+                .report
+                .reconciliation
+                .unique_estimate
+                .as_ref()
+                .is_some_and(|u| u.needs_reconciliation)
+        {
             format!("unique totals not recomputed · {}", app.root.display())
         } else {
             app.root.display().to_string()
         },
         format!("{obs}{since}"),
+        app.report
+            .reconciliation
+            .unique_estimate
+            .as_ref()
+            .map(|u| {
+                format!(
+                    "{} unique{}",
+                    human_bytes(u.bytes),
+                    if u.needs_reconciliation {
+                        " (needs reconciliation)"
+                    } else {
+                        " (reconciled)"
+                    }
+                )
+            })
+            .unwrap_or_default(),
         format!("{projects} projects"),
         format!("{} attributed", human_bytes(attributed)),
         format!("{} unowned", human_bytes(unowned)),
@@ -300,6 +326,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if let Some(p) = &app.picker {
         draw_picker(frame, app, p, size);
+    }
+    if let Some(lines) = &app.cargo_inspection {
+        let popup = Rect {
+            x: size.x + 1,
+            y: size.y + 1,
+            width: size.width.saturating_sub(2),
+            height: size.height.saturating_sub(2),
+        };
+        frame.render_widget(Clear, popup);
+        let visible: Vec<Line> = lines
+            .iter()
+            .skip(app.cargo_inspection_scroll as usize)
+            .take(popup.height.saturating_sub(2) as usize)
+            .map(|s| Line::from(s.as_str()))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(
+                " Cargo dependency inspection · ↑↓ scroll · Esc close · no cleanup action ",
+            )),
+            popup,
+        );
     }
 }
 
@@ -673,7 +720,23 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     // Keep the selection visible even in projects with hundreds of build groups.
     let selected_evidence_lines: Vec<String> = rows
         .get(app.selected)
-        .map(|r| ordered_evidence_lines(&r.evidence))
+        .map(|r| {
+            let path = r
+                .unit
+                .as_ref()
+                .map(|u| std::path::Path::new(&u.0))
+                .or_else(|| r.worktree.as_ref().map(|w| w.path.as_path()));
+            let mut lines = if let Some(path) = path {
+                swamp_core::render::render_sharing_lines(
+                    app.report.reconciliation.unique_estimate.as_ref(),
+                    Some(path),
+                )
+            } else {
+                Vec::new()
+            };
+            lines.extend(ordered_evidence_lines(&r.evidence));
+            lines
+        })
         .unwrap_or_default();
     let base_detail = if cleanup_view { 3 } else { 2 };
     // Each evidence line can itself wrap to several physical rows at a
@@ -849,15 +912,14 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from(
             "  v, 1-9    switch view (projects · tree · builds · deps · docker · kinds · unowned ·",
         ),
-        Line::from(
-            "            types · external); v also reaches agents (read-only, no digit: 0 is clear filter)",
-        ),
+        Line::from("            types · external); v also reaches agents (0 is clear filter)"),
         Line::from(
             "  g/s/n/t/a sort by growth / size / name / type / age · r reverses (remembered)",
         ),
         Line::from(
             "  k         keep executables: copy target/{release,debug} binaries, dist/*.whl to bin/ before trashing",
         ),
+        Line::from("  i         inspect selected Cargo profile dependencies (on demand)"),
         Line::from("  ?         toggle this help"),
         Line::from("  q         quit"),
         Line::from(""),

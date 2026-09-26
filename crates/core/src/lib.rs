@@ -70,6 +70,7 @@ pub mod report;
 pub mod scan;
 pub mod schedule;
 pub mod scope;
+pub mod sharing;
 pub mod signals;
 pub mod store;
 pub mod systemd_user;

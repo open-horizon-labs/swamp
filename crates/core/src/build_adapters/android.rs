@@ -39,6 +39,13 @@ pub struct Adapter;
 const BUILD_TYPES: &[&str] = &["debug", "release", "benchmark", "profile", "staging"];
 
 impl BuildAdapter for Adapter {
+    fn trash_roles(&self) -> &'static [ArtifactRole] {
+        &[
+            ArtifactRole::Output,
+            ArtifactRole::TestOutput,
+            ArtifactRole::Intermediate,
+        ]
+    }
     fn id(&self) -> &'static str {
         "android"
     }
@@ -51,7 +58,7 @@ impl BuildAdapter for Adapter {
         BuildCapabilities {
             identifies_shared_stores: true,
             attributes_package_identity: false,
-            actions_available: false,
+            actions_available: true,
         }
     }
 

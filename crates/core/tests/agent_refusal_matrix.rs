@@ -88,6 +88,38 @@ fn touch(path: &Path, content: &[u8]) {
     fs::write(path, content).unwrap();
 }
 
+#[test]
+fn trash_capability_does_not_promise_history_or_logs_regenerate() {
+    for (category, expected) in [
+        (AgentCategory::LocalHistory, "loses past command recall"),
+        (AgentCategory::Logs, "loses past diagnostic logs"),
+        (AgentCategory::Caches, "may require rerunning"),
+    ] {
+        let unit = synthetic_unit(
+            "github-copilot-cli",
+            "Copilot",
+            category,
+            AgentActionCapability::CacheOrLogTrash,
+            false,
+            None,
+            PathBuf::from("/fixture/tool/removable"),
+            vec![],
+        );
+        let plan = actions::propose_agents(&[unit], &[], "test").unwrap();
+        assert_eq!(plan.len(), 1, "history remains removable by user choice");
+        assert!(plan[0].recovery().contains(expected), "{:?}", plan[0]);
+        assert!(plan[0].warnings().iter().any(|s| s.contains(expected)));
+        assert!(!plan[0].recovery().contains("local_rebuild"));
+        assert!(
+            !plan[0]
+                .warnings()
+                .iter()
+                .any(|s| s.contains("regenerated automatically"))
+        );
+        assert_eq!(AgentCategory::from_label(category.label()), Some(category));
+    }
+}
+
 /// Row 1: every named tool's `ProtectedConfig`-category unit refuses at
 /// proposal time -- the category-default protection #91 requires
 /// (`AgentCategory::default_protected`), never bypassable by a bare

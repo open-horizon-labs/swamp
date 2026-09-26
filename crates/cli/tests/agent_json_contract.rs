@@ -225,6 +225,8 @@ fn rust_json_view_is_filtered_to_the_requested_project() {
 
     let node_project = make_checkout(root.path(), "other", 4096);
     fs::write(node_project.join("package.json"), b"{\"name\":\"other\"}\n").unwrap();
+    let nested = make_checkout(&rust_project, "inner", 4096);
+    fs::write(nested.join("package.json"), b"{\"name\":\"inner\"}\n").unwrap();
     let store = tempfile::tempdir().unwrap();
     observe(store.path(), root.path(), &[]);
 
@@ -264,6 +266,18 @@ fn rust_json_view_is_filtered_to_the_requested_project() {
     let rows = filtered["result"]
         .as_array()
         .expect("filtered Rust result array");
+    assert!(
+        all_rows.iter().any(|r| r["path"]
+            .as_str()
+            .is_some_and(|p| p.contains("/inner/node_modules"))),
+        "nested fixture was not identified"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r["path"].as_str().is_some_and(|p| p.contains("/inner/"))),
+        "nested checkout was attributed to its enclosing repo"
+    );
     assert!(
         !rows.is_empty(),
         "Cargo project should have nested rows: {filtered:#}"

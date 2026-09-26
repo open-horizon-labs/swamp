@@ -1216,6 +1216,7 @@ mod tests {
             projects,
             unowned: Vec::new(),
             reconciliation: crate::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

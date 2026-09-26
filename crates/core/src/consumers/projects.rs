@@ -131,6 +131,7 @@ impl Consumer for ProjectsConsumer {
             }
         }
         let reconciliation = Reconciliation {
+            unique_estimate: None,
             attributed: attribution.attributed_total,
             unowned: attribution.unowned_total,
             walked_total: attribution.walked_total,

@@ -11,17 +11,9 @@
 //! comment for the full item-by-item citation, including the correction
 //! of #97's own issue-text guess (`history-session-state/`) to the real
 //! `session-state/`/`command-history-state/` names.
-//!
-//! `session-state/`'s own interior schema (what exactly each session
-//! artifact directory contains) is not documented on that reference page
-//! beyond "session history and workspace artifacts"; this adapter folds
-//! each immediate child of `session-state/` into one `Sessions` unit and
-//! attempts a bounded, small-JSON-file scan for a `cwd`/`workspace`
-//! field for project linkage, honestly reporting `Unresolved` when
-//! nothing is found rather than guessing a schema this chunk could not
-//! confirm. That scan is a capped, cached header read
-//! (`IdentifyCtx::derived`), so an unchanged session home costs zero
-//! header bytes on a second pass.
+//! Session linkage reads only the bounded, cached `workspace.yaml` metadata.
+//! Transcript bodies and arbitrary adjacent JSON files are never searched.
+//! Exact session directories can be removed independently of project linkage.
 
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
@@ -181,43 +173,34 @@ fn protected_unit(
         .protect(note)
 }
 
-/// Bounded small-JSON scan of `dir` (not recursive beyond one level) for
-/// a `cwd`/`workspace`/`workspaceFolder` string field. Never reads a
-/// file larger than `MAX_METADATA_SCAN_BYTES`, never reads more than
-/// `HEADER_READ_BYTES` of the ones it does look at, and never returns
-/// anything but the one field value -- no content is retained. The read
-/// goes through `IdentifyCtx::derived`, so an unchanged metadata file is
-/// Why Copilot CLI sessions carry no project link and no selective
-/// action.
-///
-/// This adapter used to parse a `cwd` / `workspace` / `workspaceFolder`
-/// field out of the small JSON files beside a session, and
-/// `docs/agent-storage.md` promised the field came from a documented
-/// schema and was "never a guess at an undocumented schema". The
-/// 2026-09-22 re-review checked: the sole citation, GitHub's own
-/// `cli-config-dir-reference`, documents *directory names* and contains
-/// zero occurrences of `cwd` or `workspaceFolder`. Those three field
-/// names were the guess the doc promised not to make.
-///
-/// Re-checked 2026-09-22 across four pinned `github/docs` pages @
-/// `72e940d15a9aff06b6e84216f3c97dac25c47d9b`
-/// (`cli-config-dir-reference.md`, `cli-command-reference.md`,
-/// `chronicle.md`, `acp-server.md`): `workspaceFolder` and
-/// `workingDirectory` appear **zero** times; every `cwd` hit is the
-/// `/cwd` slash command, prose, an MCP server launch key, or an ACP wire
-/// parameter in client-side example code -- none is an on-disk session
-/// field. `github/copilot-cli` is closed source (its repository holds
-/// only a README, a changelog, an installer and issue templates), so
-/// there is no schema to pin.
-///
-/// The directory layout itself stays confirmed, so the bytes are still
-/// identified and measured. What is withdrawn is the claim about what is
-/// *inside* them.
-const NO_LINKAGE_SOURCE_REASON: &str = "no upstream source documents a working-directory field in Copilot CLI session state: \
-     GitHub's cli-config-dir-reference documents directory names only, and the CLI itself is \
-     closed source. The cwd/workspace/workspaceFolder fields this adapter used to parse were a \
-     guess at an undocumented schema, so linkage is unresolved and no selective action is \
-     offered";
+/// SDK workspace-file evidence: github/copilot-sdk @
+/// 4001c1da7d832c51bad1d38619c1a082af390efb,
+/// nodejs/test/e2e/session_fs.e2e.test.ts. The cwd scalar layout is reproduced
+/// in github/copilot-cli#2446 (1.0.14), corroborated by copilot-sdk#1735.
+/// These sources do not establish a universal schema across CLI versions.
+const NO_LINKAGE_SOURCE_REASON: &str =
+    "workspace.yaml has no supported absolute cwd; arbitrary session files are not searched";
+
+/// Only the observed single-line top-level scalar forms, not a general YAML
+/// parser. Reject unsupported forms instead of manufacturing a project path.
+fn workspace_cwd(text: &str) -> Option<String> {
+    let mut matches = text.lines().filter_map(|line| line.strip_prefix("cwd:"));
+    let raw = matches.next()?.trim();
+    if matches.next().is_some() || !text.ends_with('\n') {
+        return None;
+    }
+    let value = if raw.starts_with('"') {
+        serde_json::from_str::<String>(raw).ok()?
+    } else if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+        raw[1..raw.len() - 1].replace("''", "'")
+    } else {
+        if raw.contains(" #") || raw.contains(": ") {
+            return None;
+        }
+        raw.to_string()
+    };
+    Path::new(&value).is_absolute().then_some(value)
+}
 
 fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
     let base = home.join("session-state");
@@ -231,13 +214,32 @@ fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candidat
             };
             (meta.len(), mtime_secs(&meta), false)
         };
-        let project_link = ProjectLinkState::Unresolved {
-            reason: NO_LINKAGE_SOURCE_REASON.to_string(),
-        };
+        let declared = entry
+            .is_dir
+            .then(|| {
+                ctx.derived(
+                    COPILOT_CLI_TOOL_ID,
+                    "workspace-yaml-cwd-v1",
+                    &path.join("workspace.yaml"),
+                    8192,
+                    &workspace_cwd,
+                )
+            })
+            .flatten();
+        let project_link = super::resolve_declared_path(declared, NO_LINKAGE_SOURCE_REASON);
         let member_kind = if entry.is_dir {
             AgentMemberKind::SessionData
         } else {
             AgentMemberKind::Transcript
+        };
+        // GitHub's directory reference (checked 2026-09-26) documents
+        // session-ID directories with events.jsonl and workspace artifacts.
+        // A confirmed directory is an exact local removal boundary even when
+        // its project's identity is unknown. Never read transcript contents.
+        let action = if entry.is_dir && ctx.is_file(&path.join("events.jsonl")) {
+            AgentActionCapability::SessionRemoval
+        } else {
+            AgentActionCapability::None
         };
         let mut unit =
             AgentUnitBuilder::new(COPILOT_CLI_TOOL_ID, AgentCategory::Sessions, path.clone())
@@ -250,13 +252,7 @@ fn identify_session_state(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candidat
                 }])
                 .mtime_max(mtime)
                 .project_link(project_link)
-                // No action on session state. The removal capability was
-                // justified by knowing which project a session belonged
-                // to; with the linkage claim withdrawn, offering to move
-                // a session whose project this tool cannot name is
-                // exactly the "inspection is not authorization" line.
-                .action(AgentActionCapability::None)
-                .note(NO_LINKAGE_SOURCE_REASON);
+                .action(action);
         if truncated {
             unit = unit.incomplete("directory entry count bound reached");
         }
@@ -270,7 +266,7 @@ fn identify_command_history(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<Candid
         return;
     }
     let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
-    let unit = AgentUnitBuilder::new(COPILOT_CLI_TOOL_ID, AgentCategory::Caches, path)
+    let unit = AgentUnitBuilder::new(COPILOT_CLI_TOOL_ID, AgentCategory::LocalHistory, path)
         .relative_path("command-history-state")
         .bytes(bytes)
         .mtime_max(mtime)
@@ -491,6 +487,97 @@ mod tests {
     }
 
     #[test]
+    fn workspace_yaml_reads_only_evidenced_top_level_path() {
+        assert_eq!(
+            workspace_cwd("id: session\ncwd: /tmp/project\nsummary: private\n"),
+            Some("/tmp/project".into())
+        );
+        assert_eq!(
+            workspace_cwd("cwd: \"/tmp/a b\"\n"),
+            Some("/tmp/a b".into())
+        );
+        assert_eq!(
+            workspace_cwd("cwd: '/tmp/it''s a project'\n"),
+            Some("/tmp/it's a project".into())
+        );
+        for text in [
+            "cwd: relative\n",
+            "summary:\n  cwd: /tmp/fake\n",
+            "cwd: |\n  /tmp/fake\n",
+            "cwd: /tmp/a\ncwd: /tmp/b\n",
+            "cwd: /tmp/truncated",
+            "cwd: /tmp/a # comment\n",
+        ] {
+            assert!(workspace_cwd(text).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn unchanged_workspace_metadata_is_not_reread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        touch(
+            &home.path().join("session-state/s/workspace.yaml"),
+            b"id: s\ncwd: /nonexistent/copilot-project\n",
+        );
+        let cache = IdentificationCache::load(store.path());
+        let (_, cold) =
+            crate::work_counters::measured(|| identify(home.path(), &IdentifyCtx::new(1, &cache)));
+        assert!(cold.header_bytes_read > 0);
+        cache.save(store.path(), 1).unwrap();
+        let warm_cache = IdentificationCache::load(store.path());
+        let (units, warm) = crate::work_counters::measured(|| {
+            identify(home.path(), &IdentifyCtx::new(2, &warm_cache))
+        });
+        assert_eq!(warm.header_bytes_read, 0);
+        assert!(matches!(
+            units
+                .iter()
+                .find(|u| u.category() == AgentCategory::Sessions)
+                .unwrap()
+                .project_link(),
+            ProjectLinkState::Missing { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_yaml_links_without_reading_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        crate::work_counters::record_spawn();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let home = tmp.path().join("copilot");
+        touch(
+            &home.join("session-state/s/workspace.yaml"),
+            format!("id: s\ncwd: {}\nsummary: PRIVATE-SUMMARY\n", repo.display()).as_bytes(),
+        );
+        touch(
+            &home.join("session-state/s/events.jsonl"),
+            b"PRIVATE-TRANSCRIPT",
+        );
+        let units = run(&home);
+        let session = units
+            .iter()
+            .find(|u| u.category() == AgentCategory::Sessions)
+            .unwrap();
+        assert!(
+            matches!(session.project_link(), ProjectLinkState::Linked { .. }),
+            "{:?}",
+            session.project_link()
+        );
+        assert_eq!(session.action(), AgentActionCapability::SessionRemoval);
+        assert!(!format!("{units:?}").contains("PRIVATE-"));
+    }
+
+    #[test]
     fn every_documented_protected_directory_is_still_protected() {
         // The exact set the reference page lists: a conversion must not
         // quietly drop one of them.
@@ -538,9 +625,8 @@ mod tests {
     /// doc promised never to make, and a fixture that contains one
     /// proves only that the fixture was written by the same guess.
     ///
-    /// The test is kept, inverted: a plausible field must **not** link,
-    /// and no action may be offered on a session whose project this tool
-    /// cannot name.
+    /// Arbitrary adjacent JSON still must not link. This fixture also lacks
+    /// the events.jsonl marker that establishes an exact session boundary.
     #[test]
     fn a_plausible_cwd_field_is_not_a_citation_and_must_not_link() {
         let home = tempfile::tempdir().unwrap();
@@ -565,13 +651,13 @@ mod tests {
             );
         };
         assert!(
-            reason.contains("no upstream source documents"),
-            "the reason must say the schema is undocumented: {reason}"
+            reason.contains("workspace.yaml"),
+            "the reason must name the supported metadata source: {reason}"
         );
         assert_eq!(
             s.action(),
             AgentActionCapability::None,
-            "no selective action on a session whose project this tool cannot name"
+            "no selective action on an unrecognized session directory"
         );
         // The bytes are still identified and measured -- the directory
         // layout is confirmed; only the claim about what is inside is
@@ -769,16 +855,11 @@ mod tests {
                 .count(),
             sessions
         );
-        // Zero, and strictly so. Since the linkage guess was withdrawn
-        // (2026-09-22) this adapter reads no file contents at all --
-        // there is no documented field to read -- so the cap it has to
-        // respect is the strongest one available. `bounded_io` is still
-        // the only route if a documented field ever appears, which the
-        // shared ceiling below keeps honest.
+        // This fixture contains no workspace.yaml. Do not compensate by
+        // searching transcript bodies or arbitrary adjacent files.
         assert_eq!(
             counters.header_bytes_read, 0,
-            "no upstream source documents a session field, so this adapter reads no contents \
-             at all; it read {} bytes",
+            "without workspace.yaml this adapter must read no contents; it read {} bytes",
             counters.header_bytes_read
         );
         assert!(

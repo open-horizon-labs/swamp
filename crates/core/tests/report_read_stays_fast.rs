@@ -129,6 +129,7 @@ fn a_large_store_reads_back_within_budget() {
     let reconciliation = HashMap::from([(
         src.clone(),
         Reconciliation {
+            unique_estimate: None,
             attributed: 3_000 << 20,
             unowned: 0,
             walked_total: 3_000 << 20,
@@ -157,6 +158,7 @@ fn a_large_store_reads_back_within_budget() {
         &store,
         &key,
         &swamp_core::growth::RunFacts {
+            unique_estimate: None,
             observed_at,
             since_secs: 86_400,
             retention_days: 30,

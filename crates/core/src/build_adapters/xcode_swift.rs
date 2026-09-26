@@ -48,6 +48,13 @@ const RECENT_WRITE_SECS: u64 = 10 * 60;
 const ARCHIVE_BUDGET: usize = 200;
 
 impl BuildAdapter for Adapter {
+    fn trash_roles(&self) -> &'static [ArtifactRole] {
+        &[
+            ArtifactRole::Output,
+            ArtifactRole::TestOutput,
+            ArtifactRole::Intermediate,
+        ]
+    }
     fn id(&self) -> &'static str {
         "xcode-swift"
     }
@@ -60,7 +67,7 @@ impl BuildAdapter for Adapter {
         BuildCapabilities {
             identifies_shared_stores: true,
             attributes_package_identity: true,
-            actions_available: false,
+            actions_available: true,
         }
     }
 

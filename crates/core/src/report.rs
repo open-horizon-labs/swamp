@@ -340,8 +340,36 @@ pub struct ProjectRow {
     pub remote: Option<String>,
 }
 
+/// Boundary of a filesystem measurement, not an ownership claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnownedMeasurement {
+    Direct,
+    Subtree,
+    /// Older measurement: sharing is known but direct/subtree shape is not.
+    Hardlinked,
+    DirectShared,
+    SubtreeShared,
+    /// Refreshed path allocation; unique charge is not reconciled.
+    DirectEstimate,
+    SubtreeEstimate,
+}
+
+impl UnownedMeasurement {
+    pub(crate) fn folded(self) -> bool {
+        matches!(
+            self,
+            Self::Subtree | Self::SubtreeShared | Self::SubtreeEstimate
+        )
+    }
+    pub fn unique_needs_reconciliation(self) -> bool {
+        matches!(self, Self::DirectEstimate | Self::SubtreeEstimate)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnownedRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<UnownedMeasurement>,
     pub path_or_object: String,
     pub bytes: u64,
     pub reason: UnownedReason,
@@ -388,7 +416,21 @@ pub struct UnownedRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UniqueEstimate {
+    #[serde(default)]
+    pub sharing: Option<crate::sharing::SharingSummary>,
+    /// Allocated regular-file bytes across observed roots and units, excluding
+    /// Docker. Deduplicated by device/inode, not shared filesystem extents.
+    /// Not a sum of the per-root charges, and not a reclaimability estimate.
+    pub bytes: u64,
+    pub reconciled_at: u64,
+    pub needs_reconciliation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reconciliation {
+    #[serde(default)]
+    pub unique_estimate: Option<UniqueEstimate>,
     pub attributed: u64,
     pub unowned: u64,
     pub walked_total: u64,
@@ -572,10 +614,12 @@ pub fn attach_decision_evidence(report: &mut Report) {
 
                 // Activity (#54): the folded walk's own newest-child-mtime
                 // stat, already recorded on every row.
-                a.evidence.push(crate::activity::modification_evidence(
-                    a.mtime_max,
-                    observed_at,
-                ));
+                a.evidence
+                    .push(crate::activity::modification_evidence_during(
+                        a.mtime_max,
+                        observed_at,
+                        crate::entities::now(),
+                    ));
 
                 // Activity (#54), the second filesystem source: this
                 // unit's own anchor path's access time. One extra `stat`
@@ -790,9 +834,10 @@ pub(crate) fn nested_decision_evidence(
         // unit's measured children. Labelled modification, never "last
         // used".
         unit.decision_evidence
-            .push(crate::activity::modification_evidence(
+            .push(crate::activity::modification_evidence_during(
                 unit.mtime_max,
                 observed_at,
+                crate::entities::now(),
             ));
 
         // Activity (#54), tool-reported: a `.fingerprint` entry's own
@@ -1936,6 +1981,7 @@ pub(crate) fn join_docker_facts(
                 let mut evidence = vec![recovery_evidence];
                 evidence.extend(candidate.docker_evidence);
                 result.unowned.push(UnownedRow {
+                    measurement: None,
                     path_or_object: candidate.reference,
                     bytes: candidate.unique_bytes,
                     reason: UnownedReason::DockerNoJoin,
@@ -2121,6 +2167,7 @@ pub fn report_scope_with_parts_covered(
         projects: Vec::new(),
         unowned: Vec::new(),
         reconciliation: Reconciliation {
+            unique_estimate: None,
             attributed: 0,
             unowned: 0,
             walked_total: 0,
@@ -2391,6 +2438,10 @@ pub fn observe_scope(
     retention_days: u64,
     since_secs: u64,
 ) -> Result<ScopeObservation> {
+    let owns_root_coverage = base.is_none();
+    if observe && let Some(dir) = store_dir {
+        crate::growth::invalidate_unique_estimate(dir, &scope_snapshot_key(scope))?;
+    }
     // Every authorized external/agent root's own replay window, taken
     // **before** the walk so each cursor is read at its previous pass's
     // value rather than one this pass has just written -- a root that is
@@ -2425,7 +2476,7 @@ pub fn observe_scope(
         eprintln!("[trace] observe: unit-root replay: {:?}", phase.elapsed());
     }
     let phase = std::time::Instant::now();
-    let (merged, coverage, per_root, events) = match base {
+    let (merged, coverage, mut per_root, events) = match base {
         // A handed-in report brings no *walk* window with it. The unit
         // roots' own cursors are independent evidence -- they were
         // replayed above, not derived from the walk -- so they still
@@ -2582,6 +2633,81 @@ pub fn observe_scope(
     }
     let phase = std::time::Instant::now();
 
+    // Reconciliation is deliberately opt-in. Normal refreshes never visit
+    // unchanged roots to recover sharing identities that folded rows discard.
+    let prior_unique = store_dir
+        .and_then(|dir| crate::growth::read_run_row(dir, &scope_snapshot_key(scope)))
+        .and_then(|r| {
+            r.unique_bytes
+                .zip(r.unique_reconciled_at)
+                .map(|(bytes, at)| (bytes, at, r.sharing))
+        })
+        .map(|(bytes, reconciled_at, sharing)| UniqueEstimate {
+            sharing,
+            bytes,
+            reconciled_at,
+            needs_reconciliation: true,
+        });
+    merged.reconciliation.unique_estimate = prior_unique;
+    if force_full
+        && owns_root_coverage
+        && want == ObservationParts::ALL
+        && external_ok
+        && agents_ok
+        && coverage.iter().all(|c| {
+            matches!(
+                c.status,
+                crate::coverage::RegionStatus::Complete
+                    | crate::coverage::RegionStatus::Excluded
+                    | crate::coverage::RegionStatus::DetectorOnly
+                    | crate::coverage::RegionStatus::Missing
+            )
+        })
+        && agent_units.iter().all(|u| u.complete)
+        && external_units.iter().all(|u| u.note.is_none())
+    {
+        let mut paths: Vec<PathBuf> = per_root.keys().cloned().collect();
+        paths.extend(external_units.iter().map(|u| u.path.clone()));
+        for unit in &agent_units {
+            if unit.members.is_empty() {
+                paths.push(unit.path.clone());
+            } else {
+                paths.extend(unit.members.iter().map(|m| m.path.clone()));
+            }
+        }
+        let excluded: Vec<PathBuf> = scope
+            .pruned_subtrees
+            .iter()
+            .map(|p| PathBuf::from(&p.pattern))
+            .collect();
+        let mut containers = paths.clone();
+        for project in &merged.projects {
+            for worktree in &project.worktrees {
+                containers.push(worktree.path.clone());
+                containers.extend(
+                    worktree
+                        .artifacts
+                        .iter()
+                        .filter(|a| !a.source.tool.starts_with("docker"))
+                        .map(|a| a.path.clone()),
+                );
+            }
+        }
+        if let Some((bytes, sharing)) =
+            crate::walk::reconcile_shared_bytes(&paths, &excluded, &containers)
+        {
+            merged.reconciliation.unique_estimate = Some(UniqueEstimate {
+                sharing: Some(sharing),
+                bytes,
+                reconciled_at: observed_at,
+                needs_reconciliation: false,
+            });
+        }
+    }
+
+    for report in per_root.values_mut() {
+        report.reconciliation.unique_estimate = merged.reconciliation.unique_estimate.clone();
+    }
     let observation = ScopeObservation {
         merged,
         coverage,
@@ -2763,6 +2889,7 @@ pub fn observe_scope(
             store_dir,
             &key,
             &crate::growth::RunFacts {
+                unique_estimate: observation.merged.reconciliation.unique_estimate.as_ref(),
                 observed_at: observation.merged.observed_at,
                 since_secs: history_since_secs,
                 retention_days: config.retention_days,
@@ -2794,6 +2921,12 @@ pub fn observe_scope(
 /// report, never an in-place double-add of the same root).
 pub fn merge_root_report_into(merged: &mut Report, r: Report) {
     let path = r.root.clone();
+    if let Some(mut estimate) = r.reconciliation.unique_estimate.clone() {
+        // A refresh merge is not an inode reconciliation. Carry one scope
+        // estimate, never sum the copies attached to its root reports.
+        estimate.needs_reconciliation = true;
+        merged.reconciliation.unique_estimate = Some(estimate);
+    }
     merge_summary_into(&mut merged.summary, &r.summary);
 
     if merged.root.as_os_str().is_empty() {
@@ -2881,6 +3014,7 @@ pub fn merge_reports(
         projects: Vec::new(),
         unowned: Vec::new(),
         reconciliation: Reconciliation {
+            unique_estimate: None,
             attributed: 0,
             unowned: 0,
             walked_total: 0,
@@ -3380,6 +3514,7 @@ pub fn report_scope_from_store(
             projects: Vec::new(),
             unowned: Vec::new(),
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

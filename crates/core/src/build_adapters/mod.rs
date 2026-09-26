@@ -465,9 +465,8 @@ impl<'a> BuildCtx<'a> {
 /// What an adapter says it can do, checked against the published matrix.
 ///
 /// Every field defaults to `false`, and that is the point: an adapter
-/// that says nothing claims nothing. `actions_available` in particular
-/// must stay false for every adapter until #73 gives one an executor,
-/// which `registry::no_adapter_claims_an_action_is_available` asserts.
+/// that says nothing claims nothing. Project-local Trash support is checked
+/// against the adapter's explicit role allowlist and the published matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BuildCapabilities {
     /// Whether this adapter identifies containers shared across
@@ -477,8 +476,8 @@ pub struct BuildCapabilities {
     /// Whether this adapter can attribute a unit to a package identity
     /// (a name and version) from read-only metadata.
     pub attributes_package_identity: bool,
-    /// Whether any action is available on this adapter's units. `false`
-    /// for every adapter in this chunk; #73 implements adapter actions.
+    /// Whether this adapter exposes exact-path actions on its nested units.
+    /// Cargo's separate fingerprint-aware cleanup plan is not this capability.
     pub actions_available: bool,
 }
 
@@ -490,6 +489,11 @@ pub struct BuildCapabilities {
 /// Each of those is a separate audited guardrail
 /// (`.oh/guardrails/build-adapters-*.md`).
 pub trait BuildAdapter: Send + Sync {
+    /// Roles this adapter can remove as an exact project-local path.
+    /// Shared stores and native manager operations need separate contracts.
+    fn trash_roles(&self) -> &'static [ArtifactRole] {
+        &[]
+    }
     /// Stable id, equal to this adapter's module name with `_` replaced
     /// by `-`, to its [`matrix`] row and to its docs table row.
     fn id(&self) -> &'static str;
@@ -891,6 +895,11 @@ impl NestedUnitBuilder {
     pub fn build(self) -> NestedArtifact {
         self.unit
     }
+
+    pub fn trash_path(mut self) -> Self {
+        self.unit.action = NestedActionCapability::TrashPath;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1021,6 +1030,7 @@ fn is_candidate(u: &NestedArtifact) -> bool {
 fn outermost<'a>(container: &Path, units: &'a [NestedArtifact]) -> Vec<&'a NestedArtifact> {
     let inside: Vec<&NestedArtifact> = units
         .iter()
+        .filter(|u| u.present)
         .filter(|u| u.path != container && u.path.starts_with(container))
         .filter(|u| u.role != ArtifactRole::Container)
         .collect();
@@ -1167,7 +1177,25 @@ pub fn identify_all(
                 if !claimed.insert(container.path.clone()) {
                     continue;
                 }
-                out.extend(ctx.container(&container, &|| adapter.identify(&container, ctx)));
+                let units = ctx.container(&container, &|| adapter.identify(&container, ctx));
+                out.extend(units.into_iter().map(|unit| {
+                    let selected_role = adapter.trash_roles().contains(&unit.role);
+                    let within_project = container
+                        .project_root
+                        .as_ref()
+                        .is_some_and(|root| unit.path != *root && unit.path.starts_with(root));
+                    if selected_role
+                        && within_project
+                        && !container.shared
+                        && unit.coverage.supported
+                        && unit.consequence.is_some()
+                        && matches!(unit.action, NestedActionCapability::InspectionOnly)
+                    {
+                        NestedUnitBuilder::amend(unit).trash_path().build()
+                    } else {
+                        unit
+                    }
+                }));
             }
         }
         for container in shared.iter().filter(|c| c.adapter_id == adapter.id()) {

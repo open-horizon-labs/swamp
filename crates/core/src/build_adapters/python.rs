@@ -184,6 +184,13 @@ const ENV_CONSEQUENCE: &str = "recreate the environment and reinstall its packag
      sources editable packages were installed from";
 
 impl BuildAdapter for Adapter {
+    fn trash_roles(&self) -> &'static [ArtifactRole] {
+        &[
+            ArtifactRole::Output,
+            ArtifactRole::TestOutput,
+            ArtifactRole::Intermediate,
+        ]
+    }
     fn id(&self) -> &'static str {
         "python"
     }
@@ -196,7 +203,7 @@ impl BuildAdapter for Adapter {
         BuildCapabilities {
             identifies_shared_stores: true,
             attributes_package_identity: true,
-            actions_available: false,
+            actions_available: true,
         }
     }
 

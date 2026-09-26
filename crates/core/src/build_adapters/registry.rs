@@ -91,12 +91,12 @@ mod tests {
     }
 
     #[test]
-    fn no_adapter_claims_an_action_is_available() {
+    fn action_claims_have_explicit_role_contracts() {
         for a in Registry::with_builtins().adapters() {
-            assert!(
-                !a.capabilities().actions_available,
-                "{} claims an action is available; #73 implements adapter actions and nothing \
-                 executes one yet",
+            assert_eq!(
+                a.capabilities().actions_available,
+                !a.trash_roles().is_empty(),
+                "{}",
                 a.id()
             );
         }

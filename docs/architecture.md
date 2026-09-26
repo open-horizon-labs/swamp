@@ -498,7 +498,7 @@ root-scoped volume id) and are replaced or appended per root.
 
 | table | one row per | what it records |
 | --- | --- | --- |
-| `runs.parquet` | scope key | the last full pass: `observed_at`, `since_secs`, `retention_days`, `include_dirs`, the live GitHub-enrichment counters (nullable), `schedule_line` (nullable, the scheduler status the pass saw). Its row is the "observed at all" marker. |
+| `runs.parquet` | scope key | the last all-family pass: observation parameters, enrichment counters and scheduler status; nullable unique-byte reconciliation total, timestamp and needs-reconciliation flag. Its row is the "observed at all" marker. |
 | `coverage.parquet` | scope root, or authorized unit root | `class` (`project`/`detector`), `status` (the bare `RegionStatus`/event-covered tag), `reason`, `mode`, `cursor_family`; for a walked root its own totals: `walked_total`, `projects`, `attributed`, `unowned`, `du_total`, `docker_attributed`, `docker_unowned` (all nullable). |
 | `notes.parquet` | note | the run's diagnostics (fsevents mode, daemon reachability, GitHub notes), `seq`-ordered. |
 | `projects.parquet` / `worktrees.parquet` / `worktree_facts.parquet` | project / worktree / signal or merge-complete term | a project's and worktree's own scalars (name, ecosystems, remote, path, kind, branch, idle, the `GithubFacts` scalars flattened under `github_`), and the two list-valued facts (`fact_kind` = `signal` \| `merge_complete_term`, `seq`). |
@@ -1251,15 +1251,54 @@ An observation with usable event history reconstructs the previous topology and 
 | Change | Work performed |
 |---|---|
 | Existing remainder directory changes | Re-list that directory and update its stored totals when the stored structure permits it. |
+| Unowned directory changes | Re-list its direct files, retain unchanged siblings, and measure new subtrees. The existing unowned Parquet rows distinguish direct-directory bytes from folded-subtree totals. A changed folded subtree is remeasured as a unit. |
+| Unowned boundary is unknown or changes project ownership | Reconcile with a full-root walk; report `checkoutless_changes` or `unowned_changes`. Unchanged observations still reuse their measurements. |
+| Unowned files share hardlinks | Refresh implicated folded/direct containers, explicitly mark estimates as needing reconciliation, and leave unrelated roots alone. |
 | Directory inside an artifact changes | Re-list affected interior directories and update allocated totals. Wide directories use bounded batches on the existing worker pool. |
 | Changed artifact has hardlinks | Keep its last unique-byte measurement, mark it stale, and update directory allocations without traversing unchanged interiors. |
 | Interior detail is unavailable | Resize the whole artifact. |
 | New or structurally changed subtree | Discover repositories or artifacts and perform the broader walk needed to rebuild attribution. |
 | Event history is incomplete or cannot be trusted | Perform a full walk and report the reason. |
 
-Hardlinks do not force a whole-target walk when interior measurements are available. `allocated_bytes` and `allocated_growth_bytes` describe current path allocations, which may count a linked inode more than once. `bytes` and `local_bytes` retain their last deduplicated measurements; `dedup_stale` distinguishes those from current measurements. CLI/TUI warn when unique-byte totals are stale. Unique-byte growth is unavailable and its history has a gap while stale, rather than inventing zero growth. A full scan reconciles the counts. Cleanup still checks its actual selected members; allocated size is not promised reclaimable space.
+Hardlinks do not force a whole-target walk when interior measurements are available. `allocated_bytes` and `allocated_growth_bytes` describe current path allocations, which may count a linked inode more than once. Artifact `bytes` and `local_bytes` retain their last deduplicated measurements; `dedup_stale` distinguishes those from current measurements. CLI/TUI warn when unique-byte totals are stale. Unique-byte growth is unavailable and its history has a gap while stale, rather than inventing zero growth. Unowned rows retain direct/subtree measurement boundaries; estimate variants explicitly identify unresolved unique charges after local refresh. They carry no growth history.
 
-Plans warn about stale unique-byte estimates, and standing grants cannot spend a budget against them. A human may explicitly approve a plan with that warning. A scoped Cargo cleanup measures its selected members freshly and still requires per-plan approval.
+`observe --full` additionally reconciles the filesystem scope with the existing
+parallel folded walker and a shared, ephemeral `(device, inode)` set. Project
+roots, external units and agent member paths form one union; nested paths are
+visited once and user exclusions are pruned. Docker is separate. Only the
+aggregate `unique_estimate` (bytes, timestamp, `needs_reconciliation`) and
+container-level sharing groups survive in typed columns in `runs.parquet`.
+The reconciliation walker temporarily maps hardlinked inodes to the deepest
+matching artifact, worktree, external/member or root container. Parents are
+not additional members. Inodes with the same container membership and unresolved
+link status collapse into one group; three-way sharing is one group, not three
+pairwise charges. No inode or file membership is persisted. Summaries retain at
+most 4,096 groups, 65,536 container memberships and 1 MiB of container path text,
+with omitted groups/bytes
+reported explicitly. Unknown peers outside coverage are never invented.
+This deliberately costs an additional traversal on an
+explicit full observation, not on normal refresh. Ordinary observations retain
+the last reconciled value as stale; incomplete coverage cannot certify a new
+one. A cold report restores the same accounting state without scanning.
+
+This is an accounting overlay, not a new charge assignment: it does not rewrite
+per-root/artifact history or claim ownership from shared inodes. Reconciliation
+therefore cannot create growth merely by moving a charge between roots. Row
+totals remain local measurements, not an additive scope-wide unique total.
+Cleanup still measures its selected members; neither total promises reclaimable
+space.
+
+The transient ledger is O(distinct measured inodes), plus hardlink/container
+memberships, released after the pass. The following key-set measurement predates
+the sharing collector and does not include its membership allocations.
+The 20,000-entry fixture (1,000 inodes, 20 links each) used 1,792 hash-set key
+slots: 28,672 bytes of key capacity, excluding hash/control/allocator overhead
+and the walker's other working memory. This is not a peak-RSS claim. Its second
+independent reconciliation verifies that no ledger state survives the call.
+
+TUI cleanup previews distinguish allocated bytes from reclaimable estimates.
+The human selects and confirms removal; the CLI reports and does not remove
+files. There are no standing grants or CLI approval/execute workflow.
 
 The fallback reasons include a missing or future event ID, a device mismatch, dropped or inconclusive events, too many changed directories, and changed classification rules. A replay too soon after the previous observation also falls back, because the persisted event log can lag writes. `--full` explicitly forces a full walk.
 
@@ -1607,11 +1646,12 @@ function pointer on the event thread is rejected rather than followed.
 - Sibling scan roots keep independent physical stores (still true), but
   `report_scope` (#42) now merges their totals coherently for a
   multi-root `report`/`observe`/`ui` call: each root's bytes are summed
-  exactly once, and the merge is root-order independent. What is *not*
-  handled: a hardlinked inode shared across two *different, non-nested*
-  top-level roots is not deduplicated against a sibling root's count
-  (only within-root/within-worktree hardlink dedup is implemented);
-  treat a multi-root unique-byte total as an upper bound in that case.
+  exactly once, and the merge is root-order independent. Those local sums
+  still include cross-root shared inodes. The separate `unique_estimate`
+  reconciles sharing across roots and units on explicit `observe --full`;
+  normal refresh marks it as needing reconciliation. Container-level shared-with
+  groups are measured in that same explicit pass, not inferred from total bytes;
+  they retain the same timestamp/staleness and disclose unresolved or omitted peers.
   Each root's own `series_by_key`/`total_series` sparkline buckets are
   computed independently (each root's own wall-clock `now`) and merged
   bucket-for-bucket only when their lengths already match; a length

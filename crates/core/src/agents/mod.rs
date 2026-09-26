@@ -87,6 +87,8 @@ pub enum AgentCategory {
     Attachments,
     Checkpoints,
     Caches,
+    /// Command recall and editor undo snapshots: removable, but not rebuildable.
+    LocalHistory,
     Logs,
     ManagedWorktrees,
     Plugins,
@@ -110,6 +112,7 @@ impl AgentCategory {
             Self::Attachments => "attachments",
             Self::Checkpoints => "checkpoints",
             Self::Caches => "caches",
+            Self::LocalHistory => "local-history",
             Self::Logs => "logs",
             Self::ManagedWorktrees => "managed-worktrees",
             Self::Plugins => "plugins",
@@ -130,6 +133,7 @@ impl AgentCategory {
             Self::Attachments,
             Self::Checkpoints,
             Self::Caches,
+            Self::LocalHistory,
             Self::Logs,
             Self::ManagedWorktrees,
             Self::Plugins,
@@ -2165,9 +2169,10 @@ pub fn discover_and_measure_in(
         // Activity evidence (#54): the adapter already recorded
         // `mtime_max` while folding this unit's members; turn it into
         // the shared contract's fact rather than a second stat pass.
-        let evidence = vec![crate::activity::modification_evidence(
+        let evidence = vec![crate::activity::modification_evidence_during(
             cand.mtime_max(),
             observed_at,
+            crate::entities::now(),
         )];
         let parts = cand.into_parts();
         units.push(AgentUnit {

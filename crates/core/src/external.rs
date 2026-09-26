@@ -712,9 +712,10 @@ pub fn observe_external(
         // this location, labelled modification and never "last used".
         // `docs/usage.md:660` promised this for external locations and
         // nothing produced it.
-        evidence.push(crate::activity::modification_evidence(
+        evidence.push(crate::activity::modification_evidence_during(
             mtime_max,
             observed_at,
+            crate::entities::now(),
         ));
         units.push(ExternalUnit {
             detector_id,

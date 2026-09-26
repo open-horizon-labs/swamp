@@ -291,7 +291,7 @@ pub fn identify_editor_profile(
     let history = user.join("History");
     if ctx.is_dir(&history) {
         let (bytes, mtime, truncated) = ctx.folded_bytes(&history, MAX_FOLD_ENTRIES);
-        let unit = AgentUnitBuilder::new("vscode-family", AgentCategory::Caches, history)
+        let unit = AgentUnitBuilder::new("vscode-family", AgentCategory::LocalHistory, history)
             .relative_path("User/History")
             .bytes(bytes)
             .mtime_max(mtime)
@@ -758,6 +758,7 @@ mod tests {
             .find(|u| u.relative_path() == "User/History")
             .unwrap();
         assert_eq!(history.action(), AgentActionCapability::CacheOrLogTrash);
+        assert_eq!(history.category(), AgentCategory::LocalHistory);
         let cache = units
             .iter()
             .find(|u| u.relative_path() == "CachedExtensionVSIXs")

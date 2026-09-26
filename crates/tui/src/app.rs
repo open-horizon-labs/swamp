@@ -154,6 +154,9 @@ impl RefreshedObservation {
 }
 
 pub struct App {
+    /// Ephemeral on-demand details; never persisted in the observation store.
+    pub cargo_inspection: Option<Vec<String>>,
+    pub cargo_inspection_scroll: u16,
     pub operation: Option<Operation>,
     operation_rx: Option<std::sync::mpsc::Receiver<OperationEvent>>,
     review_progress: Option<std::sync::mpsc::Sender<OperationEvent>>,
@@ -314,6 +317,7 @@ pub struct Operation {
 }
 
 enum OperationEvent {
+    Inspected(Vec<String>),
     Progress {
         completed: usize,
         total: usize,
@@ -403,6 +407,8 @@ impl App {
         let filter = filter::default_filter();
         let root = roots.first().cloned().unwrap_or_default();
         App {
+            cargo_inspection: None,
+            cargo_inspection_scroll: 0,
             operation: None,
             operation_rx: None,
             review_progress: None,
@@ -1440,7 +1446,7 @@ impl App {
         self.marked.insert(
             unit_id.0.clone(),
             MarkedUnit {
-                cargo_unit,
+                cargo_unit: cargo_unit.filter(|u| u.cargo_group().is_some()),
                 agent_unit,
                 path: unit_path,
                 docker,
@@ -1467,6 +1473,87 @@ impl App {
         if let Some(op) = &self.operation {
             op.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// Explicit inspection only: ordinary observation and drawing never call it.
+    pub fn inspect_selected_cargo_profile(&mut self) {
+        if self.operation.is_some() {
+            return;
+        }
+        let path = self.selected_row().and_then(|row| {
+            row.expansion_key
+                .as_deref()
+                .and_then(|key| key.strip_prefix("cargo:"))
+                .map(PathBuf::from)
+                .or_else(|| row.unit.map(|id| PathBuf::from(id.0)))
+        });
+        let profile = path.and_then(|path| {
+            self.report
+                .nested_artifacts
+                .iter()
+                .filter(|u| {
+                    u.present
+                        && u.adapter.as_deref() == Some("cargo")
+                        && u.role == swamp_core::artifact::ArtifactRole::Profile
+                        && path.starts_with(&u.path)
+                })
+                .max_by_key(|u| u.path.components().count())
+                .map(|u| u.path.clone())
+        });
+        let Some(profile) = profile else {
+            self.set_refusal("Select a Cargo profile or an item within it, then press i");
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.operation = Some(Operation {
+            label: "Inspecting",
+            completed: 0,
+            total: 1,
+            succeeded: 0,
+            failed: 0,
+            current: profile.clone(),
+            started: Instant::now(),
+            cancel: cancel.clone(),
+        });
+        self.operation_rx = Some(rx);
+        crate::worker::spawn(move || {
+            let inspection =
+                swamp_core::cargo_artifacts::inspect_profile(&profile, Default::default(), &cancel);
+            let mut lines = vec![
+                format!("{}", profile.display()),
+                format!(
+                    "deps: {} allocated / {} unique within inspected files · {} entries · {}ms",
+                    model::human_bytes(inspection.allocated_bytes),
+                    model::human_bytes(inspection.unique_allocated_bytes),
+                    inspection.entries_examined,
+                    inspection.elapsed_ms
+                ),
+                inspection.accounting_note.clone(),
+            ];
+            lines.extend(inspection.coverage.limits.iter().cloned());
+            if !inspection.coverage.complete {
+                lines.push(
+                    "PARTIAL: totals cover inspected entries only, not the whole profile.".into(),
+                );
+                lines.push("For more: swamp inspect-cargo <profile> --max-entries 262144 --max-ms 30000 --json".into());
+            }
+            lines.push("Target / variant (package identity only when evidenced)".into());
+            for group in inspection.groups {
+                lines.push(format!(
+                    "{}  {}  {} · features {} · package {}",
+                    model::human_bytes(group.allocated_bytes),
+                    group.target.as_deref().unwrap_or("unattributed"),
+                    group.target_kind.as_deref().unwrap_or("unknown"),
+                    group.variant.features.as_deref().unwrap_or("unknown"),
+                    group.package_id.as_deref().unwrap_or("unknown")
+                ));
+                if let Some(reason) = group.residual_reason {
+                    lines.push(format!("  {reason}"));
+                }
+            }
+            let _ = tx.send(OperationEvent::Inspected(lines));
+        });
     }
 
     /// UI entry point; synchronous marking helpers run only on the worker.
@@ -1540,6 +1627,13 @@ impl App {
                 _ => break,
             };
             match event {
+                OperationEvent::Inspected(lines) => {
+                    self.operation = None;
+                    self.operation_rx = None;
+                    self.cargo_inspection = Some(lines);
+                    self.cargo_inspection_scroll = 0;
+                    break;
+                }
                 OperationEvent::Progress {
                     completed,
                     total,
@@ -2566,6 +2660,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
@@ -3101,6 +3196,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

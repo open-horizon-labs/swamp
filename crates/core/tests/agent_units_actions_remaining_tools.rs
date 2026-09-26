@@ -18,6 +18,57 @@ use swamp_core::scope::{ScanConfig, resolve_effective_scope};
 
 const CANARY: &str = "CANARY-REMAINING-TOOLS-DO-NOT-LEAK-4f9c";
 
+#[test]
+fn copilot_exact_local_session_is_removable_without_guessing_a_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join(".copilot");
+    write(&home.join("settings.json"), b"{}");
+    write(
+        &home.join("session-state/selected/events.jsonl"),
+        CANARY.as_bytes(),
+    );
+    write(
+        &home.join("session-state/selected/checkpoints/snapshot"),
+        b"unique checkpoint",
+    );
+    write(
+        &home.join("session-state/retained/events.jsonl"),
+        b"retained session",
+    );
+    write(
+        &home.join("session-state/unrecognized/file"),
+        b"not a documented session",
+    );
+    write(&home.join("session-store.db"), b"protected index");
+    let store = tempfile::tempdir().unwrap();
+    let units = units_for(
+        tmp.path(),
+        HashMap::new(),
+        "github-copilot-cli",
+        &[],
+        store.path(),
+    );
+    let path = home.join("session-state/selected");
+    let unit = units.iter().find(|u| u.path == path).unwrap();
+    assert!(matches!(
+        unit.project_link,
+        ProjectLinkState::Unresolved { .. }
+    ));
+    let plan = actions::propose_agents(&units, std::slice::from_ref(&path), "test").unwrap();
+    assert!(
+        plan[0]
+            .warnings()
+            .iter()
+            .any(|s| s.contains("resume/rewind"))
+    );
+    assert_refused(&units, &home.join("session-state/unrecognized"));
+    assert_eq!(execute_one(&units, &path, store.path()), "completed");
+    assert!(!path.exists());
+    assert!(home.join("session-state/retained/events.jsonl").exists());
+    assert!(home.join("session-store.db").exists());
+    no_canary_anywhere(&units, store.path());
+}
+
 fn write(path: &Path, content: &[u8]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();

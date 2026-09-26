@@ -391,6 +391,7 @@ impl<'a> Ctx<'a> {
                 };
                 self.unowned_total += bytes;
                 self.unowned.push(UnownedRow {
+                    measurement: None,
                     path_or_object: path.display().to_string(),
                     bytes,
                     reason,
@@ -409,6 +410,7 @@ impl<'a> Ctx<'a> {
 
     fn record_permission_denied(&mut self, path: &Path) {
         self.unowned.push(UnownedRow {
+            measurement: None,
             path_or_object: path.display().to_string(),
             bytes: 0,
             reason: UnownedReason::PermissionDenied,
@@ -449,6 +451,7 @@ impl<'a> Ctx<'a> {
                 };
                 self.unowned_total += bytes;
                 self.unowned.push(UnownedRow {
+                    measurement: None,
                     path_or_object: path.display().to_string(),
                     bytes,
                     reason,

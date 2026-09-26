@@ -7,11 +7,12 @@ Maven repository, a Gradle home, npm/pnpm stores, Go's module and build
 caches, pip/uv caches, DerivedData, CoreSimulator, the Android SDK,
 BuildKit's cache) -- and what removing a piece of it would cost.
 
-**This layer never removes anything.** No build adapter implements an
-action. Every unit is inspection only; say so rather than implying a
-cleanup path exists. Cargo's own purpose groups
-(`references/cleanup-and-recovery.md`) are the only build-artifact
-cleanup swamp supports, and they are separate from this.
+**The CLI is read-only.** The TUI supports exact-path Trash for identified
+project-local outputs, test output and intermediates. Shared stores,
+installations and unknown layouts remain inspection-only. Cargo's
+fingerprint-aware purpose groups use their separate membership plan
+(`references/cleanup-and-recovery.md`). Describe the row's actual capability;
+do not imply a CLI deletion command exists.
 
 ## Where it appears
 
@@ -23,6 +24,11 @@ cleanup swamp supports, and they are separate from this.
 - `swamp report <root> --view deps` -- the same breakdown under an
   installed dependency tree.
 - `swamp report <root> --view rust` -- the Cargo drill-down.
+- `swamp inspect-cargo <profile-path> --json` -- explicit, bounded dependency
+  inspection. Target/variant groups use existing fingerprint evidence;
+  package identity stays unknown unless directly evidenced. Read coverage
+  limits and residuals before comparing totals. No source/build execution,
+  persistent inventory or per-crate deletion. TUI equivalent: `i` on a profile.
 - TUI: opening a project expands an identified container into its
   families; a `node_modules` that is mostly pnpm store shows that.
 - `swamp report --view external` -- each machine-wide store's family rows
@@ -51,7 +57,7 @@ column.
 | `bytes` + `basis` | a size on one stated basis | not reclaimable space, and never addable across bases |
 | `role` / family | what kind of thing this is | not that it is obsolete or removable |
 | `consequence` | what happens if the bytes go | not a recommendation to remove them |
-| `action` | inspection only, or unavailable-with-a-reason | never an available action |
+| `action` | exact-path TUI Trash, inspection only, or unavailable-with-a-reason | not permission to delete or evidence of disuse |
 | `coverage.limits` | exactly what swamp could not establish | |
 | `variant.unknowns` | fields with no evidence behind them | |
 

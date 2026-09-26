@@ -47,7 +47,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_pipe_is_a_successful_early_exit() {
+    fn closed_pipe_is_not_an_output_error() {
         assert!(
             write_to(
                 &mut FailingWriter(io::ErrorKind::BrokenPipe),

@@ -35,6 +35,16 @@ use std::path::Path;
 /// recorded a timestamp (an older store row, a Docker/pseudo row): that
 /// is `Unknown`, never displayed as epoch-1970.
 pub fn modification_evidence(mtime_max: u64, observed_at: u64) -> Evidence {
+    modification_evidence_during(mtime_max, observed_at, observed_at)
+}
+
+/// The scan has a duration. Writes after its start but before measurement
+/// completes are ordinary activity, not evidence of a broken clock.
+pub fn modification_evidence_during(
+    mtime_max: u64,
+    observed_at: u64,
+    measured_at: u64,
+) -> Evidence {
     if mtime_max == 0 {
         return Evidence::unknown(
             FactKind::Activity,
@@ -65,9 +75,9 @@ pub fn modification_evidence(mtime_max: u64, observed_at: u64) -> Evidence {
     // recent" without comment -- and, per the cleanup-guidance contract,
     // must never be ranked as ancient either. State it; let the renderer
     // decide how to display it (never as a verdict).
-    if mtime_max > observed_at {
+    if mtime_max > measured_at.max(observed_at) {
         ev = ev.with_note(
-            "recorded modification time is after this observation; clock skew or a \
+            "recorded modification time is after measurement completed; clock skew or a \
              future-dated timestamp, not evidence of unusual recency",
         );
     }
@@ -411,6 +421,15 @@ mod tests {
         let ev = modification_evidence(5_000, 2_000);
         assert!(ev.is_known());
         assert!(ev.note.as_deref().unwrap().contains("clock skew"));
+    }
+
+    #[test]
+    fn writes_during_observation_are_not_clock_skew() {
+        let during = modification_evidence_during(2_030, 2_000, 2_050);
+        assert!(during.note.is_none());
+        assert_eq!(during.event_at, Some(2_030));
+        let future = modification_evidence_during(2_060, 2_000, 2_050);
+        assert!(future.note.as_deref().unwrap().contains("clock skew"));
     }
 
     #[test]

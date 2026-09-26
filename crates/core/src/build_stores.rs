@@ -357,6 +357,7 @@ fn encode(units: &[NestedArtifact]) -> Vec<Vec<String>> {
         put("basis", u.basis.label().to_string());
         put("time_source", u.time_source.label().to_string());
         match &u.action {
+            NestedActionCapability::TrashPath => put("action", "trash-path".into()),
             NestedActionCapability::InspectionOnly => put("action", "inspection-only".into()),
             NestedActionCapability::Unsupported { reason } => {
                 put("action", "unsupported".into());
@@ -468,6 +469,7 @@ fn decode_one(id: &str, fields: &[(String, String)]) -> Option<NestedArtifact> {
         _ => TimeSource::Unknown,
     };
     let action = match one("action")?.as_str() {
+        "trash-path" => NestedActionCapability::TrashPath,
         "unsupported" => NestedActionCapability::Unsupported {
             reason: one("action_reason").unwrap_or_default(),
         },

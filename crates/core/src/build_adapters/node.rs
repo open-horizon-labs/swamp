@@ -312,6 +312,13 @@ const STORE_ENTRIES: &[(&str, &str)] = &[
 ];
 
 impl BuildAdapter for Adapter {
+    fn trash_roles(&self) -> &'static [ArtifactRole] {
+        &[
+            ArtifactRole::Output,
+            ArtifactRole::TestOutput,
+            ArtifactRole::Intermediate,
+        ]
+    }
     fn id(&self) -> &'static str {
         "node"
     }
@@ -324,7 +331,7 @@ impl BuildAdapter for Adapter {
         BuildCapabilities {
             identifies_shared_stores: true,
             attributes_package_identity: true,
-            actions_available: false,
+            actions_available: true,
         }
     }
 

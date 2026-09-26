@@ -15,6 +15,7 @@ compile_fail:
   - history_rows_are_private_to_the_store
 runtime_tests:
   - crates/core/tests/coverage_changes_are_not_storage_changes.rs
+  - crates/core/tests/scope_unique_accounting.rs
 ---
 
 # Coverage changes are not storage changes
@@ -67,13 +68,22 @@ test or find where its coverage moved to.)
 
 ## Validation gap
 
-The remaining gap after 2026-09-22 is concurrent mutation during a pass
-and shared physical-storage accounting across volumes; neither has an
-executable check. Check nested and
+2026-09-26: the owner selected fast refresh with explicitly unreconciled
+unique-byte estimates between explicit full reconciliations. The scope overlay
+does not reassign history charges. `scope_unique_accounting.rs` covers scope
+round trips, root order, cross-root links, changed-container/unchanged traversal
+cost, and invalidation before a partial-family observation. Walker tests cover
+device/inode keys, excluded paths, symlinks and a 20,000-entry sharing fixture.
+Known missing roots remain coverage facts and do not erase historical rows;
+the reconciled overlay describes the observed set, never a growth delta.
+
+Concurrent mutation during a pass and shared filesystem extents (clones or
+snapshots, not inode hardlinks) remain limits. Actual cross-device mounted
+fixtures and per-row shared-with attribution remain unverified here. Check nested and
 aliased roots, root-order changes, scope additions/removals, permission failures,
 disconnected volumes, partial runs, and identity changes against actual filesystem
 changes. Preserve the distinction between incomplete observations and tombstones.
-Concurrent mutation and shared physical-storage accounting require explicit limits.
+Do not describe the overlay as exact reclaimable storage or atomic auditing.
 
 The existing separate-root loop and volume-keyed state are evidence of a boundary
 that needs checking, not a passed multi-root correctness test. Relevant source:

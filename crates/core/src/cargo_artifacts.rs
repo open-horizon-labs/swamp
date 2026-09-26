@@ -52,8 +52,8 @@ pub struct CargoProfileInspectionLimits {
 impl Default for CargoProfileInspectionLimits {
     fn default() -> Self {
         Self {
-            max_entries: 8_192,
-            max_duration: Duration::from_secs(2),
+            max_entries: 262_144,
+            max_duration: Duration::from_secs(5),
             max_metadata_bytes: 8 * 1024 * 1024,
         }
     }
@@ -98,7 +98,7 @@ pub struct CargoDependencyGroup {
     pub residual_reason: Option<String>,
 }
 
-const MAX_PROFILE_INSPECTION_ENTRIES: usize = 65_536;
+const MAX_PROFILE_INSPECTION_ENTRIES: usize = 262_144;
 const MAX_PROFILE_INSPECTION_TIME: Duration = Duration::from_secs(30);
 const MAX_PROFILE_METADATA_BYTES: usize = 64 * 1024 * 1024;
 type ProfileFingerprintEvidence = (
@@ -215,20 +215,8 @@ pub fn inspect_profile(
         );
     }
     coverage.supported = true;
-    let build_lock = profile_path
-        .parent()
-        .unwrap_or(profile_path)
-        .join(".cargo-lock");
-    match crate::fs_gate::symlink_metadata(&build_lock) {
-        Ok(_) => add_limit(
-            &mut coverage,
-            "Cargo build lock file exists; inspection is on-demand but concurrent writes may make this snapshot inconsistent".into(),
-        ),
-        Err(_) => add_limit(
-            &mut coverage,
-            "Cargo build lock state is unavailable; concurrent-build consistency is unknown".into(),
-        ),
-    }
+    // Inspection is a non-atomic observation, not a cleanup authorization.
+    // Do not mistake Cargo's persistent lock file for evidence of active use.
     let mut evidence: HashMap<String, Vec<ProfileFingerprintEvidence>> = HashMap::new();
     // Reserve room for dependency entries: a large fingerprint tree must not
     // consume the entire scan budget before any storage rows can be returned.
@@ -568,7 +556,7 @@ fn profile_inspection_result(
     metadata_bytes_read: u64,
     coverage: ArtifactCoverage,
 ) -> CargoProfileInspection {
-    CargoProfileInspection { profile_path: path.to_path_buf(), inspected_at: crate::entities::now(), elapsed_ms: started.elapsed().as_millis() as u64, entries_examined, groups, allocated_bytes, unique_allocated_bytes, metadata_bytes_read, coverage, accounting_note: "Allocated bytes count each dependency entry; profile unique bytes deduplicate filesystem inode identity. These are storage observations, not reclaimable bytes or proof of final-binary contribution.".into() }
+    CargoProfileInspection { profile_path: path.to_path_buf(), inspected_at: crate::entities::now(), elapsed_ms: started.elapsed().as_millis() as u64, entries_examined, groups, allocated_bytes, unique_allocated_bytes, metadata_bytes_read, coverage, accounting_note: "This observation is not atomic; concurrent builds may change files. Allocated bytes count each dependency entry; profile unique bytes deduplicate filesystem inode identity. These are storage observations, not reclaimable bytes or proof of final-binary contribution.".into() }
 }
 
 /// The effective local Cargo directories that can be established without
@@ -1320,6 +1308,11 @@ mod tests {
         fs::create_dir_all(profile.join("deps")).unwrap();
         fs::create_dir_all(profile.join(".fingerprint")).unwrap();
         fs::write(profile.join("deps/librenamed-abc123.rlib"), b"artifact").unwrap();
+        fs::write(
+            profile.join("deps/libsecond-def456.rlib"),
+            b"second artifact",
+        )
+        .unwrap();
         let cancelled = AtomicBool::new(true);
         let result = inspect_profile(
             &profile,
@@ -1377,13 +1370,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn profile_inspection_reports_concurrent_build_caveat_without_gating() {
+    fn profile_inspection_does_not_gate_on_cargo_build_lock() {
         let tmp = tempdir().unwrap();
         let profile = tmp.path().join("debug");
         fs::create_dir_all(profile.join("deps")).unwrap();
         fs::create_dir_all(profile.join(".fingerprint")).unwrap();
         fs::write(profile.join("deps/libbusy-abc.rlib"), b"artifact").unwrap();
-        let build_lock = profile.join("..").join(".cargo-lock");
+        let build_lock = profile.join(".cargo-lock");
         fs::File::create(&build_lock).unwrap();
         let lock = crate::fs_gate::sys::RegularFile::open_nofollow(&build_lock).unwrap();
         lock.try_lock().unwrap();
@@ -1392,16 +1385,20 @@ mod tests {
             CargoProfileInspectionLimits::default(),
             &AtomicBool::new(false),
         );
-        assert!(!result.coverage.complete);
+        assert!(result.coverage.complete);
         assert!(result.allocated_bytes > 0);
-        assert!(
-            result
-                .coverage
-                .limits
-                .iter()
-                .any(|s| s.contains("concurrent writes may"))
-        );
+        assert!(result.accounting_note.contains("not atomic"));
         lock.unlock().unwrap();
+        let after = inspect_profile(
+            &profile,
+            CargoProfileInspectionLimits::default(),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            after.coverage.complete,
+            "an idle lock file is not an active build: {:?}",
+            after.coverage.limits
+        );
     }
 
     #[cfg(unix)]

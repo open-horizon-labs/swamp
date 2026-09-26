@@ -136,9 +136,9 @@ enum Command {
         profile: PathBuf,
         #[arg(long)]
         json: bool,
-        #[arg(long, default_value_t = 8192)]
+        #[arg(long, default_value_t = 262144)]
         max_entries: usize,
-        #[arg(long, default_value_t = 2000)]
+        #[arg(long, default_value_t = 5000)]
         max_ms: u64,
     },
     /// Diffstat-ledger terminal UI (ratatui). Default when no
@@ -817,6 +817,7 @@ fn report_json_envelope(
         if v == View::Grown {
             envelope["coverage"] = serde_json::json!({
                 "walked_total": rr.reconciliation.walked_total,
+                "unique_estimate": rr.reconciliation.unique_estimate,
                 "du_total": rr.reconciliation.du_total,
                 "unowned_total": rr.reconciliation.unowned,
                 "attributed_total": rr.reconciliation.attributed,
@@ -898,10 +899,17 @@ fn main() -> Result<()> {
                         "partial"
                     }
                 );
+                safe_println!("{}", result.accounting_note);
+                for limit in &result.coverage.limits {
+                    safe_println!("Limit: {limit}");
+                }
                 for group in result.groups {
                     safe_println!(
-                        "{}: {} bytes allocated{}",
+                        "{} [{}; features {}; package {}]: {} bytes allocated{}",
                         group.target.unwrap_or_else(|| "unknown/residual".into()),
+                        group.target_kind.as_deref().unwrap_or("unknown kind"),
+                        group.variant.features.as_deref().unwrap_or("unknown"),
+                        group.package_id.as_deref().unwrap_or("unknown"),
                         group.allocated_bytes,
                         group
                             .residual_reason

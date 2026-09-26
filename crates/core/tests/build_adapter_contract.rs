@@ -93,6 +93,7 @@ fn blank_report(root: &Path) -> swamp_core::Report {
         projects: Vec::new(),
         unowned: Vec::new(),
         reconciliation: swamp_core::report::Reconciliation {
+            unique_estimate: None,
             attributed: 0,
             unowned: 0,
             walked_total: 0,
@@ -114,23 +115,20 @@ fn blank_report(root: &Path) -> swamp_core::Report {
 }
 
 #[test]
-fn builder_defaults_are_inspection_only_and_unsupported() {
-    // Nothing any adapter emits may claim an action, and nothing may
-    // claim a support level its own code did not state a reason for.
+fn action_claims_are_backed_by_role_contracts_and_project_boundaries() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("app");
     let dirs = mixed_project(&root);
     let units = identify(&root, &dirs);
     assert!(!units.is_empty(), "the mixed project identified nothing");
     for u in &units {
-        assert!(
-            matches!(
-                u.action,
-                NestedActionCapability::InspectionOnly | NestedActionCapability::Unsupported { .. }
-            ),
-            "{} claims an action nothing executes",
-            u.path.display()
-        );
+        if u.action == NestedActionCapability::TrashPath {
+            let registry = Registry::with_builtins();
+            let adapter = registry.get(u.adapter.as_deref().unwrap()).unwrap();
+            assert!(adapter.trash_roles().contains(&u.role));
+            assert!(u.path.starts_with(&root) && u.path != root);
+            assert!(u.consequence.is_some() && u.coverage.supported);
+        }
         if u.coverage.supported {
             assert!(
                 !u.producer_evidence.is_empty(),

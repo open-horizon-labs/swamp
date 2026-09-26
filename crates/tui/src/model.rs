@@ -977,7 +977,15 @@ fn family_tree_children_of(
             (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
             (None, _) => "consequence not established".into(),
         }];
-        signals.push("inspection only: selective cleanup unsupported here".into());
+        let actionable = members
+            .iter()
+            .filter(|u| u.action == swamp_core::artifact::NestedActionCapability::TrashPath)
+            .count();
+        signals.push(if actionable > 0 {
+            format!("Space marks {actionable} exact paths; remaining items are inspection only")
+        } else {
+            "inspection only: selective cleanup unsupported here".into()
+        });
         signals.push(match f.basis {
             swamp_core::artifact::AccountingBasis::Unknown => {
                 "mixed accounting bases: not summed".to_string()
@@ -987,7 +995,9 @@ fn family_tree_children_of(
         if !f.complete {
             signals.push("measurement incomplete".into());
         }
-        signals.push("blocked".into());
+        if actionable == 0 {
+            signals.push("blocked".into());
+        }
         row.signals = signals;
         rows.push(row);
         if open {
@@ -1094,6 +1104,9 @@ fn family_member_row(
         }
     ));
     let action = match &u.action {
+        swamp_core::artifact::NestedActionCapability::TrashPath => {
+            "Space marks this exact path for Trash".into()
+        }
         swamp_core::artifact::NestedActionCapability::Unsupported { reason } => {
             format!("selective cleanup unsupported: {reason}")
         }
@@ -1111,7 +1124,13 @@ fn family_member_row(
         ),
     ];
     row.signals.extend(u.coverage.limits.iter().cloned());
-    row.signals.push("blocked".into());
+    if u.action == swamp_core::artifact::NestedActionCapability::TrashPath {
+        row.unit = Some(UnitId::for_artifact(&u.path));
+        row.kind = Some(ArtifactKind::BuildOutput);
+        row.evidence = u.decision_evidence.clone();
+    } else {
+        row.signals.push("blocked".into());
+    }
     row
 }
 
@@ -1308,6 +1327,27 @@ pub(crate) fn cleanup_members<'a>(
     key: &str,
 ) -> Vec<&'a swamp_core::artifact::NestedArtifact> {
     use swamp_core::artifact::ArtifactRole as R;
+    if let Some((container, family)) = key
+        .strip_prefix("family-open:")
+        .and_then(|s| s.rsplit_once(':'))
+    {
+        let Some(family) = report
+            .nested_artifacts
+            .iter()
+            .map(|u| u.role.family())
+            .find(|f| f.label() == family)
+        else {
+            return Vec::new();
+        };
+        return swamp_core::build_adapters::family_members(
+            std::path::Path::new(container),
+            &report.nested_artifacts,
+            family,
+        )
+        .into_iter()
+        .filter(|u| u.action == swamp_core::artifact::NestedActionCapability::TrashPath)
+        .collect();
+    }
     let selection = key
         .strip_prefix("cleanup:")
         .and_then(|k| k.split_once(':'))
@@ -1356,7 +1396,8 @@ pub(crate) fn cleanup_members<'a>(
 }
 
 pub(crate) fn is_cleanup_selection(report: &Report, key: &str) -> bool {
-    key.starts_with("cleanup:")
+    (key.starts_with("family-open:") && !cleanup_members(report, key).is_empty())
+        || key.starts_with("cleanup:")
         || key.strip_prefix("cargo:").is_some_and(|path| {
             report.nested_artifacts.iter().any(|u| {
                 u.present
@@ -2519,6 +2560,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: swamp_core::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,
@@ -2586,6 +2628,7 @@ mod tests {
             projects: vec![],
             unowned: vec![
                 swamp_core::report::UnownedRow {
+                    measurement: None,
                     path_or_object: "img".into(),
                     bytes: 100,
                     reason: UnownedReason::DockerNoJoin,
@@ -2599,6 +2642,7 @@ mod tests {
                     evidence: Vec::new(),
                 },
                 swamp_core::report::UnownedRow {
+                    measurement: None,
                     path_or_object: "cache".into(),
                     bytes: 200,
                     reason: UnownedReason::SharedCache,
@@ -2613,6 +2657,7 @@ mod tests {
                 },
             ],
             reconciliation: swamp_core::report::Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

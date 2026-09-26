@@ -117,7 +117,7 @@ is recorded per row below and in
 | Gemini CLI | `gemini-cli` | supported | yes | `~/.gemini`, or the whole of `GEMINI_CLI_HOME` when set (`settings.json`, `GEMINI.md`, `extensions/`, `trustedFolders.json`, `oauth_creds.json`, and **`tmp/bin`** -- not `bin/`); `tmp/<project-id>/` and `history/<project-id>/`, where the id is a legacy `sha256` or a current registry slug. Under `SANDBOX=sandbox-exec` the runtime dir moves to `~/.cache/.gemini` | google-gemini/gemini-cli `main` @ `d5b3e3accb26000d273abf16e0f1dd83aa5428a9`: `packages/core/src/config/storage.ts` (`getGlobalBinDir() = join(getGlobalTempDir(), 'bin')` -- so the cache is at `tmp/bin` and this row's `~/.gemini/bin` was a path no version writes; and the `sandbox-exec` -> `~/.cache/.gemini` runtime move), `packages/core/src/utils/paths.ts` (`GEMINI_DIR` is a constant, not an env var), `packages/core/src/config/projectRegistry.ts` (the `projects.json` slug registry and the hash-to-slug migration) |
 | Pi | `pi` | supported | yes | `~/.pi/agent/`, overridable via `PI_CODING_AGENT_DIR` (shared with Oh My Pi's own override) | earendil-works/pi `main` @ `d201760ffee16564aa8d9a759e0c85b70db33674`: **`packages/coding-agent/docs/environment-variables.md`** (`PI_CODING_AGENT_DIR`) -- this row previously cited `settings.md`, which does not contain that string at all; the claim was true, the citation did not establish it. Also `packages/coding-agent/src/config.ts` (`CONFIG_DIR_NAME = .pi`, `getAgentDir`, `getSessionsDir`) and `docs/sessions.md` |
 | Aider | `aider` | supported | yes | `~/.aider/caches` and an optional home-level `.aider.conf.yml`; per-repo `.aider.chat.history.md`/`.aider.input.history` and `.aider.tags.cache.v{3,4}/` at the git root -- project-local, attached to the worktree model. `.aider.llm.history` is **opt-in** upstream, so it is identified where present and never assumed | Aider-AI/aider `main` @ `5dc9490bb35f9729ef2c95d00a19ccd30c26339c`: `aider/args.py` (the history filenames and `--llm-history-file` defaulting to `None`), `aider/repomap.py` (`TAGS_CACHE_DIR`), `aider/models.py` (the 24-hour-TTL price cache), `aider/main.py` (`.aider.conf.yml`) |
-| GitHub Copilot CLI | `github-copilot-cli` | supported | yes | `~/.copilot`, overridable via `COPILOT_HOME`; separate platform-conventional cache via `COPILOT_CACHE_HOME`. The directory names are documented; **what is inside `session-state/` is not**, so linkage is `unresolved` and no selective action is offered on it | github/docs `main` @ `72e940d15a9aff06b6e84216f3c97dac25c47d9b`: `content/copilot/reference/copilot-cli-reference/cli-config-dir-reference.md` -- the full config-directory listing and both overrides. Re-checked 2026-09-22 across four pinned pages: `workspaceFolder` and `workingDirectory` appear **zero** times and every `cwd` hit is the `/cwd` command, prose, an MCP launch key or an ACP wire parameter. The CLI is closed source. The `cwd`/`workspace`/`workspaceFolder` fields this adapter parsed were the guess this page promised it would not make |
+| GitHub Copilot CLI | `github-copilot-cli` | supported | yes | `COPILOT_HOME` and `COPILOT_CACHE_HOME` supported. Local session directories with `events.jsonl` can be removed; `workspace.yaml` supplies bounded cwd linkage. Unknown formats remain unresolved | GitHub config-directory reference; copilot-sdk @ `4001c1da7d832c51bad1d38619c1a082af390efb` session filesystem tests; upstream CLI #2446 and SDK #1735. See detailed format limits below |
 | Cursor | `cursor` | unverified | no | editor-profile storage, macOS only: `~/Library/Application Support/Cursor` (`User/globalStorage/state.vscdb`, `User/workspaceStorage/<id>/{state.vscdb,workspace.json}`, `User/History`), plus `~/.cursor/` (not decomposed) | Re-searched 2026-09-22 -- `cursor.com/docs/llms.txt` (the official 457-line index), `/docs/agent/overview`, `/docs/agent/projects`, `/docs/configuration/worktrees`; the former `docs.cursor.com/en/agent/chat/history` now redirects to the docs root. **NOT CONFIRMED**: zero hits for `state.vscdb`, `workspaceStorage`, `globalStorage` or `Application Support` in any of them, and Cursor is closed source so there is no repository to pin. The only official on-disk path found is unrelated to session state (`cli/reference/configuration`: `~/.cursor/cli-config.json`). Only `forum.cursor.com` community threads corroborate the profile layout |
 | Windsurf | `windsurf` | unverified | no | macOS only: the **current** profile at `~/Library/Application Support/Devin` and the **legacy** one at `.../Windsurf` (both modeled -- an installation mid-migration has bytes in each), plus `~/.codeium/windsurf`, which upstream states is *not* changing in the rename and stays read-write | [docs.devin.ai desktop FAQ](https://docs.devin.ai/desktop/devin-desktop-faq), retrieved 2026-09-22 (`docs.windsurf.com` 307-redirects here): **PARTIALLY CONFIRMED** -- both profile roots on macOS/Windows/Linux are named, with `User/settings.json`, `User/keybindings.json`, `User/snippets/`, `globalStorage/`, `Workspaces/` and `argv.json` inside them. `workspaceStorage` is **not** on the page, and neither are the `Cache`/`CachedData`/`CachedExtensionVSIXs`/`logs` siblings this adapter also models, so the row stays unverified |
 | Cline | `cline` | supported | yes | VS Code extension global storage, one location per known editor host (Code, Code Insiders, Cursor, Windsurf, `~/.vscode-server` remote): `globalStorage/saoudrizwan.claude-dev/tasks/<task-id>/` plus `state/taskHistory.json`. The second root -- `CLINE_DATA_DIR`, else `CLINE_DIR/data`, else `~/.cline/data` -- **is now modeled** as its own location | cline/cline `main` @ `254f40c4b592d1e662b84f2ba06fe45dca77cab3`: `apps/vscode/src/sdk/legacy-state-reader.ts` (the per-task filenames, and `path.join(resolveDataDir(dataDir), "state", "taskHistory.json")`), `apps/vscode/src/hosts/vscode/vscode-to-file-migration.ts` (taskHistory "is **NOT** migrated here" -- it lives at `{globalStorageFsPath}/state/taskHistory.json`, and for VS Code that path is *not* `~/.cline/data`), `apps/vscode/src/shared/HistoryItem.ts` (`cwdOnTaskInitialization`, optional), `apps/vscode/src/shared/storage/storage-context.ts` + `sdk/packages/shared/src/storage/paths.ts` (the second root), `.clinerules/storage.md`. **Upstream's own spelling is ambiguous** -- `state/taskHistory.json` (migration comment), `tasks/taskHistory.json` (same file's skip list), `~/.cline/data/tasks/taskHistory.json` (`.clinerules/storage.md`) -- so this catalog follows the executable code (`state/`) and says so in the unresolved reason rather than asserting one path |
@@ -231,11 +231,12 @@ without needing to be widened.
 
 ### Cache/log Trash move
 
-A single directory (e.g. `debug/`, `shell-snapshots/`, `statsig`,
-`plugins/.trash`, `skills/.trash`) is moved into Trash as one unit,
-recoverable until Trash is emptied. The tool regenerates these
-automatically; removing them costs nothing except the next
-regeneration.
+A supported single directory is moved into Trash as one unit, recoverable
+until Trash is emptied. The move does not imply its contents are rebuildable:
+cache recreation may require another tool run or a download; diagnostic logs
+lose past records; command recall and editor undo snapshots lose local history.
+New logs or history files do not recreate deleted records. Restore those from
+Trash or a backup if needed. The preview states this distinction.
 
 ### Session removal
 
@@ -246,11 +247,10 @@ moved together into one Trash envelope. This is **not** a
 rebuildable-cache action: it discards unique resume/rewind/checkpoint
 history for that session. The linked project's own files are never
 touched -- only the tool's own record of the conversation is affected.
-Before acting, `execute` re-derives the session's current membership
-from scratch and refuses if it has drifted (a member is now missing, a
-new member the plan did not know about has appeared, or the whole
-session is no longer identifiable at that path) rather than acting on
-a stale plan.
+The TUI moves the member paths shown in its confirmation. It does not run
+the retired CLI `execute` command or a post-mark membership recheck.
+Stop the owning tool first if it may still be writing. Partial move failures
+retain their per-member outcomes in the Trash envelope's `restore.json`.
 
 ### What is refused, always
 
@@ -651,32 +651,29 @@ re-pinned 2026-09-22 to `github/docs` @
 guessed directory name (`history-session-state/`, which upstream's
 changelog shows is the *pre-0.0.342* name, migrated on `--resume`) to
 the real `session-state/` and `command-history-state/`.
+The [current directory reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
+documents session-ID directories containing `events.jsonl` and workspace
+artifacts. Each such directory is an exact local-session Trash selection;
+unknown project linkage does not prohibit choosing it. This loses local
+conversation/checkpoint history, not a rebuildable cache. Remote copies,
+if any, are outside this action.
 
-What that page documents is **directory names**. It documents nothing
-about the contents of a session's own files, which is why linkage and
-selective action are withheld -- see the sessions bullet below.
-
-- **Protected config:** `config.json`, `settings.json`, `mcp-config.json`,
-  `lsp-config.json`, `permissions-config.json`, `providers.json`,
-  `copilot-instructions.md`, `instructions/`, `agents/`, `hooks/`,
-  `skills/`, `extensions/`, `installed-plugins/`, `plugin-data/`,
-  `mcp-oauth-config/`, `mcp-secrets/`.
-- **Sessions (identified, not actionable):** `session-state/` -- one
-  unit per immediate child (file or folded directory). Project linkage
-  is always `unresolved` and **no selective action is offered**. This
-  adapter used to scan a child's small JSON files for a
-  `cwd`/`workspace`/`workspaceFolder` field and this document used to
-  promise that was "never a guess at an undocumented schema". It was
-  exactly that: no upstream source documents any field inside Copilot
-  CLI session state (four pinned `github/docs` pages contain zero
-  occurrences of `workspaceFolder` or `workingDirectory`), and the CLI
-  is closed source. The directory names stay confirmed, so the bytes
-  are still identified and measured; the claim about what is inside
-  them is withdrawn, and with it the removal capability that rested on
-  it.
+- **Protected config:** authentication, settings, instructions, extensions,
+  hooks and secrets remain protected.
+- **Sessions:** immediate directories with `events.jsonl` support removal.
+  Unrecognized files/directories remain inspection-only.
+- **Project linkage:** one bounded, cached read of `workspace.yaml` extracts
+  its top-level absolute `cwd` in supported single-line scalar forms.
+  Missing or unfamiliar metadata remains unresolved. No transcript search
+  or arbitrary adjacent JSON scan occurs. The SDK tests establish the file
+  ([pinned source](https://github.com/github/copilot-sdk/blob/4001c1da7d832c51bad1d38619c1a082af390efb/nodejs/test/e2e/session_fs.e2e.test.ts));
+  upstream reports show the on-disk field in CLI 1.0.14
+  ([#2446](https://github.com/github/copilot-cli/issues/2446),
+  [SDK #1735](https://github.com/github/copilot-sdk/issues/1735)).
+  These are format evidence, not a guarantee for every CLI version.
 - **`session-store.db`** (+ `-wal`/`-shm`): protected, non-actionable,
   same discipline as every other tool's cross-session SQLite store.
-- **Caches (actionable):** `command-history-state/` (reverse-search
+- **Local history (actionable):** `command-history-state/` (reverse-search
   command recall, not conversation content).
 - **Logs (actionable):** `logs/`.
 - **`ide/`** (IDE integration state/lock files): identified but never

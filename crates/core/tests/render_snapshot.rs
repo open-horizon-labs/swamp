@@ -147,6 +147,7 @@ fn fixture_report() -> Report {
         nested_artifacts: Vec::new(),
         unowned: vec![
             UnownedRow {
+                measurement: None,
                 path_or_object: "old-project/build".to_string(),
                 bytes: 300_000_000,
                 reason: UnownedReason::NoContainingRepo,
@@ -160,6 +161,7 @@ fn fixture_report() -> Report {
                 evidence: Vec::new(),
             },
             UnownedRow {
+                measurement: None,
                 path_or_object: "old-project/tmp".to_string(),
                 bytes: 100_000_000,
                 reason: UnownedReason::NoContainingRepo,
@@ -173,6 +175,7 @@ fn fixture_report() -> Report {
                 evidence: Vec::new(),
             },
             UnownedRow {
+                measurement: None,
                 path_or_object: "restricted/vault".to_string(),
                 bytes: 0,
                 reason: UnownedReason::PermissionDenied,
@@ -186,6 +189,7 @@ fn fixture_report() -> Report {
                 evidence: Vec::new(),
             },
             UnownedRow {
+                measurement: None,
                 path_or_object: "/Users/x/.cache".to_string(),
                 bytes: 4_000_000_000,
                 reason: UnownedReason::SharedCache,
@@ -200,6 +204,7 @@ fn fixture_report() -> Report {
             },
         ],
         reconciliation: Reconciliation {
+            unique_estimate: None,
             attributed: 6_200_000_000,
             unowned: 4_400_000_000,
             walked_total: 10_600_000_000,
@@ -400,6 +405,7 @@ fn view_builds_lists_build_and_cache_rows_sorted_by_bytes() {
 fn view_docker_lists_unowned_name_alike_candidates_as_unattributed() {
     let mut report = fixture_report();
     report.unowned.push(UnownedRow {
+        measurement: None,
         path_or_object: "big-grower-staging:latest".to_string(),
         bytes: 500_000_000,
         reason: UnownedReason::DockerNoJoin,

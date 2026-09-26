@@ -95,6 +95,7 @@ fn report_json_with_nested_artifacts_serializes_byte_identically_across_a_real_c
         projects: Vec::new(),
         unowned: Vec::new(),
         reconciliation: swamp_core::report::Reconciliation {
+            unique_estimate: None,
             attributed: 0,
             unowned: 0,
             walked_total: 0,

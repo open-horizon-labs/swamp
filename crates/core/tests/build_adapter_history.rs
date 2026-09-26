@@ -71,6 +71,16 @@ fn observe(
     changed: Vec<PathBuf>,
     force_full: bool,
 ) -> swamp_core::Report {
+    observe_excluding(root, store, changed, force_full, &[])
+}
+
+fn observe_excluding(
+    root: &Path,
+    store: &Path,
+    changed: Vec<PathBuf>,
+    force_full: bool,
+    excluded: &[PathBuf],
+) -> swamp_core::Report {
     // `docker_in_scope: false`: these fixtures assert exact
     // `containers_identified`/`containers_reused` counts for adapters
     // that have nothing to do with Docker. `report_full_mode_with_source`
@@ -102,7 +112,7 @@ fn observe(
         false,
         force_full,
         &Live(changed),
-        &[],
+        excluded,
         false,
     )
     .unwrap()
@@ -124,6 +134,384 @@ fn facts(r: &swamp_core::Report) -> Vec<(String, String, u64, bool)> {
 fn fresh_full(root: &Path) -> swamp_core::Report {
     let store = tempfile::tempdir().unwrap();
     observe(root, store.path(), vec![], true)
+}
+
+#[test]
+fn checkoutless_incremental_remeasurement_matches_full_across_file_mutations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let file = root.join("loose/cache/file");
+    write(&file, 16_384);
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    let unchanged = observe(&root, store.path(), vec![], false);
+    assert!(
+        unchanged
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        unchanged.notes
+    );
+    for mutation in 0..5 {
+        match mutation {
+            0 => write(&root.join("new/file"), 32_768),
+            1 => write(&file, 65_536),
+            2 => write(&file, 4_096),
+            3 => fs::rename(&file, root.join("renamed")).unwrap(),
+            _ => fs::remove_file(root.join("renamed")).unwrap(),
+        }
+        let incremental = observe(
+            &root,
+            store.path(),
+            vec![root.clone(), root.join("loose/cache"), root.join("new")],
+            false,
+        );
+        let full = fresh_full(&root);
+        assert!(
+            incremental
+                .notes
+                .iter()
+                .any(|n| n.starts_with("fsevents: mode=incremental")),
+            "changed unowned bytes must be measured locally: {:?}",
+            incremental.notes
+        );
+        assert_eq!(
+            incremental.reconciliation.walked_total, full.reconciliation.walked_total,
+            "mutation {mutation}"
+        );
+        assert!(incremental.projects.is_empty());
+    }
+}
+
+#[test]
+fn mixed_root_refreshes_unowned_mutations_without_disabling_unchanged_reuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    git_init(&root.join("repo"));
+    write(&root.join("repo/source"), 4096);
+    let store = tempfile::tempdir().unwrap();
+    let loose = root.join("loose/file");
+    write(&loose, 16384);
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    for mutation in 0..6 {
+        match mutation {
+            0 => write(&loose, 65536),
+            1 => write(&loose, 4096),
+            2 => fs::rename(&loose, root.join("loose/renamed")).unwrap(),
+            3 => fs::remove_file(root.join("loose/renamed")).unwrap(),
+            4 => write(&loose, 32768),
+            _ => git_init(&root.join("loose")),
+        }
+        let actual = observe(
+            &root,
+            store.path(),
+            vec![root.join(if mutation == 5 { "loose/.git" } else { "loose" })],
+            false,
+        );
+        assert!(
+            actual.notes.iter().any(|n| if mutation == 5 {
+                n.contains("reason=unowned_changes")
+            } else {
+                n.starts_with("fsevents: mode=incremental")
+            }),
+            "{:?}",
+            actual.notes
+        );
+        let expected = fresh_full(&root);
+        assert_eq!(
+            actual.reconciliation.walked_total,
+            expected.reconciliation.walked_total
+        );
+        assert_eq!(
+            actual.reconciliation.unowned,
+            expected.reconciliation.unowned
+        );
+        let unchanged = observe(&root, store.path(), vec![], false);
+        assert!(
+            unchanged
+                .notes
+                .iter()
+                .any(|n| n.starts_with("fsevents: mode=incremental")),
+            "{:?}",
+            unchanged.notes
+        );
+    }
+    // The repair must not turn ordinary checkout edits into full-root walks.
+    write(&root.join("repo/source"), 8192);
+    let owned = observe(&root, store.path(), vec![root.join("repo")], false);
+    assert!(
+        owned
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        owned.notes
+    );
+    assert_eq!(
+        owned.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+}
+
+#[test]
+fn unowned_refresh_cost_is_local_and_folded_boundaries_survive_storage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("root-file"), 4096);
+    write(&root.join("loose/file"), 4096);
+    write(&root.join("target/deep/file"), 8192);
+    for i in 0..2000 {
+        write(&root.join(format!("unchanged/{i}")), 4096);
+    }
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    let (_, full_work) = swamp_core::work_counters::measured(|| fresh_full(&root));
+    assert!(
+        full_work.files_statted >= 2000,
+        "instrument must see the reference traversal: {full_work:?}"
+    );
+    for (file, changed) in [
+        ("root-file", ""),
+        ("loose/file", "loose"),
+        ("target/deep/file", "target/deep"),
+    ] {
+        write(&root.join(file), 65536);
+        let (actual, work) = swamp_core::work_counters::measured(|| {
+            observe(
+                &root,
+                store.path(),
+                vec![root.join(file), root.join(changed), root.clone()],
+                false,
+            )
+        });
+        assert!(
+            actual
+                .notes
+                .iter()
+                .any(|n| n.starts_with("fsevents: mode=incremental")),
+            "{:?}",
+            actual.notes
+        );
+        assert_eq!(
+            actual.reconciliation.walked_total,
+            fresh_full(&root).reconciliation.walked_total
+        );
+        assert!(
+            work.files_statted < 100,
+            "unchanged sibling was traversed: {work:?}"
+        );
+        eprintln!("{changed}: {work:?}; reference: {full_work:?}");
+    }
+    let (_, unchanged) =
+        swamp_core::work_counters::measured(|| observe(&root, store.path(), vec![], false));
+    assert_eq!(unchanged.files_statted, 0, "{unchanged:?}");
+    assert_eq!(unchanged.dirs_listed, 0, "{unchanged:?}");
+    let (storm, storm_work) = swamp_core::work_counters::measured(|| {
+        observe(
+            &root,
+            store.path(),
+            (0..20)
+                .map(|i| root.join(format!("unchanged/{i}")))
+                .collect(),
+            false,
+        )
+    });
+    assert!(
+        storm
+            .notes
+            .iter()
+            .any(|n| n.contains("reason=too_many_changes")),
+        "{:?}",
+        storm.notes
+    );
+    assert!(
+        storm_work.files_statted <= full_work.files_statted + 20,
+        "event burst must not relist before choosing a full scan: {storm_work:?}"
+    );
+    write(&root.join("new/target/deep/file"), 32768);
+    let actual = observe(
+        &root,
+        store.path(),
+        vec![
+            root.join("new/target/deep/file"),
+            root.join("new/target/deep"),
+        ],
+        false,
+    );
+    let full = fresh_full(&root);
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        full.reconciliation.walked_total
+    );
+    assert!(actual.unowned.iter().any(|r| r.path_or_object
+        == root.join("new/target").to_string_lossy()
+        && r.measurement == Some(swamp_core::report::UnownedMeasurement::Subtree)));
+}
+
+#[test]
+fn unowned_shared_links_refresh_locally_until_reconciliation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("a/file"), 16384);
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::hard_link(root.join("a/file"), root.join("b/file")).unwrap();
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    fs::remove_file(root.join("a/file")).unwrap();
+    let (actual, work) = swamp_core::work_counters::measured(|| {
+        observe(&root, store.path(), vec![root.join("a")], false)
+    });
+    assert!(
+        actual.notes.iter().any(|n| n.contains("mode=incremental")),
+        "sharing must not force a root walk: {:?}",
+        actual.notes
+    );
+    assert!(work.dirs_listed <= 1, "{work:?}");
+    assert!(actual.unowned.iter().any(|r| {
+        r.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }));
+    assert!(swamp_core::render::render_view_unowned(&actual).contains("need reconciliation"));
+    let reconciled = observe(&root, store.path(), vec![], true);
+    assert_eq!(
+        reconciled.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+    assert!(!reconciled.unowned.iter().any(|r| {
+        r.measurement
+            .is_some_and(|m| m.unique_needs_reconciliation())
+    }));
+
+    let outside = tempfile::tempdir().unwrap();
+    write(&outside.path().join("deep/file"), 131072);
+    write(&root.join("replace/deep/file"), 32768);
+    observe(&root, store.path(), vec![], true);
+    fs::rename(root.join("replace"), outside.path().join("old")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("replace")).unwrap();
+    let actual = observe(&root, store.path(), vec![root.join("replace/deep")], false);
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+}
+
+#[test]
+fn unowned_refresh_preserves_excluded_subtrees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("loose/file"), 4096);
+    write(&root.join("target/cache/file"), 8192);
+    let excluded = vec![root.join("loose/excluded"), root.join("target/excluded")];
+    for p in &excluded {
+        write(&p.join("file"), 131072);
+    }
+    for _ in 0..3 {
+        observe_excluding(&root, store.path(), vec![], false, &excluded);
+    }
+    write(&root.join("loose/file"), 32768);
+    write(&root.join("target/cache/file"), 65536);
+    let actual = observe_excluding(
+        &root,
+        store.path(),
+        vec![root.join("loose"), root.join("target/cache")],
+        false,
+        &excluded,
+    );
+    let full_store = tempfile::tempdir().unwrap();
+    let full = observe_excluding(&root, full_store.path(), vec![], true, &excluded);
+    assert!(
+        actual
+            .notes
+            .iter()
+            .any(|n| n.starts_with("fsevents: mode=incremental")),
+        "{:?}",
+        actual.notes
+    );
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        full.reconciliation.walked_total
+    );
+    assert!(!actual.unowned.iter().any(|r| {
+        excluded
+            .iter()
+            .any(|p| Path::new(&r.path_or_object).starts_with(p))
+    }));
+}
+
+#[test]
+fn missing_unowned_baseline_reconciles_instead_of_dropping_unchanged_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("a/file"), 8192);
+    write(&root.join("b/file"), 16384);
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    let baseline =
+        swamp_core::growth::volume_store_dir(store.path(), &root).join("unowned.parquet");
+    assert!(baseline.exists());
+    fs::remove_file(baseline).unwrap(); // disposable fixture cache only
+    write(&root.join("a/file"), 32768);
+    let actual = observe(&root, store.path(), vec![root.join("a")], false);
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        fresh_full(&root).reconciliation.walked_total
+    );
+    assert!(
+        actual
+            .notes
+            .iter()
+            .any(|n| n.contains("reason=checkoutless_changes")),
+        "{:?}",
+        actual.notes
+    );
+}
+
+#[test]
+fn removed_cache_tag_reconciles_the_unowned_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let store = tempfile::tempdir().unwrap();
+    write(&root.join("tagged/deep/file"), 8192);
+    let tag = root.join("tagged/CACHEDIR.TAG");
+    fs::write(&tag, b"Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+    for _ in 0..3 {
+        observe(&root, store.path(), vec![], false);
+    }
+    fs::remove_file(&tag).unwrap();
+    let actual = observe(&root, store.path(), vec![tag, root.join("tagged")], false);
+    let full = fresh_full(&root);
+    let boundaries = |r: &swamp_core::Report| {
+        let mut rows: Vec<_> = r
+            .unowned
+            .iter()
+            .map(|r| {
+                (
+                    r.path_or_object.clone(),
+                    r.bytes,
+                    format!("{:?}", r.measurement),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(boundaries(&actual), boundaries(&full));
+    assert_eq!(
+        actual.reconciliation.walked_total,
+        full.reconciliation.walked_total
+    );
 }
 
 #[test]
@@ -538,6 +926,94 @@ fn polyglot_fixture() -> (tempfile::TempDir, Vec<PathBuf>) {
         8_000,
     );
     (tmp, vec![py, go, swift, android])
+}
+
+#[test]
+fn project_local_actions_are_plannable_across_non_rust_adapters() {
+    use swamp_core::artifact::NestedActionCapability;
+    let (_tmp, mut roots) = polyglot_fixture();
+    let (node_tmp, node) = node_fixture();
+    roots.push(node);
+    for (name, marker, contents, output) in [
+        (
+            "gradle-actions",
+            "build.gradle",
+            "",
+            "build/classes/java/main/App.class",
+        ),
+        (
+            "maven-actions",
+            "pom.xml",
+            "<project><artifactId>app</artifactId></project>",
+            "target/classes/App.class",
+        ),
+    ] {
+        let root = node_tmp.path().join(name);
+        git_init(&root);
+        fs::write(root.join(marker), contents).unwrap();
+        fs::write(root.join(".gitignore"), "build/\ntarget/\n").unwrap();
+        write(&root.join(output), 4096);
+        roots.push(root);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        let report = fresh_full(&root);
+        let actionable: Vec<_> = report
+            .nested_artifacts
+            .iter()
+            .filter(|u| u.action == NestedActionCapability::TrashPath)
+            .collect();
+        assert!(
+            !actionable.is_empty(),
+            "{} produced no supported action",
+            root.display()
+        );
+        for unit in actionable {
+            let plan = swamp_core::actions::propose_checking_protection(
+                &report,
+                None,
+                std::slice::from_ref(&unit.path),
+                "test",
+                &[],
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} claims action but cannot be planned: {e}",
+                    unit.path.display()
+                )
+            });
+            assert_eq!(plan.len(), 1);
+            assert_eq!(plan[0].path(), unit.path);
+            assert!(plan[0].cargo_group().is_none());
+            seen.insert(unit.adapter.clone().unwrap());
+        }
+        for unit in report.nested_artifacts.iter().filter(|u| {
+            matches!(
+                u.role,
+                swamp_core::artifact::ArtifactRole::InstalledDependencies
+                    | swamp_core::artifact::ArtifactRole::Installation
+                    | swamp_core::artifact::ArtifactRole::DeviceState
+                    | swamp_core::artifact::ArtifactRole::Archive
+            )
+        }) {
+            assert_ne!(unit.action, NestedActionCapability::TrashPath);
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "node",
+            "gradle",
+            "maven",
+            "python",
+            "go",
+            "android",
+            "xcode-swift"
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    );
 }
 
 #[test]

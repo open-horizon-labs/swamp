@@ -676,6 +676,10 @@ pub fn interior_json(
         .families
         .iter()
         .map(|f| {
+            let actionable = crate::build_adapters::family_members(container, &units, f.family)
+                .iter()
+                .filter(|u| u.action == crate::artifact::NestedActionCapability::TrashPath)
+                .count();
             json!({
                 "family": f.family.label(),
                 "title": f.family.title(),
@@ -688,7 +692,8 @@ pub fn interior_json(
                 "oldest_modified": f.oldest_modified,
                 "unknown_age": f.unknown_age,
                 "complete": f.complete,
-                "action": "inspection-only",
+                "action": if actionable == 0 { "inspection-only" } else { "tui-trash-selection" },
+                "actionable_count": actionable,
             })
         })
         .collect();
@@ -765,6 +770,7 @@ mod tests {
             }],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 500_000_000,
                 unowned: 0,
                 walked_total: 500_000_000,

@@ -61,6 +61,22 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         return;
     }
+    if let Some(lines) = &app.cargo_inspection {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => app.cargo_inspection = None,
+            KeyCode::Down => {
+                app.cargo_inspection_scroll = app
+                    .cargo_inspection_scroll
+                    .saturating_add(1)
+                    .min(lines.len().saturating_sub(1).min(u16::MAX as usize) as u16)
+            }
+            KeyCode::Up => {
+                app.cargo_inspection_scroll = app.cargo_inspection_scroll.saturating_sub(1)
+            }
+            _ => {}
+        }
+        return;
+    }
     if let Some(p) = app.picker.as_mut() {
         match code {
             KeyCode::Up => p.up(),
@@ -137,6 +153,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('r') => app.toggle_reverse(),
         KeyCode::Char('k') => app.toggle_keep_executables(),
         KeyCode::Char('?') => app.toggle_help(),
+        KeyCode::Char('i') => app.inspect_selected_cargo_profile(),
         _ => {}
     }
 }
@@ -529,6 +546,7 @@ mod tests {
             projects: vec![],
             unowned: vec![],
             reconciliation: Reconciliation {
+                unique_estimate: None,
                 attributed: 0,
                 unowned: 0,
                 walked_total: 0,

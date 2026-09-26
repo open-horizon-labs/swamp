@@ -342,14 +342,15 @@ impl TimeSource {
 /// What, if anything, swamp can do to a unit -- carried separately from
 /// its identity (#64: "Identification works without a cleanup adapter").
 ///
-/// Every build adapter in this chunk declares [`Self::InspectionOnly`].
-/// #73 implements adapter actions; until it does, a unit claiming
-/// anything else would be a promise with no executor behind it, which is
-/// what `build_adapter_matrix_matches_docs` checks the published table
-/// for.
+/// Exact project-local paths can be selected for TUI Trash. Shared stores,
+/// installations and unknown layouts retain explicit inspection-only limits.
+/// Cargo's fingerprint-aware cleanup groups use their existing separate plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "capability", rename_all = "kebab-case")]
 pub enum NestedActionCapability {
+    /// Exact filesystem path moved to Trash by the human in the TUI.
+    /// This never authorizes a manager-wide prune or a parent fallback.
+    TrashPath,
     /// Identified and explainable; no action is offered.
     #[default]
     InspectionOnly,
@@ -362,6 +363,7 @@ pub enum NestedActionCapability {
 impl NestedActionCapability {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::TrashPath => "trash-path",
             Self::InspectionOnly => "inspection-only",
             Self::Unsupported { .. } => "unsupported",
         }
@@ -374,6 +376,7 @@ impl NestedActionCapability {
     /// reading -- never a claimed capability nothing behind it granted.
     pub fn from_label(label: &str, reason: Option<String>) -> Self {
         match label {
+            "trash-path" => Self::TrashPath,
             "unsupported" => Self::Unsupported {
                 reason: reason.unwrap_or_default(),
             },

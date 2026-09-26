@@ -259,6 +259,7 @@ fn the_derived_views_follow_the_facts_they_are_computed_from() {
         .expect("a walked root");
     let vol = swamp_core::growth::volume_store_dir(&fx.store, &root);
     let docker = swamp_core::report::UnownedRow {
+        measurement: None,
         path_or_object: "sha256:tampered".into(),
         bytes: 4096,
         reason: swamp_core::report::UnownedReason::DockerNoJoin,

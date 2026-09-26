@@ -51,6 +51,37 @@ are attached to each release as well.
 
 ## Observations and history
 
+### Unique bytes and fast refresh
+
+Ordinary refreshes update changed containers without revisiting unchanged roots
+to resolve hardlinks. Their unique-byte estimates can therefore be stale. The
+TUI labels these totals as needing reconciliation; JSON exposes the same fact
+as `reconciliation.unique_estimate.needs_reconciliation`.
+
+Run `swamp observe --full` for the configured scope (or pass the same explicit
+roots you normally observe), then `swamp report --view reconciliation`.
+When using explicit roots, pass the same roots to both commands.
+The full observation includes an additional parallel measurement across the
+observed project roots, external units, and agent units. It counts a shared
+device/inode once, respects exclusions, and does not follow symlinks. This
+extra traversal is explicit, never part of an ordinary incremental refresh.
+
+Only the resulting byte total and reconciliation timestamp are stored, in the
+existing Parquet run row. No inode inventory is retained. Later observations
+keep that last result with `needs_reconciliation: true`; an incomplete full
+observation cannot certify it as current. Before the first reconciliation the
+JSON value is `null`, not zero. The estimate covers the observed paths: known
+missing roots remain listed in scope coverage and contribute no paths. That
+does not delete their stored history. Inaccessible or partially read roots
+prevent a fresh reconciliation.
+
+This scope-wide physical-byte estimate excludes Docker and does not change
+per-root charges, artifact growth history, or cleanup advice. Do not add it to
+the row totals. Row totals use local accounting and may include shared storage;
+neither figure promises how much deletion will free.
+Uniqueness here means hardlink deduplication by inode, not detection of shared
+APFS clone/snapshot extents.
+
 `swamp observe` is the only command that scans: it walks the filesystem,
 groups projects, computes signals, discovers external/agent-tool
 storage, and persists all of it. `swamp report` is a pure read of what
@@ -348,6 +379,24 @@ separately (#50).
 
 ## External and shared storage
 
+### Which projects share these bytes?
+
+`swamp observe --full` records hardlink-sharing groups between folded containers.
+Select an artifact or worktree in the TUI to see its sharing evidence, or use
+`swamp report --view reconciliation` (`--json` for the stored groups).
+For example, a package-manager store and two projects can share one 400 MB
+group: that is 400 MB counted once, not 400 MB for each pair.
+
+These facts carry their reconciliation time. Normal refresh retains them with
+“needs reconciliation”; it does not rescan other projects to rediscover peers.
+Links outside scanned coverage remain unresolved, and very large summaries
+explicitly report omissions. Absence of a listed peer is not proof of exclusivity.
+
+Sharing is not a deletion prohibition or an ownership claim. Cleanup estimates
+are calculated for the selection: deleting one link may free no space, while
+deleting all its links can free the inode's storage. APFS clones and snapshots
+can still affect actual savings. Sharing groups do not change growth history.
+
 Storage with no containing project -- the Cargo registry, rustup
 toolchains, a Homebrew prefix, and future detector-resolved locations
 (model stores, package caches, ...) -- is measured as a first-class
@@ -563,9 +612,10 @@ bytes no unit accounts for are one "Not identified" line, so the
 families and the residual add up to the container. Units of unknown age
 are counted separately and never rank as ancient. `--view builds --json`
 and `--view deps --json` carry the same summary and every unit under an
-`interior` key on each identified row. Nothing
-in this section is actionable: build-artifact cleanup beyond Cargo's own
-groups is not implemented, and every row says "inspection only". See
+`interior` key on each identified row. In the TUI, Space marks supported
+project-local outputs, test output and intermediates, individually or by
+family. The selection uses the same non-overlapping members as the displayed
+family. Shared stores, installations and unknown layouts stay inspection-only. See
 [docs/build-artifacts.md](build-artifacts.md) for the capability matrix,
 the per-ecosystem layouts that are covered, and the attribution limits.
 
@@ -587,7 +637,33 @@ but is not yet joined into the report (see
 
 Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. Opening a project in the TUI shows cleanup groups under each build profile: **Compiler caches**, **Compiled tests & examples**, and **Build-script output**, when supported members exist. Space marks a group's exact members for review; Backspace opens confirmation. Expand with → to choose Tests, Examples, or individual age-ranked members instead. Unrelated dependencies are not part of these groups. **Inspect directories** retains the physical layout as another view of the same bytes. No switch to Builds is required. The selected-row details explain cleanup recommendations and rebuilding consequences. Incremental compiler caches are suggested as a starting point if slower subsequent builds are an acceptable trade-off—not because Swamp has proved them obsolete. Compiled dependencies remain a folded aggregate without selective dependency cleanup.
 
-In the project tree or Builds view, mark an identified test/example executable or an individual incremental/build-script directory to review an exact cleanup group. Physical category rows only expand; purpose-based cleanup groups in the project tree mark their supported members. CLI plans can select the same exact paths. Executable groups include existing dep-info and debug-symbol companions. Approval applies only to the reviewed group, not future files at that path.
+In the project tree or Builds view, mark an identified test/example executable or an individual incremental/build-script directory to review an exact cleanup group. Purpose groups and profiles mark their supported members, not the entire profile directory. Executable groups include existing dep-info and debug-symbol companions. Cleanup is TUI-only; there is no CLI cleanup plan or approval command.
+
+### On-demand Cargo dependency inspection
+
+Select a Cargo profile in the TUI and press `i`. Inspection runs in the
+background; Esc or Ctrl-C cancels while it runs. The results are scrollable
+with ↑/↓ and close with Esc. To request the same details from the CLI:
+
+```sh
+swamp inspect-cargo ./target/debug --json
+```
+
+This reads only that profile's immediate `deps/` entries and bounded
+`.fingerprint/` metadata. Default limits are 262,144 entries, five seconds and
+8 MiB of metadata; a limit produces explicitly partial results. It does not
+run Cargo, read source files, or save a file inventory. Ordinary scans keep
+dependencies folded.
+
+For a large profile, request a larger bounded inspection with
+`--max-entries 262144 --max-ms 30000`. These are hard ceilings, not a new
+background scan schedule. A partial result describes only inspected entries.
+
+Groups name targets and variants when fingerprint evidence matches; target
+names are not package identities. Unmatched or ambiguous files remain
+unattributed. Allocated bytes may count hardlinks repeatedly; the unique
+total deduplicates only the inspected files, and neither means reclaimable
+space. These diagnostics do not enable per-crate deletion.
 
 ### Build details: choose what to give up
 
@@ -612,7 +688,7 @@ Its sizes and ages are one observation of Swamp's own build directory, not expec
 
 **Candidates are not guaranteed free space.** The debug profile's 20.7 GB candidate total covers supported cleanup members, not all debug output. Missing groups or “Selective cleanup unsupported” describe Swamp's action support, not a requirement to retain those files. Final outputs and the remaining compiled dependencies are inspection-only for selective cleanup. Space or Backspace on a profile reviews all supported cleanup groups beneath it, not the entire profile directory. Use the candidate total, not the profile's full size, to understand that selection.
 
-Cleanup moves supported filesystem groups to Trash; those bytes are not immediately freed. Emptying Trash later may reclaim space, but surviving hardlinks and filesystem snapshots can limit the result. Source files and unrelated dependency artifacts are outside these purpose-based selections. Existing identity, occupancy, Cargo-lock and approval checks still apply.
+Cleanup moves supported filesystem groups to Trash; those bytes are not immediately freed. Emptying Trash later may reclaim space, but surviving hardlinks and filesystem snapshots can limit the result. Source files and unrelated dependency artifacts are outside these purpose-based selections. Protection is checked when marking, and Cargo's advisory lock is held during removal. There is no post-mark occupancy veto or separate approval grant.
 
 ### Progress and cancellation
 
