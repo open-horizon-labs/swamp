@@ -5,10 +5,34 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.7.0
 
-Swamp now connects more of the storage produced by development back to the
-projects that use it, then helps you choose what to keep or remove. This release
-extends that workflow beyond checkouts and makes build details useful for
-cleanup decisions—not just a list of large directories.
+Swamp 0.7.0 adds Linux support, toolchain and version-manager storage discovery,
+and project-linked agent storage. It extends disk usage and history beyond
+checkouts, with build details that help you choose what to keep or remove.
+
+### See installed toolchains and which projects reference them
+
+- Discover storage managed by mise, asdf, pyenv, uv, Conda, rbenv, RVM,
+  ruby-install, nvm, and rustup, including supported location overrides.
+- Distinguish installations, environments, downloads, caches, shims, and other
+  manager state rather than treating each tool home as one unexplained total.
+- Match project declarations such as `.tool-versions`, `mise.toml`,
+  `.python-version`, `.ruby-version`, `.nvmrc`, and `rust-toolchain.toml` to
+  measured mise/asdf/pyenv/rbenv/RVM/nvm/rustup installations. Show resolved
+  references on both the project and the installation; keep rustup's global
+  default separate from project declarations.
+- These links identify declared consumers, not proven runtime use. An unmatched
+  installation is not necessarily unused, and discovery does not imply that
+  every installation supports cleanup. See the
+  [tool-location catalog](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/locations.md).
+
+### Run Swamp on Linux
+
+- Linux x86_64 joins Apple silicon macOS as a supported release target, with
+  a glibc-based archive built on Ubuntu 24.04 and tested on a newer Ubuntu runner.
+- Linux uses inotify while the TUI or opt-in collector is running; uncovered
+  intervals trigger a full walk. macOS continues to use persisted FSEvents.
+- Linux scheduling uses systemd user timers; macOS uses LaunchAgent.
+  Scheduled observation does not perform cleanup.
 
 ### Find growth across your development environment
 
@@ -51,13 +75,8 @@ cleanup decisions—not just a list of large directories.
 - Project/worktree deduplication, scope exclusions through path aliases, growth
   coverage, and text/JSON project filtering received regression fixes.
 
-### Use the same workflow on macOS and Linux
+### Use the CLI and installable agent skill
 
-- Release archives support Apple silicon macOS and generic Linux x86_64 with
-  glibc, built on Ubuntu 24.04.
-- macOS uses persisted FSEvents. Linux uses inotify while the TUI or opt-in
-  collector is running; uncovered intervals trigger a full walk.
-- Scheduling uses LaunchAgent or systemd user timers. Neither performs cleanup.
 - The agent interface is the CLI plus an installable skill. Install it through
   `npx skills add open-horizon-labs/swamp --skill swamp`;
   a bundled reference covers platform-appropriate binary installation.
