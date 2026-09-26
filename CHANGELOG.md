@@ -1,5 +1,8 @@
 # Changelog
 
+Release notes describe behavior at the named version. Older timings are individual
+observations, not general performance guarantees. See the README for current use.
+
 ## v0.7.0
 
 Swamp now connects more of the storage produced by development back to the
@@ -22,17 +25,16 @@ cleanup decisions—not just a list of large directories.
 
 ### Understand the cleanup trade-off
 
-- Cargo builds open into purpose groups: compiler caches, compiled tests and
-  examples, and build-script output. Group/profile selection expands to supported
-  members, not an indiscriminate deletion of the profile.
+- Building on 0.6's Cargo cleanup groups, shared role families extend build
+  identification and consequences to other ecosystems. Cargo group/profile
+  selection still expands to supported members, not the entire profile.
 - Shared build-role families carry identification, age, accounting, and removal
   consequences into other ecosystem adapters. Project-local cleanup and
   shared-store inspection remain distinct capabilities.
 - Age prioritizes review without claiming a build is obsolete. Shared hardlinks
   do not automatically prohibit removal or justify a promise about freed space.
-- The TUI performs observation, selection review, and cleanup in the background.
-  Deletion progress shows completed/total groups and supports cancellation
-  between groups.
+- The TUI retains background observation, selection review, deletion progress,
+  and cancellation between groups while extending the storage it can explain.
 - On-demand Cargo inspection provides deeper bounded detail without making
   every ordinary refresh index individual dependency files.
 
@@ -59,22 +61,21 @@ cleanup decisions—not just a list of large directories.
 - The agent interface is the CLI plus an installable skill. Install it through
   `npx skills add open-horizon-labs/swamp --skill swamp`;
   a bundled reference covers platform-appropriate binary installation.
-  The MCP server and
-  CLI deletion/approval commands are removed; supported removal is confirmed
+  The MCP server and CLI deletion/approval commands are removed; removal is confirmed
   by a human in the TUI.
 
 ### Know the boundaries
 
 History begins with observation. Ownership and cleanup coverage vary by adapter;
-see the checked [build](docs/build-artifacts.md) and
-[agent-storage](docs/agent-storage.md) matrices. Homebrew discovery is opt-in.
+see the checked [build](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/build-artifacts.md) and
+[agent-storage](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/agent-storage.md) matrices. Homebrew discovery is opt-in.
 
 Filesystem cleanup moves paths to Trash, which must be emptied to reclaim space.
 Docker image/volume removal has no Trash recovery. Allocated row sizes are not
 guaranteed freed bytes, and cleanup does not re-check every fact after marking.
 
-The [usage guide](docs/usage.md) covers the workflow and controls. The rewritten
-[architecture guide](docs/architecture.md) explains folding, history, adapters,
+The [usage guide](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/usage.md) covers the workflow and controls. The rewritten
+[architecture guide](https://github.com/open-horizon-labs/swamp/blob/v0.7.0/docs/architecture.md) explains folding, history, adapters,
 enrichment, and the costs that remain.
 
 ## v0.6.3
