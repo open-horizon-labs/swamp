@@ -221,3 +221,45 @@ workspace/all-target Clippy. Logs: `/tmp/swamp-sharing-routine.log`,
 `/tmp/swamp-sharing-final-focused.log`, `/tmp/swamp-sharing-final-clippy.log`.
 No remaining model-checkable risk from this handoff is intentionally deferred.
 Native CI/release remain separate gates; no installation or release claimed.
+
+## Review — integration and release promotion
+
+Owner requested integration merge and release-readiness review. Fast-forwarded
+`integration/full-scope-merge` from b27de3f to 54d8aae and pushed. This preserves
+the entire stack without conflicts; main and published v0.6.3 were not changed.
+
+Verdict: **Adjust / hold release promotion.** Targeted review against the Claude
+packet found two freshness/performance issues; it is not an exhaustive new audit
+of the entire historical stack.
+
+1. P2: `tui/src/app.rs::prune_removed` updates rows and totals after successful
+   cleanup but leaves `unique_estimate.needs_reconciliation` false. The last
+   unique estimate and peer facts can still look current until a later observer
+   finishes; if it fails they remain misleading. Reproduced by seeding a fresh
+   UniqueEstimate in the existing prune regression, then asserting it was
+   invalidated after successful removal. Test fails at that exact assertion.
+   Temporary test edits were removed after reproduction; production unchanged.
+   Evidence: `/tmp/swamp-release-review-cleanup-freshness.log`. Required repair:
+   invalidate in-memory reconciliation evidence immediately on successful local
+   mutation; test failed/cancelled/no-op results separately from successful ones.
+2. P2: CLI `observe --full` says it re-anchors the event ID, but a fresh probe
+   store followed by ordinary observe produced `no_stored_event_id` and another
+   full walk. A subsequent immediate run was full/too_soon; after the lag floor
+   elapsed, incremental/no-change completed in 411ms. The forced-full unit-root
+   test explicitly expects no source call/cursor. Clarify/fix that contract
+   without certifying a cursor that could miss concurrent mutations. Logs:
+   `/tmp/swamp-release-review-refresh-{1,2,3}.log`, probe scope ~/.cache/uv only.
+
+Green: native macOS/Linux routine CI and Linux archive/smoke jobs on 54d8aae,
+the local routine gate, shared-group/persistence regressions and 31 TUI frames.
+Full-tier jobs (compile-fail/mutations/cost) on that exact code commit remain
+running: https://github.com/open-horizon-labs/swamp/actions/runs/36264182848.
+Their earlier-commit passes are not evidence for this head.
+
+Frame remains developer cleanup, not audit-perfect accounting. The new finding
+is an omitted state transition, not a reason to redesign storage or prohibit
+hardlinked cleanup. Issue #131 policy remains owner-approved. All-catalog/epic
+completion is not inferred from this targeted pass. Human checkpoint remains
+whether real selected-row guidance is clear; reproduced freshness defects must
+be fixed before asking the owner to validate the UI. No release/tag/install or
+production repair was performed in this review-only step.
