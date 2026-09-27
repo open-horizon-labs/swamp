@@ -51,7 +51,7 @@ The observation path has five responsibilities:
 4. **Persist facts and history.** Store current typed rows and prior values needed for growth comparisons.
 5. **Assemble reports.** Apply the requested view, project filter, and pagination to the stored observation.
 
-`swamp observe` performs this work without rendering a report. The TUI uses observation in the background. Scheduling invokes observation without cleanup. `swamp report` reads the resulting store; it may check root presence to resolve scope, but does not recursively traverse roots, inspect artifact contents, or launch subprocesses.
+`swamp observe` performs this work without rendering a report. The TUI uses observation in the background. Every complete successful observation, including scheduled and TUI refreshes, performs a one-time cleanup of recognized retired Swamp store formats under a serialized writer lock. It preserves user configuration, protection, notes, compatible Parquet history, and current enrichment. This housekeeping never removes developer files. `swamp report` reads the resulting store; it may check root presence to resolve scope, but does not recursively traverse roots, inspect artifact contents, or launch subprocesses.
 
 A scope with no observation returns an explicit error, not a fabricated empty report. Report timestamps refer to the observation, not the moment someone requested JSON.
 

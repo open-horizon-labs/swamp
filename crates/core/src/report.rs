@@ -2439,6 +2439,19 @@ pub fn observe_scope(
     since_secs: u64,
 ) -> Result<ScopeObservation> {
     let owns_root_coverage = base.is_none();
+    // Every observing entry point (CLI, scheduled run, and TUI) holds the
+    // same store lock for its complete write pipeline. The CLI's
+    // single-flight PID lock remains useful for its user-facing skip
+    // message; this lock also covers TUI refreshes and housekeeping.
+    let _writer_lock = if observe {
+        store_dir
+            .map(|dir| -> Result<_> {
+                Ok(crate::fs_gate::store::StoreDir::at(dir)?.lock_observation_writes()?)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     if observe && let Some(dir) = store_dir {
         crate::growth::invalidate_unique_estimate(dir, &scope_snapshot_key(scope))?;
     }
@@ -2902,6 +2915,28 @@ pub fn observe_scope(
 
     if trace {
         eprintln!("[trace] observe: scope tables: {:?}", phase.elapsed());
+    }
+    // Retired-format housekeeping is a one-time store upgrade. Run only
+    // after the whole scope snapshot and its unit families were persisted
+    // successfully. Incomplete/missing roots keep all prior root state;
+    // cleanup is deferred until a later complete observation.
+    if observe
+        && owns_root_coverage
+        && want == ObservationParts::ALL
+        && external_ok
+        && agents_ok
+        && !observation.coverage.is_empty()
+        && observation.coverage.iter().all(|c| {
+            matches!(
+                c.status,
+                crate::coverage::RegionStatus::Complete
+                    | crate::coverage::RegionStatus::Excluded
+                    | crate::coverage::RegionStatus::DetectorOnly
+            )
+        })
+        && let Some(store_dir) = store_dir
+    {
+        crate::fs_gate::store::StoreDir::at(store_dir)?.clean_retired_store_state()?;
     }
     Ok(observation)
 }

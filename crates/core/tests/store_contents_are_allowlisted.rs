@@ -140,7 +140,7 @@ fn allowed(rel: &Path) -> bool {
         return true;
     }
     // Lock files and the store's own bookkeeping markers.
-    if name.ends_with(".lock") || name == "VERSION" {
+    if name.ends_with(".lock") || name == "housekeeping.version" {
         return true;
     }
     false

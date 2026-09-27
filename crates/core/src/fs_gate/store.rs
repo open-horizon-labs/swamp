@@ -27,7 +27,7 @@
 //! `list(path)` or `remove(path)` a caller can point anywhere.
 
 use serde::Serialize;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// A swamp state directory: every [`JsonFile`], [`TextFile`] and lock
@@ -82,6 +82,145 @@ impl StoreDir {
     pub fn create(&self) -> io::Result<()> {
         std::fs::create_dir_all(&self.0)
     }
+
+    /// Serializes observation writers that may update the same store.
+    /// The lock is advisory and held for the full observing pipeline.
+    pub fn lock_observation_writes(&self) -> io::Result<super::continuity::FileLock> {
+        self.create()?;
+        let path = self.0.join("store-write.lock");
+        loop {
+            if let Some(lock) = super::continuity::try_lock(&path, true)? {
+                return Ok(lock);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// Removes retired Swamp store formats once, after a successful
+    /// observation. Paths and basenames are a fixed ownership allow-list;
+    /// directory traversal is limited to numeric volume directories and
+    /// UUID-named legacy plan payloads. Symlink entries are unlinked as
+    /// links and are never descended into.
+    pub fn clean_retired_store_state(&self) -> io::Result<bool> {
+        const FORMAT: &str = "1\n";
+        let marker = self.0.join("housekeeping.version");
+        if read_housekeeping_marker(&marker)?.as_deref() == Some(FORMAT) {
+            return Ok(false);
+        }
+
+        self.create()?;
+        let entries = std::fs::read_dir(&self.0)?;
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let path = entry.path();
+            let ty = entry.file_type()?;
+            if ty.is_dir() && name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() {
+                clean_legacy_volume_dir(&path)?;
+            } else if is_legacy_store_file(&name) && (ty.is_file() || ty.is_symlink()) {
+                std::fs::remove_file(path)?;
+            } else if name == "plans" && ty.is_dir() {
+                clean_legacy_plans_dir(&path)?;
+            }
+        }
+        // `rename` replaces an existing marker entry itself, including a
+        // symlink, without opening or following its target.
+        write_atomic(&marker, FORMAT.as_bytes())?;
+        Ok(true)
+    }
+}
+
+fn read_housekeeping_marker(path: &Path) -> io::Result<Option<String>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if is_symlink_open_error(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut marker = String::new();
+    file.read_to_string(&mut marker)?;
+    Ok(Some(marker))
+}
+
+#[cfg(unix)]
+fn is_symlink_open_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_symlink_open_error(_error: &io::Error) -> bool {
+    false
+}
+
+fn is_legacy_store_file(name: &str) -> bool {
+    matches!(
+        name,
+        "unowned.json"
+            | "fsevents.json"
+            | "topology.json"
+            | "docker_facts.json"
+            | "last_run.json"
+            | "grants.json"
+            | "ledger.jsonl"
+    ) || is_legacy_report(name)
+}
+
+fn is_legacy_report(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("last_report-") else {
+        return false;
+    };
+    [".json", ".json.zst"].iter().any(|suffix| {
+        rest.strip_suffix(suffix)
+            .is_some_and(|key| key.len() == 16 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+    })
+}
+
+fn clean_legacy_volume_dir(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if (ty.is_file() || ty.is_symlink())
+            && is_legacy_store_file(&entry.file_name().to_string_lossy())
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn clean_legacy_plans_dir(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ty = entry.file_type()?;
+        if (ty.is_file() || ty.is_symlink()) && is_uuid_json(&name) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn is_uuid_json(name: &str) -> bool {
+    let Some(id) = name.strip_suffix(".json") else {
+        return false;
+    };
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
 }
 
 /// The one JSON file swamp persists: the TUI's remembered filter and
@@ -99,6 +238,155 @@ impl JsonFile<'_> {
         Ok(match *self {
             JsonFile::UiState { store } => store.0.join("ui_state.json"),
         })
+    }
+}
+
+#[cfg(test)]
+mod housekeeping_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn one_time_cleanup_removes_only_retired_owned_payloads() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let store = StoreDir::at(root).unwrap();
+        let volume = root.join("12345");
+        fs::create_dir(&volume).unwrap();
+        let plans = root.join("plans");
+        fs::create_dir(&plans).unwrap();
+        for name in [
+            "unowned.json",
+            "fsevents.json",
+            "topology.json",
+            "docker_facts.json",
+            "last_run.json",
+            "grants.json",
+            "ledger.jsonl",
+            "last_report-0123456789abcdef.json",
+            "last_report-0123456789abcdef.json.zst",
+        ] {
+            fs::write(root.join(name), b"legacy").unwrap();
+            fs::write(volume.join(name), b"legacy").unwrap();
+        }
+        fs::write(
+            plans.join("01234567-89ab-cdef-0123-456789abcdef.json"),
+            b"plan",
+        )
+        .unwrap();
+        fs::write(plans.join("leave-me.txt"), b"user file").unwrap();
+
+        for name in [
+            "config.toml",
+            "protect.parquet",
+            "notes.parquet",
+            "enrich.parquet",
+        ] {
+            fs::write(root.join(name), b"current data").unwrap();
+        }
+        fs::write(volume.join("current.parquet"), b"compatible history").unwrap();
+        fs::create_dir(volume.join("deltas")).unwrap();
+        fs::write(volume.join("deltas/delta-1.parquet"), b"history").unwrap();
+        fs::write(root.join("last_report-not-a-key.json"), b"unrecognized").unwrap();
+
+        let outside = tmp.path().join("outside-sentinel");
+        fs::write(&outside, b"must survive").unwrap();
+        #[cfg(unix)]
+        fs::remove_file(volume.join("unowned.json")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, volume.join("unowned.json")).unwrap();
+
+        assert!(store.clean_retired_store_state().unwrap());
+        for name in [
+            "unowned.json",
+            "fsevents.json",
+            "topology.json",
+            "docker_facts.json",
+            "last_run.json",
+            "grants.json",
+            "ledger.jsonl",
+            "last_report-0123456789abcdef.json",
+            "last_report-0123456789abcdef.json.zst",
+        ] {
+            assert!(!root.join(name).exists());
+            assert!(fs::symlink_metadata(volume.join(name)).is_err());
+        }
+        assert!(
+            !plans
+                .join("01234567-89ab-cdef-0123-456789abcdef.json")
+                .exists()
+        );
+        assert!(plans.join("leave-me.txt").exists());
+        for name in [
+            "config.toml",
+            "protect.parquet",
+            "notes.parquet",
+            "enrich.parquet",
+        ] {
+            assert!(root.join(name).exists(), "removed retained file {name}");
+        }
+        assert_eq!(
+            fs::read(volume.join("current.parquet")).unwrap(),
+            b"compatible history"
+        );
+        assert!(root.join("last_report-not-a-key.json").exists());
+        assert_eq!(fs::read(outside).unwrap(), b"must survive");
+
+        fs::write(root.join("unowned.json"), b"later file").unwrap();
+        assert!(!store.clean_retired_store_state().unwrap());
+        assert!(root.join("unowned.json").exists());
+        fs::write(root.join("housekeeping.version"), b"0\n").unwrap();
+        assert!(store.clean_retired_store_state().unwrap());
+        assert!(!root.join("unowned.json").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("housekeeping.version")).unwrap(),
+            "1\n"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside_marker = root.join("outside-marker");
+            fs::write(&outside_marker, "1\n").unwrap();
+            fs::remove_file(root.join("housekeeping.version")).unwrap();
+            std::os::unix::fs::symlink(&outside_marker, root.join("housekeeping.version")).unwrap();
+            fs::write(root.join("unowned.json"), b"legacy").unwrap();
+            assert!(store.clean_retired_store_state().unwrap());
+            assert!(!root.join("unowned.json").exists());
+            assert_eq!(fs::read_to_string(outside_marker).unwrap(), "1\n");
+        }
+    }
+
+    #[test]
+    fn observation_writer_lock_serializes_holders() {
+        let tmp = tempdir().unwrap();
+        let store = StoreDir::at(tmp.path()).unwrap();
+        let first = store.lock_observation_writes().unwrap();
+        let other_store = store.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _second = other_store.lock_observation_writes().unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observation_writer_lock_refuses_a_symlinked_lock_file() {
+        let tmp = tempdir().unwrap();
+        let store = StoreDir::at(tmp.path()).unwrap();
+        let outside = tmp.path().join("outside");
+        fs::write(&outside, b"sentinel").unwrap();
+        std::os::unix::fs::symlink(&outside, tmp.path().join("store-write.lock")).unwrap();
+        assert!(store.lock_observation_writes().is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"sentinel");
     }
 }
 

@@ -49,6 +49,214 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
     assert_eq!(last_run.outcome, "ok");
 }
 
+#[test]
+fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roots() {
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    for (i, root) in roots.iter().enumerate() {
+        std::fs::write(root.path().join("hello.txt"), format!("root {i}")).unwrap();
+    }
+    let store = tempfile::tempdir().unwrap();
+    let root_paths: Vec<_> = roots
+        .iter()
+        .map(|r| std::fs::canonicalize(r.path()).unwrap())
+        .collect();
+    // A volume-keyed store generation with compatible state for another
+    // root remains owned by the store when this invocation names only
+    // root 0. Use a numeric volume directory to match the on-disk layout.
+    let other_volume = store.path().join(u64::MAX.to_string());
+    assert!(
+        root_paths
+            .iter()
+            .all(|root| { swamp_core::growth::root_scoped_volume_id(root) != u64::MAX })
+    );
+
+    let initial = Command::new(bin())
+        .arg("observe")
+        .args(&root_paths)
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("initial two-root observe");
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+
+    // Keep a valid protection entry and config alongside current Parquet
+    // facts, then simulate an older store format marker.
+    std::fs::write(root_paths[0].join("keep.txt"), b"keep").unwrap();
+    let protect = Command::new(bin())
+        .args(["protect", "add"])
+        .arg(root_paths[0].join("keep.txt"))
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("add retained protection");
+    assert!(
+        protect.status.success(),
+        "{}",
+        String::from_utf8_lossy(&protect.stderr)
+    );
+    std::fs::write(
+        store.path().join("config.toml"),
+        "# retained user configuration\n",
+    )
+    .unwrap();
+    let retained = ["config.toml", "protect.parquet"]
+        .map(|name| (name, std::fs::read(store.path().join(name)).unwrap()));
+    std::fs::create_dir(&other_volume).unwrap();
+    std::fs::write(other_volume.join("current.parquet"), b"compatible history").unwrap();
+    let other_root_state = std::fs::read(other_volume.join("current.parquet")).unwrap();
+
+    let previous_scope_report = Command::new(bin())
+        .arg("report")
+        .args(&root_paths)
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("read compatible prior scope history");
+    assert!(
+        previous_scope_report.status.success(),
+        "compatible previous scope was lost: {}",
+        String::from_utf8_lossy(&previous_scope_report.stderr)
+    );
+
+    std::fs::write(
+        other_volume.join("enrich.parquet"),
+        b"active enrichment marker",
+    )
+    .unwrap();
+
+    for name in [
+        "unowned.json",
+        "fsevents.json",
+        "topology.json",
+        "docker_facts.json",
+    ] {
+        std::fs::write(other_volume.join(name), b"retired").unwrap();
+    }
+    for name in ["last_run.json", "grants.json", "ledger.jsonl"] {
+        std::fs::write(store.path().join(name), b"retired").unwrap();
+    }
+    for name in [
+        "last_report-0123456789abcdef.json",
+        "last_report-0123456789abcdef.json.zst",
+    ] {
+        std::fs::write(store.path().join(name), b"retired").unwrap();
+    }
+    let plans = store.path().join("plans");
+    std::fs::create_dir(&plans).unwrap();
+    std::fs::write(
+        plans.join("01234567-89ab-cdef-0123-456789abcdef.json"),
+        b"retired plan",
+    )
+    .unwrap();
+    std::fs::write(store.path().join("housekeeping.version"), b"0\n").unwrap();
+
+    // A narrow-root observation must not treat the other root as orphaned.
+    let upgraded = Command::new(bin())
+        .arg("observe")
+        .arg(&root_paths[0])
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("narrow upgrade observe");
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    for name in [
+        "unowned.json",
+        "fsevents.json",
+        "topology.json",
+        "docker_facts.json",
+    ] {
+        assert!(!other_volume.join(name).exists());
+    }
+    for name in ["last_run.json", "grants.json", "ledger.jsonl"] {
+        assert!(!store.path().join(name).exists());
+    }
+    assert!(
+        !store
+            .path()
+            .join("last_report-0123456789abcdef.json")
+            .exists()
+    );
+    assert!(
+        !store
+            .path()
+            .join("last_report-0123456789abcdef.json.zst")
+            .exists()
+    );
+    assert!(
+        !plans
+            .join("01234567-89ab-cdef-0123-456789abcdef.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read(other_volume.join("current.parquet")).unwrap(),
+        other_root_state
+    );
+    assert_eq!(
+        std::fs::read(other_volume.join("enrich.parquet")).unwrap(),
+        b"active enrichment marker"
+    );
+    for (name, bytes) in retained {
+        assert_eq!(std::fs::read(store.path().join(name)).unwrap(), bytes);
+    }
+    assert!(store.path().join("notes.parquet").is_file());
+    assert_eq!(
+        std::fs::read_to_string(store.path().join("housekeeping.version")).unwrap(),
+        "1\n"
+    );
+
+    let repeated = Command::new(bin())
+        .arg("observe")
+        .arg(&root_paths[0])
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .env("SWAMP_FSEVENTS_MIN_INTERVAL_SECS", "0")
+        .output()
+        .expect("repeat observe");
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let output = String::from_utf8_lossy(&repeated.stdout);
+    assert!(
+        output.contains("mode=incremental"),
+        "repeat observe was not incremental: {output}"
+    );
+}
+
+#[test]
+fn missing_root_does_not_run_store_housekeeping() {
+    let missing_parent = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    std::fs::write(store.path().join("housekeeping.version"), b"0\n").unwrap();
+    std::fs::write(store.path().join("last_run.json"), b"retired candidate").unwrap();
+
+    let _ = Command::new(bin())
+        .arg("observe")
+        .arg(missing_parent.path().join("not-created"))
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("observe missing root");
+
+    assert_eq!(
+        std::fs::read(store.path().join("last_run.json")).unwrap(),
+        b"retired candidate"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.path().join("housekeeping.version")).unwrap(),
+        "0\n"
+    );
+}
+
 /// A closed real pipe makes the first stdout write return EPIPE. Observe
 /// has already saved its snapshot at that point, so the CLI must exit
 /// cleanly and still finish recording the successful run.

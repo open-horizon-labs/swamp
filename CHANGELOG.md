@@ -3,6 +3,13 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.1
+
+- Remove recognized retired store files automatically after a complete successful
+  observation. The one-time housekeeping pass preserves configuration, protection,
+  notes, current Parquet tables, compatible history, and active enrichment data.
+- Serialize observation writers across CLI, scheduled, and TUI refresh paths.
+
 ## v0.7.0
 
 Swamp 0.7.0 adds Linux support, toolchain and version-manager storage discovery,
