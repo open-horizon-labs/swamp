@@ -87,7 +87,7 @@ History starts with your first observation. To collect it while the UI is closed
 swamp schedule --every 15m
 ```
 
-This uses a per-user LaunchAgent on macOS or a systemd user timer on Linux. It observes storage and can refresh GitHub context; it does not clean anything. On Linux, `--collector` also enables continuous change tracking between scheduled observations. `swamp schedule` shows status; `swamp schedule --off` removes the schedule.
+This uses a per-user LaunchAgent on macOS or a systemd user timer on Linux. It observes storage and can refresh GitHub context. If the store has no current format marker, normal observation automatically discards recognized incompatible derived caches and rescans; compatible history is retained. Housekeeping is limited to known Swamp-owned state and runs under the observation writer lock. On Linux, `--collector` also enables continuous change tracking between scheduled observations. `swamp schedule` shows status; `swamp schedule --off` removes the schedule.
 
 ## Review before removing
 

@@ -67,6 +67,12 @@ fn a_large_store_reads_back_within_budget() {
     std::fs::create_dir_all(&src).unwrap();
     let store = root.join("store");
     std::fs::create_dir_all(&store).unwrap();
+    // This test seeds complete current-format fact tables directly; normal
+    // production writers publish the marker after their observation pipeline.
+    swamp_core::fs_gate::StoreDir::at(&store)
+        .unwrap()
+        .mark_current_format()
+        .unwrap();
 
     let env = Environment::fixture(root.clone(), Default::default(), Platform::MacOS);
     let registry = Registry::with_builtins();

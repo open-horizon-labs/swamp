@@ -3,6 +3,20 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.1
+
+- Automatically reset incompatible Swamp scan state before observation and rebuild
+  it with a fresh scan. An unversioned/incompatible store loses incompatible derived
+  history; valid current-format history is retained. Reset is limited to recognized
+  Swamp-owned derived generations before cached tables are read. Configuration,
+  protection intent, notes, ledger state, user-declared consumers, unrelated files,
+  and active enrichment are preserved.
+- Compatible stores retain history across narrow-root observations. Reset recognizes
+  retired Parquet views, JSON sidecars, external measurement caches, association
+  caches, reverse-delta generations, reports, and plans; no age-based pruning or
+  root-liveness inference is used.
+- Serialize observation writers across CLI, scheduled, and TUI refresh paths.
+
 ## v0.7.0
 
 Swamp 0.7.0 adds Linux support, toolchain and version-manager storage discovery,

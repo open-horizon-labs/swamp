@@ -51,7 +51,7 @@ The observation path has five responsibilities:
 4. **Persist facts and history.** Store current typed rows and prior values needed for growth comparisons.
 5. **Assemble reports.** Apply the requested view, project filter, and pagination to the stored observation.
 
-`swamp observe` performs this work without rendering a report. The TUI uses observation in the background. Scheduling invokes observation without cleanup. `swamp report` reads the resulting store; it may check root presence to resolve scope, but does not recursively traverse roots, inspect artifact contents, or launch subprocesses.
+`swamp observe` performs this work without rendering a report. The TUI uses observation in the background. Before any derived-table reads, an absent or incompatible store-format marker causes the shared observer to reset recognized Swamp-owned derived generations under a serialized writer lock and perform a fresh scan. The marker is committed only after the observation pipeline succeeds; partial or missing roots are recorded normally and do not defer schema reset. Configuration, protection intent, notes, ledger state, user-declared consumer associations, unknown files, and active enrichment remain. Once the marker is current, compatible history survives narrow-root observations. `swamp report` is a pure read and skips incompatible cached generations rather than attempting cleanup.
 
 A scope with no observation returns an explicit error, not a fabricated empty report. Report timestamps refer to the observation, not the moment someone requested JSON.
 

@@ -2439,6 +2439,35 @@ pub fn observe_scope(
     since_secs: u64,
 ) -> Result<ScopeObservation> {
     let owns_root_coverage = base.is_none();
+    // Every observing entry point (CLI, scheduled run, and TUI) holds the
+    // same store lock for its complete write pipeline. The CLI's
+    // single-flight PID lock remains useful for its user-facing skip
+    // message; this lock also covers TUI refreshes and housekeeping.
+    let _writer_lock = if observe {
+        store_dir
+            .map(|dir| -> Result<_> {
+                Ok(crate::fs_gate::store::StoreDir::at(dir)?.lock_observation_writes()?)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let mut force_full = force_full;
+    if observe
+        && owns_root_coverage
+        && want == ObservationParts::ALL
+        && let Some(dir) = store_dir
+    {
+        let store = crate::fs_gate::store::StoreDir::at(dir)?;
+        let force_full_for_generation = store.has_incompatible_marker()?;
+        if store.reset_incompatible_format()? {
+            // The CLI resolves and records scope before entering this shared
+            // observer. Reset just retired that preflight bookkeeping, so
+            // regenerate it from the in-memory scope before continuing.
+            crate::scope::persist_effective_scope(dir, scope)?;
+        }
+        force_full |= force_full_for_generation;
+    }
     if observe && let Some(dir) = store_dir {
         crate::growth::invalidate_unique_estimate(dir, &scope_snapshot_key(scope))?;
     }
@@ -2902,6 +2931,18 @@ pub fn observe_scope(
 
     if trace {
         eprintln!("[trace] observe: scope tables: {:?}", phase.elapsed());
+    }
+    // The generation marker is committed only after the entire observation
+    // pipeline succeeds. Missing/partial roots are valid coverage outcomes;
+    // they do not defer a schema-wide reset or make old tables readable.
+    if observe
+        && owns_root_coverage
+        && want == ObservationParts::ALL
+        && external_ok
+        && agents_ok
+        && let Some(store_dir) = store_dir
+    {
+        crate::fs_gate::store::StoreDir::at(store_dir)?.mark_current_format()?;
     }
     Ok(observation)
 }
@@ -3626,6 +3667,16 @@ pub fn report_scope_from_store(
     scope: &crate::scope::EffectiveScope,
     store_dir: &Path,
 ) -> std::result::Result<ReportSnapshot, NoObservation> {
+    // Do not parse caches from an incompatible generation. The observer
+    // owns reset + rescan; report remains a pure read and reports no snapshot.
+    if !crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false)
+    {
+        return Err(NoObservation {
+            scope_description: describe_scope_for_error(scope),
+        });
+    }
     let key = scope_snapshot_key(scope);
     let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) else {
         return Err(NoObservation {

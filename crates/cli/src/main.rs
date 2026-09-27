@@ -412,7 +412,11 @@ fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveSco
 /// history: it is coverage bookkeeping only, per
 /// `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
 fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::EffectiveScope) {
-    if let Some(previous) = swamp_core::scope::load_last_effective_scope(store_dir) {
+    let current_store = swamp_core::fs_gate::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false);
+    if current_store && let Some(previous) = swamp_core::scope::load_last_effective_scope(store_dir)
+    {
         let changes = swamp_core::scope::coverage_changes(&previous, scope);
         if !changes.is_empty() {
             let summary = changes
