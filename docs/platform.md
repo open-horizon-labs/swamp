@@ -258,7 +258,9 @@ Everything else it cannot answer is **`Unknown`, which every destructive sink re
 
 ## Release archives and what they require
 
-`release.yml` builds each target on its own runner and publishes only after both, and a test-only run on the newest hosted Ubuntu, have passed (#88):
+`release.yml` builds each shipping binary once on its target runner. Publication requires full checks on both macOS and Ubuntu 24.04, smoke tests of both packaged binaries, and a smoke test of the same Linux archive on the newest hosted Ubuntu (#88).
+
+The full checks run the workspace tests, source audits, compile-fail cases, mutation sweep, and cost test. They use the normal test profile; we do not rebuild the whole test suite with shipping LTO settings. Optimized-code coverage comes from exercising the packaged binary, not from recompiling every test harness. This does not provide full unit-test coverage under release optimization. The newer-Ubuntu job validates archive compatibility without installing Rust or rebuilding the workspace.
 
 | Asset | Contents |
 |---|---|

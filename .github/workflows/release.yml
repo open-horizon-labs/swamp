@@ -2,8 +2,8 @@ name: Release
 
 # Tag pushes are the single release trigger (`git tag vX.Y.Z && git push --tags`,
 # or `gh release create`, which pushes the tag). Two build jobs, one per
-# supported target, each producing its own archives and checksums; a
-# test-only job on a newer Ubuntu; two full-tier jobs (the same
+# supported target, each producing its own archives and checksums; an
+# archive-only job on a newer Ubuntu; two full-tier jobs (the same
 # `scripts/check-full.sh` `check-full.yml` runs for a PR labelled
 # `full-check`, one per OS); and one publishing job that runs only after
 # every one of those succeeds, so a release is never published half-built,
@@ -11,11 +11,11 @@ name: Release
 # tier (compile-fail cases, mutation sweep, cost test) not yet checked on
 # this exact tagged commit.
 #
-#   macos-arm64              aarch64-apple-darwin, release profile, tests, package, smoke
+#   macos-arm64              aarch64-apple-darwin, release binary, package, smoke
 #   linux-x86_64             x86_64-unknown-linux-gnu on Ubuntu 24.04 (the baseline),
-#                            generic x86-64 CPU, tests, package, smoke, linkage + glibc
-#   linux-x86_64-newer       test-only: the 24.04-built archive smoke-tested on the
-#                            newest hosted Ubuntu, and the workspace tests run there
+#                            generic x86-64 CPU, package, smoke, linkage + glibc
+#   linux-x86_64-newer       archive-only: the 24.04-built archive smoke-tested on the
+#                            newest hosted Ubuntu; no second build or workspace suite
 #   linux-x86_64-check-full,
 #   macos-arm64-check-full   scripts/check-full.sh, one per OS -- independent of the
 #                            build jobs (their own toolchain/cache), required by
@@ -79,7 +79,7 @@ jobs:
       # swamp-core's `testing` feature is test-fixture API. Only
       # `[dev-dependencies]` enable it, and resolver 2 never unifies those
       # into this build; refuse a graph that says otherwise before
-      # building what ships (the test step below has it on by design).
+      # building what ships (the full-check test job has it on by design).
       - name: Release graph has no test-fixture API
         run: |
           set -euo pipefail
@@ -94,14 +94,6 @@ jobs:
           SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
           RUSTC_WRAPPER: sccache
         run: cargo build --release --locked --target aarch64-apple-darwin -p swamp
-
-      # Same profile and target as the build: only the test harnesses are
-      # new work, and the tests exercise the optimized code that ships.
-      - name: Test (release, aarch64-apple-darwin)
-        env:
-          SCCACHE_GHA_ENABLED: "${{ vars.LOCAL_MACOS_CI_ENABLED != 'true' }}"
-          RUSTC_WRAPPER: sccache
-        run: cargo test --workspace --locked --release --target aarch64-apple-darwin
 
       - name: Package
         run: ./scripts/package-release.sh aarch64-apple-darwin "${{ steps.v.outputs.version }}" target/aarch64-apple-darwin/release/swamp dist
@@ -148,7 +140,7 @@ jobs:
       # swamp-core's `testing` feature is test-fixture API. Only
       # `[dev-dependencies]` enable it, and resolver 2 never unifies those
       # into this build; refuse a graph that says otherwise before
-      # building what ships (the test step below has it on by design).
+      # building what ships (the full-check test job has it on by design).
       - name: Release graph has no test-fixture API
         run: |
           set -euo pipefail
@@ -160,9 +152,6 @@ jobs:
 
       - name: Build (release, x86_64-unknown-linux-gnu, generic x86-64)
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p swamp
-
-      - name: Test (release, x86_64-unknown-linux-gnu)
-        run: cargo test --workspace --locked --release --target x86_64-unknown-linux-gnu
 
       - name: Package
         run: ./scripts/package-release.sh x86_64-unknown-linux-gnu "${{ steps.v.outputs.version }}" target/x86_64-unknown-linux-gnu/release/swamp dist
@@ -184,7 +173,7 @@ jobs:
             dist/smoke/*
 
   linux-x86_64-newer:
-    name: Linux x86_64 (newest hosted Ubuntu, test-only)
+    name: Linux x86_64 (newest hosted Ubuntu, archive-only)
     needs: linux-x86_64
     runs-on: ubuntu-latest
     steps:
@@ -209,17 +198,6 @@ jobs:
           set -euo pipefail
           v="$(./scripts/release-version.sh | cut -d= -f2)"
           ./scripts/release-smoke.sh "dist/swamp-${v}-x86_64-unknown-linux-gnu.tar.gz" "$v" dist/smoke-newer
-
-      - name: Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-linux-x86_64-newer
-
-      - name: Test (native, newest hosted Ubuntu)
-        run: cargo test --workspace --locked --release
 
       - name: Upload smoke report
         uses: actions/upload-artifact@v4

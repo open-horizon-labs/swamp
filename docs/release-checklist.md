@@ -50,6 +50,14 @@ depends on an unreviewed tap edit is how the two get out of step.
 
 ## After publishing
 
+The release workflow gates publication on full checks for both platforms and
+smoke tests of the actual optimized archives, including the Linux archive on
+the newest hosted Ubuntu. Do not add `cargo test --workspace --release` to
+packaging jobs: compiling every test executable with shipping LTO settings
+cost 48 minutes on the 0.7.0 Linux runner, before roughly two minutes of tests.
+Keep full-suite correctness checks in the full-check jobs and packaged-binary
+checks in the packaging/compatibility jobs.
+
 5. Download the published archive and verify its checksum against the
    release's own recorded value — not the locally built one. A locally
    overwritten old-version executable is not evidence that the
