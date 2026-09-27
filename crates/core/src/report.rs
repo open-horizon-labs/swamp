@@ -2452,6 +2452,22 @@ pub fn observe_scope(
     } else {
         None
     };
+    let mut force_full = force_full;
+    if observe
+        && owns_root_coverage
+        && want == ObservationParts::ALL
+        && let Some(dir) = store_dir
+    {
+        let store = crate::fs_gate::store::StoreDir::at(dir)?;
+        let force_full_for_generation = store.has_incompatible_marker()?;
+        if store.reset_incompatible_format()? {
+            // The CLI resolves and records scope before entering this shared
+            // observer. Reset just retired that preflight bookkeeping, so
+            // regenerate it from the in-memory scope before continuing.
+            crate::scope::persist_effective_scope(dir, scope)?;
+        }
+        force_full |= force_full_for_generation;
+    }
     if observe && let Some(dir) = store_dir {
         crate::growth::invalidate_unique_estimate(dir, &scope_snapshot_key(scope))?;
     }
@@ -2916,27 +2932,17 @@ pub fn observe_scope(
     if trace {
         eprintln!("[trace] observe: scope tables: {:?}", phase.elapsed());
     }
-    // Retired-format housekeeping is a one-time store upgrade. Run only
-    // after the whole scope snapshot and its unit families were persisted
-    // successfully. Incomplete/missing roots keep all prior root state;
-    // cleanup is deferred until a later complete observation.
+    // The generation marker is committed only after the entire observation
+    // pipeline succeeds. Missing/partial roots are valid coverage outcomes;
+    // they do not defer a schema-wide reset or make old tables readable.
     if observe
         && owns_root_coverage
         && want == ObservationParts::ALL
         && external_ok
         && agents_ok
-        && !observation.coverage.is_empty()
-        && observation.coverage.iter().all(|c| {
-            matches!(
-                c.status,
-                crate::coverage::RegionStatus::Complete
-                    | crate::coverage::RegionStatus::Excluded
-                    | crate::coverage::RegionStatus::DetectorOnly
-            )
-        })
         && let Some(store_dir) = store_dir
     {
-        crate::fs_gate::store::StoreDir::at(store_dir)?.clean_retired_store_state()?;
+        crate::fs_gate::store::StoreDir::at(store_dir)?.mark_current_format()?;
     }
     Ok(observation)
 }
@@ -3661,6 +3667,16 @@ pub fn report_scope_from_store(
     scope: &crate::scope::EffectiveScope,
     store_dir: &Path,
 ) -> std::result::Result<ReportSnapshot, NoObservation> {
+    // Do not parse caches from an incompatible generation. The observer
+    // owns reset + rescan; report remains a pure read and reports no snapshot.
+    if !crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false)
+    {
+        return Err(NoObservation {
+            scope_description: describe_scope_for_error(scope),
+        });
+    }
     let key = scope_snapshot_key(scope);
     let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) else {
         return Err(NoObservation {

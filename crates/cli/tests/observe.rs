@@ -9,6 +9,30 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_swamp"))
 }
 
+fn write_git_project(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+            .env("GIT_COMMITTER_NAME", "fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("README.md"), b"real project fixture\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-q", "-m", "initial"]);
+}
+
 #[test]
 fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
     let root = tempfile::tempdir().expect("root");
@@ -106,8 +130,16 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
     let retained = ["config.toml", "protect.parquet"]
         .map(|name| (name, std::fs::read(store.path().join(name)).unwrap()));
     std::fs::create_dir(&other_volume).unwrap();
-    std::fs::write(other_volume.join("current.parquet"), b"compatible history").unwrap();
-    let other_root_state = std::fs::read(other_volume.join("current.parquet")).unwrap();
+    std::fs::write(
+        other_volume.join("report_rows.parquet"),
+        b"obsolete report cache",
+    )
+    .unwrap();
+    std::fs::write(
+        other_volume.join("summary.parquet"),
+        b"obsolete derived view",
+    )
+    .unwrap();
 
     let previous_scope_report = Command::new(bin())
         .arg("report")
@@ -127,12 +159,22 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         b"active enrichment marker",
     )
     .unwrap();
+    std::fs::write(
+        store.path().join("ledger.parquet"),
+        b"preserve ledger state",
+    )
+    .unwrap();
 
     for name in [
         "unowned.json",
         "fsevents.json",
         "topology.json",
         "docker_facts.json",
+        "scope.json",
+        "external_consumers.json",
+        "toolchain_declarations_cache.json",
+        "dependency_identities_cache.json",
+        "ledger.jsonl",
     ] {
         std::fs::write(other_volume.join(name), b"retired").unwrap();
     }
@@ -152,6 +194,11 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         b"retired plan",
     )
     .unwrap();
+    std::fs::write(
+        store.path().join("agent_protect.json"),
+        b"unknown human intent",
+    )
+    .unwrap();
     std::fs::write(store.path().join("housekeeping.version"), b"0\n").unwrap();
 
     // A narrow-root observation must not treat the other root as orphaned.
@@ -167,11 +214,21 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         "{}",
         String::from_utf8_lossy(&upgraded.stderr)
     );
+    let upgrade_output = String::from_utf8_lossy(&upgraded.stdout);
+    assert!(
+        upgrade_output.contains("mode=full"),
+        "incompatible generation must force a fresh scan: {upgrade_output}"
+    );
     for name in [
         "unowned.json",
         "fsevents.json",
         "topology.json",
         "docker_facts.json",
+        "scope.json",
+        "external_consumers.json",
+        "toolchain_declarations_cache.json",
+        "dependency_identities_cache.json",
+        "ledger.jsonl",
     ] {
         assert!(!other_volume.join(name).exists());
     }
@@ -195,9 +252,19 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
             .join("01234567-89ab-cdef-0123-456789abcdef.json")
             .exists()
     );
+    for name in ["report_rows.parquet", "summary.parquet"] {
+        assert!(
+            !other_volume.join(name).exists(),
+            "obsolete table survived: {name}"
+        );
+    }
     assert_eq!(
-        std::fs::read(other_volume.join("current.parquet")).unwrap(),
-        other_root_state
+        std::fs::read(store.path().join("ledger.parquet")).unwrap(),
+        b"preserve ledger state"
+    );
+    assert_eq!(
+        std::fs::read(store.path().join("agent_protect.json")).unwrap(),
+        b"unknown human intent"
     );
     assert_eq!(
         std::fs::read(other_volume.join("enrich.parquet")).unwrap(),
@@ -209,7 +276,21 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
     assert!(store.path().join("notes.parquet").is_file());
     assert_eq!(
         std::fs::read_to_string(store.path().join("housekeeping.version")).unwrap(),
-        "1\n"
+        "2\n"
+    );
+
+    let report = Command::new(bin())
+        .arg("report")
+        .arg("--json")
+        .arg(&root_paths[0])
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("report after automatic generation reset");
+    assert!(
+        report.status.success(),
+        "report failed after automatic reset: {}",
+        String::from_utf8_lossy(&report.stderr)
     );
 
     let repeated = Command::new(bin())
@@ -226,9 +307,15 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         String::from_utf8_lossy(&repeated.stderr)
     );
     let output = String::from_utf8_lossy(&repeated.stdout);
+    #[cfg(target_os = "macos")]
     assert!(
         output.contains("mode=incremental"),
         "repeat observe was not incremental: {output}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        output.contains("mode=full") && output.contains("no_persisted_change_history"),
+        "Linux without a collector should use its documented full-scan fallback: {output}"
     );
 }
 
@@ -254,6 +341,80 @@ fn missing_root_does_not_run_store_housekeeping() {
     assert_eq!(
         std::fs::read_to_string(store.path().join("housekeeping.version")).unwrap(),
         "0\n"
+    );
+}
+
+#[test]
+fn current_generation_narrow_observe_keeps_other_explicit_root_history() {
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    for root in &roots {
+        write_git_project(root.path());
+    }
+    let paths: Vec<_> = roots
+        .iter()
+        .map(|root| std::fs::canonicalize(root.path()).unwrap())
+        .collect();
+    let store = tempfile::tempdir().unwrap();
+    let first = Command::new(bin())
+        .arg("observe")
+        .args(&paths)
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.path().join("housekeeping.version")).unwrap(),
+        "2\n"
+    );
+    let other_volume = swamp_core::growth::volume_store_dir(store.path(), &paths[1]);
+    let history = std::fs::read(other_volume.join("current.parquet")).unwrap();
+
+    let narrow = Command::new(bin())
+        .arg("observe")
+        .arg(&paths[0])
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        narrow.status.success(),
+        "{}",
+        String::from_utf8_lossy(&narrow.stderr)
+    );
+    assert_eq!(
+        std::fs::read(other_volume.join("current.parquet")).unwrap(),
+        history
+    );
+
+    let report = Command::new(bin())
+        .arg("report")
+        .arg("--json")
+        .args(&paths)
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "compatible two-root history was lost: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    let names: Vec<_> = json["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert_eq!(
+        names.len(),
+        2,
+        "both stored projects should remain reportable: {names:?}"
     );
 }
 

@@ -42,6 +42,7 @@ use std::path::{Path, PathBuf};
 pub struct StoreDir(PathBuf);
 
 impl StoreDir {
+    const FORMAT: &'static str = "2\n";
     /// `$SWAMP_DIR`, else `$HOME/.local/share/swamp`: the one resolver.
     pub fn resolved() -> StoreDir {
         if let Some(dir) = std::env::var_os("SWAMP_DIR") {
@@ -96,18 +97,29 @@ impl StoreDir {
         }
     }
 
-    /// Removes retired Swamp store formats once, after a successful
-    /// observation. Paths and basenames are a fixed ownership allow-list;
-    /// directory traversal is limited to numeric volume directories and
-    /// UUID-named legacy plan payloads. Symlink entries are unlinked as
-    /// links and are never descended into.
-    pub fn clean_retired_store_state(&self) -> io::Result<bool> {
-        const FORMAT: &str = "1\n";
+    /// Whether derived tables belong to the current store generation.
+    /// The marker read is bounded and never follows links or blocks on a FIFO.
+    pub fn has_current_format(&self) -> io::Result<bool> {
         let marker = self.0.join("housekeeping.version");
-        if read_housekeeping_marker(&marker)?.as_deref() == Some(FORMAT) {
+        Ok(read_housekeeping_marker(&marker)?.as_deref() == Some(Self::FORMAT))
+    }
+
+    /// True for an explicit but incompatible generation marker. A missing
+    /// marker is the ordinary first-use case once recognized caches reset.
+    pub fn has_incompatible_marker(&self) -> io::Result<bool> {
+        let marker = read_housekeeping_marker(&self.0.join("housekeeping.version"))?;
+        Ok(marker.is_some() && marker.as_deref() != Some(Self::FORMAT))
+    }
+
+    /// Resets recognized Swamp-derived state for an absent/older generation.
+    /// Call under the observation writer lock, before reading any derived
+    /// tables. Durable human intent, action history, live enrichment, and
+    /// unknown user files are deliberately outside this ownership set.
+    pub fn reset_incompatible_format(&self) -> io::Result<bool> {
+        let marker = read_housekeeping_marker(&self.0.join("housekeeping.version"))?;
+        if marker.as_deref() == Some(Self::FORMAT) {
             return Ok(false);
         }
-
         self.create()?;
         let entries = std::fs::read_dir(&self.0)?;
         for entry in entries {
@@ -116,38 +128,66 @@ impl StoreDir {
             let name = name.to_string_lossy();
             let path = entry.path();
             let ty = entry.file_type()?;
-            if ty.is_dir() && name.bytes().all(|b| b.is_ascii_digit()) && !name.is_empty() {
-                clean_legacy_volume_dir(&path)?;
-            } else if is_legacy_store_file(&name) && (ty.is_file() || ty.is_symlink()) {
+            if ty.is_dir() && is_numeric(&name) {
+                clean_derived_directory(&path)?;
+                remove_dir_if_empty(&path)?;
+            } else if ty.is_dir() && name == "external" {
+                clean_external_generation(&path)?;
+                remove_dir_if_empty(&path)?;
+            } else if ty.is_dir() && name == "associations" {
+                clean_association_generation(&path)?;
+                remove_dir_if_empty(&path)?;
+            } else if is_reset_owned_file(&name) && (ty.is_file() || ty.is_symlink()) {
                 std::fs::remove_file(path)?;
             } else if name == "plans" && ty.is_dir() {
                 clean_legacy_plans_dir(&path)?;
+                remove_dir_if_empty(&path)?;
             }
         }
-        // `rename` replaces an existing marker entry itself, including a
-        // symlink, without opening or following its target.
-        write_atomic(&marker, FORMAT.as_bytes())?;
         Ok(true)
+    }
+
+    /// Publish the generation only after the complete observation pipeline
+    /// has persisted successfully. Keep this separate from reset so errors
+    /// are retryable and cannot bless a partial scan.
+    pub fn mark_current_format(&self) -> io::Result<()> {
+        write_atomic(
+            &self.0.join("housekeeping.version"),
+            Self::FORMAT.as_bytes(),
+        )
     }
 }
 
 fn read_housekeeping_marker(path: &Path) -> io::Result<Option<String>> {
+    let Some(bytes) = read_small_regular_file(path, 64)? else {
+        return Ok(None);
+    };
+    Ok(String::from_utf8(bytes).ok())
+}
+
+fn read_small_regular_file(path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = match options.open(path) {
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) if is_symlink_open_error(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    let mut marker = String::new();
-    file.read_to_string(&mut marker)?;
-    Ok(Some(marker))
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(limit.min(256));
+    file.take((limit as u64) + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 #[cfg(unix)]
@@ -160,17 +200,51 @@ fn is_symlink_open_error(_error: &io::Error) -> bool {
     false
 }
 
-fn is_legacy_store_file(name: &str) -> bool {
+fn is_numeric(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn is_reset_owned_file(name: &str) -> bool {
+    is_derived_table(name)
+        || matches!(
+            name,
+            "unowned.json"
+                | "fsevents.json"
+                | "topology.json"
+                | "docker_facts.json"
+                | "last_run.json"
+                | "grants.json"
+                | "ledger.jsonl"
+                | "scope.json"
+                | "external_consumers.json"
+                | "toolchain_declarations_cache.json"
+                | "dependency_identities_cache.json"
+        )
+        || is_legacy_report(name)
+}
+
+fn is_derived_table(name: &str) -> bool {
     matches!(
-        name,
-        "unowned.json"
-            | "fsevents.json"
-            | "topology.json"
-            | "docker_facts.json"
-            | "last_run.json"
-            | "grants.json"
-            | "ledger.jsonl"
-    ) || is_legacy_report(name)
+        name.strip_suffix(".parquet"),
+        Some(
+            "cursors" | "current" | "dirs" | "files" | "unowned" | "unowned_lists"
+        | "unowned_evidence" | "docker_unowned" | "docker_unowned_lists"
+        | "docker_unowned_evidence" | "dir_tracks" | "topology" | "volume_stamps"
+        | "build_stores" | "xcode_derived_data" | "declarations" | "dependency_identities"
+        | "git_signals" | "git_signals_values" | "cargo_replay_cache"
+        | "cargo_replay_cache_lists" | "cargo_replay_cache_evidence" | "cargo_replay_cache_meta"
+        | "scope" | "scope_values" | "scope_roots" | "scope_root_reasons" | "docker_meta"
+        | "docker_images" | "docker_build_cache" | "docker_volumes" | "docker_builders"
+        | "docker_values" | "docker_containers" | "runs" | "coverage" | "projects"
+        | "worktrees" | "worktree_facts" | "artifact_shape" | "artifact_shape_lists"
+        | "external_units" | "agent_units" | "agent_unit_members" | "unit_consumers"
+        | "agent_identifications" | "agent_containers" | "nested_artifacts"
+        | "nested_artifact_lists" | "nested_artifact_evidence" | "evidence"
+        // Historical rendered caches and removed derived views.
+        | "report_rows" | "summary" | "series" | "unowned_summary" | "worktree_entries"
+        | "github_enrichment"
+        )
+    )
 }
 
 fn is_legacy_report(name: &str) -> bool {
@@ -183,17 +257,132 @@ fn is_legacy_report(name: &str) -> bool {
     })
 }
 
-fn clean_legacy_volume_dir(dir: &Path) -> io::Result<()> {
+fn clean_derived_directory(dir: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
         let ty = entry.file_type()?;
+        let path = entry.path();
         if (ty.is_file() || ty.is_symlink())
-            && is_legacy_store_file(&entry.file_name().to_string_lossy())
+            && (is_reset_owned_file(&name) || is_derived_table(&name))
         {
-            std::fs::remove_file(entry.path())?;
+            std::fs::remove_file(path)?;
+        } else if ty.is_dir()
+            && matches!(
+                name.as_ref(),
+                "deltas" | "dirs_deltas" | "files_deltas" | "external"
+            )
+        {
+            if name == "external" {
+                clean_external_generation(&path)?;
+            } else {
+                clean_delta_generation(&path)?;
+            }
         }
     }
     Ok(())
+}
+
+fn clean_delta_generation(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let ty = entry.file_type()?;
+        if (ty.is_file() || ty.is_symlink()) && is_delta_cache_name(&name) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    remove_dir_if_empty(dir)?;
+    Ok(())
+}
+
+fn clean_external_generation(dir: &Path) -> io::Result<()> {
+    remove_known_file(&dir.join("current.parquet"))?;
+    let volume_stamps = dir.join("volume_stamps.parquet");
+    remove_known_file(&volume_stamps)?;
+    let deltas = dir.join("deltas");
+    if std::fs::symlink_metadata(&deltas).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+        clean_delta_generation(&deltas)?;
+    }
+    // R18's pre-split folded cache was a single external/folded.parquet.
+    remove_known_file(&dir.join("folded.parquet"))?;
+    let folded = dir.join("folded");
+    if std::fs::symlink_metadata(&folded).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+        for entry in std::fs::read_dir(&folded)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let ty = entry.file_type()?;
+            if (ty.is_file() || ty.is_symlink()) && is_folded_cache_name(&name) {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        remove_dir_if_empty(&folded)?;
+    }
+    remove_dir_if_empty(dir)?;
+    Ok(())
+}
+
+fn clean_association_generation(dir: &Path) -> io::Result<()> {
+    for name in [
+        "declarations.parquet",
+        "dependency_identities.parquet",
+        "xcode_derived_data.parquet",
+        "agent_identifications.parquet",
+        "agent_containers.parquet",
+        "build_stores.parquet",
+    ] {
+        remove_known_file(&dir.join(name))?;
+    }
+    // external_consumers.parquet is a user-declared association (see
+    // ConsumerTable), so unlike the fingerprinted caches it survives reset.
+    remove_dir_if_empty(dir)
+}
+
+fn is_folded_cache_name(name: &str) -> bool {
+    let Some(id) = name.strip_suffix(".parquet") else {
+        return false;
+    };
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_delta_cache_name(name: &str) -> bool {
+    let Some(sequence) = name
+        .strip_prefix("delta-")
+        .and_then(|name| name.strip_suffix(".parquet"))
+    else {
+        return false;
+    };
+    sequence.len() == 12 && sequence.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn remove_known_file(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() || meta.file_type().is_symlink() => std::fs::remove_file(path),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_dir_if_empty(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        // Windows reports PermissionDenied for a non-empty directory.
+        #[cfg(windows)]
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn clean_legacy_plans_dir(dir: &Path) -> io::Result<()> {
@@ -245,6 +434,10 @@ impl JsonFile<'_> {
 mod housekeeping_tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use tempfile::tempdir;
 
     #[test]
@@ -282,12 +475,16 @@ mod housekeeping_tests {
             "protect.parquet",
             "notes.parquet",
             "enrich.parquet",
+            "agent_protect.json",
         ] {
             fs::write(root.join(name), b"current data").unwrap();
         }
         fs::write(volume.join("current.parquet"), b"compatible history").unwrap();
         fs::create_dir(volume.join("deltas")).unwrap();
-        fs::write(volume.join("deltas/delta-1.parquet"), b"history").unwrap();
+        fs::write(volume.join("deltas/delta-000000000001.parquet"), b"history").unwrap();
+        let empty_generation = root.join("67890");
+        fs::create_dir(&empty_generation).unwrap();
+        fs::write(empty_generation.join("current.parquet"), b"retired").unwrap();
         fs::write(root.join("last_report-not-a-key.json"), b"unrecognized").unwrap();
 
         let outside = tmp.path().join("outside-sentinel");
@@ -297,7 +494,7 @@ mod housekeeping_tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, volume.join("unowned.json")).unwrap();
 
-        assert!(store.clean_retired_store_state().unwrap());
+        assert!(store.reset_incompatible_format().unwrap());
         for name in [
             "unowned.json",
             "fsevents.json",
@@ -323,25 +520,28 @@ mod housekeeping_tests {
             "protect.parquet",
             "notes.parquet",
             "enrich.parquet",
+            "agent_protect.json",
         ] {
             assert!(root.join(name).exists(), "removed retained file {name}");
         }
-        assert_eq!(
-            fs::read(volume.join("current.parquet")).unwrap(),
-            b"compatible history"
+        assert!(!volume.exists(), "empty numeric generation remains");
+        assert!(
+            !empty_generation.exists(),
+            "empty numeric generation remains"
         );
         assert!(root.join("last_report-not-a-key.json").exists());
         assert_eq!(fs::read(outside).unwrap(), b"must survive");
 
         fs::write(root.join("unowned.json"), b"later file").unwrap();
-        assert!(!store.clean_retired_store_state().unwrap());
+        store.mark_current_format().unwrap();
+        assert!(!store.reset_incompatible_format().unwrap());
         assert!(root.join("unowned.json").exists());
         fs::write(root.join("housekeeping.version"), b"0\n").unwrap();
-        assert!(store.clean_retired_store_state().unwrap());
+        assert!(store.reset_incompatible_format().unwrap());
         assert!(!root.join("unowned.json").exists());
         assert_eq!(
             fs::read_to_string(root.join("housekeeping.version")).unwrap(),
-            "1\n"
+            "0\n"
         );
 
         #[cfg(unix)]
@@ -351,10 +551,131 @@ mod housekeeping_tests {
             fs::remove_file(root.join("housekeeping.version")).unwrap();
             std::os::unix::fs::symlink(&outside_marker, root.join("housekeeping.version")).unwrap();
             fs::write(root.join("unowned.json"), b"legacy").unwrap();
-            assert!(store.clean_retired_store_state().unwrap());
+            assert!(store.reset_incompatible_format().unwrap());
             assert!(!root.join("unowned.json").exists());
             assert_eq!(fs::read_to_string(outside_marker).unwrap(), "1\n");
         }
+    }
+
+    #[test]
+    fn missing_generation_resets_known_old_parquet_but_preserves_durable_and_unknown_files() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let store = StoreDir::at(root).unwrap();
+        let volume = root.join("12345");
+        fs::create_dir(&volume).unwrap();
+        for path in [
+            root.join("report_rows.parquet"),
+            root.join("summary.parquet"),
+            volume.join("report_rows.parquet"),
+            volume.join("current.parquet"),
+            volume.join("scope.json"),
+            volume.join("external_consumers.json"),
+        ] {
+            fs::write(path, b"old generation").unwrap();
+        }
+        let external = root.join("external");
+        fs::create_dir_all(external.join("folded")).unwrap();
+        fs::create_dir_all(external.join("deltas")).unwrap();
+        fs::write(external.join("current.parquet"), b"old").unwrap();
+        fs::write(external.join("volume_stamps.parquet"), b"old").unwrap();
+        fs::write(external.join("deltas/delta-000000000001.parquet"), b"old").unwrap();
+        fs::write(external.join("folded.parquet"), b"old").unwrap();
+        fs::write(
+            external
+                .join("folded")
+                .join(format!("{}.parquet", "a".repeat(64))),
+            b"old",
+        )
+        .unwrap();
+        fs::write(
+            external.join("folded").join("user-data.parquet"),
+            b"unknown",
+        )
+        .unwrap();
+        let associations = root.join("associations");
+        fs::create_dir(&associations).unwrap();
+        for name in [
+            "declarations.parquet",
+            "dependency_identities.parquet",
+            "xcode_derived_data.parquet",
+            "agent_identifications.parquet",
+            "agent_containers.parquet",
+            "build_stores.parquet",
+            "external_consumers.parquet",
+        ] {
+            fs::write(associations.join(name), b"old").unwrap();
+        }
+        for path in [
+            root.join("protect.parquet"),
+            root.join("notes.parquet"),
+            root.join("ledger.parquet"),
+            root.join("external_consumers.parquet"),
+            root.join("config.toml"),
+            root.join("unrelated.bin"),
+            volume.join("enrich.parquet"),
+            external.join("folded/user-data.parquet"),
+        ] {
+            fs::write(path, b"preserve").unwrap();
+        }
+        let lock = store.lock_observation_writes().unwrap();
+        let lock_inode = fs::metadata(root.join("store-write.lock")).unwrap();
+        assert!(store.reset_incompatible_format().unwrap());
+        assert!(!root.join("report_rows.parquet").exists());
+        assert!(!root.join("summary.parquet").exists());
+        assert!(!volume.join("report_rows.parquet").exists());
+        assert!(!volume.join("current.parquet").exists());
+        assert!(!volume.join("scope.json").exists());
+        assert!(!volume.join("external_consumers.json").exists());
+        assert!(!external.join("current.parquet").exists());
+        assert!(!external.join("volume_stamps.parquet").exists());
+        assert!(!external.join("deltas/delta-000000000001.parquet").exists());
+        assert!(!external.join("folded.parquet").exists());
+        assert!(
+            !external
+                .join("folded")
+                .join(format!("{}.parquet", "a".repeat(64)))
+                .exists()
+        );
+        assert!(!associations.join("declarations.parquet").exists());
+        assert!(!associations.join("dependency_identities.parquet").exists());
+        for name in [
+            "xcode_derived_data.parquet",
+            "agent_identifications.parquet",
+            "agent_containers.parquet",
+            "build_stores.parquet",
+        ] {
+            assert!(
+                !associations.join(name).exists(),
+                "old association table survived: {name}"
+            );
+        }
+        assert_eq!(
+            fs::read(associations.join("external_consumers.parquet")).unwrap(),
+            b"old",
+            "user-declared consumer intent must survive"
+        );
+        for path in [
+            root.join("protect.parquet"),
+            root.join("notes.parquet"),
+            root.join("ledger.parquet"),
+            root.join("external_consumers.parquet"),
+            root.join("config.toml"),
+            root.join("unrelated.bin"),
+            volume.join("enrich.parquet"),
+        ] {
+            assert_eq!(fs::read(path).unwrap(), b"preserve");
+        }
+        assert_eq!(
+            fs::read(external.join("folded/user-data.parquet")).unwrap(),
+            b"preserve"
+        );
+        assert_eq!(
+            fs::metadata(root.join("store-write.lock")).unwrap().ino(),
+            lock_inode.ino()
+        );
+        drop(lock);
+        assert!(!store.has_current_format().unwrap());
     }
 
     #[test]
@@ -387,6 +708,52 @@ mod housekeeping_tests {
         std::os::unix::fs::symlink(&outside, tmp.path().join("store-write.lock")).unwrap();
         assert!(store.lock_observation_writes().is_err());
         assert_eq!(fs::read(outside).unwrap(), b"sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn marker_fifo_is_nonblocking_and_replaced_only_when_generation_commits() {
+        let tmp = tempdir().unwrap();
+        let store = StoreDir::at(tmp.path()).unwrap();
+        let marker = tmp.path().join("housekeeping.version");
+        let path = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a valid NUL-terminated pathname; mkfifo does not
+        // retain the pointer after returning.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(store.reset_incompatible_format().unwrap());
+        assert!(!store.has_current_format().unwrap());
+        store.mark_current_format().unwrap();
+        assert!(store.has_current_format().unwrap());
+        assert!(fs::symlink_metadata(marker).unwrap().is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_never_descends_through_numeric_or_plans_symlink_directories() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("current.parquet"), b"sentinel").unwrap();
+        fs::write(
+            outside.join("01234567-89ab-cdef-0123-456789abcdef.json"),
+            b"sentinel",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("12345")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("plans")).unwrap();
+        StoreDir::at(root)
+            .unwrap()
+            .reset_incompatible_format()
+            .unwrap();
+        assert_eq!(
+            fs::read(outside.join("current.parquet")).unwrap(),
+            b"sentinel"
+        );
+        assert_eq!(
+            fs::read(outside.join("01234567-89ab-cdef-0123-456789abcdef.json")).unwrap(),
+            b"sentinel"
+        );
     }
 }
 

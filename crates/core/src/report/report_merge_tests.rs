@@ -95,6 +95,12 @@ fn duplicate_stored_rows_keep_shapes_union_tags_and_dedup_facts() {
     use crate::locations::{Environment, Platform, Registry};
     use crate::scope::{ScanConfig, resolve_effective_scope};
     let temp = tempfile::tempdir().unwrap();
+    // This fixture writes a fully formed current-generation cache directly,
+    // rather than entering the observer that normally publishes the marker.
+    crate::fs_gate::StoreDir::at(temp.path())
+        .unwrap()
+        .mark_current_format()
+        .unwrap();
     let env = Environment::fixture(temp.path().into(), Default::default(), Platform::MacOS);
     let scope = resolve_effective_scope(
         &env,
