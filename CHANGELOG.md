@@ -3,6 +3,15 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.3
+
+- `swamp observe` now enriches worktrees from GitHub by default, as its help and the
+  usage guide already described. Before this, only `--enrich` made any `gh` call, so
+  the scheduled observation (which passes no flags) never did and every worktree's
+  `merged` state stayed `unknown`. Results are cached by tip SHA for six hours, so
+  repeat observations make few or no calls. `--no-enrich` skips it; `--enrich` is
+  removed because it is now the default.
+
 ## v0.7.2
 
 - Count linked worktrees that live outside every scan root. Each discovered
