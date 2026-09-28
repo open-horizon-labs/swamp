@@ -5899,15 +5899,14 @@ fn full_walk(
     excluded: &[PathBuf],
     sibling_roots: &[PathBuf],
 ) -> Result<TrackedWalk> {
-    let (discovered, mut attribution, registry_reached) =
-        crate::walk::discover_and_attribute_reaching(
-            stage,
-            root,
-            observed_at,
-            large_file_min_bytes,
-            excluded,
-            sibling_roots,
-        )?;
+    let (discovered, mut attribution, registry_reached) = crate::walk::discover_and_attribute(
+        stage,
+        root,
+        observed_at,
+        large_file_min_bytes,
+        excluded,
+        sibling_roots,
+    )?;
     split_remainder(&discovered, &mut attribution);
     Ok(TrackedWalk {
         discovered,

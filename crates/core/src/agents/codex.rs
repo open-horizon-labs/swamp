@@ -178,7 +178,7 @@ fn identify_managed_worktrees(
     let mut residue_truncated = false;
     let mut residue_count = 0usize;
     let (tasks, truncation) = ctx.list_checked(pool);
-    let tasks_truncated = !matches!(truncation, crate::locations::Truncation::Complete);
+    let tasks_truncated = truncation.is_truncated();
     for task in tasks.into_iter().take(MAX_POOL_TASKS) {
         let task_path = pool.join(&task.name);
         if !task.is_dir {

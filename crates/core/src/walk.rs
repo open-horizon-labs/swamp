@@ -2069,30 +2069,12 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
 /// from both passes: nothing under an excluded path is discovered as a
 /// worktree, measured, or reported as unowned. Empty for every caller
 /// with no scope-level exclusions to enforce.
+///
+/// Registry expansion: linked worktrees the discovered checkouts register
+/// outside this root (and outside every `sibling_root` and excluded
+/// subtree) are discovered and walked too, each as its own root. The
+/// third element names what was reached that way, for coverage.
 pub fn discover_and_attribute(
-    stage: &crate::bus::Stage,
-    root: &Path,
-    observed_at: u64,
-    large_file_min_bytes: u64,
-    excluded: &[PathBuf],
-) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
-    let (discovered, attribution, _) = discover_and_attribute_reaching(
-        stage,
-        root,
-        observed_at,
-        large_file_min_bytes,
-        excluded,
-        &[],
-    )?;
-    Ok((discovered, attribution))
-}
-
-/// [`discover_and_attribute`], plus registry expansion: linked worktrees
-/// the discovered checkouts register outside this root (and outside
-/// every `sibling_root` and excluded subtree) are discovered and walked
-/// too, each as its own root. The third element names what was reached
-/// that way, for coverage.
-pub fn discover_and_attribute_reaching(
     _stage: &crate::bus::Stage,
     root: &Path,
     observed_at: u64,
@@ -2265,8 +2247,7 @@ mod registry_reach_tests {
         AttributionResult,
         Vec<crate::coverage::RegistryReach>,
     ) {
-        discover_and_attribute_reaching(&crate::bus::Stage::for_tests(), root, 1, 1 << 40, &[], &[])
-            .unwrap()
+        discover_and_attribute(&crate::bus::Stage::for_tests(), root, 1, 1 << 40, &[], &[]).unwrap()
     }
 
     #[test]

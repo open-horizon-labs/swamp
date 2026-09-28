@@ -72,7 +72,7 @@ impl Consumer for WalkConsumer {
             (tracked.discovered, tracked.attribution)
         } else {
             notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
-            let (discovered, attribution, reached) = crate::walk::discover_and_attribute_reaching(
+            let (discovered, attribution, reached) = crate::walk::discover_and_attribute(
                 stage,
                 &ctx.root,
                 ctx.observed_at,
