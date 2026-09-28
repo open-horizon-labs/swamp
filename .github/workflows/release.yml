@@ -3,20 +3,22 @@ name: Release
 # Tag pushes are the single release trigger (`git tag vX.Y.Z && git push --tags`,
 # or `gh release create`, which pushes the tag). Two build jobs, one per
 # supported target, each producing its own archives and checksums; an
-# archive-only job on a newer Ubuntu; a gate that the full tier
-# (`check-full.yml`: compile-fail cases, mutation sweep, cost test) passed
-# for this exact tagged commit; and one publishing job that runs only after
-# every one of those succeeds, so a release is never published half-built,
-# with one target's assets overwriting another's (#88), or from a commit
-# the full tier has not passed.
+# archive-only job on a newer Ubuntu; a gate that both `ci.yml` (fast tier,
+# platform isolation, traversal and archive checks) and `check-full.yml`
+# (compile-fail cases, mutation sweep, cost test) passed for this exact
+# tagged commit; and one publishing job that runs only after every one of
+# those succeeds, so a release is never published half-built, with one
+# target's assets overwriting another's (#88), or from a commit either
+# workflow has not passed.
 #
 #   macos-arm64              aarch64-apple-darwin, release binary, package, smoke
 #   linux-x86_64             x86_64-unknown-linux-gnu on Ubuntu 24.04 (the baseline),
 #                            generic x86-64 CPU, package, smoke, linkage + glibc
 #   linux-x86_64-newer       archive-only: the 24.04-built archive smoke-tested on the
 #                            newest hosted Ubuntu; no second build or workspace suite
-#   full-tier                waits for (or, with none, dispatches) `check-full.yml`
-#                            on this commit: scripts/verify-full-tier.sh
+#   gates                    waits for (or, with none, dispatches) `ci.yml` and
+#                            `check-full.yml` on this commit; fails fast:
+#                            scripts/verify-gates.sh
 #   release                  needs all four; publishes every archive + checksum
 #
 # Each archive holds the CLI/TUI binary, README.md and the agent skill
@@ -202,11 +204,12 @@ jobs:
           name: swamp-linux-newer-smoke
           path: dist/smoke-newer/*
 
-  # The full tier is not run here: `check-full.yml` runs on every push to
-  # main, so the tagged commit normally has a finished (or in-progress)
-  # run and this only waits for it. With none, it dispatches one.
-  full-tier:
-    name: Full tier passed for this commit
+  # Neither ci.yml nor the full tier is run here: both workflows run on
+  # every push to main, so the tagged commit normally has finished (or
+  # in-progress) runs and this only waits for them, failing as soon as a
+  # job in every active run has failed. With no run it dispatches one.
+  gates:
+    name: CI and the full tier passed for this commit
     runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
@@ -216,8 +219,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
-      - name: scripts/verify-full-tier.sh
-        run: scripts/verify-full-tier.sh "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY"
+      - name: scripts/verify-gates.sh
+        run: scripts/verify-gates.sh "$GITHUB_SHA" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY"
 
   release:
     name: Publish
@@ -226,7 +229,7 @@ jobs:
         macos-arm64,
         linux-x86_64,
         linux-x86_64-newer,
-        full-tier,
+        gates,
       ]
     runs-on: ubuntu-24.04
     steps:

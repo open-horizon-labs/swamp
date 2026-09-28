@@ -13,7 +13,7 @@ name: check-full
 # Runs on every push to main, so the tier has already passed (or is
 # running) for a commit by the time it is tagged: `release.yml` does not
 # run it again, it waits for this workflow's run on the tagged commit
-# (`scripts/verify-full-tier.sh`) and runs it here only if there is none.
+# (`scripts/verify-gates.sh`) and runs it here only if there is none.
 # It never runs on a feature-branch push, an unlabelled PR, or a schedule.
 # Other ways to run it: `gh workflow run check-full.yml`, or adding the
 # `full-check` label to a PR (removing and re-adding the label
