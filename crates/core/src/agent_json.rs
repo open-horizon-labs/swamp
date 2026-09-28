@@ -902,6 +902,7 @@ mod tests {
                 walked_total: 200,
                 projects: 1,
                 mode: "full".into(),
+                reached_by_registry: Vec::new(),
             })
             .collect();
         let render = |coverage: &[RootCoverage]| {

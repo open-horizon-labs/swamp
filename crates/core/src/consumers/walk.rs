@@ -37,7 +37,7 @@ impl Consumer for WalkConsumer {
         let mut changed_paths = None;
         let mut unconfirmed_worktree_ids: Vec<String> = Vec::new();
         let (discovered, attribution) = if let Some(dir) = &ctx.store_dir {
-            let (tracked, checkpoint) = crate::growth::stage_tracked_with_source(
+            let (tracked, checkpoint) = crate::growth::stage_tracked_reaching(
                 stage,
                 dir,
                 &ctx.root,
@@ -47,12 +47,14 @@ impl Consumer for WalkConsumer {
                 ctx.observe,
                 ctx.fs_events,
                 &ctx.pruned_subtrees,
+                &ctx.sibling_roots,
             )?;
             *self.checkpoint.lock().unwrap() = checkpoint;
             notes.push(format!(
                 "fsevents: mode={} reason={} changed_dirs={}",
                 tracked.mode, tracked.reason, tracked.changed_dirs
             ));
+            notes.extend(registry_reach_notes(&tracked.registry_reached));
             if !tracked.unconfirmed_worktree_ids.is_empty() {
                 notes.push(format!(
                     "coverage: {} worktree(s) could not be confirmed this pass (access lost, not deleted); history preserved",
@@ -70,13 +72,16 @@ impl Consumer for WalkConsumer {
             (tracked.discovered, tracked.attribution)
         } else {
             notes.push("fsevents: mode=full reason=no_store changed_dirs=0".to_string());
-            crate::walk::discover_and_attribute(
+            let (discovered, attribution, reached) = crate::walk::discover_and_attribute_reaching(
                 stage,
                 &ctx.root,
                 ctx.observed_at,
                 ctx.large_file_min_bytes,
                 &ctx.pruned_subtrees,
-            )?
+                &ctx.sibling_roots,
+            )?;
+            notes.extend(registry_reach_notes(&reached));
+            (discovered, attribution)
         };
         Ok(vec![Event::RootObserved {
             changed_paths,
@@ -87,4 +92,8 @@ impl Consumer for WalkConsumer {
             unconfirmed_worktree_ids: Arc::new(unconfirmed_worktree_ids),
         }])
     }
+}
+
+fn registry_reach_notes(reached: &[crate::coverage::RegistryReach]) -> Vec<String> {
+    reached.iter().map(|r| r.to_note()).collect()
 }

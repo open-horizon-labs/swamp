@@ -43,10 +43,18 @@
 //!   or incompatible index rows stay unresolved; there is no transcript
 //!   parsing fallback.
 //!
-//! No managed-worktree creation by the Codex CLI itself is confirmed by
-//! primary source this chunk, so `AgentCategory::ManagedWorktrees` is
-//! never populated by this adapter -- an honest absence, not a silent
-//! gap (`docs/agent-storage.md` records the same note in prose).
+//! - Managed worktrees, openai/codex @ `4fd5745e8486`:
+//!   `codex-rs/worktree/src/settings.rs` resolves the pool root as the
+//!   `[desktop]` table's `git-worktree-root`, defaulting to
+//!   `codex_home.join("worktrees")`; `codex-rs/features/src/lib.rs`
+//!   ships `Feature::Worktrees` stable and enabled by default. Each task
+//!   gets `<pool>/<task>/<repo>/`, an ordinary linked worktree of the
+//!   user's checkout. Those are project storage: the project walk reaches
+//!   them through the checkout's own `.git/worktrees/` registry and
+//!   measures them there (`crate::git::registry_linked_worktrees`). This
+//!   adapter only cross-references them as byte-less
+//!   `AgentCategory::ManagedWorktrees` units, and keeps bytes only for a
+//!   pool entry no project walk measured this pass.
 
 use super::{
     AdapterCapabilities, AgentActionCapability, AgentAdapter, AgentCategory, AgentMember,
@@ -132,8 +140,115 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
     walk.walk(&home.join("archived_sessions"), 0);
     let mut units = walk.units;
     identify_sqlite_stores(home, ctx, &mut units);
-    identify_static_categories(home, ctx, &mut units);
+    // Only a pool that is a direct child of the home is identified here:
+    // anywhere else it is outside this adapter's authorized root (the
+    // project walk still reaches its worktrees through their checkouts'
+    // registries), and a deeper one would split a top-level entry the
+    // residual accounts for whole.
+    let pool_entry = codex_state::managed_worktree_pool(home, ctx)
+        .filter(|pool| pool.parent() == Some(home))
+        .and_then(|pool| pool.file_name().map(|n| n.to_string_lossy().into_owned()));
+    if let Some(name) = &pool_entry {
+        identify_managed_worktrees(home, &home.join(name), ctx, &mut units);
+    }
+    identify_static_categories(home, ctx, pool_entry.as_deref(), &mut units);
     units
+}
+
+// ---------------------------------------------------------------------
+// Managed worktrees: `<pool>/<task>/<repo>/`, each a linked worktree.
+// ---------------------------------------------------------------------
+
+/// Task directories one pass lists under the pool. Codex Desktop's own
+/// auto-cleanup keeps 15 (`DEFAULT_WORKTREE_KEEP_COUNT`); this only stops
+/// a pathological pool from making identification unbounded.
+const MAX_POOL_TASKS: usize = 4096;
+
+fn identify_managed_worktrees(
+    home: &Path,
+    pool: &Path,
+    ctx: &IdentifyCtx,
+    out: &mut Vec<CandidateAgentUnit>,
+) {
+    if !ctx.is_dir(pool) {
+        return;
+    }
+    let mut residue_bytes = 0u64;
+    let mut residue_mtime = 0u64;
+    let mut residue_truncated = false;
+    let mut residue_count = 0usize;
+    let (tasks, truncation) = ctx.list_checked(pool);
+    let tasks_truncated = !matches!(truncation, crate::locations::Truncation::Complete);
+    for task in tasks.into_iter().take(MAX_POOL_TASKS) {
+        let task_path = pool.join(&task.name);
+        if !task.is_dir {
+            let (b, m, t) = ctx.folded_bytes(&task_path, MAX_FOLD_ENTRIES);
+            (residue_bytes, residue_mtime) = (residue_bytes + b, residue_mtime.max(m));
+            residue_truncated |= t;
+            residue_count += 1;
+            continue;
+        }
+        for child in ctx.list(&task_path) {
+            let path = task_path.join(&child.name);
+            if !(child.is_dir && ctx.is_file(&path.join(".git"))) {
+                let (b, m, t) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
+                (residue_bytes, residue_mtime) = (residue_bytes + b, residue_mtime.max(m));
+                residue_truncated |= t;
+                residue_count += 1;
+                continue;
+            }
+            out.push(managed_worktree_unit(home, path, ctx));
+        }
+    }
+    if residue_count > 0 || tasks_truncated {
+        let mut unit = AgentUnitBuilder::new(
+            CODEX_TOOL_ID,
+            AgentCategory::Unclassified,
+            pool.to_path_buf(),
+        )
+        .relative_to(home)
+        .bytes(residue_bytes)
+        .mtime_max(residue_mtime)
+        .project_link(ProjectLinkState::NotApplicable)
+        .action(AgentActionCapability::None)
+        .note(
+            "entries in the managed-worktree pool that are not a `<task>/<repo>` linked \
+             worktree (stray files, a task directory's non-worktree contents)",
+        );
+        if residue_truncated || tasks_truncated {
+            unit =
+                unit.incomplete("pool listing or fold bound reached; total may be an undercount");
+        }
+        out.push(unit.build());
+    }
+}
+
+fn managed_worktree_unit(home: &Path, path: PathBuf, ctx: &IdentifyCtx) -> CandidateAgentUnit {
+    let declared = Some(path.to_string_lossy().into_owned());
+    let builder =
+        AgentUnitBuilder::new(CODEX_TOOL_ID, AgentCategory::ManagedWorktrees, path.clone())
+            .relative_to(home)
+            .project_link_declared(declared, "")
+            .action(AgentActionCapability::None);
+    if ctx.project_walk_measures(&path) {
+        return builder
+            .bytes(0)
+            .note(
+                "Codex managed worktree; the project walk measured it as a linked worktree of \
+                 its checkout, so its bytes are counted there and not again here",
+            )
+            .build();
+    }
+    let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
+    let mut unit = builder.bytes(bytes).mtime_max(mtime).note(
+        "Codex managed worktree no project walk measured this pass (its checkout is outside \
+         every scanned root, or its registry entry does not round-trip), so its bytes are \
+         counted here",
+    );
+    if truncated {
+        unit = unit.incomplete("directory entry count bound reached; total may be an undercount");
+    }
+    unit.build()
 }
 
 // ---------------------------------------------------------------------
@@ -494,8 +609,18 @@ const STATIC_ENTRIES: &[StaticEntry] = &[
     },
 ];
 
-fn identify_static_categories(home: &Path, ctx: &IdentifyCtx, out: &mut Vec<CandidateAgentUnit>) {
+fn identify_static_categories(
+    home: &Path,
+    ctx: &IdentifyCtx,
+    pool_entry: Option<&str>,
+    out: &mut Vec<CandidateAgentUnit>,
+) {
     let mut seen_top_level: HashSet<String> = HashSet::new();
+    // Accounted for by `identify_managed_worktrees`, whose units hold its
+    // bytes (or say which project worktree does).
+    if let Some(name) = pool_entry {
+        seen_top_level.insert(name.to_string());
+    }
     for entry in STATIC_ENTRIES {
         seen_top_level.insert(entry.rel.to_string());
         let path = home.join(entry.rel);
@@ -1127,5 +1252,207 @@ mod tests {
                 .map(|u| (u.category(), u.relative_path().to_string(), u.bytes()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        crate::work_counters::record_spawn();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        touch(&dir.join("README.md"), b"x");
+        git(dir, &["add", "README.md"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// A Codex home with a real pool: `worktrees/<task>/proj` is a linked
+    /// worktree of `src/a/proj`, next to an unrelated `src/b/proj` with
+    /// the same basename, plus a stray file and an empty task directory.
+    struct Pool {
+        _tmp: tempfile::TempDir,
+        home: PathBuf,
+        a: PathBuf,
+        b: PathBuf,
+        wt: PathBuf,
+    }
+
+    fn pool_fixture() -> Pool {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let home = base.join("codex-home");
+        let (a, b) = (base.join("src/a/proj"), base.join("src/b/proj"));
+        init_repo(&a);
+        init_repo(&b);
+        let wt = home.join("worktrees/task-slug/proj");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(
+            &a,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "task"],
+        );
+        touch(&wt.join("target/debug/blob"), &vec![7u8; 256 << 10]);
+        touch(&home.join("worktrees/stray.png"), b"not a worktree");
+        fs::create_dir_all(home.join("worktrees/empty-task")).unwrap();
+        touch(
+            &home.join("sessions/2026/09/21/rollout-live.jsonl"),
+            b"live",
+        );
+        Pool {
+            _tmp: tmp,
+            home,
+            a,
+            b,
+            wt,
+        }
+    }
+
+    fn residual_note(units: &[CandidateAgentUnit]) -> String {
+        units
+            .iter()
+            .find(|u| u.relative_path() == "(unclassified residual)")
+            .and_then(|u| u.note().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn pool_worktrees_leave_the_residual_and_reconcile_with_no_project_walk() {
+        let fx = pool_fixture();
+        let units = run(&fx.home);
+        let managed: Vec<&CandidateAgentUnit> = units
+            .iter()
+            .filter(|u| u.category() == AgentCategory::ManagedWorktrees)
+            .collect();
+        assert_eq!(managed.len(), 1, "{managed:?}");
+        assert_eq!(managed[0].path, fx.wt);
+        assert!(
+            managed[0].bytes() >= 256 << 10,
+            "no project walk measured it, so the unit keeps its bytes: {:?}",
+            managed[0]
+        );
+        assert!(
+            !residual_note(&units).contains("worktrees"),
+            "the pool is not unclassified: {}",
+            residual_note(&units)
+        );
+        let identified: u64 = units.iter().map(|u| u.bytes()).sum();
+        let (home_total, _, _) = crate::agents::folded_bytes(&fx.home, MAX_FOLD_ENTRIES);
+        assert_eq!(
+            identified, home_total,
+            "every byte in the home is identified exactly once"
+        );
+    }
+
+    #[test]
+    fn a_pool_worktree_the_project_walk_measured_holds_no_bytes_and_links_by_gitdir() {
+        let fx = pool_fixture();
+        let cache = IdentificationCache::disabled();
+        // Registry expansion hands project discovery the worktree's
+        // canonical path; the home here is spelled the same way.
+        let known = crate::agents::ContainerCache::disabled().with_known_worktrees(&[
+            fx.a.clone(),
+            fx.b.clone(),
+            fx.wt.clone(),
+        ]);
+        let ctx = IdentifyCtx::with_containers(1, &cache, &known);
+        let units = identify(&fx.home, &ctx);
+        let unit = units
+            .iter()
+            .find(|u| u.category() == AgentCategory::ManagedWorktrees)
+            .expect("managed worktree unit");
+        assert_eq!(unit.bytes(), 0, "counted by the project walk, never twice");
+
+        let a_id = crate::git::discover(&fx.a).unwrap()[0].project_id.clone();
+        let b_id = crate::git::discover(&fx.b).unwrap()[0].project_id.clone();
+        match unit.project_link() {
+            ProjectLinkState::Linked {
+                project_id,
+                worktree_kind,
+                ..
+            } => {
+                assert_eq!(project_id, &a_id, "the checkout that owns it");
+                assert_ne!(project_id, &b_id, "never the same-basename neighbour");
+                assert_eq!(worktree_kind, "linked");
+            }
+            other => panic!("expected a declared link, got {other:?}"),
+        }
+
+        let identified: u64 = units.iter().map(|u| u.bytes()).sum();
+        let (home_total, _, _) = crate::agents::folded_bytes(&fx.home, MAX_FOLD_ENTRIES);
+        let (wt_total, _, _) = crate::agents::folded_bytes(&fx.wt, MAX_FOLD_ENTRIES);
+        assert_eq!(
+            identified + wt_total,
+            home_total,
+            "agent units plus the project-measured worktree cover the home exactly once"
+        );
+    }
+
+    #[test]
+    fn a_configured_pool_root_is_followed_and_the_default_one_is_then_unclassified() {
+        let fx = pool_fixture();
+        let custom = fx.home.join("wt-pool");
+        fs::create_dir_all(&custom).unwrap();
+        fs::rename(
+            fx.home.join("worktrees/task-slug"),
+            custom.join("task-slug"),
+        )
+        .unwrap();
+        git(
+            &fx.a,
+            &[
+                "worktree",
+                "repair",
+                custom.join("task-slug/proj").to_str().unwrap(),
+            ],
+        );
+        touch(
+            &fx.home.join("config.toml"),
+            format!("[desktop]\ngit-worktree-root = \"{}\"\n", custom.display()).as_bytes(),
+        );
+        let units = run(&fx.home);
+        let managed: Vec<&CandidateAgentUnit> = units
+            .iter()
+            .filter(|u| u.category() == AgentCategory::ManagedWorktrees)
+            .collect();
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].path, custom.join("task-slug/proj"));
+        let note = residual_note(&units);
+        assert!(!note.contains("wt-pool"), "{note}");
+        assert!(
+            note.contains("worktrees"),
+            "a directory that is no longer the pool is not assumed to be one: {note}"
+        );
+    }
+
+    #[test]
+    fn a_pool_outside_the_home_is_left_to_the_project_walk() {
+        let fx = pool_fixture();
+        touch(
+            &fx.home.join("config.toml"),
+            b"[desktop]\ngit-worktree-root = \"/somewhere/else/entirely\"\n",
+        );
+        let units = run(&fx.home);
+        assert!(
+            units
+                .iter()
+                .all(|u| u.category() != AgentCategory::ManagedWorktrees),
+            "never identified outside the authorized home"
+        );
+        assert!(residual_note(&units).contains("worktrees"));
     }
 }

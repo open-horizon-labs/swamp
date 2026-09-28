@@ -250,6 +250,93 @@ fn small_text(path: &Path, cap: BoundedCap) -> Option<String> {
     bounded_read(path, cap).ok()?.complete_utf8()
 }
 
+/// Registry entries (`<common>/worktrees/<name>`) read per main checkout.
+/// Git keeps this list small; the bound only stops a corrupted registry
+/// from turning one checkout into an unbounded listing.
+const MAX_REGISTRY_ENTRIES: usize = 4096;
+
+/// The shared common `.git` directory of a `Main` checkout: its `.git`
+/// directory, or, for a submodule-style main whose `.git` is a pointer
+/// file, the gitdir that pointer resolves to.
+fn common_dir_of_main(main: &DiscoveredWorktree) -> Option<PathBuf> {
+    let git_path = main.path.join(".git");
+    let meta = fs::symlink_metadata(&git_path).ok()?;
+    if meta.is_dir() {
+        fs::canonicalize(&git_path).ok()
+    } else if meta.is_file() {
+        resolve_gitdir(&main.path, &git_path)
+    } else {
+        None
+    }
+}
+
+/// The linked worktrees a main checkout's own registry names, wherever
+/// they live on disk. This is how a worktree parked outside every scan
+/// root (an agent tool's worktree pool, a hand-made `git worktree add
+/// ~/elsewhere/x`) is reached at all: the root walk cannot see it, but
+/// the checkout it belongs to has always known about it.
+///
+/// Every entry must round-trip before it becomes a row: the registered
+/// path exists and is a real directory (never a symlink), its `.git` is a
+/// pointer file whose gitdir resolves back to this very registry entry,
+/// and classifying it yields a `Linked` worktree with this project's
+/// identity. A prunable entry (the worktree was deleted), a moved
+/// worktree, or an unrelated repository now sitting at the registered
+/// path all fail that round trip and yield nothing -- never a fabricated
+/// worktree, never bytes under a guessed owner. Paths are canonical, the
+/// same form the root walk produces for a canonical root.
+pub fn registry_linked_worktrees(main: &DiscoveredWorktree) -> Vec<DiscoveredWorktree> {
+    let mut out = Vec::new();
+    if main.kind != WorktreeKind::Main {
+        return out;
+    }
+    let Some(common) = common_dir_of_main(main) else {
+        return out;
+    };
+    let Ok(entries) = fs::read_dir(common.join("worktrees")) else {
+        return out;
+    };
+    for entry in entries.flatten().take(MAX_REGISTRY_ENTRIES) {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(pointer) = small_text(&entry.path().join("gitdir"), BoundedCap::POINTER) else {
+            continue;
+        };
+        let git_file = PathBuf::from(pointer.trim());
+        if !git_file.is_absolute() {
+            continue;
+        }
+        let Some(registered_dir) = git_file.parent() else {
+            continue;
+        };
+        let Ok(meta) = fs::symlink_metadata(registered_dir) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() || !fs::is_real_file(&git_file) {
+            continue;
+        }
+        let Ok(worktree_dir) = fs::canonicalize(registered_dir) else {
+            continue;
+        };
+        let git_file = worktree_dir.join(".git");
+        let Some(back) = resolve_gitdir(&worktree_dir, &git_file) else {
+            continue;
+        };
+        if fs::canonicalize(entry.path()).ok().as_deref() != Some(back.as_path()) {
+            continue;
+        }
+        let Some(dw) = classify_git_file(&worktree_dir, &git_file) else {
+            continue;
+        };
+        if dw.kind != WorktreeKind::Linked || dw.project_id != main.project_id {
+            continue;
+        }
+        out.push(dw);
+    }
+    out
+}
+
 /// For a linked worktree at `worktree` (whose `.git` is a `gitdir:`
 /// file), the shared common `.git` directory; `None` for a main checkout
 /// or anything unreadable. What `git worktree prune` runs against after
@@ -503,5 +590,141 @@ mod tests {
             found.is_empty(),
             "must not descend into node_modules: {found:?}"
         );
+    }
+
+    fn init_repo(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        run_git(dir, &["init", "-q", "-b", "main"]);
+        run_git(dir, &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.join("README.md"), b"x").unwrap();
+        run_git(dir, &["add", "README.md"]);
+        run_git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn add_worktree(main: &Path, at: &Path, branch: &str) {
+        fs::create_dir_all(at.parent().unwrap()).unwrap();
+        run_git(
+            main,
+            &["worktree", "add", "-q", at.to_str().unwrap(), "-b", branch],
+        );
+    }
+
+    fn main_row(root: &Path) -> DiscoveredWorktree {
+        let mut found = discover(root).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let dw = found.remove(0);
+        assert_eq!(dw.kind, WorktreeKind::Main);
+        dw
+    }
+
+    /// The registry entry whose worktree is `at`, by round-tripping each
+    /// entry's `gitdir` pointer (git names entries by basename, so the
+    /// name alone is ambiguous once two worktrees share one).
+    fn registry_entry_for(main: &Path, at: &Path) -> PathBuf {
+        let want = fs::canonicalize(at).unwrap();
+        fs::read_dir(main.join(".git/worktrees"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|entry| {
+                let pointer = fs::read_to_string(entry.join("gitdir")).unwrap();
+                let dir = Path::new(pointer.trim()).parent().unwrap().to_path_buf();
+                fs::canonicalize(dir).ok().as_deref() == Some(want.as_path())
+            })
+            .expect("registry entry")
+    }
+
+    #[test]
+    fn registry_reaches_a_linked_worktree_outside_any_root() {
+        let tmp = tempdir().unwrap();
+        let main = tmp.path().join("src/proj");
+        init_repo(&main);
+        let pool = tmp.path().join("pool/task-slug/proj");
+        add_worktree(&main, &pool, "task");
+
+        let main_dw = main_row(&tmp.path().join("src"));
+        let reached = registry_linked_worktrees(&main_dw);
+        assert_eq!(reached.len(), 1, "{reached:?}");
+        assert_eq!(reached[0].kind, WorktreeKind::Linked);
+        assert_eq!(reached[0].project_id, main_dw.project_id);
+        assert_eq!(reached[0].path, fs::canonicalize(&pool).unwrap());
+    }
+
+    #[test]
+    fn registry_entries_that_do_not_round_trip_yield_nothing() {
+        let tmp = tempdir().unwrap();
+        let main = tmp.path().join("src/proj");
+        init_repo(&main);
+        let live = tmp.path().join("pool/live/proj");
+        add_worktree(&main, &live, "live");
+
+        // Prunable: the worktree directory was deleted.
+        let gone = tmp.path().join("pool/gone/proj");
+        add_worktree(&main, &gone, "gone");
+        fs::remove_dir_all(&gone).unwrap();
+
+        // Moved: the registered path no longer holds it.
+        let moved = tmp.path().join("pool/moved/proj");
+        add_worktree(&main, &moved, "moved");
+        fs::rename(&moved, tmp.path().join("pool/moved-elsewhere")).unwrap();
+
+        // Foreign: an unrelated repository now sits at the registered path.
+        let foreign = tmp.path().join("pool/foreign/proj");
+        add_worktree(&main, &foreign, "foreign");
+        fs::remove_dir_all(&foreign).unwrap();
+        init_repo(&foreign);
+
+        // Hijacked: the entry points at another project's linked worktree.
+        let other = tmp.path().join("src/other");
+        init_repo(&other);
+        let others_wt = tmp.path().join("pool/others/other");
+        add_worktree(&other, &others_wt, "theirs");
+        let hijacked = tmp.path().join("pool/hijacked/proj");
+        add_worktree(&main, &hijacked, "hijacked");
+        fs::write(
+            registry_entry_for(&main, &hijacked).join("gitdir"),
+            format!("{}\n", others_wt.join(".git").display()),
+        )
+        .unwrap();
+
+        // Symlinked: the entry names a symlink to a real worktree.
+        let target = tmp.path().join("pool/alias-target/proj");
+        add_worktree(&main, &target, "alias");
+        let link = tmp.path().join("pool/alias/proj");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        fs::write(
+            registry_entry_for(&main, &target).join("gitdir"),
+            format!("{}\n", link.join(".git").display()),
+        )
+        .unwrap();
+
+        let main_dw = discover(&tmp.path().join("src"))
+            .unwrap()
+            .into_iter()
+            .find(|d| d.path == main)
+            .unwrap();
+        let reached = registry_linked_worktrees(&main_dw);
+        let paths: Vec<&Path> = reached.iter().map(|d| d.path.as_path()).collect();
+        assert_eq!(
+            paths,
+            vec![fs::canonicalize(&live).unwrap().as_path()],
+            "only the live entry round-trips: {reached:?}"
+        );
+    }
+
+    #[test]
+    fn registry_is_read_only_for_main_checkouts() {
+        let tmp = tempdir().unwrap();
+        let main = tmp.path().join("src/proj");
+        init_repo(&main);
+        let linked = tmp.path().join("src/linked");
+        add_worktree(&main, &linked, "linked");
+        let linked_dw = discover(&tmp.path().join("src"))
+            .unwrap()
+            .into_iter()
+            .find(|d| d.kind == WorktreeKind::Linked)
+            .unwrap();
+        assert!(registry_linked_worktrees(&linked_dw).is_empty());
     }
 }

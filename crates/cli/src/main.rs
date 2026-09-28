@@ -445,6 +445,20 @@ fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::Effective
 /// be noisy.
 fn print_scope_coverage_note(coverage: &[swamp_core::coverage::RootCoverage]) {
     use swamp_core::coverage::RegionStatus;
+    // Paths outside every root that a walk measured anyway, because a
+    // checkout inside a root registers them as its linked worktrees:
+    // named in full, since nothing in `swamp scope` lists them.
+    let reached: Vec<String> = coverage
+        .iter()
+        .flat_map(|c| c.reached_by_registry.iter())
+        .map(|r| format!("{} (via {})", r.worktree.display(), r.via.display()))
+        .collect();
+    if !reached.is_empty() {
+        eprintln!(
+            "reached outside roots through git worktree registries: {}",
+            reached.join(", ")
+        );
+    }
     let incomplete: Vec<&swamp_core::coverage::RootCoverage> = coverage
         .iter()
         .filter(|c| !matches!(c.status, RegionStatus::Complete))

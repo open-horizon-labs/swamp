@@ -2070,18 +2070,48 @@ pub fn discover_shallow(dir: &Path) -> Vec<DiscoveredWorktree> {
 /// worktree, measured, or reported as unowned. Empty for every caller
 /// with no scope-level exclusions to enforce.
 pub fn discover_and_attribute(
-    _stage: &crate::bus::Stage,
+    stage: &crate::bus::Stage,
     root: &Path,
     observed_at: u64,
     large_file_min_bytes: u64,
     excluded: &[PathBuf],
 ) -> Result<(Vec<DiscoveredWorktree>, AttributionResult)> {
+    let (discovered, attribution, _) = discover_and_attribute_reaching(
+        stage,
+        root,
+        observed_at,
+        large_file_min_bytes,
+        excluded,
+        &[],
+    )?;
+    Ok((discovered, attribution))
+}
+
+/// [`discover_and_attribute`], plus registry expansion: linked worktrees
+/// the discovered checkouts register outside this root (and outside
+/// every `sibling_root` and excluded subtree) are discovered and walked
+/// too, each as its own root. The third element names what was reached
+/// that way, for coverage.
+pub fn discover_and_attribute_reaching(
+    _stage: &crate::bus::Stage,
+    root: &Path,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    excluded: &[PathBuf],
+    sibling_roots: &[PathBuf],
+) -> Result<(
+    Vec<DiscoveredWorktree>,
+    AttributionResult,
+    Vec<crate::coverage::RegistryReach>,
+)> {
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
-    let discovered = discover_parallel_excluding(root, excluded)?;
+    let mut discovered = discover_parallel_excluding(root, excluded)?;
     if trace {
         eprintln!("[trace] walk::discover_parallel: {:?}", t0.elapsed());
     }
+    let reached = reach_by_registry(&discovered, root, sibling_roots, excluded);
+    discovered.extend(reached.iter().map(|(dw, _)| dw.clone()));
     let worktree_ids: Vec<(PathBuf, String)> = discovered
         .iter()
         .map(|dw| (dw.path.clone(), id_for(&dw.path.display().to_string())))
@@ -2091,7 +2121,7 @@ pub fn discover_and_attribute(
         .map(|(p, id)| (p.as_path(), id.as_str()))
         .collect();
     let t1 = std::time::Instant::now();
-    let attribution = attribute_parallel_carrying(
+    let mut attribution = attribute_parallel_carrying(
         root,
         &worktree_refs,
         observed_at,
@@ -2099,10 +2129,299 @@ pub fn discover_and_attribute(
         HashMap::new(),
         excluded,
     );
+    // Each registry-reached worktree is walked as its own root: its own
+    // device boundary, the same symlink rules, and the complete worktree
+    // list so a checkout nested inside it keeps its own boundary.
+    for (dw, _) in &reached {
+        let extra = attribute_parallel_carrying(
+            &dw.path,
+            &worktree_refs,
+            observed_at,
+            large_file_min_bytes,
+            HashMap::new(),
+            &[],
+        );
+        merge_attribution(&mut attribution, extra);
+    }
     if trace {
         eprintln!("[trace] walk::attribute_parallel: {:?}", t1.elapsed());
     }
-    Ok((discovered, attribution))
+    let reach = reached
+        .into_iter()
+        .map(|(dw, via)| crate::coverage::RegistryReach {
+            worktree: dw.path,
+            via,
+        })
+        .collect();
+    Ok((discovered, attribution, reach))
+}
+
+/// Linked worktrees the root walk could not have reached, found through
+/// the registries of the main checkouts it did discover
+/// (`git::registry_linked_worktrees`). Kept only when the worktree lies
+/// outside `root`, outside every sibling scan root (that root's own walk
+/// owns it), outside every excluded subtree (excluded stays excluded,
+/// whichever way a path is reached), and is not already discovered.
+/// Returns each worktree with the main checkout that named it.
+pub(crate) fn reach_by_registry(
+    discovered: &[DiscoveredWorktree],
+    root: &Path,
+    sibling_roots: &[PathBuf],
+    excluded: &[PathBuf],
+) -> Vec<(DiscoveredWorktree, PathBuf)> {
+    let known: HashSet<&Path> = discovered.iter().map(|d| d.path.as_path()).collect();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::new();
+    for main in discovered
+        .iter()
+        .filter(|d| d.kind == crate::report::WorktreeKind::Main)
+    {
+        for dw in crate::git::registry_linked_worktrees(main) {
+            let p = dw.path.as_path();
+            if known.contains(p)
+                || p.starts_with(root)
+                || sibling_roots.iter().any(|r| p.starts_with(r))
+                || excluded.iter().any(|e| p == e || p.starts_with(e))
+                || !seen.insert(dw.path.clone())
+            {
+                continue;
+            }
+            out.push((dw, main.path.clone()));
+        }
+    }
+    out
+}
+
+/// Folds a second walk's result into the first: rows keyed per worktree
+/// are appended, totals summed. The two walks never share a subtree, so
+/// nothing here can double a byte.
+fn merge_attribution(into: &mut AttributionResult, extra: AttributionResult) {
+    for (id, rows) in extra.artifacts_by_worktree {
+        into.artifacts_by_worktree
+            .entry(id)
+            .or_default()
+            .extend(rows);
+    }
+    into.unowned.extend(extra.unowned);
+    into.dirs.extend(extra.dirs);
+    into.files.extend(extra.files);
+    into.walked_total += extra.walked_total;
+    into.attributed_total += extra.attributed_total;
+    into.unowned_total += extra.unowned_total;
+}
+
+#[cfg(test)]
+mod registry_reach_tests {
+    use super::*;
+    use crate::report::WorktreeKind;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(dir: &Path, args: &[&str]) {
+        crate::work_counters::record_spawn();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.join("README.md"), b"x").unwrap();
+        git(dir, &["add", "README.md"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    fn add_worktree(main: &Path, at: &Path, branch: &str) {
+        fs::create_dir_all(at.parent().unwrap()).unwrap();
+        git(
+            main,
+            &["worktree", "add", "-q", at.to_str().unwrap(), "-b", branch],
+        );
+    }
+
+    fn canon(p: &Path) -> PathBuf {
+        crate::fs_gate::canonicalize(p).unwrap()
+    }
+
+    fn walk(
+        root: &Path,
+    ) -> (
+        Vec<DiscoveredWorktree>,
+        AttributionResult,
+        Vec<crate::coverage::RegistryReach>,
+    ) {
+        discover_and_attribute_reaching(&crate::bus::Stage::for_tests(), root, 1, 1 << 40, &[], &[])
+            .unwrap()
+    }
+
+    #[test]
+    fn reach_skips_paths_under_the_root_its_siblings_and_exclusions() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("src");
+        let main = root.join("proj");
+        init_repo(&main);
+        let sibling = tmp.path().join("other-root");
+        let excluded = tmp.path().join("hidden");
+        let pool = tmp.path().join("pool/wt");
+        add_worktree(&main, &root.join("inside"), "inside");
+        add_worktree(&main, &sibling.join("wt"), "sib");
+        add_worktree(&main, &excluded.join("wt"), "ex");
+        add_worktree(&main, &pool, "pool");
+
+        let root = canon(&root);
+        let discovered = discover_parallel_excluding(&root, &[]).unwrap();
+        let reached =
+            reach_by_registry(&discovered, &root, &[canon(&sibling)], &[canon(&excluded)]);
+        let paths: Vec<&Path> = reached.iter().map(|(dw, _)| dw.path.as_path()).collect();
+        assert_eq!(paths, vec![canon(&pool).as_path()], "{reached:?}");
+        assert_eq!(reached[0].1, canon(&main));
+    }
+
+    #[test]
+    fn out_of_root_worktree_artifacts_belong_to_its_project_not_to_unowned() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("src");
+        let main = root.join("proj");
+        init_repo(&main);
+        let pool = tmp.path().join("pool/task/proj");
+        add_worktree(&main, &pool, "task");
+        fs::create_dir_all(pool.join("target/debug")).unwrap();
+        fs::write(pool.join("target/debug/blob"), vec![7u8; 1 << 20]).unwrap();
+
+        let (root, pool, main) = (canon(&root), canon(&pool), canon(&main));
+        let (discovered, attribution, reach) = walk(&root);
+        let linked = discovered
+            .iter()
+            .find(|d| d.path == pool)
+            .expect("the reached worktree is discovered");
+        assert_eq!(linked.kind, WorktreeKind::Linked);
+        let main_id = &discovered
+            .iter()
+            .find(|d| d.path == main)
+            .unwrap()
+            .project_id;
+        assert_eq!(&linked.project_id, main_id);
+        assert_eq!(
+            reach,
+            vec![crate::coverage::RegistryReach {
+                worktree: pool.clone(),
+                via: main.clone(),
+            }]
+        );
+        let rows = attribution
+            .artifacts_by_worktree
+            .get(&id_for(&pool.display().to_string()))
+            .expect("rows keyed by the reached worktree's own id");
+        let target = rows
+            .iter()
+            .find(|r| r.path == pool.join("target"))
+            .expect("target/ classified as this worktree's build output");
+        assert!(target.bytes >= 1 << 20, "{target:?}");
+        let pool_str = pool.display().to_string();
+        assert!(
+            attribution
+                .unowned
+                .iter()
+                .all(|u| !u.path_or_object.starts_with(&pool_str)),
+            "nothing under the reached worktree is unowned: {:?}",
+            attribution.unowned
+        );
+        assert!(attribution.attributed_total >= 1 << 20);
+        assert!(attribution.walked_total >= attribution.attributed_total);
+    }
+
+    #[test]
+    fn a_worktree_that_appears_later_gets_its_own_rows_and_leaves_the_checkouts_rows_alone() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("src");
+        let main = root.join("proj");
+        init_repo(&main);
+        fs::create_dir_all(main.join("target")).unwrap();
+        fs::write(main.join("target/blob"), vec![1u8; 64 << 10]).unwrap();
+        let root = canon(&root);
+        let main_id = id_for(&canon(&main).display().to_string());
+
+        let (_, before, _) = walk(&root);
+        let pool = tmp.path().join("pool/task/proj");
+        add_worktree(&main, &pool, "task");
+        fs::create_dir_all(pool.join("target")).unwrap();
+        fs::write(pool.join("target/blob"), vec![2u8; 1 << 20]).unwrap();
+        let (_, after, _) = walk(&root);
+
+        // `git worktree add` itself writes the new entry's registry
+        // directory, index and branch ref into the checkout's `.git`,
+        // which really is the checkout's storage. What must never happen
+        // is the new worktree's own bytes landing in the checkout's rows.
+        let non_git = |a: &AttributionResult| {
+            let mut v: Vec<(String, PathBuf, u64)> = a.artifacts_by_worktree[&main_id]
+                .iter()
+                .filter(|r| r.kind != ArtifactKind::Git)
+                .map(|r| (format!("{:?}", r.kind), r.path.clone(), r.bytes))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(non_git(&before), non_git(&after));
+        let total = |a: &AttributionResult| -> u64 {
+            a.artifacts_by_worktree[&main_id]
+                .iter()
+                .map(|r| r.bytes)
+                .sum()
+        };
+        assert!(
+            total(&after) - total(&before) < 1 << 20,
+            "the checkout grew by {} -- the new worktree's 1 MiB target/ was absorbed",
+            total(&after) - total(&before)
+        );
+        let pool_id = id_for(&canon(&pool).display().to_string());
+        assert!(!before.artifacts_by_worktree.contains_key(&pool_id));
+        let pool_target: u64 = after.artifacts_by_worktree[&pool_id]
+            .iter()
+            .filter(|r| r.kind == ArtifactKind::BuildOutput)
+            .map(|r| r.bytes)
+            .sum();
+        assert!(pool_target >= 1 << 20, "{pool_target}");
+    }
+
+    #[test]
+    fn ownership_follows_the_registry_not_the_basename() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("src");
+        let a = root.join("a/proj");
+        let b = root.join("b/proj");
+        init_repo(&a);
+        init_repo(&b);
+        let pool = tmp.path().join("pool/proj");
+        add_worktree(&a, &pool, "task");
+
+        let root = canon(&root);
+        let (discovered, _, _) = walk(&root);
+        let id_of = |p: &Path| {
+            discovered
+                .iter()
+                .find(|d| d.path == canon(p))
+                .unwrap()
+                .project_id
+                .clone()
+        };
+        assert_eq!(id_of(&pool), id_of(&a));
+        assert_ne!(id_of(&pool), id_of(&b));
+    }
 }
 
 #[cfg(test)]

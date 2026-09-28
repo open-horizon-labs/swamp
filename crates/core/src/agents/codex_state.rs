@@ -65,6 +65,9 @@ impl SessionIndex {
 #[serde(default)]
 struct CodexConfig {
     sqlite_home: Option<String>,
+    /// Desktop's host-local settings table. Only `git-worktree-root` is
+    /// ever looked at (`managed_worktree_pool`).
+    desktop: Option<toml::Table>,
 }
 
 enum ConfigHome {
@@ -73,21 +76,69 @@ enum ConfigHome {
     Invalid,
 }
 
-fn config_sqlite_home(codex_home: &Path, ctx: &IdentifyCtx) -> ConfigHome {
+enum ConfigRead {
+    Missing,
+    Invalid,
+    Parsed(CodexConfig),
+}
+
+fn read_config(codex_home: &Path, ctx: &IdentifyCtx) -> ConfigRead {
     let path = codex_home.join("config.toml");
     let metadata = match ctx.stat(&path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ConfigHome::Missing,
-        Err(_) => return ConfigHome::Invalid,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ConfigRead::Missing,
+        Err(_) => return ConfigRead::Invalid,
     };
     if !metadata.is_file() || metadata.len() > CONFIG_READ_BYTES as u64 {
-        return ConfigHome::Invalid;
+        return ConfigRead::Invalid;
     }
     let Some(text) = ctx.read_header(&path, CONFIG_READ_BYTES) else {
-        return ConfigHome::Invalid;
+        return ConfigRead::Invalid;
     };
-    let Ok(config) = toml::from_str::<CodexConfig>(&text) else {
-        return ConfigHome::Invalid;
+    match toml::from_str::<CodexConfig>(&text) {
+        Ok(config) => ConfigRead::Parsed(config),
+        Err(_) => ConfigRead::Invalid,
+    }
+}
+
+/// Where Codex allocates managed worktrees, per upstream
+/// `codex-rs/worktree/src/settings.rs` (`WorktreeSettings::for_cli` /
+/// `from_desktop_config`, openai/codex @ `4fd5745e8486`), which the CLI
+/// and TUI both call with `config_toml.desktop`: the `[desktop]` table's
+/// `git-worktree-root` when it is a non-empty absolute string, else
+/// `<CODEX_HOME>/worktrees` when it is absent, null or empty. `None` for
+/// every case upstream itself rejects (a non-string or relative value)
+/// and for a config file that cannot be read: the pool is then unknown,
+/// and nothing is assumed about it.
+pub(super) fn managed_worktree_pool(codex_home: &Path, ctx: &IdentifyCtx) -> Option<PathBuf> {
+    let configured = match read_config(codex_home, ctx) {
+        ConfigRead::Missing => None,
+        ConfigRead::Invalid => return None,
+        ConfigRead::Parsed(config) => config
+            .desktop
+            .and_then(|mut d| d.remove("git-worktree-root")),
+    };
+    choose_worktree_pool(codex_home, configured)
+}
+
+fn choose_worktree_pool(codex_home: &Path, configured: Option<toml::Value>) -> Option<PathBuf> {
+    let default = || Some(codex_home.join("worktrees"));
+    match configured {
+        None => default(),
+        Some(toml::Value::String(s)) if s.trim().is_empty() => default(),
+        Some(toml::Value::String(s)) => {
+            let path = PathBuf::from(s.trim());
+            path.is_absolute().then_some(path)
+        }
+        Some(_) => None,
+    }
+}
+
+fn config_sqlite_home(codex_home: &Path, ctx: &IdentifyCtx) -> ConfigHome {
+    let config = match read_config(codex_home, ctx) {
+        ConfigRead::Missing => return ConfigHome::Missing,
+        ConfigRead::Invalid => return ConfigHome::Invalid,
+        ConfigRead::Parsed(config) => config,
     };
     match config.sqlite_home {
         Some(value) => {
@@ -234,6 +285,53 @@ mod tests {
         let cache = super::super::IdentificationCache::disabled();
         let ctx = IdentifyCtx::new(1, &cache);
         read_session_rows(db, &ctx)
+    }
+
+    #[test]
+    fn worktree_pool_follows_upstream_desktop_setting_rules() {
+        let home = Path::new("/codex-home");
+        let s = |v: &str| Some(toml::Value::String(v.to_string()));
+        assert_eq!(
+            choose_worktree_pool(home, None),
+            Some(PathBuf::from("/codex-home/worktrees"))
+        );
+        assert_eq!(
+            choose_worktree_pool(home, s("  ")),
+            Some(PathBuf::from("/codex-home/worktrees")),
+            "empty means default upstream"
+        );
+        assert_eq!(
+            choose_worktree_pool(home, s("/elsewhere/pool")),
+            Some(PathBuf::from("/elsewhere/pool"))
+        );
+        assert_eq!(choose_worktree_pool(home, s("relative/pool")), None);
+        assert_eq!(
+            choose_worktree_pool(home, Some(toml::Value::Integer(3))),
+            None
+        );
+    }
+
+    #[test]
+    fn worktree_pool_is_read_from_the_desktop_table_of_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = super::super::IdentificationCache::disabled();
+        let ctx = IdentifyCtx::new(1, &cache);
+        assert_eq!(
+            managed_worktree_pool(dir.path(), &ctx),
+            Some(dir.path().join("worktrees")),
+            "no config file"
+        );
+        fs::write(
+            dir.path().join("config.toml"),
+            "model = \"x\"\n[desktop]\ngit-worktree-root = \"/custom/pool\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            managed_worktree_pool(dir.path(), &ctx),
+            Some(PathBuf::from("/custom/pool"))
+        );
+        fs::write(dir.path().join("config.toml"), "not = [valid toml").unwrap();
+        assert_eq!(managed_worktree_pool(dir.path(), &ctx), None);
     }
 
     #[test]
