@@ -1621,6 +1621,10 @@ pub struct StoredCoverageRow {
     /// Which `FsEventsState` anchor this row's replay answer came from:
     /// `"walk"` for a project root, `"unit_root"` for a detector root.
     pub cursor_family: Option<String>,
+    /// `RootCoverage::reached_by_registry`, one
+    /// `coverage::RegistryReach::to_note` line per worktree; `None` when
+    /// nothing was reached. Absent from stores written before it.
+    pub reached_by_registry: Option<String>,
     pub observed_at: u64,
 }
 
@@ -1640,6 +1644,7 @@ fn coverage_schema() -> Arc<Schema> {
         Field::new("docker_attributed", DataType::UInt64, true),
         Field::new("docker_unowned", DataType::UInt64, true),
         Field::new("cursor_family", DataType::Utf8, true),
+        Field::new("reached_by_registry", DataType::Utf8, true),
         Field::new("observed_at", DataType::UInt64, false),
     ]))
 }
@@ -1661,6 +1666,10 @@ pub(super) fn write_coverage_rows(path: &Path, rows: &[StoredCoverageRow]) -> Re
     let docker_unowned: Vec<Option<u64>> = rows.iter().map(|r| r.docker_unowned).collect();
     let cursor_family: Vec<Option<&str>> =
         rows.iter().map(|r| r.cursor_family.as_deref()).collect();
+    let reached_by_registry: Vec<Option<&str>> = rows
+        .iter()
+        .map(|r| r.reached_by_registry.as_deref())
+        .collect();
     let observed_at: Vec<u64> = rows.iter().map(|r| r.observed_at).collect();
 
     let batch = RecordBatch::try_new(
@@ -1680,6 +1689,7 @@ pub(super) fn write_coverage_rows(path: &Path, rows: &[StoredCoverageRow]) -> Re
             Arc::new(UInt64Array::from(docker_attributed)),
             Arc::new(UInt64Array::from(docker_unowned)),
             Arc::new(StringArray::from(cursor_family)),
+            Arc::new(StringArray::from(reached_by_registry)),
             Arc::new(UInt64Array::from(observed_at)),
         ],
     )?;
@@ -1732,6 +1742,7 @@ pub(super) fn read_coverage_rows(path: &Path) -> Result<Vec<StoredCoverageRow>> 
                 cursor_family: cursor_family
                     .is_valid(i)
                     .then(|| cursor_family.value(i).to_string()),
+                reached_by_registry: opt_str(&batch, "reached_by_registry", i)?,
                 observed_at: observed_at.value(i),
             });
         }

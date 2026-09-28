@@ -184,7 +184,7 @@ Every identified unit falls into one of these (`AgentCategory` in
 | Checkpoints | File-history/backup material not currently linked to any live session | No (unless orphaned and adapter-flagged) | None yet |
 | Caches | Regenerated-automatically technical caches | No | **Cache/log Trash move** |
 | Logs | Regenerated-automatically debug/diagnostic logs | No | **Cache/log Trash move** |
-| Managed worktrees | Git worktrees a tool created | N/A -- reuses existing worktree identity, never separately re-measured | Existing Git/worktree action protections apply, not this module's |
+| Managed worktrees | Git worktrees a tool created | N/A -- reuses existing worktree identity. A worktree the project walk measured (it is found under a scan root, or through its checkout's `.git/worktrees/` registry wherever it lives) holds no bytes here; one no project walk measured keeps its own bytes, so nothing goes uncounted or is counted twice | Existing Git/worktree action protections apply, not this module's |
 | Plugins | Marketplace configuration and downloaded plugin/skill code | No (the `.trash` staging subdirectories are actionable; the rest is not) | **Cache/log Trash move** for `.trash` only |
 | Protected config | Credentials, settings, skills, commands, subagent/automation definitions | **Yes, always** | None -- never actionable |
 | Protected databases | SQLite state stores and their `-wal`/`-shm` sidecars (e.g. Codex's `state_5.sqlite`, `logs_2.sqlite`, `thread_history_1.sqlite`) -- Codex's state DB is queried read-only for exact session linkage; no store is a cleanup target | **Yes, always** | None -- never actionable |
@@ -358,9 +358,12 @@ treats anything else as an unknown, never a parse panic or a guess.
 - **Not separately re-measured:** git worktrees Claude Code creates
   (`--worktree`, `EnterWorktree`, `isolation: worktree`). Claude Code
   documents no fixed on-disk location for them; they are ordinary Git
-  worktrees the normal project scan already discovers and measures.
-  This adapter cross-references via project linkage rather than
-  inventing a second measurement of the same bytes.
+  worktrees the project walk measures -- under a scan root directly, or
+  anywhere else through their checkout's `.git/worktrees/` registry
+  (`git::registry_linked_worktrees`; each entry must round-trip, so a
+  prunable or foreign entry yields nothing). This adapter
+  cross-references via project linkage rather than inventing a second
+  measurement of the same bytes.
 - **Active-session detection:** an `lsof`-style occupancy check on a
   session's transcript file (`crate::occupancy::occupied`), run only
   when proposing/executing an action on that specific unit -- never
@@ -434,10 +437,26 @@ linkage now: no rollout line or field is parsed.
 - **Logs (actionable):** `log/` (name carried over from this epic's
   prior research, not independently re-confirmed by source this
   chunk).
-- **Not confirmed, not modeled:** no managed-worktree creation by the
-  CLI itself was found in this chunk's source research, so
-  `AgentCategory::ManagedWorktrees` is never populated by this adapter
-  -- an honest absence, not a silent gap.
+- **Managed worktrees (category `managed-worktrees`):** confirmed at
+  openai/codex @ `4fd5745e8486`. `codex-rs/worktree/src/settings.rs`
+  resolves the pool as the `[desktop]` table's `git-worktree-root`
+  (non-empty absolute string) or `<CODEX_HOME>/worktrees` when absent,
+  null or empty; the CLI and TUI both read it from `config_toml.desktop`,
+  and `codex-rs/features/src/lib.rs` ships `Feature::Worktrees` stable
+  and enabled by default. Each task is `<pool>/<task>/<repo>/`, a linked
+  worktree of the user's checkout. Those bytes are project storage: the
+  project walk reaches them through the checkout's registry, so a unit
+  here holds **no bytes** when the project walk measured it, and its own
+  folded bytes only when none did (the checkout is outside every scanned
+  root). Links are declared from the worktree's own gitdir, never its
+  path. Only a pool that is a direct child of the Codex home is
+  identified here; a configured pool elsewhere is outside this adapter's
+  authorized root and is left to the project walk. The pool is never in
+  the unclassified residual; its non-worktree entries (stray files, a
+  task directory's other contents) get one `unclassified` unit of their
+  own. No action is offered:
+  removal is `git worktree remove` from the owning checkout, under the
+  existing worktree protections.
 
 ### Codex desktop app (#93)
 

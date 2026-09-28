@@ -886,6 +886,14 @@ impl<'a> IdentifyCtx<'a> {
         self.codex_sqlite_home_override.as_deref()
     }
 
+    /// Whether this pass's project walk measured the worktree at `path`,
+    /// so a tool's managed-worktree unit must not count its bytes again.
+    /// `false` with no project discovery (a bare adapter pass): the unit
+    /// then carries its own bytes, so nothing goes unmeasured.
+    pub fn project_walk_measures(&self, path: &Path) -> bool {
+        self.containers.is_some_and(|c| c.known.measures(path))
+    }
+
     /// Refreshes one cached declared link from a tool's current metadata,
     /// then resolves it through the shared project/worktree machinery.
     /// This keeps externally indexed metadata fresh without making a
@@ -1288,6 +1296,9 @@ const FOLDER_SEP: char = '\u{2}';
 #[derive(Debug, Default, Clone)]
 pub struct KnownWorktrees {
     by_slug: HashMap<String, Vec<PathBuf>>,
+    /// The same paths, as given and canonicalized: exact membership for
+    /// [`KnownWorktrees::measures`].
+    exact: HashSet<PathBuf>,
 }
 
 /// Claude Code's `projects/<slug>` encoding of a workspace path: every
@@ -1306,6 +1317,7 @@ pub fn claude_folder_slug(path: &Path) -> String {
 impl KnownWorktrees {
     pub fn from_paths(paths: &[PathBuf]) -> Self {
         let mut by_slug: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut exact: HashSet<PathBuf> = HashSet::new();
         for p in paths {
             let entry = by_slug.entry(claude_folder_slug(p)).or_default();
             // The same worktree listed twice (two projects sharing a
@@ -1313,8 +1325,19 @@ impl KnownWorktrees {
             if !entry.contains(p) {
                 entry.push(p.clone());
             }
+            exact.insert(p.clone());
+            if let Ok(c) = crate::fs_gate::canonicalize(p) {
+                exact.insert(c);
+            }
         }
-        Self { by_slug }
+        Self { by_slug, exact }
+    }
+
+    /// Whether this pass's project walk discovered -- and so measured --
+    /// the worktree at exactly `path`.
+    pub fn measures(&self, path: &Path) -> bool {
+        self.exact.contains(path)
+            || crate::fs_gate::canonicalize(path).is_ok_and(|c| self.exact.contains(&c))
     }
 
     /// The fallback link a session whose declared path cannot be linked

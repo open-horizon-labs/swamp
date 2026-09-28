@@ -420,6 +420,7 @@ fn coverage_from_scope(
                 walked_total: 0,
                 projects: 0,
                 mode: String::new(),
+                reached_by_registry: Vec::new(),
             })
         })
         .collect()

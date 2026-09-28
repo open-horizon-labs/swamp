@@ -1199,6 +1199,7 @@ pub fn report_full_mode_scoped(
         pruned_subtrees,
         docker_in_scope,
         None,
+        &[],
     )
     .map(|(r, _)| r)
 }
@@ -1226,6 +1227,7 @@ pub(crate) fn report_full_mode_scoped_tracked(
     pruned_subtrees: &[PathBuf],
     docker_in_scope: bool,
     observed_at: Option<u64>,
+    sibling_roots: &[PathBuf],
 ) -> Result<(Report, Option<crate::fs_events::TrustedWindow>)> {
     // Store topology, replay paths, and report paths under one canonical
     // representation. This is essential when one invocation uses a symlink
@@ -1256,6 +1258,11 @@ pub(crate) fn report_full_mode_scoped_tracked(
         &pruned_subtrees,
     );
     ctx.docker_in_scope = docker_in_scope;
+    ctx.sibling_roots = sibling_roots
+        .iter()
+        .map(|p| crate::fs_gate::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .filter(|p| p != &root)
+        .collect();
     // R20: one scope observation, one timestamp. Every root's rows,
     // growth window and sparkline history are computed at the scope's
     // `observed_at`, which `runs.parquet` records -- so a read derives
@@ -2161,6 +2168,15 @@ pub fn report_scope_with_parts_covered(
     let observed_at = crate::entities::now();
     let mut coverage: Vec<RootCoverage> = Vec::new();
     let mut events = crate::fs_events::EventCoverage::untrusted();
+    // Every project root this observation walks. A root's registry
+    // expansion skips worktrees under any *other* one of these, which
+    // that root's own walk discovers and measures (`bus::Ctx::sibling_roots`).
+    let project_roots: Vec<PathBuf> = scope
+        .roots
+        .iter()
+        .filter(|r| matches!(r.status, RootStatus::Present) && r.is_project_root())
+        .map(|r| r.path.clone())
+        .collect();
     let mut merged = Report {
         observed_at,
         root: PathBuf::new(),
@@ -2281,6 +2297,7 @@ pub fn report_scope_with_parts_covered(
                     &pruned,
                     docker_authorized,
                     Some(observed_at),
+                    &project_roots,
                 );
                 let r = match r {
                     Ok((r, window)) => {
@@ -2329,6 +2346,7 @@ pub fn report_scope_with_parts_covered(
                     walked_total: r.reconciliation.walked_total,
                     projects: r.projects.len(),
                     mode,
+                    reached_by_registry: registry_reach_from_notes(&r.notes),
                 });
                 per_root.insert(path.clone(), r.clone());
                 merge_root_report_into(&mut merged, r);
@@ -2336,6 +2354,15 @@ pub fn report_scope_with_parts_covered(
         }
     }
     Ok((merged, coverage, per_root, events))
+}
+
+/// The registry reaches the walk consumer noted on a root's report,
+/// back as coverage facts.
+fn registry_reach_from_notes(notes: &[String]) -> Vec<crate::coverage::RegistryReach> {
+    notes
+        .iter()
+        .filter_map(|n| crate::coverage::RegistryReach::from_note(n))
+        .collect()
 }
 
 /// One scope observation's whole result: the merged report, per-root

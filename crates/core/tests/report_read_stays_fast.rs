@@ -131,6 +131,7 @@ fn a_large_store_reads_back_within_budget() {
         walked_total: 3_000 << 20,
         projects: PROJECTS,
         mode: "full".into(),
+        reached_by_registry: Vec::new(),
     }];
     let reconciliation = HashMap::from([(
         src.clone(),

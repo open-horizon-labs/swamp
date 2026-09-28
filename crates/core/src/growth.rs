@@ -1809,6 +1809,25 @@ fn region_status_tag(status: &crate::coverage::RegionStatus) -> &'static str {
     }
 }
 
+/// `RootCoverage::reached_by_registry` as one nullable column: the
+/// notes, one per line, `None` when nothing was reached.
+fn reached_column(reached: &[crate::coverage::RegistryReach]) -> Option<String> {
+    (!reached.is_empty()).then(|| {
+        reached
+            .iter()
+            .map(|r| r.to_note())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+fn reached_from_column(column: &str) -> Vec<crate::coverage::RegistryReach> {
+    column
+        .lines()
+        .filter_map(crate::coverage::RegistryReach::from_note)
+        .collect()
+}
+
 /// Writes `coverage.parquet` for `scope_key`, replacing that scope's
 /// rows wholesale from this same pass's already-computed coverage --
 /// `class = "project"` for a walked scan root's [`crate::coverage::RootCoverage`],
@@ -1854,6 +1873,7 @@ pub fn write_coverage_table(
             docker_attributed: rec.map(|r| r.docker_attributed),
             docker_unowned: rec.map(|r| r.docker_unowned),
             cursor_family: Some("walk".to_string()),
+            reached_by_registry: reached_column(&c.reached_by_registry),
             observed_at,
         });
     }
@@ -1877,6 +1897,7 @@ pub fn write_coverage_table(
             docker_attributed: None,
             docker_unowned: None,
             cursor_family: Some("unit_root".to_string()),
+            reached_by_registry: None,
             observed_at,
         });
     }
@@ -1948,6 +1969,11 @@ fn rebuild_coverage_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mu
             walked_total: r.walked_total.unwrap_or(0),
             projects: r.projects.unwrap_or(0) as usize,
             mode: r.mode.clone().unwrap_or_default(),
+            reached_by_registry: r
+                .reached_by_registry
+                .as_deref()
+                .map(reached_from_column)
+                .unwrap_or_default(),
         });
     }
     snapshot.coverage = coverage;
@@ -4976,6 +5002,11 @@ pub struct TrackedWalk {
     /// (`ENOENT`) is *not* included here -- that is real deletion, and
     /// tombstoning is exactly correct for it.
     pub unconfirmed_worktree_ids: Vec<String>,
+    /// Linked worktrees outside this root that the walk reached through
+    /// a discovered checkout's registry (`walk::reach_by_registry`), for
+    /// the coverage row. Their rows are in `discovered`/`attribution`
+    /// like any other worktree's.
+    pub registry_reached: Vec<crate::coverage::RegistryReach>,
 }
 
 /// Threshold past which re-walking piecemeal costs more than a full
@@ -5342,6 +5373,36 @@ pub fn stage_tracked_with_source(
     source: &dyn crate::fs_events::FsEventsSource,
     excluded: &[PathBuf],
 ) -> Result<(TrackedWalk, Option<ObservationCheckpoint>)> {
+    stage_tracked_reaching(
+        stage,
+        swamp_dir,
+        root,
+        observed_at,
+        large_file_min_bytes,
+        force_full,
+        observe,
+        source,
+        excluded,
+        &[],
+    )
+}
+
+/// [`stage_tracked_with_source`] for one root of a multi-root scope:
+/// `sibling_roots` are the scope's other project roots, whose own walks
+/// own any registry-reached worktree under them (`bus::Ctx::sibling_roots`).
+#[allow(clippy::too_many_arguments)]
+pub fn stage_tracked_reaching(
+    stage: &crate::bus::Stage,
+    swamp_dir: &Path,
+    root: &Path,
+    observed_at: u64,
+    large_file_min_bytes: u64,
+    force_full: bool,
+    observe: bool,
+    source: &dyn crate::fs_events::FsEventsSource,
+    excluded: &[PathBuf],
+    sibling_roots: &[PathBuf],
+) -> Result<(TrackedWalk, Option<ObservationCheckpoint>)> {
     // This public lower-level entry point must be safe for direct callers;
     // never persist alias-form topology into a canonical root scope.
     let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -5415,6 +5476,7 @@ pub fn stage_tracked_with_source(
             large_file_min_bytes,
             reason,
             excluded,
+            sibling_roots,
         )?;
         result.unconfirmed_worktree_ids =
             compute_unconfirmed_worktrees(prev_topology_for_check.as_deref(), &result.discovered);
@@ -5502,6 +5564,7 @@ pub fn stage_tracked_with_source(
             large_file_min_bytes,
             crate::fs_events::RefreshRefusal::TooSoon.as_str(),
             excluded,
+            sibling_roots,
         )?
     } else if !plan.incremental {
         full_walk(
@@ -5511,6 +5574,7 @@ pub fn stage_tracked_with_source(
             large_file_min_bytes,
             plan.reason_str(),
             excluded,
+            sibling_roots,
         )?
     } else {
         match prev_topology {
@@ -5521,6 +5585,7 @@ pub fn stage_tracked_with_source(
                 large_file_min_bytes,
                 "no_stored_event_id",
                 excluded,
+                sibling_roots,
             )?,
             Some(ref topo) => {
                 // Relist direct unowned directories; remeasure an implicated
@@ -5567,6 +5632,7 @@ pub fn stage_tracked_with_source(
                             "unowned_changes"
                         },
                         excluded,
+                        sibling_roots,
                     )?
                 } else {
                     // Floored at a minimum so a tiny tree (a handful of
@@ -5582,6 +5648,7 @@ pub fn stage_tracked_with_source(
                             large_file_min_bytes,
                             "too_many_changes",
                             excluded,
+                            sibling_roots,
                         )?
                     } else {
                         apply_incremental(
@@ -5592,6 +5659,9 @@ pub fn stage_tracked_with_source(
                             large_file_min_bytes,
                             &dir,
                             refreshed_unowned,
+                            &root,
+                            excluded,
+                            sibling_roots,
                         )?
                     }
                 }
@@ -5827,13 +5897,15 @@ fn full_walk(
     large_file_min_bytes: u64,
     reason: &'static str,
     excluded: &[PathBuf],
+    sibling_roots: &[PathBuf],
 ) -> Result<TrackedWalk> {
-    let (discovered, mut attribution) = crate::walk::discover_and_attribute(
+    let (discovered, mut attribution, registry_reached) = crate::walk::discover_and_attribute(
         stage,
         root,
         observed_at,
         large_file_min_bytes,
         excluded,
+        sibling_roots,
     )?;
     split_remainder(&discovered, &mut attribution);
     Ok(TrackedWalk {
@@ -5847,6 +5919,7 @@ fn full_walk(
         rewalked: None,
         in_place: (0, 0, 0, 0),
         unconfirmed_worktree_ids: Vec::new(),
+        registry_reached,
     })
 }
 
@@ -6215,6 +6288,7 @@ fn relist_source_dirs(
 /// The incremental path: re-walks only the worktrees/artifact roots
 /// FSEvents implicated, carrying every other row forward from the store
 /// unchanged (see [`reconstruct_attribution`]).
+#[allow(clippy::too_many_arguments)]
 fn apply_incremental(
     stage: &crate::bus::Stage,
     prev: &[StoredWorktree],
@@ -6223,6 +6297,9 @@ fn apply_incremental(
     large_file_min_bytes: u64,
     dir: &Path,
     refreshed_unowned: Option<Vec<UnownedRow>>,
+    root: &Path,
+    excluded: &[PathBuf],
+    sibling_roots: &[PathBuf],
 ) -> Result<TrackedWalk> {
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let t0 = std::time::Instant::now();
@@ -6434,6 +6511,38 @@ fn apply_incremental(
             t_scan.elapsed()
         );
     }
+
+    // Worktrees outside this root are reached only through a checkout's
+    // registry, and FSEvents for this root never reports on them. So the
+    // registries are re-read every pass: an entry that no longer
+    // round-trips is dropped (tombstoned like any vanished worktree), a
+    // new one is added, and every one still reached is re-walked from
+    // scratch -- a window that cannot see a path cannot vouch for its
+    // carried-forward rows.
+    let in_root: Vec<DiscoveredWorktree> = discovered
+        .iter()
+        .filter(|dw| dw.path.starts_with(root))
+        .cloned()
+        .collect();
+    let reached = crate::walk::reach_by_registry(&in_root, root, sibling_roots, excluded);
+    let reached_paths: HashSet<&Path> = reached.iter().map(|(dw, _)| dw.path.as_path()).collect();
+    discovered.retain(|dw| dw.path.starts_with(root) || reached_paths.contains(dw.path.as_path()));
+    let mut registry_ids: HashSet<String> = HashSet::new();
+    for (dw, _) in &reached {
+        let id = crate::entities::id_for(&dw.path.display().to_string());
+        if !discovered.iter().any(|w| w.path == dw.path) {
+            discovered.push(dw.clone());
+        }
+        worktrees_to_rewalk.insert(id.clone());
+        registry_ids.insert(id);
+    }
+    let registry_reached: Vec<crate::coverage::RegistryReach> = reached
+        .into_iter()
+        .map(|(dw, via)| crate::coverage::RegistryReach {
+            worktree: dw.path,
+            via,
+        })
+        .collect();
     // Rebuild the root lookup now that new worktrees may have been added.
     let worktree_root: HashMap<String, PathBuf> = discovered
         .iter()
@@ -6629,21 +6738,25 @@ fn apply_incremental(
         // directory touches is carried forward as-is; the walk re-sizes
         // only the implicated ones (a touch inside `target/` re-sizes
         // `target/`, not the six other artifacts next to it).
-        let carry: HashMap<PathBuf, ArtifactRow> = attribution
-            .artifacts_by_worktree
-            .get(worktree_id)
-            .map(|rows| {
-                rows.iter()
-                    .filter(|r| !r.kind.is_worktree_remainder())
-                    .filter(|r| {
-                        !changed_dirs
-                            .iter()
-                            .any(|c| c == &r.path || c.starts_with(&r.path))
-                    })
-                    .map(|r| (r.path.clone(), r.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let carry: HashMap<PathBuf, ArtifactRow> = if registry_ids.contains(worktree_id) {
+            HashMap::new()
+        } else {
+            attribution
+                .artifacts_by_worktree
+                .get(worktree_id)
+                .map(|rows| {
+                    rows.iter()
+                        .filter(|r| !r.kind.is_worktree_remainder())
+                        .filter(|r| {
+                            !changed_dirs
+                                .iter()
+                                .any(|c| c == &r.path || c.starts_with(&r.path))
+                        })
+                        .map(|r| (r.path.clone(), r.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let carried_rels: Vec<String> = carry.keys().map(|p| rel_path_string(root, p)).collect();
         let fresh = crate::walk::attribute_one_worktree(
             stage,
@@ -6776,6 +6889,7 @@ fn apply_incremental(
         // Set by the caller (`stage_tracked_with_source`), which has both
         // the previous topology and this result's `discovered` in hand.
         unconfirmed_worktree_ids: Vec::new(),
+        registry_reached,
     })
 }
 

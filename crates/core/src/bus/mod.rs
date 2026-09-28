@@ -95,6 +95,12 @@ pub struct Ctx<'a> {
     /// subtree the window must be able to speak about -- and the
     /// observation time it replays from.
     pub event_window: crate::fs_events::EventWindowSlot,
+    /// The other project roots of the same scope observation. A linked
+    /// worktree a checkout's registry names under one of them belongs
+    /// to that root's own walk, so this root's registry expansion
+    /// (`walk::reach_by_registry`) leaves it alone rather than measuring
+    /// it twice. Empty for a single-root call.
+    pub sibling_roots: Vec<PathBuf>,
 }
 
 /// Per-worktree git activity, as one consumer computes it and others read it.
@@ -356,6 +362,7 @@ pub fn ctx_for_excluding<'a>(
         pruned_subtrees: pruned_subtrees.to_vec(),
         docker_in_scope: true,
         event_window: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        sibling_roots: Vec::new(),
     }
 }
 

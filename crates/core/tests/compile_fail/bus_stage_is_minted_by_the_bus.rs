@@ -6,5 +6,5 @@ use swamp_core::bus::Stage;
 
 fn main() {
     let stage = Stage { _minted_by_the_bus: () };
-    let _ = swamp_core::walk::discover_and_attribute(&stage, std::path::Path::new("/"), 0, 0, &[]);
+    let _ = swamp_core::walk::discover_and_attribute(&stage, std::path::Path::new("/"), 0, 0, &[], &[]);
 }

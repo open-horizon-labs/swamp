@@ -990,6 +990,7 @@ fn header_shows_scope_coverage_clause_for_a_missing_root() {
                 walked_total: 0,
                 projects: 0,
                 mode: String::new(),
+                reached_by_registry: Vec::new(),
             },
             swamp_core::coverage::RootCoverage::missing("/Users/dev/other".into()),
         ]);

@@ -75,6 +75,46 @@ impl RegionStatus {
     }
 }
 
+/// One linked worktree this root's walk measured although it lies
+/// outside the root: a main checkout discovered under the root registers
+/// it in `<common>/worktrees/`, and the registry round-tripped
+/// (`crate::git::registry_linked_worktrees`). A coverage fact, so a
+/// reader can see exactly which paths beyond the configured roots an
+/// observation reached and why; never a byte figure of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryReach {
+    pub worktree: PathBuf,
+    /// The main checkout whose registry named it.
+    pub via: PathBuf,
+}
+
+/// Prefix of the report note the walk consumer writes per registry
+/// reach (`<worktree> via <main>`), the way `fsevents: mode=` carries
+/// the walk mode; `report::report_scope` reads it back into
+/// [`RootCoverage::reached_by_registry`].
+pub const REGISTRY_REACH_NOTE: &str = "registry-reached: ";
+
+impl RegistryReach {
+    pub fn to_note(&self) -> String {
+        format!(
+            "{REGISTRY_REACH_NOTE}{} via {}",
+            self.worktree.display(),
+            self.via.display()
+        )
+    }
+
+    /// The inverse of [`RegistryReach::to_note`]; `None` for any other note.
+    pub fn from_note(note: &str) -> Option<Self> {
+        let (worktree, via) = note
+            .strip_prefix(REGISTRY_REACH_NOTE)?
+            .rsplit_once(" via ")?;
+        Some(Self {
+            worktree: PathBuf::from(worktree),
+            via: PathBuf::from(via),
+        })
+    }
+}
+
 /// One root's coverage row for a `report_scope` call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RootCoverage {
@@ -91,6 +131,10 @@ pub struct RootCoverage {
     /// `"full"` / `"incremental"` / `""` when not walked.
     #[serde(default)]
     pub mode: String,
+    /// Worktrees outside this root that its walk reached through a
+    /// discovered checkout's own registry. Empty unless walked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reached_by_registry: Vec<RegistryReach>,
 }
 
 /// One authorized unit root's event-coverage outcome for a pass: whether
@@ -132,40 +176,26 @@ impl UnitRootCoverage {
 }
 
 impl RootCoverage {
-    pub fn excluded(path: PathBuf) -> Self {
+    fn unwalked(path: PathBuf, status: RegionStatus) -> Self {
         Self {
             path,
-            status: RegionStatus::Excluded,
+            status,
             walked_total: 0,
             projects: 0,
             mode: String::new(),
+            reached_by_registry: Vec::new(),
         }
+    }
+    pub fn excluded(path: PathBuf) -> Self {
+        Self::unwalked(path, RegionStatus::Excluded)
     }
     pub fn missing(path: PathBuf) -> Self {
-        Self {
-            path,
-            status: RegionStatus::Missing,
-            walked_total: 0,
-            projects: 0,
-            mode: String::new(),
-        }
+        Self::unwalked(path, RegionStatus::Missing)
     }
     pub fn inaccessible(path: PathBuf, reason: String) -> Self {
-        Self {
-            path,
-            status: RegionStatus::Inaccessible { reason },
-            walked_total: 0,
-            projects: 0,
-            mode: String::new(),
-        }
+        Self::unwalked(path, RegionStatus::Inaccessible { reason })
     }
     pub fn detector_only(path: PathBuf) -> Self {
-        Self {
-            path,
-            status: RegionStatus::DetectorOnly,
-            walked_total: 0,
-            projects: 0,
-            mode: String::new(),
-        }
+        Self::unwalked(path, RegionStatus::DetectorOnly)
     }
 }
