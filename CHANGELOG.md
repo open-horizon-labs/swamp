@@ -3,6 +3,18 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.2
+
+- Count linked worktrees that live outside every scan root. Each discovered
+  checkout's `.git/worktrees/` registry is read, and every entry that points back
+  to the same repository is measured under its project, on full and incremental
+  observations alike. Deleted, moved, symlinked or foreign entries are skipped.
+  `report` lists the paths reached this way.
+- Codex managed worktrees (`~/.codex/worktrees`, or `[desktop] git-worktree-root`)
+  now appear as linked worktrees of their projects instead of inside Codex's
+  unclassified residual. The Codex agent view cross-references them without
+  counting their bytes twice.
+
 ## v0.7.1
 
 - Automatically reset incompatible Swamp scan state before observation and rebuild
