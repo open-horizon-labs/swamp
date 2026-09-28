@@ -26,8 +26,17 @@ step compile-fail
 pinned=$(awk -F'"' '/^channel/{print $2}' "$here/../rust-toolchain.toml")
 rustup run "$pinned" cargo test -p swamp-source-audit --locked ${target[@]+"${target[@]}"} --test compile_fail -- --ignored
 
-step mutation-sweep
-cargo test -p swamp-source-audit --locked ${target[@]+"${target[@]}"} --test mutation_sweep -- --ignored
+# `SWAMP_SKIP_MUTATION_SWEEP` (any non-empty value) skips the sweep, the
+# slowest step by far (about 14-19 minutes). Its rejections come from
+# source audits and from compiling code appended to shared files, not from
+# anything a platform changes, so one OS running it covers the workspace:
+# `check-full.yml` sets this on macOS and leaves it to Linux.
+if [ -n "${SWAMP_SKIP_MUTATION_SWEEP:-}" ]; then
+  step 'mutation-sweep (skipped: SWAMP_SKIP_MUTATION_SWEEP is set)'
+else
+  step mutation-sweep
+  cargo test -p swamp-source-audit --locked ${target[@]+"${target[@]}"} --test mutation_sweep -- --ignored
+fi
 
 step cost
 cargo test -p swamp-core --locked ${target[@]+"${target[@]}"} \
