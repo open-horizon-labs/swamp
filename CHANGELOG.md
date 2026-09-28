@@ -3,7 +3,7 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
-## Unreleased
+## v0.7.3
 
 - `swamp observe` now enriches worktrees from GitHub by default, as its help and the
   usage guide already described. Before this, only `--enrich` made any `gh` call, so
