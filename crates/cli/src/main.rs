@@ -251,11 +251,12 @@ enum Command {
         unowned_only: bool,
     },
     /// Observe-only: walk `root`s, write the growth store, and refresh
-    /// GitHub enrichment live for every GitHub-remote worktree found
-    /// (concurrent, coalesced per repo -- see `github::observe_all`). No
-    /// rendering. This is what a scheduled LaunchAgent run executes, and
-    /// the only `swamp` command that calls `gh` on your behalf by
-    /// default; `report` reads whatever this last wrote.
+    /// GitHub enrichment for every GitHub-remote worktree found
+    /// (concurrent, coalesced per repo, cached by tip SHA for six hours --
+    /// see `github::observe_all`). No rendering. This is what a scheduled
+    /// LaunchAgent run executes, and the only `swamp` command that calls
+    /// `gh` on your behalf by default; `report` reads whatever this last
+    /// wrote.
     Observe {
         /// Defaults to every present root in the configured effective
         /// scope when omitted (see `swamp scope`); explicit roots still
@@ -278,13 +279,10 @@ enum Command {
         /// "30m", "7d"). Overrides the `since` setting in config.toml.
         #[arg(long)]
         since: Option<String>,
-        /// Refresh GitHub enrichment live before persisting it, instead
-        /// of leaving `enrich.parquet` as-is. Every `swamp observe`
-        /// already shells out to `gh` for enrichment (see the command's
-        /// own doc); this additionally forces a live refresh rather
-        /// than trusting the cache's TTL.
+        /// Skip GitHub enrichment: no `gh` calls, and `enrich.parquet` is
+        /// left as-is.
         #[arg(long)]
-        enrich: bool,
+        no_enrich: bool,
     },
     /// Linux: watch the scope's roots with inotify until stopped and keep
     /// a bounded change list, so a later `observe` can reuse measurements
@@ -1327,7 +1325,7 @@ fn main() -> Result<()> {
             docker_facts,
             verify_du,
             since,
-            enrich,
+            no_enrich,
         } => {
             let store_dir = swamp_dir();
             let scope = resolve_scope(&roots)?;
@@ -1351,7 +1349,7 @@ fn main() -> Result<()> {
                 docker_facts,
                 verify_du,
                 since,
-                enrich,
+                !no_enrich,
             );
             progress.stop();
             result?;

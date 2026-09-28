@@ -681,3 +681,71 @@ fn observe_with_invalid_scan_config_fails_visibly() {
 
     assert!(!output.status.success());
 }
+
+/// A `gh` on PATH that only records that it was run and then fails, so
+/// the test sees whether observe *tried* to enrich without a network.
+fn gh_shim(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin_dir = dir.join("shim-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let log = dir.join("gh-calls.log");
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> '{}'\necho 'shim: not authenticated' >&2\nexit 1\n",
+        log.display()
+    );
+    let gh = bin_dir.join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin_dir
+}
+
+fn observe_with_gh_shim(extra: &[&str]) -> String {
+    let root = tempfile::tempdir().expect("root");
+    write_git_project(&root.path().join("proj"));
+    let git_remote = Command::new("git")
+        .arg("-C")
+        .arg(root.path().join("proj"))
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/proj.git",
+        ])
+        .status()
+        .unwrap();
+    assert!(git_remote.success());
+    let store = tempfile::tempdir().expect("store");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let shim = gh_shim(scratch.path());
+    let path = format!("{}:{}", shim.display(), std::env::var("PATH").unwrap());
+    let output = Command::new(bin())
+        .arg("observe")
+        .args(extra)
+        .arg(root.path())
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .env("PATH", path)
+        .output()
+        .expect("run observe");
+    assert!(
+        output.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(scratch.path().join("gh-calls.log")).unwrap_or_default()
+}
+
+#[test]
+fn observe_enriches_from_github_by_default() {
+    let calls = observe_with_gh_shim(&[]);
+    assert!(
+        calls.contains("auth status"),
+        "a plain observe must try GitHub enrichment (the scheduled run passes no flags); gh calls: {calls:?}"
+    );
+}
+
+#[test]
+fn observe_no_enrich_makes_no_gh_calls() {
+    let calls = observe_with_gh_shim(&["--no-enrich"]);
+    assert_eq!(calls, "", "--no-enrich must not run gh");
+}
