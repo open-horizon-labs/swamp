@@ -13,19 +13,31 @@ if [ -n "${SWAMP_TARGET_DIR:-}" ]; then
   target=(--target-dir "$SWAMP_TARGET_DIR")
 fi
 step() { printf '\n== %s (%s)\n' "$1" "$(date +%H:%M:%S)"; }
+# `SWAMP_CHECK_SKIP` (optional, space-separated step names: fmt clippy
+# audits tests) names steps the caller has already run on this exact tree
+# with the same commands, so CI's platform jobs, which run each as their
+# own step for ordering and flags, do not run them a second time. Unset,
+# which is every local run, the whole tier runs.
+skipped() { case " ${SWAMP_CHECK_SKIP:-} " in *" $1 "*) return 0 ;; esac; return 1; }
 
-step fmt
-cargo fmt --all -- --check
+if ! skipped fmt; then
+  step fmt
+  cargo fmt --all -- --check
+fi
 
 # Once, over every target: `--all-targets` includes each library and
 # binary in its non-test configuration, which is where the crate roots
 # deny the capability gate's lints, so a separate `--lib --bins` pass
 # would repeat work already done.
-step clippy
-cargo clippy --workspace --all-targets --locked ${target[@]+"${target[@]}"} -- -D warnings
+if ! skipped clippy; then
+  step clippy
+  cargo clippy --workspace --all-targets --locked ${target[@]+"${target[@]}"} -- -D warnings
+fi
 
-step audits
-cargo run -q --locked ${target[@]+"${target[@]}"} -p swamp-source-audit
+if ! skipped audits; then
+  step audits
+  cargo run -q --locked ${target[@]+"${target[@]}"} -p swamp-source-audit
+fi
 
 # The shipped build graph must not contain swamp-core's `testing`
 # feature (test-fixture API). Only `[dev-dependencies]` enable it, which
@@ -40,9 +52,11 @@ fi
 
 # Unit and integration tests, once. The cost test is left to
 # check-full.sh: it measures process-global counters and must run alone.
-step tests
-cargo test --workspace --locked ${target[@]+"${target[@]}"} -- \
-  --skip unchanged_observations_spaced_past_the_toosoon_floor
+if ! skipped tests; then
+  step tests
+  cargo test --workspace --locked ${target[@]+"${target[@]}"} -- \
+    --skip unchanged_observations_spaced_past_the_toosoon_floor
+fi
 
 # Named so a rename cannot silently drop them (the runtime halves of the
 # review guardrails). Test targets are discovered from these files, and
@@ -79,6 +93,11 @@ for t in \
   source-audit/tests/mutation_sweep; do
   test -f "crates/$t.rs" || { echo "named test target crates/$t.rs is gone" >&2; exit 1; }
 done
+
+# The release gate's own logic (scripts/verify-full-tier.sh) against a fake
+# `gh`: a gate that passes when it should not is worse than a slow one.
+step gate-scripts
+./scripts/verify-full-tier.test.sh
 
 step greps
 # These checks intentionally fail obvious safety regressions in source

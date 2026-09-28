@@ -39,19 +39,59 @@ fn packaging_tests_archives_without_rebuilding_workspace_tests() {
 }
 
 #[test]
-fn publication_still_requires_both_full_checks_and_all_archive_checks() {
-    for name in ["macos-arm64-check-full", "linux-x86_64-check-full"] {
-        assert!(job(name).contains("run: scripts/check-full.sh"));
-    }
+fn publication_still_requires_the_full_tier_and_all_archive_checks() {
+    // The release waits for the full tier to have passed on this exact
+    // commit; it does not rebuild and re-run it (about 27 minutes).
+    let gate = job("full-tier");
+    assert!(gate.contains("scripts/verify-full-tier.sh"));
+    assert!(
+        !gate.contains("scripts/check-full.sh"),
+        "the gate must not re-run the tier"
+    );
     let publish = job("release");
     let needs = publish.split("runs-on:").next().unwrap();
     for name in [
         "macos-arm64",
         "linux-x86_64",
         "linux-x86_64-newer",
-        "macos-arm64-check-full",
-        "linux-x86_64-check-full",
+        "full-tier",
     ] {
         assert!(needs.contains(&format!("{name},")), "missing gate {name}");
     }
+    for name in ["macos-arm64-check-full", "linux-x86_64-check-full"] {
+        assert!(
+            !WORKFLOW.contains(&format!("\n  {name}:\n")),
+            "{name}: the full tier lives in check-full.yml"
+        );
+    }
+}
+
+const CHECK_FULL: &str = include_str!("../../../.github/workflows/check-full.yml");
+
+#[test]
+fn the_full_tier_runs_on_main_so_a_tag_finds_it_already_done() {
+    let on = CHECK_FULL.split("\npermissions:").next().unwrap();
+    assert!(
+        on.contains("push:\n    branches: [main]"),
+        "must run on every push to main"
+    );
+    // Per commit, so a later push to main cannot cancel the run a tag waits on.
+    assert!(CHECK_FULL.contains("github.event.pull_request.number || github.sha"));
+    // The sweep is Linux's alone; macOS opts out of it.
+    let macos = CHECK_FULL
+        .split("\n  macos-arm64-check-full:")
+        .nth(1)
+        .unwrap();
+    assert!(macos.contains("SWAMP_SKIP_MUTATION_SWEEP"));
+    let linux = CHECK_FULL
+        .split("\n  linux-x86_64-check-full:")
+        .nth(1)
+        .unwrap()
+        .split("\n  macos-arm64-check-full:")
+        .next()
+        .unwrap();
+    assert!(
+        !linux.contains("SWAMP_SKIP_MUTATION_SWEEP"),
+        "Linux must run the sweep"
+    );
 }

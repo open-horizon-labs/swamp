@@ -22,8 +22,9 @@ name: CI
 # This is the fast tier only (target: under ~10 minutes per OS on a warm
 # cache). The heavy harnesses (compile-fail, mutation sweep, cost test --
 # `scripts/check-full.sh`) live in `check-full.yml`, which never runs on
-# an ordinary push: only `gh workflow run check-full.yml`, a PR labelled
-# `full-check`, or a `v*` tag push (`release.yml`, gating publish). Every
+# a feature-branch push: it runs on every push to main (so `release.yml`
+# finds it already done for a tagged commit and only waits for it), and on
+# `gh workflow run check-full.yml` or a PR labelled `full-check`. Every
 # push still gets this workflow (fast tier + the Linux archive smoke) so
 # ordinary iteration stays quick without losing the deep coverage
 # entirely -- that just moves off the push path.
@@ -141,7 +142,12 @@ jobs:
       - name: Test (native Linux)
         run: cargo test --workspace --locked --no-fail-fast
 
+      # fmt, clippy, the source audit and the workspace tests already ran
+      # above as their own steps (same commands, same tree), so the gate
+      # runs only what is left: release-graph, named targets and greps.
       - name: Repo gate (scripts/check.sh)
+        env:
+          SWAMP_CHECK_SKIP: fmt clippy audits tests
         run: ./scripts/check.sh
 
   linux-x86_64-package:
@@ -296,6 +302,11 @@ jobs:
       - name: Test (native macOS)
         run: cargo test --workspace --locked --no-fail-fast
 
+      # fmt, clippy, the source audit and the workspace tests already ran
+      # above as their own steps (same commands, same tree), so the gate
+      # runs only what is left: release-graph, named targets and greps.
       - name: Repo gate (scripts/check.sh)
+        env:
+          SWAMP_CHECK_SKIP: fmt clippy audits tests
         run: ./scripts/check.sh
 

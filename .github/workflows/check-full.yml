@@ -10,27 +10,35 @@ name: check-full
 # doesn't already cover on every push -- they exist to catch drift
 # between pushes, not to gate one.
 #
-# Never runs on an ordinary push, an unlabelled PR, or on a schedule.
-# Two ways to run it here: `gh workflow run check-full.yml`, or adding
-# the `full-check` label to a PR (removing and re-adding the label
+# Runs on every push to main, so the tier has already passed (or is
+# running) for a commit by the time it is tagged: `release.yml` does not
+# run it again, it waits for this workflow's run on the tagged commit
+# (`scripts/verify-full-tier.sh`) and runs it here only if there is none.
+# It never runs on a feature-branch push, an unlabelled PR, or a schedule.
+# Other ways to run it: `gh workflow run check-full.yml`, or adding the
+# `full-check` label to a PR (removing and re-adding the label
 # re-triggers it; a `synchronize` push to an already-labelled PR does
 # not, by design -- ask for it explicitly if a later push needs another
-# full-tier run before merge). A third way is `release.yml`'s own
-# `check-full` job, which runs the same `scripts/check-full.sh` (not
-# this workflow -- a separate job definition, since `workflow_call`
-# would need this file restructured into reusable-workflow shape for no
-# benefit) on every `v*` tag push, gating `publish`.
+# full-tier run before merge).
+#
+# The mutation sweep is about 70% of this tier's time and runs on Linux
+# only: it applies mutations to a copy of the workspace and checks source
+# audits and compile errors, none of which a platform changes.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
   pull_request:
     types: [labeled]
 
 permissions:
   contents: read
 
+# One group per commit, not per ref: a newer push to main must not cancel
+# the run a tag on the earlier commit is waiting for.
 concurrency:
-  group: check-full-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: check-full-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -79,6 +87,8 @@ jobs:
       GIT_CONFIG_COUNT: "1"
       GIT_CONFIG_KEY_0: commit.gpgsign
       GIT_CONFIG_VALUE_0: "false"
+      # Linux runs the sweep; see the header.
+      SWAMP_SKIP_MUTATION_SWEEP: "1"
     steps:
       - uses: actions/checkout@v5
 
