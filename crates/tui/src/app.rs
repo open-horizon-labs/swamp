@@ -1472,6 +1472,7 @@ impl App {
     pub fn cancel_operation(&mut self) {
         if let Some(op) = &self.operation {
             op.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::worker::spawn(swamp_core::fs_gate::spawn::kill_all_children);
         }
     }
 
@@ -1843,7 +1844,7 @@ impl App {
             .unwrap_or_else(|| "unmeasured".into());
         self.last_result = Some(if results.len() < total {
             format!(
-                "Cancelled · {ok} completed · {} refused · {} not attempted; completed filesystem moves are in Trash",
+                "Cancelled · {ok} completed · {} refused · {} not attempted; completed filesystem moves are in Trash; an in-flight docker/git command was killed and may still have completed",
                 failed.len(),
                 total - results.len()
             )
