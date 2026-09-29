@@ -229,6 +229,10 @@ pub struct App {
     pub observing: Option<(u32, u32)>,
     pub last_result: Option<String>,
     pub observed_label: String,
+    /// Set when the store's volume is nearly full: the refresh was
+    /// skipped and this stored report is all there is. Shown first in
+    /// the header.
+    pub disk_banner: Option<String>,
     pub actor: String,
     pub sort: Sort,
     /// Flip the active sort's order (`r`). Persisted with the sort.
@@ -439,6 +443,7 @@ impl App {
             observing: None,
             last_result: None,
             observed_label: "just now".to_string(),
+            disk_banner: None,
             actor: "human".to_string(),
             sort: Sort::None,
             reverse: false,
