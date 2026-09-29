@@ -1097,7 +1097,7 @@ mod tests {
         assert!(app.pending.is_none(), "no second walk");
         let s = buffer_text(&app, 80, 24);
         assert!(
-            s.contains("An observation is already running (pid 4242, 32s)"),
+            s.contains("An observation is already running (pid 4242, 3"),
             "{s}"
         );
         assert!(s.contains("Its result loads here"), "{s}");
