@@ -226,11 +226,16 @@ pub struct App {
     /// What the last check could not include (`b` lists it).
     pub blocked: Vec<BlockedItem>,
     pub blocked_open: bool,
+    /// First blocked item shown in the blocked list.
+    pub blocked_scroll: usize,
     /// First body row shown; moves only when the selection leaves the
     /// window, so one keypress moves the selection one row.
     pub scroll_offset: std::cell::Cell<usize>,
     /// Redraws so far; drives the busy glyph.
     pub frame: u64,
+    /// Per-project mark counts for the projects view, kept until the marks
+    /// or the report change (computing one is a tree build per project).
+    mark_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<MarkStates>)>>,
     pub report: Report,
     /// Primary root: the first entry of `roots`, kept for every call
     /// site that only ever needed one representative path (a "resize
@@ -425,6 +430,9 @@ pub fn blocked_next_step(reason: &str) -> &'static str {
     }
 }
 
+/// Marked and total units per project (report project name).
+pub type MarkStates = std::collections::HashMap<String, (usize, usize)>;
+
 pub struct Operation {
     pub label: &'static str,
     /// Items checked (review) or moved (delete) so far.
@@ -556,8 +564,10 @@ impl App {
             refusal_ctx: None,
             blocked: Vec::new(),
             blocked_open: false,
+            blocked_scroll: 0,
             scroll_offset: std::cell::Cell::new(0),
             frame: 0,
+            mark_cache: std::sync::Mutex::new(None),
             report,
             root,
             roots,
@@ -1278,6 +1288,49 @@ impl App {
         (marked, units.len())
     }
 
+    /// `project_mark_state` for every project that owns a marked unit,
+    /// cached until the marks or the report change. A drawn frame asks for
+    /// this, so it must cost nothing when nothing changed.
+    pub fn project_mark_states(&self) -> std::sync::Arc<MarkStates> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.marked.keys().for_each(|k| k.hash(&mut h));
+        (self.report.observed_at, self.report.projects.len()).hash(&mut h);
+        let sig = h.finish();
+        if let Ok(cache) = self.mark_cache.lock()
+            && let Some((s, states)) = cache.as_ref()
+            && *s == sig
+        {
+            return states.clone();
+        }
+        let mut owners: Option<HashSet<String>> = Some(HashSet::new());
+        for u in self.marked.values() {
+            match names::project_key_of(&self.report, &u.path) {
+                Some(p) => {
+                    if let Some(o) = owners.as_mut() {
+                        o.insert(p);
+                    }
+                }
+                // Not under any checkout (docker, unowned): any project
+                // may own it, so look at all of them.
+                None => owners = None,
+            }
+        }
+        let mut states = MarkStates::new();
+        if !self.marked.is_empty() {
+            for p in &self.report.projects {
+                if owners.as_ref().is_none_or(|o| o.contains(&p.name)) {
+                    states.insert(p.name.clone(), self.project_mark_state(&p.name));
+                }
+            }
+        }
+        let states = std::sync::Arc::new(states);
+        if let Ok(mut cache) = self.mark_cache.lock() {
+            *cache = Some((sig, states.clone()));
+        }
+        states
+    }
+
     /// The rows a mark on this project row acts on.
     fn project_units(&self, project: &str, include_checkouts: bool) -> Vec<Row> {
         let rows = model::tree_rows(
@@ -1845,28 +1898,43 @@ impl App {
     }
 
     /// How many items a check of `row` (or of every row in the view, for
-    /// `None`) will look at: what "checked N of M" counts against.
+    /// `None`) will look at: what "checked N of M" counts against. Items
+    /// are counted once by path (the same directory is listed under more
+    /// than one row), and a row with nothing to check counts as one that
+    /// will be reported blocked.
     fn count_targets(&self, only: Option<&Row>) -> usize {
-        let one = |row: &Row, checkouts: bool| -> usize {
+        let mut ids: HashSet<String> = HashSet::new();
+        let mut blocked_rows = 0usize;
+        let mut add = |row: &Row, checkouts: bool| {
             if let Some(key) = row
                 .expansion_key
                 .as_deref()
                 .filter(|k| model::is_cleanup_selection(&self.report, k))
             {
-                return model::cleanup_members(&self.report, key).len().max(1);
-            }
-            if row.unit.is_some() {
-                return 1;
-            }
-            match row.project.as_deref() {
-                Some(p) if row.kind.is_none() => self.project_units(p, checkouts).len().max(1),
-                _ => 0,
+                let members = model::cleanup_members(&self.report, key);
+                if members.is_empty() {
+                    blocked_rows += 1;
+                }
+                ids.extend(members.iter().map(|u| u.path.display().to_string()));
+            } else if let Some(u) = &row.unit {
+                ids.insert(u.0.clone());
+            } else if let Some(p) = row.project.as_deref().filter(|_| row.kind.is_none()) {
+                let units = self.project_units(p, checkouts);
+                if units.is_empty() {
+                    blocked_rows += 1;
+                }
+                ids.extend(
+                    units
+                        .iter()
+                        .filter_map(|r| r.unit.as_ref().map(|u| u.0.clone())),
+                );
             }
         };
         match only {
-            Some(row) => one(row, true),
-            None => self.rows().iter().map(|r| one(r, false)).sum(),
+            Some(row) => add(row, true),
+            None => self.rows().iter().for_each(|r| add(r, false)),
         }
+        ids.len() + blocked_rows
     }
 
     pub fn poll_operation(&mut self) {
@@ -2045,6 +2113,7 @@ impl App {
     pub fn open_blocked(&mut self) {
         if !self.blocked.is_empty() {
             self.blocked_open = true;
+            self.blocked_scroll = 0;
         }
     }
 

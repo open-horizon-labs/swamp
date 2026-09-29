@@ -1697,6 +1697,22 @@ fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
     assert!(f.contains("Blocked: 2"), "{f}");
     assert!(f.contains("next: open the project"), "{f}");
     assert!(f.contains("Esc back to the plan"), "{f}");
+    // The list scrolls by item and never runs off the sheet.
+    app.blocked = (0..12)
+        .map(|i| swamp_tui::app::BlockedItem {
+            name: format!("project-{i}"),
+            reason: "nothing reclaimable in this project".into(),
+            next: "open the project with Enter".into(),
+        })
+        .collect();
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("project-0") && f.contains("more below"), "{f}");
+    for _ in 0..7 {
+        swamp_tui::handle_key(&mut app, KeyCode::Down);
+    }
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("from item 8") && f.contains("project-7"), "{f}");
+    assert!(!f.contains("project-0"), "{f}");
     // Enter cannot move anything while the list is open.
     swamp_tui::handle_key(&mut app, KeyCode::Enter);
     assert!(app.operation.is_none() && app.confirm_open && app.blocked_open);

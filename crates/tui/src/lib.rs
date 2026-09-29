@@ -122,8 +122,14 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     }
     if app.blocked_open {
         // The blocked list is read-only: nothing under it can be marked.
-        if matches!(code, KeyCode::Esc | KeyCode::Char('b' | 'd')) {
-            app.blocked_open = false;
+        match code {
+            KeyCode::Esc | KeyCode::Char('b' | 'd') => app.blocked_open = false,
+            KeyCode::Down => {
+                app.blocked_scroll =
+                    (app.blocked_scroll + 1).min(app.blocked.len().saturating_sub(1))
+            }
+            KeyCode::Up => app.blocked_scroll = app.blocked_scroll.saturating_sub(1),
+            _ => {}
         }
         return;
     }

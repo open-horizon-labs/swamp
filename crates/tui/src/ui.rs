@@ -352,7 +352,12 @@ fn clip_end(s: &str, width: usize) -> String {
 
 /// Whole lines that fit `cap` rows once wrapped at `width`; what does not
 /// fit is counted in a last line instead of being cut mid-sentence.
-fn fit_lines(lines: &[(String, Color)], width: usize, cap: usize) -> Vec<(String, Color)> {
+fn fit_lines(
+    lines: &[(String, Color)],
+    width: usize,
+    cap: usize,
+    more: &dyn Fn(usize) -> String,
+) -> Vec<(String, Color)> {
     let mut used = 0usize;
     let mut fit: Vec<(String, Color)> = Vec::new();
     for (i, (l, c)) in lines.iter().enumerate() {
@@ -361,10 +366,7 @@ fn fit_lines(lines: &[(String, Color)], width: usize, cap: usize) -> Vec<(String
         // Keep one row for the "+N more" line when something is left over.
         let reserve = usize::from(left > 0);
         if used + rows + reserve > cap && !fit.is_empty() {
-            fit.push((
-                format!("+{} more lines (Esc, then check the rows)", left + 1),
-                Color::Yellow,
-            ));
+            fit.push((more(left + 1), Color::Yellow));
             return fit;
         }
         used += rows;
@@ -499,7 +501,7 @@ fn project_breakdown(app: &App) -> Vec<(String, Color)> {
 /// The blocked sheet: each item, why, and what to do next.
 fn blocked_sheet(app: &App) -> Vec<(String, Color)> {
     let mut out = Vec::new();
-    for b in &app.blocked {
+    for b in app.blocked.iter().skip(app.blocked_scroll) {
         out.push((format!("{}  {}", b.name, b.reason), Color::Reset));
         out.push((format!("  next: {}", b.next), Color::Yellow));
     }
@@ -508,7 +510,13 @@ fn blocked_sheet(app: &App) -> Vec<(String, Color)> {
 
 /// A sheet over the bottom of the body: bordered, fixed height, whole
 /// lines with a count of what did not fit.
-fn draw_sheet(frame: &mut Frame, body: Rect, title: &str, lines: &[(String, Color)]) {
+fn draw_sheet(
+    frame: &mut Frame,
+    body: Rect,
+    title: &str,
+    lines: &[(String, Color)],
+    more: &dyn Fn(usize) -> String,
+) {
     let h = SHEET_ROWS.min(body.height);
     if h < 3 {
         return;
@@ -523,7 +531,7 @@ fn draw_sheet(frame: &mut Frame, body: Rect, title: &str, lines: &[(String, Colo
         .borders(Borders::ALL)
         .title(format!(" {title} "));
     let inner = block.inner(area);
-    let fit = fit_lines(lines, inner.width as usize, inner.height as usize);
+    let fit = fit_lines(lines, inner.width as usize, inner.height as usize, more);
     let text: Vec<Line> = fit
         .iter()
         .map(|(l, c)| Line::styled(l.clone(), Style::default().fg(*c)))
@@ -656,8 +664,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_sheet(
                 frame,
                 chunks[2],
-                &format!("Blocked: {}", app.blocked.len()),
+                &if app.blocked_scroll > 0 {
+                    format!(
+                        "Blocked: {} · from item {}",
+                        app.blocked.len(),
+                        app.blocked_scroll + 1
+                    )
+                } else {
+                    format!("Blocked: {}", app.blocked.len())
+                },
                 &blocked_sheet(app),
+                &|_| "more below (↓ to scroll)".to_string(),
             );
         } else if app.confirm_open {
             draw_sheet(
@@ -665,6 +682,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 chunks[2],
                 "Plan · nothing has changed yet",
                 &plan_sheet(app, &summary),
+                &|n| format!("+{n} more lines"),
             );
         }
     }
@@ -683,9 +701,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     } else if app.blocked_open {
         if app.confirm_open {
-            "Esc back to the plan".to_string()
+            "↑↓ scroll · Esc back to the plan".to_string()
         } else {
-            "Esc close".to_string()
+            "↑↓ scroll · Esc close".to_string()
         }
     } else if app.confirm_open {
         let mut clauses = vec!["Enter confirm".to_string(), "Esc back".to_string()];
@@ -978,6 +996,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             "* allocated incl. shared links; not additive with report totals. Age = modified",
         ));
     }
+    let mark_states = app.project_mark_states();
     for (i, row) in rows.iter().enumerate() {
         let mut marked = row
             .unit
@@ -1006,7 +1025,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             && row.expansion_key.is_none()
             && let Some(project) = row.project.as_deref()
         {
-            let (n, of) = app.project_mark_state(project);
+            let (n, of) = mark_states.get(project).copied().unwrap_or((0, 0));
             if of > 0 && n == of {
                 mark_prefix = "✗ ".to_string();
             } else if n > 0 {

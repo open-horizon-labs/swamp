@@ -65,6 +65,21 @@ fn cargo_words(parts: &[String]) -> Option<String> {
     })
 }
 
+/// The report's own name (not the display name) of the project whose
+/// checkout holds `path`.
+pub fn project_key_of(report: &Report, path: &Path) -> Option<String> {
+    let mut best: Option<(&str, usize)> = None;
+    for p in &report.projects {
+        for wt in &p.worktrees {
+            let len = wt.path.as_os_str().len();
+            if path.starts_with(&wt.path) && best.is_none_or(|(_, l)| len > l) {
+                best = Some((p.name.as_str(), len));
+            }
+        }
+    }
+    best.map(|(n, _)| n.to_string())
+}
+
 /// The display name of the project whose checkout holds `path`.
 pub fn project_of(report: &Report, path: &Path) -> Option<String> {
     locate(report, path).map(|(project, _)| project)
