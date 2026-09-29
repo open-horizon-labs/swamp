@@ -2370,3 +2370,40 @@ fn the_blocked_list_shows_the_whole_reason_and_offers_r() {
         assert!(f.contains("r check again"), "{w}: the key is offered\n{f}");
     }
 }
+
+/// A long name gives way, not the tree rail in front of it; the cargo
+/// popup wraps a long line instead of cutting its tail.
+#[test]
+fn long_rows_keep_their_rail_and_long_popup_lines_wrap() {
+    let mut report = fixture_report();
+    let wt = &mut report.projects[0].worktrees[0];
+    let base = wt.path.clone();
+    wt.artifacts.push(art(
+        ArtifactKind::DependencyTree,
+        base.join("a-very-long-package-directory-name-that-cannot-fit/node_modules")
+            .to_str()
+            .unwrap(),
+        3_000_000_000,
+        None,
+    ));
+    let mut app = App::new(report, "/Users/dev/src".into());
+    app.clear_filter();
+    app.drill_into_selected();
+    let f = capture(&app, 50, 24);
+    let cut: Vec<&str> = f.lines().filter(|l| l.contains('…')).collect();
+    assert!(!cut.is_empty(), "the long name is shortened:\n{f}");
+    for l in cut {
+        let ell = l.find('…').unwrap();
+        let rail = l.find("├─").or_else(|| l.find("└─")).unwrap_or(usize::MAX);
+        assert!(rail < ell, "the rail survives the cut: {l}");
+    }
+    app.cargo_inspection = Some(vec![
+        "features [\"alloc\", \"default\", \"perf-inline\", \"perf-literal\", \"std\", \"unicode-word-boundary\", ENDMARK]"
+            .to_string(),
+    ]);
+    let f = capture(&app, 50, 24);
+    assert!(
+        f.contains("ENDMARK"),
+        "the tail of a long line is wrapped in, not cut:\n{f}"
+    );
+}
