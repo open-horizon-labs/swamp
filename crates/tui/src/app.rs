@@ -244,6 +244,12 @@ pub struct App {
     refusal_ctx: Option<String>,
     /// What the last check could not include (`b` lists it).
     pub blocked: Vec<BlockedItem>,
+    /// What the last check looked at: every row in the view, or one row.
+    /// `r` in the blocked list runs it again.
+    last_check: Option<(bool, Option<Row>)>,
+    /// The marks that check added, so a re-check replaces exactly those and
+    /// keeps marks made any other way.
+    last_check_marks: Vec<String>,
     pub blocked_open: bool,
     /// First blocked item shown in the blocked list.
     pub blocked_scroll: usize,
@@ -606,6 +612,8 @@ impl App {
             blocked_scroll: 0,
             scroll_offset: std::cell::Cell::new(0),
             frame: 0,
+            last_check: None,
+            last_check_marks: Vec::new(),
             ui_state_tx: None,
             page: std::cell::Cell::new(10),
             help_scroll: std::cell::Cell::new(0),
@@ -1955,10 +1963,42 @@ impl App {
         if !all && row.is_none() {
             return;
         }
+        let marks = self.marked.clone();
+        self.start_review(all, row, confirm, marks);
+    }
+
+    /// `r` in the blocked list: the same check again, from a fresh look at
+    /// the disk (something that was open may have closed). The marks the
+    /// last check added are replaced by what this one finds; marks made
+    /// any other way stay.
+    pub fn recheck_blocked(&mut self) {
+        if self.operation.is_some() {
+            return;
+        }
+        let Some((all, row)) = self.last_check.clone() else {
+            return;
+        };
+        let mut marks = self.marked.clone();
+        for id in &self.last_check_marks {
+            marks.remove(id);
+        }
+        let confirm = self.confirm_open;
+        self.blocked_open = false;
+        self.start_review(all, row, confirm, marks);
+    }
+
+    fn start_review(
+        &mut self,
+        all: bool,
+        row: Option<Row>,
+        confirm: bool,
+        base_marks: BTreeMap<String, MarkedUnit>,
+    ) {
+        self.last_check = Some((all, row.clone()));
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut worker = App::new(self.report.clone(), self.root.clone());
-        worker.marked = self.marked.clone();
+        worker.marked = base_marks;
         worker.view = self.view;
         worker.filter = self.filter.clone();
         worker.selected_project = self.selected_project.clone();
@@ -2151,6 +2191,7 @@ impl App {
                             .cloned()
                             .collect();
                         let removed = before.keys().filter(|k| !marked.contains_key(*k)).count();
+                        self.last_check_marks = added.clone();
                         self.marked = marked;
                         self.blocked = blocked;
                         self.refusal = refusal.map(|msg| (msg, Instant::now()));
@@ -3571,6 +3612,43 @@ mod tests {
         app.mark_all_in_view();
         assert!(!app.marked.is_empty(), "dependency trees are actionable");
         assert!(app.confirm_open, "one confirm for the whole set");
+    }
+
+    #[test]
+    fn r_in_the_blocked_list_checks_again_and_replaces_only_what_the_check_added() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        let first: Vec<String> = app.marked.keys().cloned().collect();
+        assert!(!first.is_empty() && app.confirm_open);
+        // A mark made another way, and one blocked item to look at.
+        let mut extra = app.marked.values().next().unwrap().clone();
+        extra.path = "/root/elsewhere/extra".into();
+        app.marked.insert("/root/elsewhere/extra".into(), extra);
+        app.blocked = vec![BlockedItem {
+            name: "x".into(),
+            reason: "in use".into(),
+            next: "close it".into(),
+        }];
+        app.open_blocked();
+        assert!(app.blocked_open);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('r'));
+        assert!(!app.blocked_open, "the sheet closes while it checks");
+        assert!(app.operation.is_some(), "the same check runs again");
+        wait_operation(&mut app);
+        let again: Vec<String> = app
+            .marked
+            .keys()
+            .filter(|k| *k != "/root/elsewhere/extra")
+            .cloned()
+            .collect();
+        assert_eq!(again, first, "same target, same marks: not toggled off");
+        assert!(
+            app.marked.contains_key("/root/elsewhere/extra"),
+            "marks made another way stay"
+        );
+        assert!(app.confirm_open, "the plan comes back");
     }
 
     #[test]

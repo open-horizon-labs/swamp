@@ -732,9 +732,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
     } else if app.blocked_open {
         if app.confirm_open {
-            "↑↓ scroll · Esc back to the plan".to_string()
+            "↑↓ scroll · r check again · Esc back to the plan".to_string()
         } else {
-            "↑↓ scroll · Esc close".to_string()
+            "↑↓ scroll · r check again · Esc close".to_string()
         }
     } else if app.confirm_open {
         let mut clauses = vec!["Enter confirm".to_string(), "Esc back".to_string()];

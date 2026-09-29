@@ -2334,3 +2334,39 @@ fn no_help_line_is_cut_at_any_width() {
         }
     }
 }
+
+/// `d` shows a blocked item's whole reason and next step, wrapped rather
+/// than cut, even at 50 columns; `r` is offered to check again.
+#[test]
+fn the_blocked_list_shows_the_whole_reason_and_offers_r() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    let u = plain_unit("/Users/dev/src/p/dir", 1_000_000);
+    app.marked.insert(u.path.display().to_string(), u);
+    app.confirm_open = true;
+    app.blocked = vec![swamp_tui::app::BlockedItem {
+        name: "swamp · swamp_tui incremental build (target/debug)".into(),
+        reason: "a process has this open: cargo (pid 4021) is running a build in this directory"
+            .into(),
+        next: "stop the build, then press r to check again".into(),
+    }];
+    swamp_tui::handle_key(&mut app, KeyCode::Char('d'));
+    for w in [50u16, 80] {
+        let f = capture(&app, w, 24);
+        let flat: String = f
+            .lines()
+            .map(|l| l.trim_matches('"').trim_matches('│').trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("cargo (pid 4021) is running a build in this directory"),
+            "{w}: the whole reason:\n{f}"
+        );
+        assert!(
+            flat.contains("stop the build, then press r to check again"),
+            "{w}\n{f}"
+        );
+        assert!(f.contains("r check again"), "{w}: the key is offered\n{f}");
+    }
+}

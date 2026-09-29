@@ -145,6 +145,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         // The blocked list is read-only: nothing under it can be marked.
         match code {
             KeyCode::Esc | KeyCode::Char('b' | 'd' | 'q') => app.blocked_open = false,
+            KeyCode::Char('r') => app.recheck_blocked(),
             _ => {
                 if let Some(at) = scrolled(
                     app.blocked_scroll,
