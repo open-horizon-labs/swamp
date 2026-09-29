@@ -21,9 +21,13 @@ name: check-full
 # not, by design -- ask for it explicitly if a later push needs another
 # full-tier run before merge).
 #
-# The mutation sweep is about 70% of this tier's time and runs on Linux
-# only: it applies mutations to a copy of the workspace and checks source
-# audits and compile errors, none of which a platform changes.
+# The mutation sweep is about 70% of this tier's time. It tests the audit
+# rules against known-bad snippets, so its verdict only changes when the
+# rules, the lint configuration, the gate, the lockfile or clippy change.
+# It runs on Linux only, and only when it has not already passed for this
+# clippy version and these inputs (a cache keyed on both, saved after a
+# passing sweep; `scripts/sweep-needed.sh`). There is no schedule. The rest
+# of the tier is about 8 minutes.
 
 on:
   workflow_dispatch:
@@ -71,12 +75,48 @@ jobs:
         with:
           shared-key: check-full-linux-x86_64
 
+      # The sweep already passed for this clippy version and these inputs?
+      # The key is both, so a new clippy or a changed input misses and the
+      # sweep runs. The marker is saved only after it passes (below).
+      - name: Mutation sweep key
+        id: sweepkey
+        run: |
+          clippy=$(cargo clippy --version | tr -c 'A-Za-z0-9.\n' '-')
+          echo "key=mutation-sweep-passed-$clippy-${{ hashFiles('crates/source-audit/**', 'crates/*/clippy.toml', 'crates/core/src/fs_gate/**', 'crates/core/src/lib.rs', 'crates/cli/src/main.rs', 'crates/tui/src/lib.rs', '.oh/guardrails/**', 'rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Mutation sweep already passed?
+        id: sweeppassed
+        uses: actions/cache/restore@v4
+        with:
+          path: sweep-passed
+          key: ${{ steps.sweepkey.outputs.key }}
+          lookup-only: true
+
+      - name: Mutation sweep needed?
+        id: sweep
+        run: echo "verdict=$(scripts/sweep-needed.sh '${{ steps.sweeppassed.outputs.cache-hit }}')" >> "$GITHUB_OUTPUT"
+
       # scripts/check-full.sh runs scripts/check.sh, then the compile-fail
       # cases, the mutation sweep and the cost test once each. The cost
       # test's own Linux contract (`reviewer_cost_measurement_stack3`'s
       # `linux_contract`) only runs where this job runs it.
       - name: scripts/check-full.sh
+        env:
+          SWAMP_SKIP_MUTATION_SWEEP: ${{ steps.sweep.outputs.verdict == 'skip' && '1' || '' }}
         run: scripts/check-full.sh
+
+      # Reached only when the whole tier passed, so a marker exists only
+      # for a sweep that passed.
+      - name: Record that the mutation sweep passed
+        if: steps.sweep.outputs.verdict == 'run'
+        run: mkdir -p sweep-passed && date -u > sweep-passed/at
+
+      - name: Save the mutation sweep marker
+        if: steps.sweep.outputs.verdict == 'run'
+        uses: actions/cache/save@v4
+        with:
+          path: sweep-passed
+          key: ${{ steps.sweepkey.outputs.key }}
 
   macos-arm64-check-full:
     name: macOS arm64 (check-full)
@@ -87,7 +127,7 @@ jobs:
       GIT_CONFIG_COUNT: "1"
       GIT_CONFIG_KEY_0: commit.gpgsign
       GIT_CONFIG_VALUE_0: "false"
-      # Linux runs the sweep; see the header.
+      # Linux runs the sweep (when it has not passed yet); see the header.
       SWAMP_SKIP_MUTATION_SWEEP: "1"
     steps:
       - uses: actions/checkout@v5
