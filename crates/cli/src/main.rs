@@ -252,7 +252,8 @@ enum Command {
     },
     /// Observe-only: walk `root`s, write the growth store, and refresh
     /// GitHub enrichment for every GitHub-remote worktree found
-    /// (concurrent, coalesced per repo, cached by tip SHA for six hours --
+    /// (concurrent, coalesced per repo, cached by tip SHA: a merged branch is
+    /// never re-enriched, everything else is refreshed after 24 hours --
     /// see `github::observe_all`). No rendering. This is what a scheduled
     /// LaunchAgent run executes, and the only `swamp` command that calls
     /// `gh` on your behalf by default; `report` reads whatever this last
@@ -283,6 +284,11 @@ enum Command {
         /// left as-is.
         #[arg(long)]
         no_enrich: bool,
+        /// Force a GitHub refresh now: refetch every worktree, ignoring the
+        /// 24h cache window and the rule that a merged branch is never
+        /// re-enriched. Plain `observe` already enriches missing/stale rows.
+        #[arg(long, conflicts_with = "no_enrich")]
+        enrich: bool,
     },
     /// Linux: watch the scope's roots with inotify until stopped and keep
     /// a bounded change list, so a later `observe` can reuse measurements
@@ -1326,7 +1332,9 @@ fn main() -> Result<()> {
             verify_du,
             since,
             no_enrich,
+            enrich,
         } => {
+            swamp_core::github::set_force_refresh(enrich);
             let store_dir = swamp_dir();
             let scope = resolve_scope(&roots)?;
             if scope.scan_paths().is_empty() {
