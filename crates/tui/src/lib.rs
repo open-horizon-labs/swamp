@@ -180,17 +180,23 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     }
 }
 
-/// Runs the interactive UI against `root`.
-/// How far back the store can answer for `root`'s volume. Growth windows
-/// are bounded by it: a 7d window over 4h of observations would report a
-/// week of growth that was never observed.
+/// How far back the store can answer for `root`. Growth windows are
+/// bounded by it: a 7d window over 4h of observations would report a
+/// week of growth that was never observed. History is stored under the
+/// root-scoped directory (`growth::history_span_for_root`), the same one
+/// the header's sparkline reads; the bare device directory holds only
+/// side tables, which made the picker say "no observations yet" next to
+/// a header that showed history.
 fn history_span(store: &std::path::Path, root: &std::path::Path) -> Option<u64> {
-    let now = swamp_core::entities::now();
-    let dev = swamp_core::fs_gate::device_of(root)?;
-    let dir = store.join(dev.to_string());
-    swamp_core::growth::history_span_secs(&dir, now)
+    swamp_core::growth::history_span_for_root(store, root, swamp_core::entities::now())
 }
 
+/// The longest history any of `roots` has.
+fn history_span_of_roots(store: &Path, roots: &[PathBuf]) -> Option<u64> {
+    roots.iter().filter_map(|r| history_span(store, r)).max()
+}
+
+/// Runs the interactive UI against `root`.
 /// The authorized scope for this invocation, resolved once from the
 /// stored config plus whatever explicit roots the command named.
 ///
@@ -472,12 +478,9 @@ fn finish_startup(
     if let Some(c) = coverage {
         app.set_scope_note(c);
     }
-    // Multi-root history windows are bounded by the *primary* root's own
-    // history for now (`App::root`, `roots[0]`) -- a per-root history
-    // bound is a real, named simplification (see this chunk's session
-    // note), not a silent one: a multi-root picker can currently offer
-    // a window longer than a non-primary root's own store actually has.
-    app.history_secs = history_span(store, &app.root);
+    // The picker may offer a window as long as the longest history of any
+    // root this report covers.
+    app.history_secs = history_span_of_roots(store, &app.roots);
     let saved = app::load_ui_state(store);
     if !saved.filter.is_empty() {
         app.filter_text = saved.filter;

@@ -3288,6 +3288,35 @@ mod tests {
     }
 
     #[test]
+    fn history_span_reads_the_root_scoped_store_the_picker_needs() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = swamp_core::growth::root_scoped_volume_id(root.path());
+        let now = swamp_core::entities::now();
+        let mut projects = fixture_report().projects;
+        swamp_core::growth::observe_and_annotate(
+            &swamp_core::bus::Stage::for_tests(),
+            store.path(),
+            id,
+            &mut projects,
+            now - 7_200,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let span = crate::history_span(store.path(), root.path());
+        assert!(
+            span.is_some_and(|s| (7_100..=7_400).contains(&s)),
+            "the picker must see the 2h of history the header shows: {span:?}"
+        );
+        assert_eq!(
+            crate::history_span_of_roots(store.path(), &[root.path().to_path_buf()]),
+            span
+        );
+    }
+
+    #[test]
     fn a_project_row_marks_the_projects_artifacts_without_entering_it() {
         let mut app = App::new(fixture_report(), "/root".into());
         app.clear_filter();
