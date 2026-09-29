@@ -15,6 +15,7 @@ pub mod filter;
 pub mod model;
 pub mod names;
 pub mod picker;
+pub mod term;
 pub mod ui;
 pub mod units;
 pub mod worker;
@@ -303,7 +304,16 @@ fn store_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// Takes the screen before the stored index is read (about half a second
+/// on a large store) so the terminal is never blank while it loads.
+fn enter_with_splash() -> Result<term::TerminalGuard> {
+    let mut guard = term::TerminalGuard::enter()?;
+    guard.splash("swamp · reading the last observation…");
+    Ok(guard)
+}
+
 pub fn run(root: &Path) -> Result<()> {
+    let guard = enter_with_splash()?;
     let store = store_dir();
     let root = swamp_core::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // The authorized scope for this invocation, resolved once with the
@@ -378,7 +388,7 @@ pub fn run(root: &Path) -> Result<()> {
         });
     finish_startup(&mut app, &store, coverage.as_deref());
     start_background_services(&mut app, has_index);
-    run_terminal_loop(&mut app)
+    run_terminal_loop(guard, &mut app)
 }
 
 /// Runs the interactive UI over every root a resolved `EffectiveScope`
@@ -397,6 +407,7 @@ pub fn run(root: &Path) -> Result<()> {
 /// demand; the schedule keeps the index current. It never blocks on the observation lock: if another
 /// process holds it, the header says who and for how long.
 pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
+    let guard = enter_with_splash()?;
     let store = store_dir();
     let present_roots = scope.scan_paths();
     anyhow::ensure!(
@@ -430,7 +441,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
         }
     };
     start_background_services(&mut app, has_index);
-    run_terminal_loop(&mut app)
+    run_terminal_loop(guard, &mut app)
 }
 
 /// After the first paint is decided: watch the observation lock (so a
@@ -521,13 +532,8 @@ fn finish_startup(
     app.keep_executables = saved.keep_executables;
 }
 
-fn run_terminal_loop(app: &mut App) -> Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let result = event_loop(&mut terminal, app);
+fn run_terminal_loop(mut guard: term::TerminalGuard, app: &mut App) -> Result<()> {
+    let result = event_loop(&mut guard.terminal, app);
 
     // Terminal failure must not abandon an in-flight filesystem move.
     if app.operation.is_some() {
@@ -538,15 +544,54 @@ fn run_terminal_loop(app: &mut App) -> Result<()> {
         }
     }
 
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen
-    )?;
+    // The last sort, filter or `k` choice reaches the disk before exit.
+    app.flush_ui_state();
+    // The guard puts the terminal back as it drops, here or on a panic.
+    drop(guard);
     result
 }
 
+/// Decides whether the screen needs painting. Idle, nothing changes and
+/// nothing is painted: no timer repaints an unchanged screen (it cost a
+/// terminal escape burst five times a second over ssh and tmux). It paints
+/// when something asked (a key, a resize, a worker's result), while
+/// anything is busy (the spinner and the elapsed time move), and when a
+/// clock-driven part of the screen reads differently (the age of the
+/// index, a refusal that ran out).
+#[derive(Default)]
+struct RedrawGate {
+    forced: bool,
+    last_clock: Option<String>,
+}
+
+impl RedrawGate {
+    /// Something other than the clock changed the screen's inputs.
+    fn touch(&mut self) {
+        self.forced = true;
+    }
+
+    /// Whether to paint now; records what the clock parts showed.
+    fn due(&mut self, app: &App) -> bool {
+        let clock = ui::clock_signature(app);
+        let due = self.forced || app.is_busy() || self.last_clock.as_deref() != Some(&clock);
+        self.forced = false;
+        self.last_clock = Some(clock);
+        due
+    }
+
+    /// How long to wait for input: quick while something moves, slow when
+    /// only the clock could change.
+    fn wait(app: &App) -> Duration {
+        if app.is_busy() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
+}
+
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    let mut gate = RedrawGate::default();
     loop {
         app.poll_operation();
         if app.operation.is_none()
@@ -555,6 +600,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         {
             app.pending = None;
             app.observing = None;
+            gate.touch();
             match res {
                 Ok(fresh) => {
                     // Each re-observed root replaced exactly its own
@@ -568,20 +614,32 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                 Err(e) => app.status = Some(format!("observation failed: {e}")),
             }
         }
-        app.drain_lock_poll();
-        if let Ok(sz) = terminal.size() {
-            app.width = sz.width;
+        if app.drain_lock_poll() {
+            gate.touch();
         }
-        app.frame = app.frame.wrapping_add(1);
-        terminal.draw(|f| ui::draw(f, app))?;
+        if let Ok(sz) = terminal.size()
+            && app.width != sz.width
+        {
+            app.width = sz.width;
+            gate.touch();
+        }
+        if gate.due(app) {
+            app.frame = app.frame.wrapping_add(1);
+            terminal.draw(|f| ui::draw(f, app))?;
+        }
         if app.quit {
             return Ok(());
         }
-        if event::poll(Duration::from_millis(200))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            handle_terminal_key(app, key);
+        if event::poll(RedrawGate::wait(app))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    gate.touch();
+                    handle_terminal_key(app, key);
+                }
+                // A resize, a focus change or anything else may have
+                // disturbed the screen: paint it again.
+                _ => gate.touch(),
+            }
         }
     }
 }
@@ -975,6 +1033,56 @@ mod tests {
             .expect("held lock is not an observation")
             .to_string();
         assert!(err.contains("another observation is running"), "{err}");
+    }
+
+    #[test]
+    fn an_idle_screen_is_never_repainted_until_something_changes() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 30);
+        let mut gate = RedrawGate::default();
+        assert!(gate.due(&app), "the first frame is always painted");
+        for _ in 0..50 {
+            assert!(!gate.due(&app), "an unchanged idle screen is not repainted");
+        }
+        assert_eq!(RedrawGate::wait(&app), Duration::from_secs(1));
+        // A key, a resize or a worker result asks for exactly one paint.
+        gate.touch();
+        assert!(gate.due(&app));
+        assert!(!gate.due(&app));
+        // Anything busy paints on the 200 ms tick so the glyph and the
+        // elapsed time move.
+        app.observing = Some((0, 0));
+        assert_eq!(RedrawGate::wait(&app), Duration::from_millis(200));
+        assert!(gate.due(&app) && gate.due(&app));
+        app.observing = None;
+        assert!(!gate.due(&app));
+        // The index's age is a clock: crossing into the next minute paints.
+        app.report.observed_at = now - 200;
+        assert!(gate.due(&app), "the age label changed");
+        assert!(!gate.due(&app));
+        // A refusal that runs out repaints without a key.
+        app.refusal = Some(("refused: x".into(), std::time::Instant::now()));
+        assert!(gate.due(&app), "the refusal appears");
+        assert!(!gate.due(&app));
+        app.refusal = Some((
+            "refused: x".into(),
+            std::time::Instant::now() - app::REFUSAL_DISPLAY - Duration::from_millis(1),
+        ));
+        assert!(gate.due(&app), "the refusal ran out: one paint clears it");
+        assert!(!gate.due(&app));
+    }
+
+    #[test]
+    fn ui_state_is_written_off_the_event_thread_newest_wins_and_flushes_on_exit() {
+        let (store, _r, mut app) = stored_app(0);
+        app.set_sort(Sort::Size);
+        app.set_sort(Sort::Size); // off again
+        app.set_sort(Sort::Name);
+        app.toggle_reverse();
+        app.flush_ui_state();
+        let saved = app::load_ui_state(store.path());
+        assert_eq!(saved.sort, "name");
+        assert!(saved.reverse);
     }
 
     #[test]

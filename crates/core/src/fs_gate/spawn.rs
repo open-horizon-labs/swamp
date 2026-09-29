@@ -516,10 +516,12 @@ pub fn kill_all_children() {
 }
 
 extern "C" fn on_exit() {
+    super::terminal::restore_signal_safe();
     kill_registered(|_| true);
 }
 
 extern "C" fn on_fatal_signal(sig: libc::c_int) {
+    super::terminal::restore_signal_safe();
     kill_registered(|_| true);
     // SAFETY: restore the default action and re-deliver, so swamp dies
     // of the same signal it would have without the handler.
@@ -529,7 +531,7 @@ extern "C" fn on_fatal_signal(sig: libc::c_int) {
     }
 }
 
-fn install_cleanup_once() {
+pub(super) fn install_cleanup_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // SAFETY: registering plain `extern "C"` functions.

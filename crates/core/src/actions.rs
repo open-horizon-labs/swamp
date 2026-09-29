@@ -1395,25 +1395,6 @@ pub fn trash_root() -> PathBuf {
     }
 }
 
-/// Free space on the volume containing `path`, in bytes, via `df -k`.
-/// Returns `None` if `df` cannot be read (advisory only: a missing
-/// measurement never blocks or fakes the reported result).
-pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    let out = crate::fs_gate::spawn::run(
-        crate::fs_gate::spawn::Program::Df,
-        [std::ffi::OsStr::new("-k"), path.as_os_str()],
-        std::time::Duration::from_secs(10),
-    )
-    .ok()?;
-    if !out.success() {
-        return None;
-    }
-    let text = out.stdout_lossy();
-    let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
-    let available_kb: u64 = fields.get(3)?.parse().ok()?;
-    Some(available_kb * 1024)
-}
-
 #[cfg(test)]
 mod agent_partial_removal_tests {
     //! #101's "account for partial failure (some members moved, then

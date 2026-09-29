@@ -256,7 +256,20 @@ fn age_label(app: &App) -> String {
     }
 }
 
-/// The header's yellow warning: the index is older than
+/// What the clock-driven parts of the screen currently read: the index's
+/// age and its warning, and whether a timed refusal is still showing.
+/// When this changes the screen is repainted even though nobody touched
+/// anything.
+pub fn clock_signature(app: &App) -> String {
+    format!(
+        "{}|{}|{}",
+        age_label(app),
+        stale_warning(app).is_some(),
+        app.refusal_active().is_some()
+    )
+}
+
+/// The header's warning: the index is older than
 /// `STALE_AFTER_SECS` (or missing) and nothing is scanning. While a scan
 /// -- ours or the scheduled one -- is running, its own indicator
 /// replaces this hint.

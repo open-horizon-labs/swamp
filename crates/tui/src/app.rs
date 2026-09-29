@@ -252,6 +252,9 @@ pub struct App {
     pub scroll_offset: std::cell::Cell<usize>,
     /// Redraws so far; drives the busy glyph.
     pub frame: u64,
+    /// The one writer of `ui_state.json`, started on first use: a slow or
+    /// full disk stalls it, never a keypress.
+    ui_state_tx: Option<std::sync::mpsc::Sender<UiStateMsg>>,
     /// Rows a page key moves in whatever is on top (the list, the blocked
     /// sheet, help, the cargo popup); each drawer sets it to its own
     /// viewport so PgUp/PgDn always mean "one screenful".
@@ -482,6 +485,14 @@ pub struct Operation {
     pub checking_open_files: Option<Instant>,
 }
 
+/// What the `ui_state.json` writer is told.
+enum UiStateMsg {
+    /// The state to keep; a newer one that has already arrived wins.
+    Save(UiState),
+    /// Everything before this has been written; tell the sender.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
 enum OperationEvent {
     /// The review's open-file snapshot started (`true`) or finished.
     OpenFileCheck(bool),
@@ -595,6 +606,7 @@ impl App {
             blocked_scroll: 0,
             scroll_offset: std::cell::Cell::new(0),
             frame: 0,
+            ui_state_tx: None,
             page: std::cell::Cell::new(10),
             help_scroll: std::cell::Cell::new(0),
             view_cursor: std::collections::HashMap::new(),
@@ -1057,24 +1069,68 @@ impl App {
         self.persist_filter();
     }
 
-    fn persist_filter(&self) {
+    fn persist_filter(&mut self) {
         self.persist_ui_state();
     }
 
-    fn persist_ui_state(&self) {
-        if let Some(store) = &self.store_dir
-            && let Ok(store) = swamp_core::fs_gate::StoreDir::at(store)
-        {
-            let state = UiState {
-                filter: self.filter_text.clone(),
-                sort: sort_to_str(self.sort).to_string(),
-                reverse: self.reverse,
-                keep_executables: self.keep_executables,
-            };
-            let _ = swamp_core::fs_gate::store::write_json(
-                swamp_core::fs_gate::store::JsonFile::UiState { store: &store },
-                &state,
-            );
+    /// Hands the current filter, sort and `k` to the writer thread and
+    /// returns at once. Writes never wait on the event thread; when several
+    /// arrive together only the newest is written.
+    fn persist_ui_state(&mut self) {
+        let Some(store) = self.store_dir.clone() else {
+            return;
+        };
+        let state = UiState {
+            filter: self.filter_text.clone(),
+            sort: sort_to_str(self.sort).to_string(),
+            reverse: self.reverse,
+            keep_executables: self.keep_executables,
+        };
+        if self.ui_state_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<UiStateMsg>();
+            crate::worker::spawn(move || {
+                let write = |state: &UiState| {
+                    if let Ok(store) = swamp_core::fs_gate::StoreDir::at(&store) {
+                        let _ = swamp_core::fs_gate::store::write_json(
+                            swamp_core::fs_gate::store::JsonFile::UiState { store: &store },
+                            state,
+                        );
+                    }
+                };
+                let mut waiting: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+                while let Ok(first) = rx.recv() {
+                    let mut latest = None;
+                    let mut msgs = vec![first];
+                    msgs.extend(rx.try_iter());
+                    for m in msgs {
+                        match m {
+                            UiStateMsg::Save(s) => latest = Some(s),
+                            UiStateMsg::Flush(done) => waiting.push(done),
+                        }
+                    }
+                    if let Some(s) = latest {
+                        write(&s);
+                    }
+                    for done in waiting.drain(..) {
+                        let _ = done.send(());
+                    }
+                }
+            });
+            self.ui_state_tx = Some(tx);
+        }
+        if let Some(tx) = &self.ui_state_tx {
+            let _ = tx.send(UiStateMsg::Save(state));
+        }
+    }
+
+    /// Waits (a moment at most) for the writer to finish what it was given,
+    /// so the last choice survives quitting. Called once, on the way out.
+    pub fn flush_ui_state(&self) {
+        if let Some(tx) = &self.ui_state_tx {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            if tx.send(UiStateMsg::Flush(done_tx)).is_ok() {
+                let _ = done_rx.recv_timeout(Duration::from_secs(2));
+            }
         }
     }
 
@@ -2909,11 +2965,12 @@ impl App {
 
     /// Applies whatever the lock poller has reported since last tick.
     /// Never blocks.
-    pub fn drain_lock_poll(&mut self) {
+    pub fn drain_lock_poll(&mut self) -> bool {
         let Some(rx) = &self.lock_poll_rx else {
-            return;
+            return false;
         };
         let msgs: Vec<LockPollMsg> = rx.try_iter().collect();
+        let changed = !msgs.is_empty();
         for m in msgs {
             match m {
                 LockPollMsg::Holder(h) => self.external_observer = h,
@@ -2933,6 +2990,16 @@ impl App {
                 }
             }
         }
+        changed
+    }
+
+    /// Something on screen moves by itself: a check or a move, our own
+    /// scan, or another process's. Only then does the UI paint on a timer.
+    pub fn is_busy(&self) -> bool {
+        self.operation.is_some()
+            || self.observing.is_some()
+            || self.pending.is_some()
+            || self.external_observer.is_some()
     }
 
     pub fn toggle_help(&mut self) {
