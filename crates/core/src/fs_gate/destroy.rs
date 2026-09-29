@@ -323,6 +323,7 @@ pub fn docker_remove(removal: &crate::docker::Removal) -> std::result::Result<()
 pub fn git_worktree_prune(common: &Path) -> Result<()> {
     let repo = common.parent().unwrap_or(common);
     let args: Vec<std::ffi::OsString> = vec![
+        "--no-pager".into(),
         "-C".into(),
         repo.as_os_str().to_owned(),
         "worktree".into(),

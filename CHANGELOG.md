@@ -3,6 +3,14 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.4
+
+- Every subprocess swamp starts (`git`, `gh`, `lsof`, `xcrun`, `docker`, ...) is now
+  its own process group and is killed with its descendants and reaped on timeout, on
+  error or panic, on TUI cancel or quit, on SIGINT/SIGTERM/SIGHUP and on process
+  exit. Children run with git/gh pagers and credential prompts disabled, so none can
+  block waiting for a terminal (#156).
+
 ## v0.7.3
 
 - `swamp observe` now enriches worktrees from GitHub by default, as its help and the
