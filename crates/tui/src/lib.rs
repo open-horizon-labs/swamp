@@ -871,31 +871,21 @@ mod tests {
             h.contains("observed 47m ago · older than 15 min, press R to refresh"),
             "{h}"
         );
-        // Yellow, not red.
+        // Bold, not a color: yellow is unreadable on many light themes.
         let mut t = Terminal::new(TestBackend::new(200, 24)).unwrap();
         t.draw(|f| ui::draw(f, &app)).unwrap();
-        let cell = t
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .find(|c| c.symbol() == "S")
-            .map(|c| c.fg);
-        let stale_cell = t
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .take(200)
-            .find(|c| c.fg == ratatui::style::Color::Yellow);
-        assert!(stale_cell.is_some(), "warning is drawn in yellow: {cell:?}");
+        let head: Vec<_> = t.backend().buffer().content().iter().take(200).collect();
         assert!(
-            !t.backend()
-                .buffer()
-                .content()
-                .iter()
-                .take(200)
-                .any(|c| c.fg == ratatui::style::Color::Red)
+            head.iter()
+                .any(|c| c.modifier.contains(ratatui::style::Modifier::BOLD)),
+            "the warning is bold"
+        );
+        assert!(
+            head.iter().all(|c| !matches!(
+                c.fg,
+                ratatui::style::Color::Yellow | ratatui::style::Color::Red
+            )),
+            "no color carries the warning"
         );
     }
 

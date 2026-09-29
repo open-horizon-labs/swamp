@@ -1,6 +1,7 @@
 //! ratatui rendering. Diffstat-ledger world: box-drawing rail, reverse
-//! video selection, yellow `✗` for marked rows, no other color. See
-//! DESIGN.md.
+//! video selection, a `✗` glyph for marked rows, red and green only for
+//! signed growth. Emphasis is bold, dim or reverse video, never a color
+//! that a light theme can wash out. See DESIGN.md.
 
 use crate::app::App;
 use crate::model::{
@@ -19,9 +20,24 @@ use ratatui::{
 /// when they leave.
 const GROW: Color = Color::Red;
 const SHRINK: Color = Color::Green;
-/// The selected row: a dark background and bold, never reverse video,
-/// so the growth colours stay readable on the line you are looking at.
-const SELECTED_BG: Color = Color::Indexed(236);
+/// The selected row is drawn in reverse video (plus bold): it follows the
+/// terminal's own foreground and background on any theme, survives
+/// `NO_COLOR`, and does not depend on telling two colors apart.
+fn selected_style() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+}
+
+/// Emphasis for a line of status text. Yellow and cyan are unreadable on
+/// many light themes (1.7:1 and 2.0:1 against white), so a "warning" is
+/// bold and a "note" is plain; red stays red because it also starts with
+/// the word that names it (`refused:`, `Blocked:`).
+fn tone(c: Color) -> Style {
+    match c {
+        Color::Yellow => Style::default().add_modifier(Modifier::BOLD),
+        Color::Red => Style::default().fg(Color::Red),
+        _ => Style::default(),
+    }
+}
 
 /// Width of every history sparkline, header and rows alike.
 const SPARK_WIDTH: u16 = 12;
@@ -31,31 +47,29 @@ const SPARK_WIDTH: u16 = 12;
 /// the change relative to the row's largest, red for bytes arriving and
 /// green for bytes leaving. A bucket where nothing moved is blank; a
 /// bucket before the first observation is a dim `·`.
-fn draw_spark(frame: &mut Frame, series: &[Option<u64>], area: Rect, selected: bool) {
+fn draw_spark(frame: &mut Frame, series: &[Option<u64>], area: Rect) {
     let d = spark_deltas(series, area.width as usize);
     let max = d
         .iter()
         .filter_map(|v| v.map(i64::unsigned_abs))
         .max()
         .unwrap_or(0);
-    let bg = |st: Style| if selected { st.bg(SELECTED_BG) } else { st };
     let bars: Vec<SparklineBar> = d
         .iter()
         .map(|v| match v {
             None => SparklineBar::from(None::<u64>),
             Some(0) => SparklineBar::from(Some(0u64)),
-            Some(x) => SparklineBar::from(Some(x.unsigned_abs())).style(Some(bg(
-                Style::default().fg(if *x > 0 { GROW } else { SHRINK })
-            ))),
+            Some(x) => SparklineBar::from(Some(x.unsigned_abs())).style(Some(
+                Style::default().fg(if *x > 0 { GROW } else { SHRINK }),
+            )),
         })
         .collect();
     frame.render_widget(
         Sparkline::default()
             .data(bars)
             .max(max.max(1))
-            .style(bg(Style::default()))
             .absent_value_symbol("·")
-            .absent_value_style(bg(Style::default().fg(Color::DarkGray))),
+            .absent_value_style(Style::default().add_modifier(Modifier::DIM)),
         area,
     );
 }
@@ -534,7 +548,7 @@ fn draw_sheet(
     let fit = fit_lines(lines, inner.width as usize, inner.height as usize, more);
     let text: Vec<Line> = fit
         .iter()
-        .map(|(l, c)| Line::styled(l.clone(), Style::default().fg(*c)))
+        .map(|(l, c)| Line::styled(l.clone(), tone(*c)))
         .collect();
     frame.render_widget(
         Paragraph::new(text)
@@ -615,7 +629,7 @@ fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
             frame.render_widget(
                 Paragraph::new(headline.clone())
                     .wrap(ratatui::widgets::Wrap { trim: true })
-                    .style(Style::default().fg(Color::Yellow)),
+                    .style(tone(Color::Yellow)),
                 area,
             );
         }
@@ -630,7 +644,7 @@ fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
         frame.render_widget(
             Paragraph::new(r.to_string())
                 .wrap(ratatui::widgets::Wrap { trim: true })
-                .style(Style::default().fg(Color::Cyan)),
+                .style(Style::default()),
             area,
         );
     }
@@ -810,9 +824,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(text[..i].to_string(), dim),
             Span::styled(
                 text[i..i + n].to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(text[i + n..].to_string(), dim),
         ]),
@@ -830,7 +842,6 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
                 width: SPARK_WIDTH,
                 height: 1,
             },
-            false,
         );
         frame.render_widget(
             Paragraph::new(human_signed_bytes(d))
@@ -1062,10 +1073,10 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         let bar_color = match row.growth {
             Some(g) if g > 0 => GROW,
             Some(g) if g < 0 => SHRINK,
-            _ => Color::DarkGray,
+            _ => Color::Reset,
         };
         // A change too small to act on is dimmed, number and tick alike.
-        let bar_style = if is_noise(row.growth) {
+        let bar_style = if is_noise(row.growth) || row.growth.is_none_or(|g| g == 0) {
             Style::default().fg(bar_color).add_modifier(Modifier::DIM)
         } else {
             Style::default().fg(bar_color)
@@ -1105,7 +1116,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         let name_style = if marked {
-            Style::default().fg(Color::Yellow)
+            Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -1142,13 +1153,20 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ];
 
+        let mut spans = spans;
+        if i == app.selected {
+            // The bar runs the full width, not only as far as the text.
+            let used: usize = spans
+                .iter()
+                .map(|s| crate::model::display_width(&s.content))
+                .sum();
+            if used < width {
+                spans.push(Span::raw(" ".repeat(width - used)));
+            }
+        }
         let mut line = Line::from(spans);
         if i == app.selected {
-            line = line.style(
-                Style::default()
-                    .bg(SELECTED_BG)
-                    .add_modifier(Modifier::BOLD),
-            );
+            line = line.style(selected_style());
         }
         lines.push(line);
     }

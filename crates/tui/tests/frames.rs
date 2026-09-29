@@ -1918,7 +1918,7 @@ fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
 /// window scrolls), whatever the rows above and below carry as evidence.
 #[test]
 fn one_down_moves_the_selection_one_row_at_80x24() {
-    use ratatui::style::Color;
+    use ratatui::style::Modifier;
     use swamp_core::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
     let mut report = fixture_report();
     let evidence = vec![
@@ -1968,7 +1968,7 @@ fn one_down_moves_the_selection_one_row_at_80x24() {
         t.draw(|f| ui::draw(f, app)).unwrap();
         let buf = t.backend().buffer().clone();
         (0..24u16)
-            .find(|y| buf[(0, *y)].bg == Color::Indexed(236))
+            .find(|y| buf[(0, *y)].modifier.contains(Modifier::REVERSED))
             .expect("a selected row is drawn") as usize
     };
     let mut prev = selected_row(&app);
@@ -2059,4 +2059,39 @@ fn the_busy_glyph_moves_between_redraws() {
     app.frame += 1;
     let b = capture(&app, 80, 24);
     assert_ne!(a, b);
+}
+
+/// The selected row is marked by reverse video: an attribute, not a color,
+/// so it follows any theme (light included) and survives `NO_COLOR`. No
+/// cell sets a background color, and nothing else on the screen is
+/// reversed.
+#[test]
+fn the_selected_row_is_reverse_video_and_sets_no_background_color() {
+    use ratatui::style::{Color, Modifier};
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.clear_filter();
+    for (w, h) in [(50u16, 20u16), (80, 24), (120, 40)] {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, &app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let reversed_rows: Vec<u16> = (0..h)
+            .filter(|y| buf[(0, *y)].modifier.contains(Modifier::REVERSED))
+            .collect();
+        assert_eq!(reversed_rows.len(), 1, "{w}x{h}: exactly one selected row");
+        let y = reversed_rows[0];
+        for x in 0..w {
+            let c = &buf[(x, y)];
+            // The second cell of a wide glyph (an emoji badge) is not drawn.
+            let continuation = x > 0
+                && buf[(x - 1, y)]
+                    .symbol()
+                    .chars()
+                    .any(|ch| ch as u32 > 0x2fff);
+            assert!(
+                continuation || c.modifier.contains(Modifier::REVERSED),
+                "{w}x{h} cell {x} {c:?}"
+            );
+            assert_eq!(c.bg, Color::Reset, "{w}x{h}: no fixed background");
+        }
+    }
 }
