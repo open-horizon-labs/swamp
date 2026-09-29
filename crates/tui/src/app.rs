@@ -11,6 +11,40 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use swamp_core::report::Report;
 
+/// Every distinct refusal with how many rows it covered, so a bulk mark
+/// that skipped rows says how many and why, not only the first reason.
+fn summarize_refusals(reasons: &[String]) -> Option<String> {
+    if reasons.is_empty() {
+        return None;
+    }
+    let mut distinct: Vec<(&str, usize)> = Vec::new();
+    for r in reasons {
+        match distinct.iter_mut().find(|(t, _)| *t == r.as_str()) {
+            Some((_, n)) => *n += 1,
+            None => distinct.push((r.as_str(), 1)),
+        }
+    }
+    if distinct.len() == 1 && distinct[0].1 == 1 {
+        return Some(distinct[0].0.to_string());
+    }
+    let shown: Vec<String> = distinct
+        .iter()
+        .take(3)
+        .map(|(t, n)| format!("{t} (x{n})"))
+        .collect();
+    let extra = distinct.len().saturating_sub(3);
+    let extra = if extra > 0 {
+        format!("; +{extra} more reasons")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} rows skipped: {}{extra}",
+        reasons.len(),
+        shown.join("; ")
+    ))
+}
+
 pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
 /// How long a finished operation's result line stays on screen.
 pub const RESULT_DISPLAY: Duration = Duration::from_secs(20);
@@ -234,6 +268,11 @@ pub struct App {
     /// Marked units, keyed by path string for stable identity.
     pub marked: BTreeMap<String, MarkedUnit>,
     pub confirm_open: bool,
+    /// Unit ids the press that opened the current confirm marked (Backspace
+    /// or `A` on an unmarked selection). Esc on that confirm unmarks exactly
+    /// these, so cancelling never leaves marks the screen did not show
+    /// before; marks made earlier with Space stay, and stay visible.
+    pub confirm_added: Vec<String>,
     pub help_open: bool,
     /// The filter picker form, when open.
     pub picker: Option<crate::picker::Picker>,
@@ -471,6 +510,7 @@ impl App {
             collapsed: HashSet::new(),
             marked: BTreeMap::new(),
             confirm_open: false,
+            confirm_added: Vec::new(),
             help_open: false,
             picker: None,
             completions: Vec::new(),
@@ -1025,7 +1065,7 @@ impl App {
     /// names how many and why.
     pub fn mark_all_in_view(&mut self) {
         let rows = self.rows();
-        let mut refused: Option<String> = None;
+        let mut refused: Vec<String> = Vec::new();
         let mut marked = 0usize;
         // Agents view (#91/#100/#101): `model::agent_rows` sets `unit`
         // on every row, protected/unsupported ones included, but never
@@ -1043,7 +1083,7 @@ impl App {
                     // checkout under the root behind one Enter.
                     let n = self.mark_project(&project, false);
                     if n == 0 {
-                        refused = refused.or(Some("nothing reclaimable in this project".into()));
+                        refused.push("nothing reclaimable in this project".into());
                     }
                     marked += n;
                 } else if row.unit.is_some() {
@@ -1070,28 +1110,26 @@ impl App {
                         marked += 1;
                     }
                 }
-                Err(why) => refused = refused.or(Some(why.into())),
+                Err(why) => refused.push(why.into()),
             }
         }
         if agent_skipped > 0 {
-            refused = refused.or(Some(format!(
+            refused.push(format!(
                 "{agent_skipped} agent-storage row{} protected, unsupported, or active; skipped",
                 if agent_skipped == 1 { " is" } else { "s are" }
-            )));
+            ));
         }
         if marked == 0 {
-            self.set_refusal(
-                refused
-                    .as_deref()
-                    .unwrap_or("nothing in this view can be acted on"),
-            );
+            let why = summarize_refusals(&refused)
+                .unwrap_or_else(|| "nothing in this view can be acted on".into());
+            self.set_refusal(&why);
             return;
         }
         // Some rows were left alone (agent-storage skip, or an empty
         // project) even though at least one row *was* marked: say so,
         // rather than silently proceeding to a confirm that looks like
         // it covers everything the human saw on screen.
-        if let Some(msg) = refused {
+        if let Some(msg) = summarize_refusals(&refused) {
             self.set_refusal(&msg);
         }
         self.confirm_open = true;
@@ -1116,6 +1154,59 @@ impl App {
     /// happens to show. Returns how many units it newly marked; a second
     /// press on a fully marked project clears it and returns 0.
     fn mark_project(&mut self, project: &str, include_checkouts: bool) -> usize {
+        let units = self.project_units(project, include_checkouts);
+        if units.is_empty() {
+            return 0;
+        }
+        let marked_already = |app: &Self, r: &Row| {
+            r.unit
+                .as_ref()
+                .is_some_and(|u| app.marked.contains_key(&u.0))
+        };
+        if units.iter().all(|r| marked_already(self, r)) {
+            for r in &units {
+                if let Some(u) = &r.unit {
+                    self.marked.remove(&u.0);
+                }
+            }
+            return 0;
+        }
+        let mut newly = 0usize;
+        for r in units {
+            if marked_already(self, &r) {
+                continue;
+            }
+            self.mark_row(&r);
+            newly += 1;
+        }
+        newly
+    }
+
+    /// How many of a project's markable units are marked, and how many it
+    /// has: what a projects-view row draws (`✗` all, `~n/m` some). The unit
+    /// set is the one Space/Backspace on the row would mark, checkouts
+    /// included when nothing rebuildable exists.
+    pub fn project_mark_state(&self, project: &str) -> (usize, usize) {
+        if self.marked.is_empty() {
+            return (0, 0);
+        }
+        let mut units = self.project_units(project, false);
+        if units.is_empty() {
+            units = self.project_units(project, true);
+        }
+        let marked = units
+            .iter()
+            .filter(|r| {
+                r.unit
+                    .as_ref()
+                    .is_some_and(|u| self.marked.contains_key(&u.0))
+            })
+            .count();
+        (marked, units.len())
+    }
+
+    /// The rows a mark on this project row acts on.
+    fn project_units(&self, project: &str, include_checkouts: bool) -> Vec<Row> {
         let rows = model::tree_rows(
             &self.report,
             project,
@@ -1147,31 +1238,7 @@ impl App {
                 .cloned()
                 .collect();
         }
-        if units.is_empty() {
-            return 0;
-        }
-        let marked_already = |app: &Self, r: &Row| {
-            r.unit
-                .as_ref()
-                .is_some_and(|u| app.marked.contains_key(&u.0))
-        };
-        if units.iter().all(|r| marked_already(self, r)) {
-            for r in &units {
-                if let Some(u) = &r.unit {
-                    self.marked.remove(&u.0);
-                }
-            }
-            return 0;
-        }
-        let mut newly = 0usize;
-        for r in units {
-            if marked_already(self, &r) {
-                continue;
-            }
-            self.mark_row(&r);
-            newly += 1;
-        }
-        newly
+        units
     }
 
     /// The mark decision for one row (testable without a selection).
@@ -1611,6 +1678,7 @@ impl App {
             return;
         }
         if confirm && !self.marked.is_empty() {
+            self.confirm_added.clear();
             self.open_confirm();
             return;
         }
@@ -1731,9 +1799,26 @@ impl App {
                             .as_ref()
                             .is_some_and(|op| op.cancel.load(std::sync::atomic::Ordering::SeqCst));
                     if !cancelled {
+                        let before = std::mem::take(&mut self.marked);
+                        let added: Vec<String> = marked
+                            .keys()
+                            .filter(|k| !before.contains_key(*k))
+                            .cloned()
+                            .collect();
+                        let removed = before.keys().filter(|k| !marked.contains_key(*k)).count();
                         self.marked = marked;
                         self.refusal = refusal.map(|msg| (msg, Instant::now()));
                         self.confirm_open = confirm && !self.marked.is_empty();
+                        if self.confirm_open {
+                            self.confirm_added = added.clone();
+                        } else {
+                            self.confirm_added.clear();
+                            // Space: say where the marks stand, the row
+                            // itself may not show a change (a project row
+                            // stands for many units).
+                            let msg = self.mark_state_line(added.len(), removed);
+                            self.set_result(msg);
+                        }
                     } else {
                         self.set_result(
                             "Review cancelled; previous selection preserved; nothing deleted"
@@ -1786,7 +1871,9 @@ impl App {
 
     pub fn refusal_active(&self) -> Option<&str> {
         self.refusal.as_ref().and_then(|(msg, at)| {
-            if at.elapsed() < REFUSAL_DISPLAY {
+            // While a confirm is open the refusals it carries (what `A`
+            // skipped and why) stay until the human answers it.
+            if self.confirm_open || at.elapsed() < REFUSAL_DISPLAY {
                 Some(msg.as_str())
             } else {
                 None
@@ -1807,17 +1894,67 @@ impl App {
             && let Some(row) = self.selected_row()
         {
             self.mark_row(&row);
+            self.confirm_added = self.marked.keys().cloned().collect();
+        } else {
+            self.confirm_added.clear();
         }
         self.open_confirm();
     }
 
+    /// Esc on the confirm: nothing is deleted, and the marks the opening
+    /// press made are taken back so a later Backspace on another row asks
+    /// about that row. Marks made earlier (Space) stay, drawn on the rows.
     pub fn cancel_confirm(&mut self) {
+        if !self.confirm_open {
+            return;
+        }
         self.confirm_open = false;
+        self.refusal = None;
+        let undone = std::mem::take(&mut self.confirm_added);
+        for id in &undone {
+            self.marked.remove(id);
+        }
+        let kept = self.marked.len();
+        let msg = match (undone.len(), kept) {
+            (0, 0) => "Cancelled. Nothing was deleted.".to_string(),
+            (0, k) => format!(
+                "Cancelled. Nothing was deleted. {k} still marked (Space unmarks, Backspace asks again)."
+            ),
+            (n, 0) => format!("Cancelled. Nothing was deleted. Unmarked the {n} it had marked."),
+            (n, k) => format!(
+                "Cancelled. Nothing was deleted. Unmarked the {n} it had marked; {k} marked earlier remain."
+            ),
+        };
+        self.set_result(msg);
+    }
+
+    /// One line on where the marks stand after a Space, for the result row.
+    fn mark_state_line(&self, added: usize, removed: usize) -> String {
+        let total = self.marked.len();
+        let bytes: u64 = self.marked.values().map(|u| u.bytes).sum();
+        if total == 0 {
+            return if removed > 0 {
+                format!("Unmarked {removed}. Nothing is marked.")
+            } else {
+                "Nothing marked.".to_string()
+            };
+        }
+        let change = if added > 0 {
+            format!("Marked {added} more. ")
+        } else if removed > 0 {
+            format!("Unmarked {removed}. ")
+        } else {
+            String::new()
+        };
+        format!(
+            "{change}{total} marked in all ({}). Backspace deletes them (asks first); Space on a row unmarks.",
+            model::human_bytes(bytes)
+        )
     }
 
     pub fn confirm_summary(&self) -> String {
         let units: Vec<MarkedUnit> = self.marked.values().cloned().collect();
-        actions::confirm_summary(&units, self.keep_executables)
+        actions::confirm_summary(&units)
     }
 
     /// Enter on the confirm banner: this keypress at the keyboard is the
@@ -1863,6 +2000,7 @@ impl App {
         });
         self.operation_rx = Some(rx);
         self.confirm_open = false;
+        self.confirm_added.clear();
         self.last_result = None;
         self.refusal = None;
         crate::worker::spawn(move || {
@@ -1936,8 +2074,9 @@ impl App {
             )
         } else {
             format!(
-                "{ok} deleted, {} refused · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
+                "{ok} deleted, {} refused (first: {}) · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
                 failed.len(),
+                failed[0],
                 model::human_bytes(planned)
             )
         });
@@ -3289,7 +3428,7 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         assert!(app.confirm_open, "one 'are you sure', with the facts on it");
         assert!(app.confirm_summary().contains("node_modules"));
-        assert!(app.confirm_summary().contains("Enter yes"));
+        assert!(app.confirm_summary().contains("→ Trash"));
     }
 
     #[test]
@@ -3301,7 +3440,21 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         app.open_confirm();
         assert!(app.confirm_open);
-        assert!(app.confirm_summary().contains("delete node_modules"));
+        assert!(app.confirm_summary().contains("Move 1 item"));
+    }
+
+    #[test]
+    fn bulk_refusals_are_counted_not_first_only() {
+        let a = "nothing reclaimable in this project".to_string();
+        let b = "protected".to_string();
+        assert_eq!(summarize_refusals(&[]), None);
+        assert_eq!(
+            summarize_refusals(std::slice::from_ref(&a)),
+            Some(a.clone())
+        );
+        let m = summarize_refusals(&[a.clone(), a.clone(), b.clone()]).unwrap();
+        assert!(m.starts_with("3 rows skipped:"), "{m}");
+        assert!(m.contains("(x2)") && m.contains("protected (x1)"), "{m}");
     }
 
     #[test]

@@ -1595,3 +1595,186 @@ fn node_and_gradle_family_group_frames() {
         );
     }
 }
+
+// ---- confirm copy, project mark state, Esc semantics (v0.7.5 audit C1/C2/H5) ----
+
+fn plain_unit(path: &str, bytes: u64) -> swamp_tui::actions::MarkedUnit {
+    swamp_tui::actions::MarkedUnit {
+        cargo_unit: None,
+        agent_unit: None,
+        path: PathBuf::from(path),
+        docker: None,
+        worktree_path: PathBuf::from(path),
+        bytes,
+        observed_at: 0,
+        worktree: None,
+        label: path.to_string(),
+        warnings: Vec::new(),
+    }
+}
+
+fn wait_idle(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.operation.is_some() {
+        assert!(std::time::Instant::now() < deadline);
+        app.poll_operation();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The confirm must show count, size and destination (and the docker
+/// "for good" line) at every width, however long the warnings are.
+#[test]
+fn confirm_keeps_count_size_and_destination_at_every_width() {
+    for w in [50u16, 80, 120, 320] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        let long = "reclaimable space is a bound, not exact: APFS clone/snapshot extent sharing outside this selection is not queried".to_string();
+        for i in 0..5 {
+            let mut u = plain_unit(&format!("/Users/dev/src/p/dir{i}"), 3_000_000_000);
+            u.warnings = vec![long.clone()];
+            app.marked.insert(u.path.display().to_string(), u);
+        }
+        let mut d = plain_unit("/docker/img", 1_200_000_000);
+        d.docker = Some(swamp_core::docker::Removal::Image { id: "abc".into() });
+        d.label = "redis:7".into();
+        app.marked.insert("/docker/img".into(), d);
+        app.confirm_open = true;
+        let f = capture(&app, w, 24);
+        let rows: Vec<&str> = f.lines().collect();
+        let top: String = rows[rows.len().saturating_sub(12)..].join("\n");
+        assert!(top.contains("Move 5 items (15.0GB) → Trash"), "w={w}\n{f}");
+        assert!(
+            top.contains("Remove 1 docker item (1.2GB) for good"),
+            "w={w}\n{f}"
+        );
+        assert!(top.contains("redis:7 (docker image)"), "w={w}\n{f}");
+        assert!(f.contains("Enter yes · Esc no"), "w={w}\n{f}");
+        // Count, size and destination are on the first confirm row itself.
+        let first = rows
+            .iter()
+            .find(|r| r.contains("Move 5 items"))
+            .unwrap_or_else(|| panic!("no first row w={w}\n{f}"));
+        assert!(
+            first.contains("(15.0GB) → Trash"),
+            "clipped at w={w}: {first}"
+        );
+    }
+}
+
+/// A refusal toast must not replace the confirm keys, and a bulk mark says
+/// how many rows it skipped and why (all reasons, counted).
+#[test]
+fn a_refusal_during_confirm_keeps_the_keys_and_counts_every_reason() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    let u = plain_unit("/Users/dev/src/p/dir", 1_000_000);
+    app.marked.insert(u.path.display().to_string(), u);
+    app.confirm_open = true;
+    app.refusal = Some((
+        "refused: 3 rows skipped: nothing reclaimable in this project (x2); protected (x1)".into(),
+        std::time::Instant::now() - std::time::Duration::from_secs(30),
+    ));
+    for w in [50u16, 80, 120] {
+        let f = capture(&app, w, 24);
+        assert!(f.contains("Enter yes · Esc no"), "w={w}\n{f}");
+        assert!(f.contains("3 rows skipped"), "w={w}\n{f}");
+        assert!(f.contains("Move 1 item"), "w={w}\n{f}");
+    }
+}
+
+/// Space on a project row: the row shows a mark state and a result line
+/// says how many are marked. Space again clears it.
+#[test]
+fn space_on_a_project_row_shows_marks_and_a_result() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
+    app.width = 80;
+    swamp_tui::handle_key(&mut app, KeyCode::Char('0'));
+    assert_eq!(app.view, ViewKind::Projects);
+    swamp_tui::handle_key(&mut app, KeyCode::Char(' '));
+    wait_idle(&mut app);
+    assert!(!app.confirm_open);
+    assert!(!app.marked.is_empty());
+    let f = capture(&app, 80, 24);
+    assert!(
+        f.contains("✗ ") || f.contains('~'),
+        "no mark on the project row:\n{f}"
+    );
+    assert!(f.contains("marked in all"), "no result line:\n{f}");
+    let (n, of) = app.project_mark_state("mole");
+    assert!(n > 0 && n <= of, "{n}/{of}");
+    swamp_tui::handle_key(&mut app, KeyCode::Char(' '));
+    wait_idle(&mut app);
+    assert!(app.marked.is_empty());
+    assert!(capture(&app, 80, 24).contains("Nothing is marked"));
+}
+
+/// Backspace, Esc, move, Backspace elsewhere: the second confirm is about
+/// the second row. Esc must not leave marks the Backspace made.
+#[test]
+fn esc_on_a_confirm_takes_back_the_marks_it_made() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
+    app.width = 80;
+    swamp_tui::handle_key(&mut app, KeyCode::Char('0'));
+    swamp_tui::handle_key(&mut app, KeyCode::Backspace);
+    wait_idle(&mut app);
+    assert!(app.confirm_open);
+    let first: Vec<String> = app.marked.keys().cloned().collect();
+    assert!(!first.is_empty());
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+    assert!(!app.confirm_open);
+    assert!(
+        app.marked.is_empty(),
+        "Esc left invisible marks: {:?}",
+        app.marked.keys()
+    );
+    swamp_tui::handle_key(&mut app, KeyCode::Down);
+    swamp_tui::handle_key(&mut app, KeyCode::Backspace);
+    wait_idle(&mut app);
+    for k in app.marked.keys() {
+        assert!(!first.contains(k), "the first row's mark came back: {k}");
+    }
+}
+
+/// Marks made earlier with Space survive an Esc and stay drawn.
+#[test]
+fn esc_keeps_marks_made_by_space_and_says_so() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
+    app.width = 80;
+    swamp_tui::handle_key(&mut app, KeyCode::Char('0'));
+    swamp_tui::handle_key(&mut app, KeyCode::Char(' '));
+    wait_idle(&mut app);
+    let marked = app.marked.len();
+    swamp_tui::handle_key(&mut app, KeyCode::Backspace);
+    assert!(
+        app.confirm_open,
+        "marks exist, so Backspace asks about them"
+    );
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+    assert_eq!(app.marked.len(), marked);
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("still marked"), "{f}");
+    assert!(f.contains("✗ ") || f.contains('~'), "{f}");
+}
+
+/// A whole checkout is named as one, and the help no longer claims the
+/// checkout always stays.
+#[test]
+fn a_checkout_is_named_as_a_checkout() {
+    let mut u = plain_unit("/Users/dev/src/esp32", 5_000_000);
+    u.worktree = Some(swamp_tui::actions::WorktreeTerms {
+        merge_complete: false,
+        pr: None,
+        whole_checkout: true,
+        remote: None,
+    });
+    let s = swamp_tui::actions::confirm_summary(std::slice::from_ref(&u));
+    assert!(s.contains("checkout esp32"), "{s}");
+    assert!(s.contains(".git and source"), "{s}");
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.help_open = true;
+    let f = capture(&app, 120, 50);
+    assert!(!f.contains("source stay"), "{f}");
+    assert!(f.contains("checkout"), "{f}");
+}

@@ -29,6 +29,19 @@ observations, not general performance guarantees. See the README for current use
   instead of 16.3 here. A failed or partial listing is still reported as unknown, never
   free. While the check runs, the overlay reads `Checking which files are open…` with
   elapsed time and no promised duration.
+- **The delete confirmation leads with what matters and no longer clips it.** It used to
+  be one line that ended in the size, the count and where the files go, so a long warning
+  pushed them off the screen at any width. It now wraps onto rows: `Move 5 items (15.0GB)
+  → Trash. Space is freed when Trash is emptied.`, then any docker items named as
+  `Remove 2 docker items (1.2GB) for good, no Trash.`, then the names, then each warning on
+  its own line. `Enter yes · Esc no` stays on the bottom row even while a refusal shows.
+  A bulk mark that skipped rows now says how many and why, not only the first reason.
+- **Marks are visible and Esc no longer leaves hidden ones.** A project row shows `✗` when
+  everything in it is marked and `~2/6` when some is. Space on a project says how many are
+  marked and how large. Esc on a confirm unmarks what that Backspace or `A` marked (marks
+  you made with Space stay, drawn on their rows), so a later Backspace on another row asks
+  about that row. When a project has nothing rebuildable, Backspace names its `checkout`
+  in the confirmation, and the help no longer says the checkout always stays.
 - **The key legend no longer disappears after a delete.** The result of a delete now
   shows on its own line above the legend for 20 seconds instead of replacing it, and
   says the files were moved to Trash, so space is freed only when Trash is emptied. The

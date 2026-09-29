@@ -304,8 +304,69 @@ fn footer_legend(width: usize) -> String {
     }
 }
 
+/// The confirm region as lines: count, size and destination first, what
+/// cannot come back next, then what a bulk mark skipped (all of it, counted),
+/// then names and warnings. Tail lines are the ones dropped when the screen
+/// is short, never the numbers.
+fn confirm_lines(app: &App) -> Vec<(String, Color)> {
+    let summary = app.confirm_summary();
+    let mut lines: Vec<(String, Color)> = summary
+        .lines()
+        .map(|l| (l.to_string(), Color::Yellow))
+        .collect();
+    if let Some(msg) = app.refusal_active() {
+        let head = lines
+            .iter()
+            .take_while(|(l, _)| {
+                l.starts_with("Move ") || l.starts_with("Remove ") || l.starts_with("Gone for good")
+            })
+            .count();
+        lines.insert(head, (msg.to_string(), Color::Red));
+    }
+    lines
+}
+
+/// Rows a greedy word wrap of `text` takes at `width` columns.
+fn wrapped_rows(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    let mut rows = 1usize;
+    let mut cur = 0usize;
+    for word in text.split_whitespace() {
+        let wl = word.chars().count();
+        if cur == 0 {
+            cur = wl;
+        } else if cur + 1 + wl <= width {
+            cur += 1 + wl;
+        } else {
+            rows += 1;
+            cur = wl;
+        }
+        while cur > width {
+            rows += 1;
+            cur -= width;
+        }
+    }
+    rows
+}
+
+/// Height of the confirm region: every line wrapped, capped so the table
+/// keeps at least half the screen.
+fn confirm_height(lines: &[(String, Color)], area: Rect) -> u16 {
+    let need: usize = lines
+        .iter()
+        .map(|(l, _)| wrapped_rows(l, area.width as usize))
+        .sum();
+    let cap = (area.height as usize).saturating_sub(4) / 2;
+    need.min(cap.max(2)).max(1) as u16
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
     let size = frame.area();
+    let confirm = if app.confirm_open && app.operation.is_none() {
+        confirm_lines(app)
+    } else {
+        Vec::new()
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -315,7 +376,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Constraint::Length(if app.operation.is_some() {
                 3
             } else if app.confirm_open {
-                1
+                confirm_height(&confirm, size)
             } else if app.result_active().is_some() {
                 // The result gets its own lines; the legend below stays.
                 2
@@ -392,8 +453,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
             },
         );
     } else if app.confirm_open {
+        let text: Vec<Line> = confirm
+            .iter()
+            .map(|(l, c)| Line::styled(l.clone(), Style::default().fg(*c)))
+            .collect();
         frame.render_widget(
-            Paragraph::new(app.confirm_summary()).style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: true }),
             chunks[3],
         );
     } else if let Some(r) = app.result_active() {
@@ -412,10 +477,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
         } else {
             "Esc / Ctrl-C: stop after current group · completed moves remain in Trash".into()
         }
+    } else if app.confirm_open {
+        // The keys stay put whatever else is showing; refusals live in the
+        // confirm region above.
+        if app.keep_executables {
+            "Enter yes · Esc no · keep executables → bin/ (k)".to_string()
+        } else {
+            "Enter yes · Esc no · k keep executables".to_string()
+        }
     } else if let Some(msg) = app.refusal_active() {
         msg.to_string()
-    } else if app.confirm_open {
-        "Enter yes · Esc no".to_string()
     } else if app.picker.is_some() {
         "↑↓ field · ←→ value · Space grew/shrank · type to narrow project · Enter apply · Esc cancel · e edit as text · 0 clear".to_string()
     } else if app.editing_filter {
@@ -423,7 +494,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else {
         footer_legend(size.width as usize)
     };
-    let footer_style = if app.refusal_active().is_some() {
+    let footer_style = if app.refusal_active().is_some() && !app.confirm_open {
         Style::default().fg(Color::Red)
     } else {
         Style::default()
@@ -717,7 +788,25 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
                     .iter()
                     .all(|u| app.marked.contains_key(&u.path.display().to_string()));
         }
-        let mark_prefix = if marked { "✗ " } else { "" };
+        // A projects-view row stands for many units: `✗` when all are
+        // marked, `~n/m` when some are.
+        let mut mark_prefix = if marked {
+            "✗ ".to_string()
+        } else {
+            String::new()
+        };
+        if row.unit.is_none()
+            && row.kind.is_none()
+            && row.expansion_key.is_none()
+            && let Some(project) = row.project.as_deref()
+        {
+            let (n, of) = app.project_mark_state(project);
+            if of > 0 && n == of {
+                mark_prefix = "✗ ".to_string();
+            } else if n > 0 {
+                mark_prefix = format!("~{n}/{of} ");
+            }
+        }
         let track = match row.track {
             Some(t) if !t.label().is_empty() => format!("  [{}]", t.label()),
             _ => String::new(),
@@ -1020,14 +1109,20 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  →/←       in / out: open or expand · collapse or go back"),
         Line::from("  Enter     open project / confirm delete"),
         Line::from(
-            "  Space     mark / unmark the row
-  A         mark every row here the tool can act on
-  Backspace delete what is under the cursor (or the marks), asks once
-            on a project row, that is every artifact it holds; its checkout, .git and source stay",
+            "  Space     mark / unmark the row; on a project row, everything rebuildable in it",
+        ),
+        Line::from("  A         mark every row here the tool can act on"),
+        Line::from("  Backspace delete what is under the cursor (or the marks), asks once"),
+        Line::from(
+            "            on a project row: its rebuildable artifacts; only if it has none, its checkout",
+        ),
+        Line::from(
+            "            (named 'checkout' in the confirm, with .git and source, into Trash)",
         ),
         Line::from(
             "            paths go to Trash; docker images and volumes are removed by the daemon and do not",
         ),
+        Line::from("  ✗ / ~n/m  a project row is all marked / n of m units marked"),
         Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
         Line::from("  0         clear filter"),
         Line::from(

@@ -403,59 +403,42 @@ pub fn free_space_bytes(path: &Path) -> Option<u64> {
     swamp_core::actions::free_space_bytes(path)
 }
 
-/// Human summary line for the confirm banner: current facts, shown
-/// once, before Enter -- never re-checked afterward.
-pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
-    let total: u64 = units.iter().map(|u| u.bytes).sum();
-    let what: Vec<String> = units
-        .iter()
-        .take(3)
-        .map(|u| {
-            let name = u
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&u.label)
-                .to_string();
-            if u.warnings.is_empty() {
-                name
-            } else {
-                format!("{name} ⚠ {}", u.warnings.join(" · "))
-            }
-        })
-        .collect();
-    let more = if units.len() > 3 {
-        format!(" +{} more", units.len() - 3)
-    } else {
-        String::new()
+/// Human summary for the confirm banner: current facts, shown once,
+/// before Enter -- never re-checked afterward.
+///
+/// One line per fact, in the order a person authorizing a delete needs
+/// them: count, size and destination first, then what cannot come back,
+/// then names, then warnings. The lines are separate so the screen can
+/// wrap or cut at the tail; the numbers are never behind the names.
+pub fn confirm_summary(units: &[MarkedUnit]) -> String {
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
     };
-    let keep = if keep_executables {
-        " · keep executables → bin/ (k)"
-    } else {
-        " · k keep executables"
-    };
+    let permanent_units: Vec<&MarkedUnit> = units.iter().filter(|u| u.docker.is_some()).collect();
+    let trash_units = units.len() - permanent_units.len();
+    let permanent: u64 = permanent_units.iter().map(|u| u.bytes).sum();
+    let trash_bytes: u64 = units.iter().map(|u| u.bytes).sum::<u64>() - permanent;
+    let mut lines: Vec<String> = Vec::new();
     // Two destinations, and the difference is the whole point: a path
     // goes to Trash and comes back, a Docker object does not.
-    let permanent_units: Vec<&MarkedUnit> = units.iter().filter(|u| u.docker.is_some()).collect();
-    let permanent: u64 = permanent_units.iter().map(|u| u.bytes).sum();
-    let destination = match (permanent, total - permanent) {
-        (0, _) => "→ Trash".to_string(),
-        (p, 0) => format!("→ removed permanently, no Trash ({})", human_bytes(p)),
-        (p, t) => format!(
-            "→ {} to Trash, {} removed permanently (docker, no Trash)",
-            human_bytes(t),
-            human_bytes(p)
-        ),
-    };
-    // Name every unit that cannot come back, not just its bytes. One
-    // project expands into many units, and the three the line has room
-    // for are usually ordinary directories -- which left the one
-    // irreversible thing in the plan showing as a number and nothing
-    // else. The human authorizing this should read what they are
-    // destroying by name.
-    let no_way_back = if permanent_units.is_empty() {
-        String::new()
-    } else {
+    if trash_units > 0 {
+        lines.push(format!(
+            "Move {} ({}) → Trash. Space is freed when Trash is emptied.",
+            plural(trash_units, "item", "items"),
+            human_bytes(trash_bytes)
+        ));
+    }
+    if !permanent_units.is_empty() {
+        lines.push(format!(
+            "Remove {} ({}) for good, no Trash.",
+            plural(permanent_units.len(), "docker item", "docker items"),
+            human_bytes(permanent)
+        ));
+        // Name every unit that cannot come back, not just its bytes.
         let names: Vec<String> = permanent_units
             .iter()
             .take(6)
@@ -483,13 +466,62 @@ pub fn confirm_summary(units: &[MarkedUnit], keep_executables: bool) -> String {
         } else {
             String::new()
         };
-        format!(" · gone for good: {}{extra}", names.join(", "))
-    };
-    format!(
-        "delete {}{more} ({}) {destination}{no_way_back}?  Enter yes · Esc no{keep}",
-        what.join(", "),
-        human_bytes(total)
-    )
+        lines.push(format!("Gone for good: {}{extra}", names.join(", ")));
+    }
+    // Names, checkouts spelled out as such.
+    let names: Vec<String> = units
+        .iter()
+        .filter(|u| u.docker.is_none())
+        .take(3)
+        .map(|u| {
+            let name = u
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&u.label)
+                .to_string();
+            match &u.worktree {
+                Some(t) if t.whole_checkout => format!("checkout {name}"),
+                Some(_) => format!("worktree {name}"),
+                None => name,
+            }
+        })
+        .collect();
+    if !names.is_empty() {
+        let more = trash_units.saturating_sub(3);
+        let more = if more > 0 {
+            format!(" +{more} more")
+        } else {
+            String::new()
+        };
+        lines.push(format!("Includes: {}{more}", names.join(", ")));
+    }
+    if units
+        .iter()
+        .any(|u| u.worktree.as_ref().is_some_and(|t| t.whole_checkout))
+    {
+        lines.push("A checkout takes its working copy, .git and source (into Trash).".to_string());
+    }
+    // Warnings, one line per distinct warning with how many items carry
+    // it, never inlined into the names.
+    let mut warned: Vec<(String, usize)> = Vec::new();
+    for w in units.iter().flat_map(|u| u.warnings.iter()) {
+        match warned.iter_mut().find(|(t, _)| t == w) {
+            Some((_, n)) => *n += 1,
+            None => warned.push((w.clone(), 1)),
+        }
+    }
+    for (text, n) in warned.iter().take(3) {
+        if *n > 1 {
+            lines.push(format!("⚠ {text} ({n} items)"));
+        } else {
+            lines.push(format!("⚠ {text}"));
+        }
+    }
+    if warned.len() > 3 {
+        lines.push(format!("⚠ +{} more warnings", warned.len() - 3));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -518,14 +550,14 @@ mod tests {
             10,
             Some(swamp_core::docker::Removal::Image { id: "abc".into() }),
         );
-        let summary = confirm_summary(std::slice::from_ref(&u), false);
+        let summary = confirm_summary(std::slice::from_ref(&u));
         assert!(summary.contains("/x"));
     }
 
     #[test]
     fn a_plan_with_no_docker_says_nothing_about_permanence() {
         let u = unit("/x", 10, None);
-        let summary = confirm_summary(std::slice::from_ref(&u), false);
+        let summary = confirm_summary(std::slice::from_ref(&u));
         assert!(!summary.to_lowercase().contains("permanent"));
     }
 
