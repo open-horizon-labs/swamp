@@ -50,13 +50,14 @@ depends on an unreviewed tap edit is how the two get out of step.
 
 ## After publishing
 
-The release workflow gates publication on the full tier (`check-full.yml`)
-having passed for the tagged commit and on smoke tests of the actual optimized
-archives, including the Linux archive on the newest hosted Ubuntu. The full
-tier runs on every push to main, so tag a commit after its push run has
-started: the release waits for that run instead of repeating it (about 27
-minutes), and dispatches one itself only when there is none. A failed run
-blocks the release; fix it and push, do not re-tag over it. Do not add `cargo test --workspace --release` to
+The release workflow gates publication on both `ci.yml` and the full tier
+(`check-full.yml`) having passed for the tagged commit, and on smoke tests of
+the actual optimized archives, including the Linux archive on the newest
+hosted Ubuntu. Both workflows run on every push to main, so tag a commit after
+its push runs have started: the release waits for them instead of repeating
+them (the full tier alone is about 27 minutes), fails as soon as a job in
+every active run has failed, and dispatches a run itself only when there is
+none. A failed run blocks the release; fix it and push, do not re-tag over it. Do not add `cargo test --workspace --release` to
 packaging jobs: compiling every test executable with shipping LTO settings
 cost 48 minutes on the 0.7.0 Linux runner, before roughly two minutes of tests.
 Keep full-suite correctness checks in `check-full.yml` and packaged-binary

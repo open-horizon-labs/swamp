@@ -94,10 +94,10 @@ for t in \
   test -f "crates/$t.rs" || { echo "named test target crates/$t.rs is gone" >&2; exit 1; }
 done
 
-# The release gate's own logic (scripts/verify-full-tier.sh) against a fake
+# The release gate's own logic (scripts/verify-gates.sh) against a fake
 # `gh`: a gate that passes when it should not is worse than a slow one.
 step gate-scripts
-./scripts/verify-full-tier.test.sh
+./scripts/verify-gates.test.sh
 
 step greps
 # These checks intentionally fail obvious safety regressions in source

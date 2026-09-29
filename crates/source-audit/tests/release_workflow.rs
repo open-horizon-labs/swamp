@@ -39,23 +39,26 @@ fn packaging_tests_archives_without_rebuilding_workspace_tests() {
 }
 
 #[test]
-fn publication_still_requires_the_full_tier_and_all_archive_checks() {
-    // The release waits for the full tier to have passed on this exact
-    // commit; it does not rebuild and re-run it (about 27 minutes).
-    let gate = job("full-tier");
-    assert!(gate.contains("scripts/verify-full-tier.sh"));
+fn publication_still_requires_ci_the_full_tier_and_all_archive_checks() {
+    // The release waits for `ci.yml` and the full tier to have passed on
+    // this exact commit; it does not rebuild and re-run either (the full
+    // tier alone is about 27 minutes).
+    let gate = job("gates");
+    assert!(gate.contains("scripts/verify-gates.sh"));
     assert!(
         !gate.contains("scripts/check-full.sh"),
         "the gate must not re-run the tier"
     );
+    // The script's own default is the release's contract, so it must name
+    // both workflows.
+    let script = include_str!("../../../scripts/verify-gates.sh");
+    assert!(
+        script.contains("VERIFY_WORKFLOWS:-ci.yml check-full.yml"),
+        "the gate must require both ci.yml and check-full.yml"
+    );
     let publish = job("release");
     let needs = publish.split("runs-on:").next().unwrap();
-    for name in [
-        "macos-arm64",
-        "linux-x86_64",
-        "linux-x86_64-newer",
-        "full-tier",
-    ] {
+    for name in ["macos-arm64", "linux-x86_64", "linux-x86_64-newer", "gates"] {
         assert!(needs.contains(&format!("{name},")), "missing gate {name}");
     }
     for name in ["macos-arm64-check-full", "linux-x86_64-check-full"] {
