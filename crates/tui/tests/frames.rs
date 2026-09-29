@@ -2093,6 +2093,7 @@ fn the_selected_row_is_reverse_video_and_sets_no_background_color() {
                 "{w}x{h} cell {x} {c:?}"
             );
             assert_eq!(c.bg, Color::Reset, "{w}x{h}: no fixed background");
+            assert_eq!(c.fg, Color::Reset, "{w}x{h}: no color inside the bar");
         }
     }
 }

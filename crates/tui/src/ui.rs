@@ -1231,6 +1231,13 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
         let mut spans = spans;
         if i == app.selected {
+            // No color inside the reverse-video bar: a colored span would
+            // turn into a colored block, and under NO_COLOR the terminal
+            // is told to reset at each one, cutting the bar short. The
+            // sign of the change is in the number.
+            for sp in &mut spans {
+                sp.style.fg = None;
+            }
             // The bar runs the full width, not only as far as the text.
             let used: usize = spans
                 .iter()
