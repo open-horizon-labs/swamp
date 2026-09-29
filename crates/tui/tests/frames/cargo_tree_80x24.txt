@@ -21,4 +21,4 @@
 "Rebuild before rerunning · Space marks 2 exact groups for review; → inspects    "
 "members. Source and unrelated dependencies are not selected. Allocated size is  "
 "not guaranteed freed space.                                                     "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / fil"
+"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ? help  q quit "

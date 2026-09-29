@@ -546,7 +546,7 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-fn format_ago(now: u64, then: u64) -> String {
+pub fn format_ago(now: u64, then: u64) -> String {
     let secs = now.saturating_sub(then);
     if secs < 60 {
         format!("{secs}s ago")
@@ -772,6 +772,36 @@ pub fn acquire_lock(store_dir: &Path) -> Result<LockOutcome> {
             }
             Err(e) => return Err(e).context("create observe lock"),
         }
+    }
+}
+
+/// Who holds the observation lock, and since when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockHolder {
+    pub pid: u32,
+    pub since: u64,
+}
+
+/// Reads the lock's holder without taking, creating or removing the
+/// lock. `None` when nobody live holds it (no file, unparsable, or the
+/// owner pid is gone -- a stale file is left for `acquire_lock` to
+/// reclaim). Spawns one `kill -0`: never call it from a UI event thread.
+pub fn peek_lock(store_dir: &Path) -> Option<LockHolder> {
+    let contents = read_owned_string(lock_path(store_dir)).ok()?;
+    let mut parts = contents.trim().splitn(2, '\t');
+    let pid: u32 = parts.next()?.parse().ok()?;
+    let since: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    pid_alive(pid).then_some(LockHolder { pid, since })
+}
+
+/// `1m 12s` style duration for live status text.
+pub fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -1263,5 +1293,29 @@ mod tests {
         assert_eq!(read.outcome, "timeout");
         let text = fs::read_to_string(&log).unwrap();
         assert!(text.contains("outcome=timeout"));
+    }
+
+    #[test]
+    fn peek_lock_reads_holder_without_taking_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(peek_lock(tmp.path()), None);
+        let LockOutcome::Acquired(guard) = acquire_lock(tmp.path()).unwrap() else {
+            panic!("fresh store must acquire");
+        };
+        let holder = peek_lock(tmp.path()).expect("held");
+        assert_eq!(holder.pid, std::process::id());
+        // Peeking did not disturb the lock.
+        assert!(matches!(
+            acquire_lock(tmp.path()).unwrap(),
+            LockOutcome::HeldBy { .. }
+        ));
+        drop(guard);
+        assert_eq!(peek_lock(tmp.path()), None);
+    }
+
+    #[test]
+    fn elapsed_format() {
+        assert_eq!(format_elapsed(72), "1m 12s");
+        assert_eq!(format_elapsed(5), "5s");
     }
 }

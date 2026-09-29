@@ -21,4 +21,4 @@
 "found)]; note: check: inspect this unit directly (its manifest/metadata) to find"
 "a restoration source before removing it                                         "
 "                                                                                "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / fil"
+"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ? help  q quit "

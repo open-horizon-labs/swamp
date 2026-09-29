@@ -12,6 +12,11 @@ use std::time::{Duration, Instant};
 use swamp_core::report::Report;
 
 pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
+/// How long a finished operation's result line stays on screen.
+pub const RESULT_DISPLAY: Duration = Duration::from_secs(20);
+/// An index older than this is called stale in the header (a warning,
+/// not an error): the schedule is meant to keep it younger.
+pub const STALE_AFTER_SECS: u64 = 15 * 60;
 
 /// Same view set the CLI's `--view` exposes at root (`worktrees` there
 /// is `Projects` here: one row per project, same aggregation), plus
@@ -110,6 +115,15 @@ pub struct RefreshedObservation {
     /// The machine-wide build stores' interiors from the same pass;
     /// `None` exactly when `external_units` is.
     pub store_interiors: Option<Vec<swamp_core::artifact::NestedArtifact>>,
+}
+
+/// What the lock poller reports back to the event loop.
+enum LockPollMsg {
+    /// Who holds the observation lock right now (not this process).
+    Holder(Option<swamp_core::schedule::LockHolder>),
+    /// The holder finished: the store's newest observation, read off the
+    /// event thread.
+    Reloaded(Box<swamp_core::report::ReportSnapshot>),
 }
 
 type PendingObservation = anyhow::Result<RefreshedObservation>;
@@ -227,8 +241,24 @@ pub struct App {
     pub completions: Vec<String>,
     pub refusal: Option<(String, Instant)>,
     pub observing: Option<(u32, u32)>,
+    /// When this UI's own observation started, for the header's elapsed
+    /// time.
+    pub observing_started: Option<Instant>,
+    /// Another process (the scheduled `swamp observe`) currently holds
+    /// the observation lock; kept fresh by `start_lock_poll`.
+    pub external_observer: Option<swamp_core::schedule::LockHolder>,
+    lock_poll_rx: Option<std::sync::mpsc::Receiver<LockPollMsg>>,
+    /// Last operation outcome or refusal worth one header clause.
     pub last_result: Option<String>,
+    /// When `last_result` was set; it stops showing `RESULT_DISPLAY` later.
+    pub last_result_at: Option<Instant>,
     pub observed_label: String,
+    /// False only while the very first observation has not landed.
+    pub has_index: bool,
+    /// Header age and stale warning come from the report's own
+    /// `observed_at` against the clock (real sessions); off, the header
+    /// shows `observed_label` verbatim (fixtures with made-up times).
+    pub live_age: bool,
     /// Set when the store's volume is nearly full: the refresh was
     /// skipped and this stored report is all there is. Shown first in
     /// the header.
@@ -318,9 +348,14 @@ pub struct Operation {
     pub current: PathBuf,
     pub started: Instant,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A review's one open-file snapshot (`lsof`, ~15 s) is being taken;
+    /// no group can finish until it returns. When it began.
+    pub checking_open_files: Option<Instant>,
 }
 
 enum OperationEvent {
+    /// The review's open-file snapshot started (`true`) or finished.
+    OpenFileCheck(bool),
     Inspected(Vec<String>),
     Progress {
         completed: usize,
@@ -441,8 +476,14 @@ impl App {
             completions: Vec::new(),
             refusal: None,
             observing: None,
+            observing_started: None,
+            external_observer: None,
+            lock_poll_rx: None,
             last_result: None,
+            last_result_at: None,
             observed_label: "just now".to_string(),
+            has_index: true,
+            live_age: false,
             disk_banner: None,
             actor: "human".to_string(),
             sort: Sort::None,
@@ -612,6 +653,7 @@ impl App {
     /// worker already computed, and the unit vectors from the same pass.
     /// No I/O: everything was prepared off the event thread.
     pub fn install_refreshed(&mut self, fresh: RefreshedObservation) {
+        self.has_index = true;
         if let Some(m) = fresh.merged {
             self.reports_by_root = m.by_root;
             self.replace_report(m.report);
@@ -1521,6 +1563,7 @@ impl App {
             current: profile.clone(),
             started: Instant::now(),
             cancel: cancel.clone(),
+            checking_open_files: None,
         });
         self.operation_rx = Some(rx);
         crate::worker::spawn(move || {
@@ -1604,6 +1647,7 @@ impl App {
             current: PathBuf::new(),
             started: Instant::now(),
             cancel: cancel.clone(),
+            checking_open_files: None,
         });
         self.operation_rx = Some(rx);
         self.refusal = None;
@@ -1611,13 +1655,21 @@ impl App {
         crate::worker::spawn(move || {
             // One open-file snapshot serves every group in this pass,
             // instead of one directory-tree walk per group.
-            swamp_core::occupancy::OccupancySnapshot::scoped(|| {
-                if all {
-                    worker.mark_all_in_view();
-                } else if let Some(row) = row {
-                    worker.mark_row(&row);
-                }
-            });
+            let phase_tx = tx.clone();
+            swamp_core::occupancy::OccupancySnapshot::scoped_observed(
+                move |phase| {
+                    let _ = phase_tx.send(OperationEvent::OpenFileCheck(
+                        phase == swamp_core::occupancy::SnapshotPhase::Capturing,
+                    ));
+                },
+                || {
+                    if all {
+                        worker.mark_all_in_view();
+                    } else if let Some(row) = row {
+                        worker.mark_row(&row);
+                    }
+                },
+            );
             let _ = tx.send(OperationEvent::Reviewed {
                 marked: worker.marked,
                 refusal: worker.refusal.map(|(msg, _)| msg),
@@ -1643,6 +1695,11 @@ impl App {
                     self.cargo_inspection = Some(lines);
                     self.cargo_inspection_scroll = 0;
                     break;
+                }
+                OperationEvent::OpenFileCheck(active) => {
+                    if let Some(op) = &mut self.operation {
+                        op.checking_open_files = active.then(Instant::now);
+                    }
                 }
                 OperationEvent::Progress {
                     completed,
@@ -1678,7 +1735,7 @@ impl App {
                         self.refusal = refusal.map(|msg| (msg, Instant::now()));
                         self.confirm_open = confirm && !self.marked.is_empty();
                     } else {
-                        self.last_result = Some(
+                        self.set_result(
                             "Review cancelled; previous selection preserved; nothing deleted"
                                 .into(),
                         );
@@ -1711,6 +1768,20 @@ impl App {
 
     fn set_refusal(&mut self, msg: &str) {
         self.refusal = Some((format!("refused: {msg}"), Instant::now()));
+    }
+
+    pub fn set_result(&mut self, msg: String) {
+        self.last_result = Some(msg);
+        self.last_result_at = Some(Instant::now());
+    }
+
+    /// The last operation's result while it is still worth showing.
+    pub fn result_active(&self) -> Option<&str> {
+        let msg = self.last_result.as_deref()?;
+        match self.last_result_at {
+            Some(at) if at.elapsed() >= RESULT_DISPLAY => None,
+            _ => Some(msg),
+        }
     }
 
     pub fn refusal_active(&self) -> Option<&str> {
@@ -1788,6 +1859,7 @@ impl App {
             current: PathBuf::new(),
             started: Instant::now(),
             cancel: cancel.clone(),
+            checking_open_files: None,
         });
         self.operation_rx = Some(rx);
         self.confirm_open = false;
@@ -1851,7 +1923,7 @@ impl App {
         let measured_txt = measured
             .map(model::human_signed_bytes)
             .unwrap_or_else(|| "unmeasured".into());
-        self.last_result = Some(if results.len() < total {
+        self.set_result(if results.len() < total {
             format!(
                 "Cancelled · {ok} completed · {} refused · {} not attempted; completed filesystem moves are in Trash; an in-flight docker/git command was killed and may still have completed",
                 failed.len(),
@@ -1859,12 +1931,12 @@ impl App {
             )
         } else if failed.is_empty() {
             format!(
-                "{ok} deleted · planned {} · measured {measured_txt}",
+                "{ok} deleted · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
                 model::human_bytes(planned)
             )
         } else {
             format!(
-                "{ok} deleted, {} refused · planned {} · measured {measured_txt}",
+                "{ok} deleted, {} refused · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
                 failed.len(),
                 model::human_bytes(planned)
             )
@@ -1970,17 +2042,9 @@ impl App {
     pub const LIVE_QUIET: Duration = Duration::from_millis(400);
 
     /// Starts one live FSEvents stream per root in `self.roots` (#51),
-    /// all feeding the same `watch_rx` through cloned senders. A root
-    /// whose stream fails to start (no FSEvents on this platform, or the
-    /// path itself is gone) simply contributes no watcher -- the others
-    /// still run; this is never fatal to the TUI, only to that root's
-    /// live updates (it still gets refreshed by the scheduled/cached
-    /// path). No-op if watches are already running.
-    pub fn start_watch(&mut self) {
-        self.start_watch_with(swamp_core::fs_events::watch_pending);
-    }
-
-    /// [`Self::start_watch`] with the stream factory supplied.
+    /// all feeding the same `watch_rx`. Not used by `swamp ui` any more
+    /// (the TUI never scans on file events); kept, with its tests, for
+    /// when a watch-driven feature returns.
     ///
     /// Every root's thread is spawned **before** any readiness is
     /// collected. `FSEventStreamStart` is a synchronous, per-process
@@ -1995,6 +2059,7 @@ impl App {
     /// bounds the wait by the slowest stream rather than by their total,
     /// and `fs_events::watch_start_budget` is now larger than the cost
     /// of the call it is bounding.
+    #[cfg(test)]
     pub(crate) fn start_watch_with(&mut self, factory: swamp_core::fs_events::WatchFactory) {
         if self.store_dir.is_none() || !self.watches.is_empty() {
             return;
@@ -2214,6 +2279,7 @@ impl App {
         });
         self.pending = Some(rx);
         self.observing = Some((0, 0));
+        self.observing_started = Some(Instant::now());
     }
 
     /// Starts an incremental observation of every root in `self.roots`
@@ -2241,6 +2307,21 @@ impl App {
         let (roots, cache) = (self.roots.clone(), self.reports_by_root.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         crate::worker::spawn(move || {
+            // Single-flight with the scheduled `swamp observe`: try the
+            // lock, never wait for it. Held elsewhere -> report that and
+            // leave the stored data alone; the lock poller shows who has
+            // it and reloads when it finishes.
+            let _lock = match swamp_core::schedule::acquire_lock(&store) {
+                Ok(swamp_core::schedule::LockOutcome::Acquired(g)) => Some(g),
+                Ok(swamp_core::schedule::LockOutcome::HeldBy { pid, .. }) => {
+                    let _ = tx.send(Err(anyhow::anyhow!(
+                        "another observation is running (pid {pid})"
+                    )));
+                    return;
+                }
+                // A lock we cannot even try is no reason to show nothing.
+                Err(_) => None,
+            };
             // The same scope-aware entry point startup uses, with the
             // same exclusions and external pruning, and returning the
             // external/agent units from that same pass so the agent view
@@ -2275,6 +2356,99 @@ impl App {
         });
         self.pending = Some(rx);
         self.observing = Some((0, 0));
+        self.observing_started = Some(Instant::now());
+    }
+
+    /// The `R` key: observe now, in the background. Never while one is
+    /// already running, and never on a nearly full disk.
+    pub fn refresh_now(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        if let Some(b) = &self.disk_banner {
+            self.status = Some(format!("refresh skipped: {b}"));
+            return;
+        }
+        self.status = None;
+        self.observe_in_background();
+    }
+
+    /// Startup policy: the only automatic scan is the first one. With an
+    /// index (stored report) at any age nothing is observed -- the
+    /// schedule keeps it current, `R` refreshes on demand. Without one
+    /// (and no full disk) the first scan starts in the background so the
+    /// UI opens at once and shows its progress. Returns whether a scan
+    /// was started.
+    pub fn scan_if_no_index(&mut self, has_index: bool) -> bool {
+        if has_index || self.disk_banner.is_some() {
+            return false;
+        }
+        self.observe_in_background();
+        self.pending.is_some()
+    }
+
+    /// Watches the observation lock every `every` on a worker, so the
+    /// header can say a scheduled observation is running (and for how
+    /// long) and the stored report reloads when it ends. `self_pid` is
+    /// this process's own pid: its own observations are shown by
+    /// `observing`, not as somebody else's.
+    pub fn start_lock_poll(&mut self, every: Duration, self_pid: u32) {
+        let (Some(store), Some(scope)) = (self.store_dir.clone(), self.scope.clone()) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::worker::spawn(move || {
+            let mut prev: Option<swamp_core::schedule::LockHolder> = None;
+            let mut first = true;
+            loop {
+                let now_holder =
+                    swamp_core::schedule::peek_lock(&store).filter(|h| h.pid != self_pid);
+                if (first || now_holder != prev)
+                    && tx.send(LockPollMsg::Holder(now_holder)).is_err()
+                {
+                    return;
+                }
+                if prev.is_some()
+                    && now_holder.is_none()
+                    && let Ok(snap) = swamp_core::report::report_scope_from_store(&scope, &store)
+                    && tx.send(LockPollMsg::Reloaded(Box::new(snap))).is_err()
+                {
+                    return;
+                }
+                first = false;
+                prev = now_holder;
+                std::thread::sleep(every);
+            }
+        });
+        self.lock_poll_rx = Some(rx);
+    }
+
+    /// Applies whatever the lock poller has reported since last tick.
+    /// Never blocks.
+    pub fn drain_lock_poll(&mut self) {
+        let Some(rx) = &self.lock_poll_rx else {
+            return;
+        };
+        let msgs: Vec<LockPollMsg> = rx.try_iter().collect();
+        for m in msgs {
+            match m {
+                LockPollMsg::Holder(h) => self.external_observer = h,
+                LockPollMsg::Reloaded(snap) => {
+                    // Our own observation in flight will replace this
+                    // report anyway.
+                    if self.pending.is_some() {
+                        continue;
+                    }
+                    self.has_index = true;
+                    self.replace_report(snap.report);
+                    self.set_external_units(snap.external_units);
+                    self.set_store_interiors(snap.store_interiors);
+                    self.set_agent_units(snap.agent_units);
+                    self.observed_label = "just now".into();
+                    self.status = None;
+                }
+            }
+        }
     }
 
     pub fn toggle_help(&mut self) {

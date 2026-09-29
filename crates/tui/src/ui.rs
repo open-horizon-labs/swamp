@@ -132,18 +132,30 @@ fn header_line(app: &App, width: usize) -> String {
             t if bytes <= t => format!(" · {}%", bytes * 100 / t),
             _ => String::new(),
         };
-        format!("observing… {} · {dirs} dirs{pct}", human_bytes(bytes))
-    } else {
+        let elapsed = app
+            .observing_started
+            .map(|t| {
+                format!(
+                    " · {}",
+                    swamp_core::schedule::format_elapsed(t.elapsed().as_secs())
+                )
+            })
+            .unwrap_or_default();
+        let roots = if app.roots.len() > 1 {
+            format!(" · {} roots", app.roots.len())
+        } else {
+            String::new()
+        };
         format!(
-            "observed {}{}",
-            app.observed_label,
-            if !app.watches.is_empty() {
-                " · live"
-            } else {
-                ""
-            }
+            "observing… {} · {dirs} dirs{pct}{roots}{elapsed}",
+            human_bytes(bytes)
         )
+    } else {
+        // The age comes from the report itself, so it keeps counting
+        // while the UI stays open.
+        format!("observed {}", age_label(app))
     };
+    let warn = stale_warning(app);
     let since = since_label(app)
         .map(|s| format!(" · since {s}"))
         .unwrap_or_default();
@@ -151,6 +163,18 @@ fn header_line(app: &App, width: usize) -> String {
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
         app.disk_banner.clone().unwrap_or_default(),
+        app.external_observer
+            .map(|h| {
+                let secs = swamp_core::entities::now().saturating_sub(h.since);
+                format!(
+                    "scheduled observation running (pid {}, {})",
+                    h.pid,
+                    swamp_core::schedule::format_elapsed(secs)
+                )
+            })
+            .unwrap_or_default(),
+        app.status.clone().unwrap_or_default(),
+        warn.clone().unwrap_or_default(),
         if stale
             || app
                 .report
@@ -163,7 +187,11 @@ fn header_line(app: &App, width: usize) -> String {
         } else {
             app.root.display().to_string()
         },
-        format!("{obs}{since}"),
+        if warn.is_some() {
+            since.trim_start_matches(" · ").to_string()
+        } else {
+            format!("{obs}{since}")
+        },
         app.report
             .reconciliation
             .unique_estimate
@@ -191,6 +219,41 @@ fn header_line(app: &App, width: usize) -> String {
 
 /// Joins clauses with " · " while the result fits in `width`; always keeps
 /// the first clause, truncated to terminal cells if necessary.
+/// How old the index is, from its own `observed_at` (so it keeps
+/// counting while the UI stays open and resets when a refresh lands).
+fn age_label(app: &App) -> String {
+    if app.live_age && app.report.observed_at > 0 {
+        swamp_core::schedule::format_ago(swamp_core::entities::now(), app.report.observed_at)
+    } else {
+        app.observed_label.clone()
+    }
+}
+
+/// The header's yellow warning: the index is older than
+/// `STALE_AFTER_SECS` (or missing) and nothing is scanning. While a scan
+/// -- ours or the scheduled one -- is running, its own indicator
+/// replaces this hint.
+pub fn stale_warning(app: &App) -> Option<String> {
+    if app.observing.is_some() || app.external_observer.is_some() || app.disk_banner.is_some() {
+        return None;
+    }
+    if !app.has_index {
+        return Some("no index yet · press R to scan".to_string());
+    }
+    let observed = app.report.observed_at;
+    if !app.live_age || observed == 0 {
+        return None;
+    }
+    let age = swamp_core::entities::now().saturating_sub(observed);
+    (age > crate::app::STALE_AFTER_SECS).then(|| {
+        format!(
+            "observed {} · older than {} min, press R to refresh",
+            swamp_core::schedule::format_ago(swamp_core::entities::now(), observed),
+            crate::app::STALE_AFTER_SECS / 60
+        )
+    })
+}
+
 pub fn fit_clauses(clauses: &[String], width: usize) -> String {
     let mut out = String::new();
     for (i, c) in clauses.iter().filter(|c| !c.is_empty()).enumerate() {
@@ -207,8 +270,38 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
     truncate_middle(&out, width)
 }
 
-fn footer_line() -> &'static str {
-    "↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  ? help  q quit"
+/// The key legend, shortened to fit `width` cells. `? help  q quit`
+/// is always kept: it is how you find every other key.
+fn footer_legend(width: usize) -> String {
+    const ITEMS: [&str; 12] = [
+        "↑↓ move",
+        "→/← in/out",
+        "Enter open/confirm",
+        "Space mark",
+        "A mark all",
+        "⌫ delete",
+        "/ filter",
+        "v view",
+        "g/s/n/t/a sort",
+        "r reverse",
+        "R refresh",
+        "? help",
+    ];
+    const TAIL: &str = "q quit";
+    let mut n = ITEMS.len();
+    loop {
+        let mut parts: Vec<&str> = ITEMS[..n].to_vec();
+        // Keep `? help` even when the middle is cut.
+        if n < ITEMS.len() {
+            parts.push(ITEMS[ITEMS.len() - 1]);
+        }
+        parts.push(TAIL);
+        let line = parts.join("  ");
+        if line.chars().count() <= width || n == 0 {
+            return line;
+        }
+        n -= 1;
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -223,6 +316,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 3
             } else if app.confirm_open {
                 1
+            } else if app.result_active().is_some() {
+                // The result gets its own lines; the legend below stays.
+                2
             } else {
                 0
             }),
@@ -243,11 +339,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
             (op.completed as f64 / op.total as f64).min(1.0)
         };
         let label = if cancelling {
-            "Cancelling after current group"
+            "Cancelling after current group".to_string()
+        } else if op.checking_open_files.is_some() {
+            "Checking which files are open (one pass, ~15 s)…".to_string()
         } else {
-            op.label
+            op.label.to_string()
         };
-        let count = if op.total == 0 {
+        let count = if op.checking_open_files.is_some() {
+            "no groups yet".to_string()
+        } else if op.total == 0 {
             format!("{} checked", op.completed)
         } else {
             format!("{}/{} groups", op.completed, op.total)
@@ -258,7 +358,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .ratio(ratio)
                 .label(format!(
                     "{label} · {count} · {}s",
-                    op.started.elapsed().as_secs()
+                    op.checking_open_files
+                        .unwrap_or(op.started)
+                        .elapsed()
+                        .as_secs()
                 ))
                 .gauge_style(Style::default().fg(Color::Yellow)),
             Rect { height: 1, ..area },
@@ -293,6 +396,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Paragraph::new(app.confirm_summary()).style(Style::default().fg(Color::Yellow)),
             chunks[3],
         );
+    } else if let Some(r) = app.result_active() {
+        frame.render_widget(
+            Paragraph::new(r.to_string())
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .style(Style::default().fg(Color::Cyan)),
+            chunks[3],
+        );
     }
 
     // The footer is the key legend for the state you are actually in.
@@ -310,10 +420,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         "↑↓ field · ←→ value · Space grew/shrank · type to narrow project · Enter apply · Esc cancel · e edit as text · 0 clear".to_string()
     } else if app.editing_filter {
         "Tab complete · Enter apply · Esc cancel".to_string()
-    } else if let Some(r) = &app.last_result {
-        r.clone()
     } else {
-        footer_line().to_string()
+        footer_legend(size.width as usize)
     };
     let footer_style = if app.refusal_active().is_some() {
         Style::default().fg(Color::Red)
@@ -399,11 +507,23 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         width: area.width.saturating_sub(right_width + 2),
         ..area
     };
-    frame.render_widget(
-        Paragraph::new(header_line(app, left.width as usize))
-            .style(Style::default().add_modifier(Modifier::DIM)),
-        left,
-    );
+    let text = header_line(app, left.width as usize);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let line = match stale_warning(app).and_then(|w| text.find(&w).map(|i| (i, w.len()))) {
+        // The warning is yellow and not dimmed; the rest stays quiet.
+        Some((i, n)) => Line::from(vec![
+            Span::styled(text[..i].to_string(), dim),
+            Span::styled(
+                text[i..i + n].to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text[i + n..].to_string(), dim),
+        ]),
+        None => Line::from(Span::styled(text, dim)),
+    };
+    frame.render_widget(Paragraph::new(line), left);
     if let Some(d) = net.filter(|_| right_width > 0) {
         let x = area.x + area.width - right_width;
         draw_spark(
@@ -921,7 +1041,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "  k         keep executables: copy target/{release,debug} binaries, dist/*.whl to bin/ before trashing",
         ),
         Line::from("  i         inspect selected Cargo profile dependencies (on demand)"),
-        Line::from("  ?         toggle this help"),
+        Line::from("  ?         toggle this help · R refresh now (background scan)"),
         Line::from("  q         quit"),
         Line::from(""),
         Line::from(

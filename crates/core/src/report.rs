@@ -513,6 +513,39 @@ pub struct Report {
     pub store_dir: Option<PathBuf>,
 }
 
+impl Report {
+    /// A report with nothing in it, for a UI that has to open before its
+    /// first observation exists.
+    pub fn empty(root: PathBuf) -> Self {
+        Report {
+            store_dir: None,
+            observed_at: 0,
+            root,
+            projects: Vec::new(),
+            unowned: Vec::new(),
+            reconciliation: Reconciliation {
+                unique_estimate: None,
+                attributed: 0,
+                unowned: 0,
+                walked_total: 0,
+                du_total: None,
+                docker_attributed: 0,
+                docker_unowned: 0,
+            },
+            notes: Vec::new(),
+            series_by_key: Default::default(),
+            total_series: Vec::new(),
+            series_window_secs: 0,
+            summary: Default::default(),
+            dirs_by_worktree: None,
+            files_by_worktree: None,
+            schedule_line: None,
+            github_enrichment: None,
+            nested_artifacts: Vec::new(),
+        }
+    }
+}
+
 /// Live GitHub enrichment stats for one `report_full(.., enrich: true)`
 /// call: how many `gh api graphql` calls it made (one per `(owner,
 /// repo)` that needed a refresh) and how long that took, independent of

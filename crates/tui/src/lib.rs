@@ -151,6 +151,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('t') => app.set_sort(Sort::Type),
         KeyCode::Char('a') => app.set_sort(Sort::Age),
         KeyCode::Char('r') => app.toggle_reverse(),
+        KeyCode::Char('R') => app.refresh_now(),
         KeyCode::Char('k') => app.toggle_keep_executables(),
         KeyCode::Char('?') => app.toggle_help(),
         KeyCode::Char('i') => app.inspect_selected_cargo_profile(),
@@ -216,6 +217,18 @@ pub fn app_from_stored_multi_root(
     store: &Path,
     banner: String,
 ) -> Option<App> {
+    stored_multi_root_app(scope, store, Some(banner))
+}
+
+/// `app_from_stored_multi_root` with an optional disk banner: the one
+/// place the stored multi-root paint is built, for both the
+/// disk-full path and the normal path (which then refreshes in the
+/// background).
+fn stored_multi_root_app(
+    scope: &swamp_core::scope::EffectiveScope,
+    store: &Path,
+    banner: Option<String>,
+) -> Option<App> {
     let snapshot = swamp_core::report::report_scope_from_store(scope, store).ok()?;
     let mut app = App::new_multi_root(snapshot.report, scope.scan_paths());
     app.set_external_units(snapshot.external_units);
@@ -223,7 +236,7 @@ pub fn app_from_stored_multi_root(
     app.set_agent_units(snapshot.agent_units);
     app.scope = Some(scope.clone());
     app.observed_label = "from last observation".into();
-    app.disk_banner = Some(banner);
+    app.disk_banner = banner;
     finish_startup(&mut app, store, Some(&snapshot.coverage));
     Some(app)
 }
@@ -255,101 +268,31 @@ pub fn run(root: &Path) -> Result<()> {
         .as_ref()
         .and_then(|s| swamp_core::report::report_scope_from_store(s, &store).ok());
     let banner = disk_full_banner(&store);
+    let has_index = cached.is_some();
     let mut app = match cached {
         Some(snapshot) => {
             let mut a = App::new(snapshot.report, root.clone());
             a.observed_label = "from last observation".into();
-            a.observing = Some((0, 0));
-            a.scope = scope.clone();
             a.set_external_units(snapshot.external_units);
             a.set_store_interiors(snapshot.store_interiors);
             a.set_agent_units(snapshot.agent_units);
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (scope2, store2) = (scope.clone(), store.clone());
-            let (roots, cache) = (a.roots.clone(), a.reports_by_root.clone());
-            if banner.is_none() {
-                crate::worker::spawn(move || {
-                    let Some(scope2) = scope2 else {
-                        let _ = tx.send(Ok(app::RefreshedObservation::merged_on_worker(
-                            &roots,
-                            cache,
-                            Vec::new(),
-                            None,
-                            None,
-                            None,
-                        )));
-                        return;
-                    };
-                    // include_dirs: the Source row expands into its own
-                    // directories, so the startup observe must produce them
-                    // too or the first report shows `source` with no children.
-                    let res = swamp_core::report::observe_scope(
-                        &scope2,
-                        swamp_core::report::ObservationParts::ALL,
-                        None,
-                        None,
-                        false,
-                        Some(&store2),
-                        None,
-                        true,
-                        true,
-                        false,
-                        false,
-                        swamp_core::fs_events::platform_source().as_ref(),
-                        30,
-                        24 * 3600,
-                    )
-                    .map(|o| {
-                        app::RefreshedObservation::merged_on_worker(
-                            &roots,
-                            cache,
-                            o.per_root.into_iter().collect(),
-                            Some(o.external_units),
-                            Some(o.agent_units),
-                            Some(o.store_interiors),
-                        )
-                    });
-                    let _ = tx.send(res);
-                });
-            }
-            if let Some(b) = &banner {
-                // Stored report only: no observation worker was started.
-                a.observing = None;
-                a.observed_label = "from last observation".into();
-                a.disk_banner = Some(b.clone());
-            } else {
-                a.pending = Some(rx);
-            }
+            a.disk_banner = banner.clone();
             a
         }
         None => {
             if let Some(b) = &banner {
                 anyhow::bail!("{b}, and there is no stored observation to show yet");
             }
-            let scope_now = scope.clone().ok_or_else(|| {
-                anyhow::anyhow!("could not resolve a scope for {}", root.display())
-            })?;
-            let observation = swamp_core::report::observe_scope(
-                &scope_now,
-                swamp_core::report::ObservationParts::ALL,
-                None,
-                None,
-                false,
-                Some(&store),
-                None,
-                true,
-                true, // include_dirs: Source rows expand into their own directories
-                false,
-                false,
-                swamp_core::fs_events::platform_source().as_ref(),
-                30,
-                24 * 3600,
-            )?;
-            let mut a = App::new(observation.merged, root.clone());
-            a.reports_by_root = observation.per_root;
-            a.set_external_units(observation.external_units);
-            a.set_store_interiors(observation.store_interiors);
-            a.set_agent_units(observation.agent_units);
+            if scope.is_none() {
+                anyhow::bail!("could not resolve a scope for {}", root.display());
+            }
+            // First ever run: open empty; the header's live "observing…"
+            // counters show the first walk instead of a blank terminal.
+            let mut a = App::new(
+                swamp_core::report::Report::empty(root.clone()),
+                root.clone(),
+            );
+            a.observed_label = "no observation yet".into();
             a
         }
     };
@@ -379,6 +322,7 @@ pub fn run(root: &Path) -> Result<()> {
             coverage_from_scope(&scope)
         });
     finish_startup(&mut app, &store, coverage.as_deref());
+    start_background_services(&mut app, has_index);
     run_terminal_loop(&mut app)
 }
 
@@ -391,15 +335,12 @@ pub fn run(root: &Path) -> Result<()> {
 /// before even starting the TUI) could never show alongside another
 /// root's projects.
 ///
-/// Unlike `run`, this always observes every present root synchronously
-/// before opening the TUI (via `report::report_scope_with_parts`, the
-/// same coherent multi-root entry point `report`/`observe` use) rather
-/// than painting a cached report and refreshing in the background --
-/// a deliberate simplification: `report_scope_with_parts` already picks
-/// the cheap incremental path per root when nothing changed, so an
-/// unchanged multi-root scope opens about as fast as a cached paint
-/// would have, without needing a second, parallel "merge fresh results
-/// into a cached multi-root report" bootstrap path.
+/// Like `run`, this paints the last stored report immediately, at any
+/// age, and scans only when there is no index at all (see
+/// `start_background_services`): on a background worker, opening empty
+/// with the first walk's progress in the header. `R` refreshes on
+/// demand; the schedule keeps the index current. It never blocks on the observation lock: if another
+/// process holds it, the header says who and for how long.
 pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
     let store = store_dir();
     let present_roots = scope.scan_paths();
@@ -407,41 +348,46 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
         !present_roots.is_empty(),
         "swamp_tui::run_scope requires at least one present root in scope"
     );
-    if let Some(banner) = disk_full_banner(&store) {
-        // Never block startup on a walk the disk cannot take: paint the
-        // last stored report with the banner, or say why there is none.
-        let mut app =
-            app_from_stored_multi_root(scope, &store, banner.clone()).ok_or_else(|| {
-                anyhow::anyhow!("{banner}, and there is no stored observation to show yet")
-            })?;
-        return run_terminal_loop(&mut app);
-    }
-    let observation = swamp_core::report::observe_scope(
-        scope,
-        swamp_core::report::ObservationParts::ALL,
-        None,
-        None,
-        false,
-        Some(&store),
-        None,
-        true,
-        true, // include_dirs: Source rows expand into their own directories
-        false,
-        false,
-        swamp_core::fs_events::platform_source().as_ref(),
-        30,
-        24 * 3600,
-    )?;
-    let coverage = observation.coverage;
-    let mut app = App::new_multi_root(observation.merged, present_roots);
-    app.reports_by_root = observation.per_root;
-    app.set_external_units(observation.external_units);
-    app.set_store_interiors(observation.store_interiors);
-    app.set_agent_units(observation.agent_units);
-    app.scope = Some(scope.clone());
-    app.observed_label = "just now".into();
-    finish_startup(&mut app, &store, Some(&coverage));
+    let banner = disk_full_banner(&store);
+    let stored = stored_multi_root_app(scope, &store, banner.clone());
+    let has_index = stored.is_some();
+    let mut app = match stored {
+        Some(app) => app,
+        None => {
+            if let Some(b) = &banner {
+                // Never block startup on a walk the disk cannot take.
+                anyhow::bail!("{b}, and there is no stored observation to show yet");
+            }
+            // First ever run: nothing stored to paint. Open on an empty
+            // report and let the header's live "observing…" counters
+            // show the first walk's progress instead of a blank terminal.
+            let mut app = App::new_multi_root(
+                swamp_core::report::Report::empty(
+                    present_roots.first().cloned().unwrap_or_default(),
+                ),
+                present_roots.clone(),
+            );
+            app.scope = Some(scope.clone());
+            app.observed_label = "no observation yet".into();
+            app.has_index = false;
+            finish_startup(&mut app, &store, None);
+            app
+        }
+    };
+    start_background_services(&mut app, has_index);
     run_terminal_loop(&mut app)
+}
+
+/// After the first paint is decided: watch the observation lock (so a
+/// scheduled observation shows in the header and its result reloads),
+/// and scan only when there is no index yet. An existing index, however
+/// old, is shown as it is; nothing here waits on a walk or the lock.
+fn start_background_services(app: &mut App, has_index: bool) {
+    if app.disk_banner.is_some() {
+        return;
+    }
+    app.start_lock_poll(Duration::from_secs(2), std::process::id());
+    app.scan_if_no_index(has_index);
 }
 
 /// Maps a resolved `EffectiveScope` to the same `coverage::RootCoverage`
@@ -484,7 +430,8 @@ fn coverage_from_scope(
 
 /// Everything after an `App` has its initial `report`/`roots` set:
 /// external/agent-tool storage discovery, the header's coverage note,
-/// starting the live watch(es), and restoring persisted UI state.
+/// and restoring persisted UI state. (No filesystem watch: the TUI never
+/// scans on file events, so there is nothing to watch for.)
 /// Shared by `run` and `run_scope` so this bookkeeping is never
 /// duplicated (or allowed to drift) between the single- and multi-root
 /// startup paths.
@@ -494,6 +441,7 @@ fn finish_startup(
     coverage: Option<&[swamp_core::coverage::RootCoverage]>,
 ) {
     app.store_dir = Some(store.to_path_buf());
+    app.live_age = true;
     // External/agent-tool storage is no longer discovered here. It
     // arrives from the same `report::observe_scope` pass that produced
     // the report, and is refreshed by every later observation -- the
@@ -502,9 +450,6 @@ fn finish_startup(
     // stale while the header said the report was live.
     if let Some(c) = coverage {
         app.set_scope_note(c);
-    }
-    if app.disk_banner.is_none() {
-        app.start_watch();
     }
     // Multi-root history windows are bounded by the *primary* root's own
     // history for now (`App::root`, `roots[0]`) -- a per-root history
@@ -571,10 +516,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                 Err(e) => app.status = Some(format!("observation failed: {e}")),
             }
         }
-        app.drain_watch();
-        if app.operation.is_none() && app.live_observe_due() {
-            app.observe_live();
-        }
+        app.drain_lock_poll();
         if let Ok(sz) = terminal.size() {
             app.width = sz.width;
         }
@@ -667,6 +609,7 @@ mod tests {
             current: "/tmp/fixture".into(),
             started: std::time::Instant::now(),
             cancel: cancel.clone(),
+            checking_open_files: None,
         });
         handle_terminal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.operation.is_some());
@@ -779,6 +722,232 @@ mod tests {
         let mut app = App::new(empty_report(), "/root".into());
         handle_key(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
+    }
+
+    fn buffer_text(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| ui::draw(f, app)).unwrap();
+        t.backend().to_string()
+    }
+
+    #[test]
+    fn delete_result_and_key_legend_are_both_visible_at_80_columns() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.set_result(
+            "3 deleted · moved to Trash: space is freed only when Trash is emptied · planned 1.3GB · measured free-space change -10.5MB"
+                .into(),
+        );
+        let s = buffer_text(&app, 80, 24);
+        assert!(s.contains("3 deleted"), "{s}");
+        assert!(
+            s.contains("space is freed only when Trash is emptied"),
+            "{s}"
+        );
+        assert!(s.contains("? help  q quit"), "{s}");
+    }
+
+    #[test]
+    fn expired_result_disappears_and_legend_stays() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.set_result("2 deleted".into());
+        app.last_result_at = Some(std::time::Instant::now() - app::RESULT_DISPLAY);
+        let s = buffer_text(&app, 80, 24);
+        assert!(!s.contains("2 deleted"), "{s}");
+        assert!(s.contains("? help  q quit"), "{s}");
+    }
+
+    #[test]
+    fn review_overlay_names_the_open_file_check() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.operation = Some(crate::app::Operation {
+            label: "Reviewing",
+            completed: 0,
+            total: 284,
+            succeeded: 0,
+            failed: 0,
+            current: "/tmp/x".into(),
+            started: std::time::Instant::now(),
+            cancel: Default::default(),
+            checking_open_files: Some(std::time::Instant::now()),
+        });
+        let s = buffer_text(&app, 100, 24);
+        assert!(s.contains("Checking which files are open"), "{s}");
+        assert!(s.contains("Review only; no files are changed."), "{s}");
+        app.operation.as_mut().unwrap().checking_open_files = None;
+        let s = buffer_text(&app, 100, 24);
+        assert!(s.contains("0/284 groups"), "{s}");
+        assert!(!s.contains("Checking which files are open"), "{s}");
+    }
+
+    /// A stored report plus a resolved scope, in a scratch store.
+    fn stored_app(observed_at: u64) -> (tempfile::TempDir, tempfile::TempDir, App) {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let scope = resolved_scope(store.path(), &[root.path().to_path_buf()]).expect("scope");
+        let mut report = empty_report();
+        report.observed_at = observed_at;
+        let mut app = App::new(report, root.path().to_path_buf());
+        app.scope = Some(scope);
+        app.store_dir = Some(store.path().to_path_buf());
+        app.live_age = true;
+        (store, root, app)
+    }
+
+    #[test]
+    fn an_existing_index_is_never_scanned_on_open_however_old() {
+        let (_s, _r, mut app) = stored_app(1);
+        assert!(!app.scan_if_no_index(true));
+        assert!(app.pending.is_none() && app.observing.is_none());
+    }
+
+    #[test]
+    fn no_index_scans_in_the_background_with_progress() {
+        let (_s, _r, mut app) = stored_app(0);
+        assert!(app.scan_if_no_index(false));
+        assert!(app.pending.is_some() && app.observing.is_some());
+        let s = buffer_text(&app, 120, 24);
+        assert!(s.contains("observing…"), "{s}");
+        assert!(!s.contains("press R"), "{s}");
+    }
+
+    fn header_of(app: &App) -> String {
+        buffer_text(app, 200, 24)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn header_shows_a_fresh_age_plainly() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, app) = stored_app(now - 4 * 60);
+        let h = header_of(&app);
+        assert!(h.contains("observed 4m ago"), "{h}");
+        assert!(!h.contains("older than"), "{h}");
+    }
+
+    #[test]
+    fn header_warns_when_the_index_is_over_the_limit() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, app) = stored_app(now - (app::STALE_AFTER_SECS + 32 * 60));
+        let h = header_of(&app);
+        assert!(
+            h.contains("observed 47m ago · older than 15 min, press R to refresh"),
+            "{h}"
+        );
+        // Yellow, not red.
+        let mut t = Terminal::new(TestBackend::new(200, 24)).unwrap();
+        t.draw(|f| ui::draw(f, &app)).unwrap();
+        let cell = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|c| c.symbol() == "S")
+            .map(|c| c.fg);
+        let stale_cell = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .take(200)
+            .find(|c| c.fg == ratatui::style::Color::Yellow);
+        assert!(stale_cell.is_some(), "warning is drawn in yellow: {cell:?}");
+        assert!(
+            !t.backend()
+                .buffer()
+                .content()
+                .iter()
+                .take(200)
+                .any(|c| c.fg == ratatui::style::Color::Red)
+        );
+    }
+
+    #[test]
+    fn a_running_scan_replaces_the_refresh_hint() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 3600);
+        assert!(header_of(&app).contains("press R to refresh"));
+        app.observing = Some((0, 0));
+        let h = header_of(&app);
+        assert!(h.contains("observing…") && !h.contains("press R"), "{h}");
+        app.observing = None;
+        app.external_observer = Some(swamp_core::schedule::LockHolder {
+            pid: 4242,
+            since: now - 72,
+        });
+        let h = header_of(&app);
+        assert!(
+            h.contains("scheduled observation running (pid 4242, 1m 12s)")
+                && !h.contains("press R"),
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn footer_legend_names_the_refresh_key() {
+        let app = App::new(empty_report(), "/root".into());
+        assert!(buffer_text(&app, 200, 24).contains("R refresh"));
+    }
+
+    #[test]
+    fn nearly_full_disk_never_observes() {
+        let (_s, _r, mut app) = stored_app(0);
+        app.disk_banner = Some("disk nearly full".into());
+        assert!(!app.scan_if_no_index(false));
+        app.refresh_now();
+        assert!(app.pending.is_none());
+    }
+
+    #[test]
+    fn held_lock_is_reported_not_waited_on() {
+        let (s, _r, mut app) = stored_app(0);
+        let _held = match swamp_core::schedule::acquire_lock(s.path()).unwrap() {
+            swamp_core::schedule::LockOutcome::Acquired(g) => g,
+            _ => panic!("scratch store must be free"),
+        };
+        let started = std::time::Instant::now();
+        app.refresh_now();
+        // The key handler returned at once; the worker answers.
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let res = app
+            .pending
+            .as_ref()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("worker answered");
+        let err = res
+            .err()
+            .expect("held lock is not an observation")
+            .to_string();
+        assert!(err.contains("another observation is running"), "{err}");
+    }
+
+    #[test]
+    fn lock_poll_shows_and_clears_an_external_observer() {
+        let (s, _r, mut app) = stored_app(0);
+        let guard = match swamp_core::schedule::acquire_lock(s.path()).unwrap() {
+            swamp_core::schedule::LockOutcome::Acquired(g) => g,
+            _ => panic!("scratch store must be free"),
+        };
+        // Pretend to be a different process so this pid reads as foreign.
+        app.start_lock_poll(std::time::Duration::from_millis(20), std::process::id() + 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.external_observer.is_none() {
+            assert!(std::time::Instant::now() < deadline, "holder never shown");
+            app.drain_lock_poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(app.external_observer.unwrap().pid, std::process::id());
+        let s = buffer_text(&app, 200, 24);
+        assert!(s.contains("scheduled observation running"), "{s}");
+        drop(guard);
+        while app.external_observer.is_some() {
+            assert!(std::time::Instant::now() < deadline, "holder never cleared");
+            app.drain_lock_poll();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
