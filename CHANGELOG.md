@@ -5,30 +5,36 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.7.4
 
-- Every subprocess swamp starts (`git`, `gh`, `lsof`, `xcrun`, `docker`, ...) is now
-  its own process group and is killed with its descendants and reaped on timeout, on
-  error or panic, on TUI cancel or quit, on SIGINT/SIGTERM/SIGHUP and on process
-  exit. Children run with git/gh pagers and credential prompts disabled, so none can
-  block waiting for a terminal (#156).
-- `swamp observe` now aborts before walking when the volume holding the swamp store is
-  nearly full (below `min_free_bytes`; default the greater of 1 GiB and 1% of the
-  volume). It exits with code 3 and a stderr message, writes nothing, takes no lock and
-  changes no coverage fact. `swamp ui` shows the last stored report immediately with a
-  "disk nearly full: refresh skipped" banner instead of walking.
-- `swamp ui` review no longer walks each group's directory tree. It used to run one
-  `lsof +D <dir>` per cleanup group, so reviewing 1,239 groups in a 35 GB cargo `target/`
-  took about an hour and timed-out probes showed as unknown open-file evidence. A review
-  pass now takes one machine-wide open-file snapshot (`lsof -F n`, no tree walk) and
-  answers every group from it by path prefix. If that snapshot fails, times out, is
-  unreadable or was permission-limited, groups it cannot find open report unknown, never
-  free. Single-path probes are unchanged.
-- GitHub enrichment is now re-fetched far less often. A worktree whose branch is already
-  merged is terminal and is never re-enriched automatically for the same tip commit, and
-  a `gh` outage no longer overwrites its merged state with `unknown`. Every other row is
-  refreshed only after a 24-hour cache window (was six hours). `swamp observe --enrich`
-  is back as the on-demand override: it refetches every worktree now, ignoring the
-  window and the merged rule. `--no-enrich` still skips GitHub. This does not speed up
-  `observe` itself; the time is the filesystem scan.
+- **Reviewing cleanup candidates is fast again.** `swamp ui` used to run one
+  `lsof +D <dir>` per cleanup group to see whether anything held it open, and each
+  one walks the whole directory tree. Reviewing 1,239 groups in a 35 GB cargo
+  `target/` took about an hour. A review now takes one machine-wide open-file snapshot
+  (`lsof -F n`, no tree walk; about 16 seconds on the machine it was measured on) and
+  answers every group from it by path prefix. If the snapshot fails, times out, or is
+  permission-limited, a group it cannot find open is reported as unknown, never free.
+  Checking a single path is unchanged.
+- **A nearly full disk no longer makes swamp crawl.** `swamp observe` first checks free
+  space on the volume holding the swamp store. Below `min_free_bytes` (default: the
+  greater of 1 GiB and 1% of the volume; `0` turns the check off) it exits with code 3
+  and one line on stderr, before walking anything. It writes nothing, takes no lock and
+  changes no coverage fact, so an aborted run never marks a root missing. `swamp ui`
+  without a root no longer waits on a full observation before opening: it shows the
+  last stored report immediately, with a "disk nearly full: refresh skipped" banner
+  when the guard trips. Only the store's volume is checked.
+- **Swamp cleans up every process it starts.** Each child (`git`, `gh`, `lsof`,
+  `xcrun`, `docker`, ...) now runs in its own process group and is killed, with its
+  descendants, and reaped on timeout, on error or panic, when you press Esc or Ctrl-C
+  on a running operation, on quit, on SIGINT, SIGTERM or SIGHUP, and at process exit.
+  Children run with git and gh pagers and credential prompts disabled, so none can sit
+  waiting for a terminal. Killing swamp with SIGKILL still leaves its children behind.
+  Closes [#156](https://github.com/open-horizon-labs/swamp/issues/156).
+- **GitHub enrichment re-fetches far less.** A worktree whose branch is merged is final:
+  it is not re-enriched automatically while its tip commit is unchanged, and a `gh`
+  outage no longer overwrites its merged state with `unknown`. Every other row is
+  refreshed after 24 hours instead of six. `swamp observe --enrich` is back as the
+  on-demand override: it refetches every worktree now, ignoring both rules.
+  `--no-enrich` still skips GitHub. This does not make `observe` faster; its time is
+  the filesystem scan.
 
 ## v0.7.3
 
