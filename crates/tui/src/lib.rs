@@ -932,7 +932,8 @@ mod tests {
         });
         let h = header_of(&app);
         assert!(
-            h.contains("another observation running (pid 4242, 1m 12s)") && !h.contains("press R"),
+            // The clock may tick between building the holder and drawing it.
+            h.contains("another observation running (pid 4242, 1m 1") && !h.contains("press R"),
             "{h}"
         );
     }
