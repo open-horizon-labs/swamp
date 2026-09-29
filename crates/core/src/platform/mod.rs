@@ -423,7 +423,7 @@ pub const CAPABILITIES: &[Capability] = &[
         id: "live-watch",
         macos: Support::Supported,
         linux: Support::Supported,
-        note: "macOS opens an FSEvents stream for the TUI. Linux registers unprivileged inotify \
+        note: "Not used by the TUI since v0.7.5. macOS can open an FSEvents stream. Linux registers unprivileged inotify \
                watches per directory and names every loss (queue overflow, watch limit, \
                permissions, unmount); a loss makes the next refresh a full walk.",
     },

@@ -69,6 +69,8 @@ swamp observe --since 24h
 swamp ui
 ```
 
+`swamp ui` opens on the last stored report at once and scans only when none exists; the schedule keeps it fresh and `R` refreshes on demand.
+
 Without explicit roots, Swamp uses built-in locations, enabled tool-location detectors, and your configured additions and exclusions. Homebrew discovery is opt-in. `swamp scope` explains what is included, missing, excluded, or disabled; [scope configuration](docs/usage.md#scope-and-coverage) controls it.
 
 To work with a specific set of directories, pass the same roots to observation and reporting:
@@ -124,7 +126,7 @@ The whole CLI is not read-only: observation, scheduling, configuration, and prot
 
 Swamp folds large artifacts into directory summaries instead of keeping a permanent row for every file. After the initial walk, filesystem events identify changed containers; unchanged measurements are reused. History stores previous values as reverse deltas in compressed Parquet.
 
-macOS FSEvents can replay changes while Swamp was closed. Linux inotify requires a live TUI watch or collector; an uncovered interval or lost events triggers a full walk. Ordinary refreshes do not revisit every root to deduplicate hardlinks. They retain the last unique-byte estimate, explicitly marked for reconciliation; `swamp observe --full` refreshes it.
+macOS FSEvents can replay changes while Swamp was closed. Linux inotify requires the opt-in collector (`swamp collect`); an uncovered interval or lost events triggers a full walk. Ordinary refreshes do not revisit every root to deduplicate hardlinks. They retain the last unique-byte estimate, explicitly marked for reconciliation; `swamp observe --full` refreshes it.
 
 These choices make repeated observation practical without promising a fixed latency or a forensic inventory. The [architecture guide](docs/architecture.md) explains the storage model, adapter boundaries, enrichment, and remaining costs.
 

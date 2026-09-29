@@ -5,7 +5,7 @@ platform can do what, and where swamp keeps its files on each, see the
 [platform guide](platform.md). The one real difference between the two:
 macOS keeps a change history swamp replays, so an observation there is
 able to reuse unchanged measurements when event coverage is valid; Linux keeps none, so an observation
-walks fully unless a live watch (the TUI, or the opt-in `swamp collect`)
+walks fully unless a live watch (the opt-in `swamp collect`)
 has been running since the last one -- and swamp says which it did.
 
 ## Installing a release

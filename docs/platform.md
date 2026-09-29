@@ -42,7 +42,7 @@ macOS's `fseventsd` writes a per-volume change log to disk. A stored event id is
 
 Linux has no equivalent. inotify reports what happens while a watch is open, keeps no history, and tells you with `IN_Q_OVERFLOW` when it dropped even some of that. An inotify watch descriptor is a handle on a running watch — it is not a cursor, and storing one where an event id belongs would turn "swamp was not watching" into "nothing changed". That is a false measurement, and the growth store's whole value is that it does not contain any.
 
-So a Linux observation walks fully and reports `mode=full reason=no_persisted_change_history` -- unless something was watching the whole time. The TUI's live watch ([#81](https://github.com/open-horizon-labs/swamp/issues/81)) and the opt-in collector ([#82](https://github.com/open-horizon-labs/swamp/issues/82), `swamp collect`) narrow the gap to the time since their watch opened (see [Live watching and continuity](#live-watching-and-continuity-on-linux)). They do not remove it: a period with no watcher is a gap, and no amount of implementation work will change that.
+So a Linux observation walks fully and reports `mode=full reason=no_persisted_change_history` -- unless something was watching the whole time. The live watch ([#81](https://github.com/open-horizon-labs/swamp/issues/81); no longer used by the TUI since v0.7.5) and the opt-in collector ([#82](https://github.com/open-horizon-labs/swamp/issues/82), `swamp collect`) narrow the gap to the time since their watch opened (see [Live watching and continuity](#live-watching-and-continuity-on-linux)). They do not remove it: a period with no watcher is a gap, and no amount of implementation work will change that.
 
 ## Reuse assessment
 

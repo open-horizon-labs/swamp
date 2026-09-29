@@ -73,7 +73,7 @@ Implementation: [folded_measurement.rs](../crates/core/src/folded_measurement.rs
 
 On macOS, FSEvents provides a persisted change stream, including periods when Swamp was not running. A cursor is useful only when it covers the measurement interval. The observation commits its event anchor after successful measurement; missing or invalid continuity requires a broader walk.
 
-On Linux, inotify covers only a live watch. The TUI or opt-in collector can maintain that coverage. A first observation, an unwatched interval, queue overflow, or lost coverage requires a full walk with a reason. Linux does not pretend that time without a watcher was unchanged.
+On Linux, inotify covers only a live watch. Only the opt-in collector maintains that coverage (the TUI no longer opens a watch). A first observation, an unwatched interval, queue overflow, or lost coverage requires a full walk with a reason. Linux does not pretend that time without a watcher was unchanged.
 
 Native implementations are selected per platform. The [platform guide](platform.md) describes watcher continuity, scheduling, filesystem measurement, and Trash behavior.
 
