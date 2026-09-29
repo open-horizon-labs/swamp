@@ -149,7 +149,7 @@ pub struct Row {
 }
 
 impl Row {
-    fn leaf(depth: usize, label: String, bytes: u64, growth: Option<i64>) -> Self {
+    pub(crate) fn leaf(depth: usize, label: String, bytes: u64, growth: Option<i64>) -> Self {
         Row {
             depth,
             rail: String::new(),

@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                               "
-"view: tree of mole  (Esc back) · filter: none                                                                                                                                                           "
+"view: tree of mole (2 of 10 · Esc: projects) · filter: none                                                                                                                                             "
 "Name                                                                                                              Size     Change Change bar    Cleanup / facts                                         "
 "└─ ▾ main /Users/dev/src/mole                                                                                    2.6GB     +1.3GB       │██████ clean                                                   "
 "   ├─ build target                                                                                               2.1GB     +1.1GB       │█████▉                                                         "

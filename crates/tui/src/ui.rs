@@ -297,21 +297,22 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
     truncate_middle(&out, width)
 }
 
-/// The key legend, shortened to fit `width` cells. `? help  q quit`
-/// is always kept: it is how you find every other key.
+/// The key legend, shortened to fit `width` cells. Ordered by what a
+/// person reaches for first: filter, view, refresh and delete come before
+/// movement (arrow keys need no legend). `? help  q quit` is always kept:
+/// it is how you find every other key. Items are dropped from the end.
 fn footer_legend(width: usize, blocked: bool) -> String {
-    const BASE: [&str; 12] = [
-        "↑↓ move",
-        "→/← in/out",
-        "Enter open/confirm",
-        "Space mark",
-        "A mark all",
-        "⌫ delete",
+    const BASE: [&str; 11] = [
         "/ filter",
         "v view",
+        "R refresh",
+        "⌫ delete",
+        "Space mark",
+        "A mark all",
+        "↑↓ move",
+        "→/← in/out",
         "g/s/n/t/a sort",
         "r reverse",
-        "R refresh",
         "? help",
     ];
     const TAIL: &str = "q quit";
@@ -675,6 +676,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_body(frame, app, chunks[2]);
     if app.operation.is_none() {
         if app.blocked_open {
+            // Two rows per item.
+            app.page
+                .set((usize::from(SHEET_ROWS.min(chunks[2].height)).saturating_sub(2) / 2).max(1));
             draw_sheet(
                 frame,
                 chunks[2],
@@ -731,7 +735,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
         });
         fit_clauses(&clauses, size.width as usize)
     } else if app.picker.is_some() {
-        "↑↓ field · ←→ value · Space grew/shrank · type to narrow project · Enter apply · Esc cancel · e edit as text · 0 clear".to_string()
+        fit_clauses(
+            &[
+                "↑↓ field".to_string(),
+                "←→ value".to_string(),
+                "Enter apply".to_string(),
+                "Esc cancel".to_string(),
+                "e edit as text".to_string(),
+                "0 clear".to_string(),
+            ],
+            size.width as usize,
+        )
     } else if app.editing_filter {
         "Tab complete · Enter apply · Esc cancel".to_string()
     } else {
@@ -740,7 +754,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(footer_text), chunks[4]);
 
     if app.help_open {
-        draw_help(frame, size);
+        draw_help(frame, app, size);
     }
     if let Some(p) = &app.picker {
         draw_picker(frame, app, p, size);
@@ -753,15 +767,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
             height: size.height.saturating_sub(2),
         };
         frame.render_widget(Clear, popup);
-        let visible: Vec<Line> = lines
+        // Long lines wrap under themselves; nothing is cut at the edge.
+        let inner_w = usize::from(popup.width.saturating_sub(2));
+        let wrapped: Vec<String> = lines
+            .iter()
+            .flat_map(|l| wrap_hanging(l, inner_w, 2))
+            .collect();
+        let inner_h = usize::from(popup.height.saturating_sub(2));
+        app.page.set(inner_h.saturating_sub(1).max(1));
+        let visible: Vec<Line> = wrapped
             .iter()
             .skip(app.cargo_inspection_scroll as usize)
-            .take(popup.height.saturating_sub(2) as usize)
+            .take(inner_h)
             .map(|s| Line::from(s.as_str()))
             .collect();
         frame.render_widget(
             Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(
-                " Cargo dependency inspection · ↑↓ scroll · Esc close · no cleanup action ",
+                " Cargo dependency inspection · ↑↓ PgUp PgDn scroll · Esc close · no cleanup action ",
             )),
             popup,
         );
@@ -794,22 +816,32 @@ fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Re
         });
     }
     lines.push(Line::from(""));
+    // The keys live in the footer, once; the box holds only the form.
     lines.push(Line::from(format!("  filter: {composed}    → {count}")));
-    lines.push(Line::from("  ↑↓ field · ←→ value · type to narrow project"));
-    lines.push(Line::from(
-        "  Enter apply · Esc cancel · e edit as text · 0 clear",
-    ));
     let block = Block::default().borders(Borders::ALL).title(" filter ");
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Header: facts on the left, the whole root's history on the right as a
-/// sparkline with its net change over the window (first observed to last).
+/// sparkline with its net change and the window it covers.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let total = &app.report.total_series;
     let net = net_change(total);
-    let right_width: u16 = match net {
-        Some(d) if area.width >= 80 => SPARK_WIDTH + 1 + human_signed_bytes(d).len() as u16,
+    // The number says what it measures: net change over the window the
+    // history covers, e.g. `-41.4GB in 1w`.
+    let net_text = net.map(|d| {
+        if app.report.series_window_secs > 0 {
+            format!(
+                "{} in {}",
+                human_signed_bytes(d),
+                human_duration(app.report.series_window_secs)
+            )
+        } else {
+            human_signed_bytes(d)
+        }
+    });
+    let right_width: u16 = match &net_text {
+        Some(t) if area.width >= 80 => SPARK_WIDTH + 1 + crate::model::display_width(t) as u16,
         _ => 0,
     };
     let left = Rect {
@@ -831,7 +863,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         None => Line::from(Span::styled(text, dim)),
     };
     frame.render_widget(Paragraph::new(line), left);
-    if let Some(d) = net.filter(|_| right_width > 0) {
+    if let Some(text) = net_text.filter(|_| right_width > 0) {
         let x = area.x + area.width - right_width;
         draw_spark(
             frame,
@@ -844,8 +876,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             },
         );
         frame.render_widget(
-            Paragraph::new(human_signed_bytes(d))
-                .style(Style::default().add_modifier(Modifier::DIM)),
+            Paragraph::new(text).style(Style::default().add_modifier(Modifier::DIM)),
             Rect {
                 x: x + SPARK_WIDTH + 1,
                 y: area.y,
@@ -865,11 +896,20 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
         };
         format!("filter › {}▏  {hint}", app.filter_text)
     } else {
+        // Which view this is, where it sits among the ten, and how to move:
+        // `v` walks the list in order, Esc goes to the projects list.
+        let place = format!(
+            "{} of {}",
+            app.view.position(),
+            crate::app::ViewKind::ALL.len()
+        );
         let scope = match (app.view, app.selected_project.as_deref()) {
-            (crate::app::ViewKind::Projects, _) => "projects".to_string(),
-            (crate::app::ViewKind::Tree, Some(p)) => format!("tree of {p}  (Esc back)"),
-            (v, Some(p)) => format!("{} of {p}  (Esc back)", v.label()),
-            (v, None) => format!("{}  (Esc back)", v.label()),
+            (crate::app::ViewKind::Projects, _) => format!("projects ({place} · v next)"),
+            (crate::app::ViewKind::Tree, Some(p)) => {
+                format!("tree of {p} ({place} · Esc: projects)")
+            }
+            (v, Some(p)) => format!("{} of {p} ({place} · v next · Esc: projects)", v.label()),
+            (v, None) => format!("{} ({place} · v next · Esc: projects)", v.label()),
         };
         let sort_name = match app.sort {
             crate::model::Sort::Growth => Some("growth"),
@@ -913,36 +953,52 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Orders a row's decision evidence for the detail area (#60): activity
-/// (with its timestamp meaning/source/freshness), consumers, current-
-/// use, recovery, reclaimability -- the order named in the acceptance
-/// criteria, so a terminal too short to show every line clips the tail
-/// (the least decision-relevant facts), never the front.
-fn ordered_evidence_lines(evidence: &[swamp_core::evidence::Evidence]) -> Vec<String> {
-    use swamp_core::evidence::FactKind;
-    fn priority(k: FactKind) -> u8 {
-        match k {
-            FactKind::Activity => 0,
-            FactKind::Consumer => 1,
-            FactKind::CurrentUse => 2,
-            FactKind::Recovery => 3,
-            FactKind::Reclaimability => 4,
-        }
+/// What an empty list says: why it is empty and what to press next.
+fn empty_state(app: &App) -> String {
+    use crate::app::ViewKind as V;
+    // Only these views read the filter; the others are never emptied by it.
+    let filtered = matches!(
+        app.view,
+        V::Projects | V::Tree | V::Builds | V::Deps | V::Kinds | V::Types
+    );
+    if filtered && app.filter_text != "0" {
+        return format!(
+            "Nothing matches the filter \"{}\". Press / to change it, or 0 to clear it and see everything.",
+            app.filter_text
+        );
     }
-    let mut sorted: Vec<swamp_core::evidence::Evidence> = evidence.to_vec();
-    sorted.sort_by_key(|e| priority(e.kind));
-    swamp_core::render::render_evidence_lines(&sorted)
+    match app.view {
+        V::Projects if !app.has_index => {
+            "Nothing has been scanned yet. Press R to scan; it runs in the background.".to_string()
+        }
+        V::Projects => format!(
+            "No projects found under {}. Press R to scan again.",
+            app.root.display()
+        ),
+        V::Tree => {
+            "Nothing to show for this project. Esc goes back to the project list.".to_string()
+        }
+        V::Builds => {
+            "No build output found. Press v for another view, or R to scan again.".to_string()
+        }
+        V::Deps => {
+            "No dependency folders found. Press v for another view, or R to scan again.".to_string()
+        }
+        V::Docker => {
+            "No Docker images, containers or volumes found. Press v for another view.".to_string()
+        }
+        V::Agents => {
+            "No AI-tool storage found. Press v for another view, or R to scan again.".to_string()
+        }
+        _ => "Nothing here yet. Press v for another view, or R to scan again.".to_string(),
+    }
 }
 
 fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
-    if app.filter_has_no_data() {
-        frame.render_widget(Paragraph::new("no data yet"), area);
-        return;
-    }
     let rows = app.rows();
     if rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("no rows match — / to change the filter, 0 to clear"),
+            Paragraph::new(empty_state(app)).wrap(ratatui::widgets::Wrap { trim: true }),
             area,
         );
         return;
@@ -1053,8 +1109,15 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             format!("  {}", row.badges)
         };
-        let raw_name = format!("{}{mark_prefix}{}{badge}{track}", row.rail, row.label);
-        let name = truncate_middle(&raw_name, name_width);
+        // The tree rail is never cut: only what follows it gives way, so a
+        // narrow terminal keeps the outline readable.
+        let rail_width = crate::model::display_width(&row.rail);
+        let rest = format!("{mark_prefix}{}{badge}{track}", row.label);
+        let name = format!(
+            "{}{}",
+            row.rail,
+            truncate_middle(&rest, name_width.saturating_sub(rail_width).max(1))
+        );
         let bytes = format!(
             "{:>10}",
             format!(
@@ -1170,33 +1233,14 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(line);
     }
-    // Keep the selection visible even in projects with hundreds of build groups.
-    let selected_evidence_lines: Vec<String> = rows
-        .get(app.selected)
-        .map(|r| {
-            let path = r
-                .unit
-                .as_ref()
-                .map(|u| std::path::Path::new(&u.0))
-                .or_else(|| r.worktree.as_ref().map(|w| w.path.as_path()));
-            let mut lines = if let Some(path) = path {
-                swamp_core::render::render_sharing_lines(
-                    app.report.reconciliation.unique_estimate.as_ref(),
-                    Some(path),
-                )
-            } else {
-                Vec::new()
-            };
-            lines.extend(ordered_evidence_lines(&r.evidence));
-            lines
-        })
-        .unwrap_or_default();
     // The detail pane is the same height whichever row is selected, so
     // the table never resizes under the cursor.
     let detail_height = DETAIL_ROWS.min(area.height / 3);
     let table_height = area.height.saturating_sub(detail_height);
     let header_count = if cleanup_view { 2 } else { 1 };
     let visible = table_height.saturating_sub(header_count) as usize;
+    // One page is a screenful with a row of overlap.
+    app.page.set(visible.saturating_sub(1).max(1));
     // Stateful window: it moves only when the selection leaves it, so one
     // keypress moves the selection one row.
     let mut offset = app.scroll_offset.get();
@@ -1305,19 +1349,30 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     if let Some(row) = rows.get(app.selected) {
-        // #60: the selected row's own decision-evidence lines (activity,
-        // consumers, current-use, recovery, reclaimability), below the
-        // existing git-status signal line. Dimmed so the signal line
-        // (the previously-existing content) stays visually primary.
-        let mut detail_lines: Vec<Line> = Vec::new();
-        if !row.signals.is_empty() {
-            detail_lines.push(Line::raw(row.signals.join(" · ")));
-        }
-        detail_lines.extend(
-            selected_evidence_lines
-                .iter()
-                .map(|l| Line::styled(l.clone(), Style::default().add_modifier(Modifier::DIM))),
-        );
+        // What the row is, what rebuilding costs, and only the facts that
+        // change a decision (crate::detail).
+        let path = row
+            .unit
+            .as_ref()
+            .map(|u| std::path::Path::new(&u.0))
+            .or_else(|| row.worktree.as_ref().map(|w| w.path.as_path()));
+        let sharing = path.map_or_else(Vec::new, |p| {
+            swamp_core::render::render_sharing_lines(
+                app.report.reconciliation.unique_estimate.as_ref(),
+                Some(p),
+            )
+        });
+        let detail_lines: Vec<Line> = crate::detail::lines(row, &sharing)
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    Line::raw(l)
+                } else {
+                    Line::styled(l, Style::default().add_modifier(Modifier::DIM))
+                }
+            })
+            .collect();
         // One fact per row, cut at the edge: the front of each fact is
         // the part that decides, and the pane never grows.
         let clipped: Vec<Line> = detail_lines
@@ -1339,101 +1394,234 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let w = area.width.min(90);
-    let h = area.height.min(48);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let popup = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
+/// Wraps `text` to `width` cells at spaces, keeping its own spacing;
+/// continuation lines start with `hang` spaces so a wrapped entry stays
+/// under its own description.
+fn wrap_hanging(text: &str, width: usize, hang: usize) -> Vec<String> {
+    let width = width.max(hang + 8);
+    let mut out: Vec<String> = Vec::new();
+    let mut rest: Vec<char> = text.chars().collect();
+    loop {
+        let total: usize = rest
+            .iter()
+            .map(|c| crate::model::display_width(&c.to_string()))
+            .sum();
+        if total <= width {
+            out.push(rest.iter().collect());
+            return out;
+        }
+        // The last space that still leaves the line within `width`.
+        let mut cells = 0usize;
+        let mut brk = None;
+        let mut cut = rest.len();
+        for (i, c) in rest.iter().enumerate() {
+            cells += crate::model::display_width(&c.to_string());
+            if cells > width {
+                cut = i;
+                break;
+            }
+            if *c == ' ' && i > hang {
+                brk = Some(i);
+            }
+        }
+        let at = brk.unwrap_or(cut.max(1));
+        let head: String = rest[..at].iter().collect();
+        out.push(head.trim_end().to_string());
+        let tail: String = rest[at..].iter().collect();
+        rest = format!("{}{}", " ".repeat(hang), tail.trim_start())
+            .chars()
+            .collect();
+    }
+}
+
+/// The help text as `(line, is_heading)`, wrapped to `width`. One key per
+/// entry, one entry per line: nothing runs together and nothing is cut.
+fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let heading = |out: &mut Vec<(String, bool)>, t: &str| out.push((t.to_string(), true));
+    let blank = |out: &mut Vec<(String, bool)>| out.push((String::new(), false));
+    // Key column of 11 cells, then the description, wrapped under itself.
+    let entry = |out: &mut Vec<(String, bool)>, key: &str, desc: &str| {
+        let text = format!("  {}{desc}", pad_display(key, 11));
+        for l in wrap_hanging(&text, width, 13) {
+            out.push((l, false));
+        }
     };
-    frame.render_widget(Clear, popup);
-    let mut text = vec![
-        Line::from("Keys"),
-        Line::from("  ↑↓        move selection"),
-        Line::from("  →/←       in / out: open or expand · collapse or go back"),
-        Line::from("  Enter     open project / confirm delete"),
-        Line::from(
-            "  Space     mark / unmark the row; on a project row, everything rebuildable in it",
+    let plain = |out: &mut Vec<(String, bool)>, text: &str, hang: usize| {
+        for l in wrap_hanging(text, width, hang) {
+            out.push((l, false));
+        }
+    };
+    heading(&mut out, "Keys");
+    entry(&mut out, "↑ ↓", "move the cursor");
+    entry(
+        &mut out,
+        "PgUp PgDn",
+        "move a screenful · Home and End jump to the first and last row",
+    );
+    entry(
+        &mut out,
+        "→ / ←",
+        "in and out: open or expand · collapse or go back",
+    );
+    entry(&mut out, "Enter", "open the project · on the plan, confirm");
+    entry(
+        &mut out,
+        "Space",
+        "mark or unmark the row. On a project row: everything in it that can be rebuilt",
+    );
+    entry(&mut out, "A", "mark every row here that can be cleaned up");
+    entry(
+        &mut out,
+        "Backspace",
+        "move what is under the cursor (or everything marked) to Trash, after one confirm",
+    );
+    entry(
+        &mut out,
+        "",
+        "On a project row that is its rebuildable items; only if it has none, the checkout itself (named 'checkout' on the plan), with .git and source, into Trash.",
+    );
+    entry(
+        &mut out,
+        "",
+        "Docker images and volumes are removed by docker for good: no Trash.",
+    );
+    entry(
+        &mut out,
+        "b  d",
+        "list what the last check could not include, with the reason and the next step (d on the plan)",
+    );
+    entry(
+        &mut out,
+        "✗  ~n/m",
+        "a project row is all marked, or n of its m items are",
+    );
+    entry(
+        &mut out,
+        "/",
+        "filter picker (a form) · : edits the filter as text, Tab completes · 0 clears it",
+    );
+    entry(
+        &mut out,
+        "v  1-9",
+        "next view, or pick one: 1 projects 2 tree 3 builds 4 deps 5 docker 6 kinds 7 unowned 8 types 9 external. v also reaches agents. Esc returns to projects.",
+    );
+    entry(
+        &mut out,
+        "g s n t a",
+        "sort by growth, size, name, type, age; press again to turn the sort off · r reverses it · remembered",
+    );
+    entry(
+        &mut out,
+        "k",
+        &format!(
+            "keep executables: {} now. Copies release and debug programs and dist wheels to bin/ before their folder goes to Trash. Remembered for next time; the result line says which way it went.",
+            if app.keep_executables { "ON" } else { "OFF" }
         ),
-        Line::from("  A         mark every row here the tool can act on"),
-        Line::from("  Backspace delete what is under the cursor (or the marks), asks once"),
-        Line::from(
-            "            on a project row: its rebuildable artifacts; only if it has none, its checkout",
-        ),
-        Line::from(
-            "            (named 'checkout' in the confirm, with .git and source, into Trash)",
-        ),
-        Line::from(
-            "            paths go to Trash; docker images and volumes are removed by the daemon and do not",
-        ),
-        Line::from("  ✗ / ~n/m  a project row is all marked / n of m units marked"),
-        Line::from("  /         filter picker (form) · : edit filter as text, Tab completes"),
-        Line::from("  0         clear filter"),
-        Line::from(
-            "  v, 1-9    switch view (projects · tree · builds · deps · docker · kinds · unowned ·",
-        ),
-        Line::from("            types · external); v also reaches agents (0 is clear filter)"),
-        Line::from(
-            "  g/s/n/t/a sort by growth / size / name / type / age · r reverses (remembered)",
-        ),
-        Line::from(
-            "  k         keep executables: copy target/{release,debug} binaries, dist/*.whl to bin/ before trashing",
-        ),
-        Line::from("  i         inspect selected Cargo profile dependencies (on demand)"),
-        Line::from("  ?         toggle this help · R refresh now (background scan)"),
-        Line::from("  q         quit"),
-        Line::from(""),
-        Line::from(
-            "Columns: bytes · growth in window, then its bar around the centre axis: left green shrank, right red grew, log-scaled, a dim tick below 1MB · facts",
-        ),
-        Line::from("  [tracked] [ignored] [untracked]: git status; untracked has no copy anywhere"),
-        Line::from(""),
-        Line::from("Filter grammar"),
-        Line::from("  growth [><] <size> in <duration>   (window capped at stored history)"),
-        Line::from(
-            "  kind:<k>   project:<name|glob*>   type:rs|js|py|go|…   pr:open|merged|closed|none",
-        ),
-        Line::from("  idle > <duration>   merge-complete   size > <bytes>   age > <duration>"),
-        Line::from(""),
-        Line::from(
-            "Badges  🦀 rs  ⬢ js  🦕 deno  🐍 py  🐹 go  ☕ java  🔺 scala  🔧 cpp  🐦 swift  🟣 net",
-        ),
-        Line::from(
-            "        💎 rb  💧 ex  🐘 php  λ hs  🎯 dart  ⚡ zig  🌍 tf  🐳 docker  🎲 unity  🎮 ue",
-        ),
-        Line::from("        🔨 has build output   ⎇ N  N linked worktrees"),
-    ];
+    );
+    entry(
+        &mut out,
+        "i",
+        "inspect the Cargo dependencies of the selected profile",
+    );
+    entry(
+        &mut out,
+        "R",
+        "refresh: scan again in the background. Opening never scans when an index exists",
+    );
+    entry(&mut out, "?", "this help · Esc or q closes it");
+    entry(
+        &mut out,
+        "q",
+        "quit. While a check or a move runs, q and Esc stop it after the current item",
+    );
+    blank(&mut out);
+    heading(&mut out, "Columns");
+    plain(
+        &mut out,
+        "  Size, then growth over the window with its bar around the centre axis: left green shrank, right red grew, log-scaled, a dim tick below 1MB. Then facts.",
+        2,
+    );
+    plain(
+        &mut out,
+        "  [tracked] [ignored] [untracked] is git status; untracked has no copy anywhere.",
+        2,
+    );
+    blank(&mut out);
+    heading(&mut out, "Filter grammar");
+    plain(
+        &mut out,
+        "  growth [><] <size> in <duration>   (window capped at stored history)",
+        4,
+    );
+    plain(
+        &mut out,
+        "  kind:<k>   project:<name|glob*>   type:rs|js|py|go|…   pr:open|merged|closed|none",
+        4,
+    );
+    plain(
+        &mut out,
+        "  idle > <duration>   merge-complete   size > <bytes>   age > <duration>",
+        4,
+    );
+    blank(&mut out);
+    heading(&mut out, "Badges");
+    for l in [
+        "  🦀 rs  ⬢ js  🦕 deno  🐍 py  🐹 go  ☕ java  🔺 scala  🔧 cpp  🐦 swift  🟣 net",
+        "  💎 rb  💧 ex  🐘 php  λ hs  🎯 dart  ⚡ zig  🌍 tf  🐳 docker  🎲 unity  🎮 ue",
+        "  🔨 has build output   ⎇ N  N linked worktrees",
+    ] {
+        out.push((l.to_string(), false));
+    }
     // The activity-evidence inventory (#54): which domains this pass can
     // establish a real activity fact for, and which it reports as
     // unknown. `docs/usage.md` carries the same table, checked against
     // the constant by `evidence_contract.rs`.
-    text.push(Line::from(""));
-    text.push(Line::from("Activity evidence this pass can establish"));
-    // Wrapped rather than clipped: the clipped tail is where each entry
-    // says what the evidence cannot establish.
-    let room = usize::from(w.saturating_sub(2)).max(20);
+    blank(&mut out);
+    heading(&mut out, "Activity evidence this pass can establish");
     for (domain, evidence) in swamp_core::activity::ACTIVITY_EVIDENCE_INVENTORY {
-        let mut line = String::from(" ");
-        for word in format!("{domain}: {evidence}").split_whitespace() {
-            if line.chars().count() + 1 + word.chars().count() > room && !line.trim().is_empty() {
-                text.push(Line::from(std::mem::replace(
-                    &mut line,
-                    String::from("   "),
-                )));
-            }
-            line.push(' ');
-            line.push_str(word);
-        }
-        text.push(Line::from(line));
+        plain(&mut out, &format!("  {domain}: {evidence}"), 4);
     }
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("help (? to close)");
-    frame.render_widget(Paragraph::new(text).block(block), popup);
+    out
+}
+
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    let w = area.width.min(96);
+    let popup = Rect {
+        x: (area.width.saturating_sub(w)) / 2,
+        y: area.y,
+        width: w,
+        height: area.height,
+    };
+    frame.render_widget(Clear, popup);
+    let inner_w = usize::from(w.saturating_sub(2));
+    let inner_h = usize::from(popup.height.saturating_sub(2));
+    let lines = help_lines(app, inner_w);
+    // Clamp here, once per frame: End may ask for "as far as it goes".
+    let last = lines.len().saturating_sub(inner_h);
+    let top = app.help_scroll.get().min(last);
+    app.help_scroll.set(top);
+    app.page.set(inner_h.saturating_sub(1).max(1));
+    let shown: Vec<Line> = lines
+        .iter()
+        .skip(top)
+        .take(inner_h)
+        .map(|(l, head)| {
+            if *head {
+                Line::styled(l.clone(), Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                Line::from(l.clone())
+            }
+        })
+        .collect();
+    let title = format!(
+        " help · ↑↓ PgUp PgDn Home End scroll · Esc closes · {}-{} of {} ",
+        (top + 1).min(lines.len()),
+        (top + inner_h).min(lines.len()),
+        lines.len()
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    frame.render_widget(Paragraph::new(shown).block(block), popup);
 }
 
 /// Chooses up to `n` signals worth a narrow column: anything that is not

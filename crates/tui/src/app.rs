@@ -105,6 +105,25 @@ impl ViewKind {
             _ => return None,
         })
     }
+    /// Every view, in the order `v` walks them.
+    pub const ALL: [ViewKind; 10] = [
+        ViewKind::Projects,
+        ViewKind::Tree,
+        ViewKind::Builds,
+        ViewKind::Deps,
+        ViewKind::Docker,
+        ViewKind::Kinds,
+        ViewKind::Unowned,
+        ViewKind::Types,
+        ViewKind::External,
+        ViewKind::Agents,
+    ];
+
+    /// 1-based place in [`ViewKind::ALL`], for "3 of 10".
+    pub fn position(self) -> usize {
+        Self::ALL.iter().position(|v| *v == self).unwrap_or(0) + 1
+    }
+
     pub fn next(self) -> Self {
         match self {
             ViewKind::Projects => ViewKind::Tree,
@@ -233,6 +252,16 @@ pub struct App {
     pub scroll_offset: std::cell::Cell<usize>,
     /// Redraws so far; drives the busy glyph.
     pub frame: u64,
+    /// Rows a page key moves in whatever is on top (the list, the blocked
+    /// sheet, help, the cargo popup); each drawer sets it to its own
+    /// viewport so PgUp/PgDn always mean "one screenful".
+    pub page: std::cell::Cell<usize>,
+    /// First help line shown. The drawer clamps it to the real end, so
+    /// `End` may set it as far as it likes.
+    pub help_scroll: std::cell::Cell<usize>,
+    /// Where the cursor was in each view when it was last left, so coming
+    /// back (Esc, `v`) lands on the same row instead of the top.
+    view_cursor: std::collections::HashMap<ViewKind, usize>,
     /// Per-project mark counts for the projects view, kept until the marks
     /// or the report change (computing one is a tree build per project).
     mark_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<MarkStates>)>>,
@@ -480,7 +509,6 @@ enum OperationEvent {
     },
     Deleted {
         results: Vec<actions::UnitResult>,
-        measured: Option<i64>,
         total: usize,
     },
     Failed(String),
@@ -567,6 +595,9 @@ impl App {
             blocked_scroll: 0,
             scroll_offset: std::cell::Cell::new(0),
             frame: 0,
+            page: std::cell::Cell::new(10),
+            help_scroll: std::cell::Cell::new(0),
+            view_cursor: std::collections::HashMap::new(),
             mark_cache: std::sync::Mutex::new(None),
             report,
             root,
@@ -864,21 +895,35 @@ impl App {
     }
 
     /// `k`: whether a delete first copies compiled outputs to `bin/`.
+    /// The setting is remembered between sessions, so the result line
+    /// says which way it went and what that means; a key that changes
+    /// something lasting never answers in silence.
     pub fn toggle_keep_executables(&mut self) {
         self.keep_executables = !self.keep_executables;
         self.persist_ui_state();
+        self.set_result(if self.keep_executables {
+            "Keep executables is now on: release and debug programs are copied to bin/ before their folder goes to Trash. Remembered for next time. k turns it off.".to_string()
+        } else {
+            "Keep executables is now off: build folders go to Trash as they are. Remembered for next time. k turns it on.".to_string()
+        });
     }
 
-    /// Whether the active filter is one that has no data source yet.
-    /// Kept for the UI: every predicate now has a data source, so a
-    /// filter never lands in a "no data yet" state.
-    pub fn filter_has_no_data(&self) -> bool {
-        false
-    }
-
+    /// Switches view. The cursor of the view being left is remembered and
+    /// the one of the view being entered is restored (clamped to its
+    /// rows), so `v` or Esc and back never sends the cursor to the top.
     pub fn set_view(&mut self, v: ViewKind) {
+        if v == self.view {
+            return;
+        }
+        self.view_cursor.insert(self.view, self.selected);
         self.view = v;
-        self.selected = 0;
+        let len = self.rows().len();
+        self.selected = self
+            .view_cursor
+            .get(&v)
+            .copied()
+            .unwrap_or(0)
+            .min(len.saturating_sub(1));
     }
 
     pub fn move_selection(&mut self, delta: i32) {
@@ -889,6 +934,22 @@ impl App {
         }
         let cur = self.selected as i32 + delta;
         self.selected = cur.clamp(0, len as i32 - 1) as usize;
+    }
+
+    /// PgUp / PgDn: one screenful, keeping one row of overlap.
+    pub fn page_selection(&mut self, direction: i32) {
+        let step = self.page.get().max(1) as i32;
+        self.move_selection(direction * step);
+    }
+
+    /// Home.
+    pub fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    /// End.
+    pub fn select_last(&mut self) {
+        self.selected = self.rows().len().saturating_sub(1);
     }
 
     /// Enter filter editing with the current text kept, so the human edits
@@ -984,6 +1045,7 @@ impl App {
             }
         }
         self.selected = 0;
+        self.view_cursor.clear();
     }
 
     pub fn clear_filter(&mut self) {
@@ -991,6 +1053,7 @@ impl App {
         self.filter = Filter::default();
         self.filter_error = None;
         self.selected = 0;
+        self.view_cursor.clear();
         self.persist_filter();
     }
 
@@ -1127,6 +1190,8 @@ impl App {
                 }
             }
             self.selected_project = Some(name);
+            // A different project's tree starts at its top.
+            self.view_cursor.remove(&ViewKind::Tree);
             self.set_view(ViewKind::Tree);
         }
     }
@@ -2062,14 +2127,10 @@ impl App {
                     self.operation_rx = None;
                     break;
                 }
-                OperationEvent::Deleted {
-                    results,
-                    measured,
-                    total,
-                } => {
+                OperationEvent::Deleted { results, total } => {
                     self.operation = None;
                     self.operation_rx = None;
-                    self.finish_delete(results, measured, total);
+                    self.finish_delete(results, total);
                     break;
                 }
                 OperationEvent::Failed(msg) => {
@@ -2249,7 +2310,6 @@ impl App {
         self.blocked_open = false;
         crate::worker::spawn(move || {
             let ledger = swamp_core::ledger::Ledger::resolved(&store);
-            let free_before = actions::free_space_bytes(&trash);
             let results = actions::execute_plan_progress(
                 &units,
                 &ledger,
@@ -2265,33 +2325,30 @@ impl App {
                     !cancel.load(std::sync::atomic::Ordering::SeqCst)
                 },
             );
-            let measured = match (free_before, actions::free_space_bytes(&trash)) {
-                (Some(b), Some(a)) => Some(a as i64 - b as i64),
-                _ => None,
-            };
-            let _ = tx.send(OperationEvent::Deleted {
-                results,
-                measured,
-                total,
-            });
+            let _ = tx.send(OperationEvent::Deleted { results, total });
         });
     }
 
-    fn finish_delete(
-        &mut self,
-        results: Vec<actions::UnitResult>,
-        measured: Option<i64>,
-        total: usize,
-    ) {
-        let failed: Vec<String> = results
+    fn finish_delete(&mut self, results: Vec<actions::UnitResult>, total: usize) {
+        // What could not be moved, kept so `b` lists each with its reason
+        // instead of the result line naming only the first.
+        let failed: Vec<BlockedItem> = results
             .iter()
             .filter_map(|r| {
-                r.outcome
-                    .as_ref()
-                    .err()
-                    .map(|e| format!("{}: {e}", r.path.display()))
+                r.outcome.as_ref().err().map(|e| BlockedItem {
+                    name: names::friendly_unit_name(&self.report, &r.path),
+                    reason: e.to_string(),
+                    next: "check that nothing is using it, then try again".to_string(),
+                })
             })
             .collect();
+        let could_not = |n: usize| {
+            if n == 0 {
+                String::new()
+            } else {
+                format!(" {n} could not be moved (b to see why).")
+            }
+        };
         // What moved to Trash and what was removed for good (docker), with
         // sizes, read before the marks of finished units are dropped.
         let (mut trash_n, mut trash_bytes, mut docker_n, mut docker_bytes) =
@@ -2341,26 +2398,21 @@ impl App {
         }
         self.set_result(if results.len() < total {
             format!(
-                "Stopped. {moved} {} blocked, {} not attempted. Items moved to Trash stay there. A docker or git command that was running was stopped and may still have finished.",
-                failed.len(),
+                "Stopped. {moved}{} {} not attempted. Items moved to Trash stay there. A docker or git command that was running was stopped and may still have finished.",
+                could_not(failed.len()),
                 total - results.len()
             )
-        } else if failed.is_empty() {
-            let space = measured
-                .map(|m| format!(" Free space changed by {}.", model::human_signed_bytes(m)))
-                .unwrap_or_default();
-            if trash_n > 0 {
-                format!("{moved} Space is freed when Trash is emptied.{space}")
-            } else {
-                format!("{moved}{space}")
-            }
-        } else {
+        } else if trash_n > 0 {
+            // No "freed" figure: on the same volume the move to Trash frees
+            // nothing until Trash is emptied, so a measured change is noise.
             format!(
-                "{moved} {} blocked (first: {}). Space is freed when Trash is emptied.",
-                failed.len(),
-                failed[0]
+                "{moved}{} Space is freed when Trash is emptied.",
+                could_not(failed.len())
             )
+        } else {
+            format!("{moved}{}", could_not(failed.len()))
         });
+        self.blocked = failed;
         // What just left the disk leaves the screen now; the store and the
         // header follow from a background incremental observe (FSEvents
         // narrows it to the touched trees), the same path startup uses.
@@ -2873,6 +2925,7 @@ impl App {
 
     pub fn toggle_help(&mut self) {
         self.help_open = !self.help_open;
+        self.help_scroll.set(0);
     }
 }
 
@@ -2960,7 +3013,6 @@ mod tests {
                     outcome: Err("busy".into()),
                 },
             ],
-            None,
             3,
         );
         assert_eq!(app.marked.len(), 2);

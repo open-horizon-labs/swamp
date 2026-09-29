@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                    "
-"view: agents  (Esc back) · filter: growth > 100MB in 7d                                                                                                                                                 "
+"view: agents (10 of 10 · v next · Esc: projects) · filter: growth > 100MB in 7d                                                                                                                         "
 "Name                                                                                                              Size     Change Change bar    Cleanup / facts                                         "
 "Claude Code · protected-config · settings.json · tool-wide [protected]                                           4.1KB          —                                                                       "
 "                                                                                                                                                                                                        "
@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "refused: nothing to propose: no actionable agent-storage unit matched (1 refused: /Users/dev/.claude/settings.json — protected: global settings)                                                        "
 "                                                                                                                                                                                                        "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  R refresh  ? help  q quit                                                       "
+"/ filter  v view  R refresh  ⌫ delete  Space mark  A mark all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                                           "

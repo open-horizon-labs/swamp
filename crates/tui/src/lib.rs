@@ -10,6 +10,7 @@
 
 pub mod actions;
 pub mod app;
+pub mod detail;
 pub mod filter;
 pub mod model;
 pub mod names;
@@ -54,6 +55,21 @@ pub fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
     );
 }
 
+/// Where a scrolled view lands after `code`, or `None` for a key that does
+/// not scroll. `page` is the rows in one screenful, `last` the furthest
+/// first-line index.
+fn scrolled(cur: usize, code: KeyCode, page: usize, last: usize) -> Option<usize> {
+    Some(match code {
+        KeyCode::Down => cur.saturating_add(1).min(last),
+        KeyCode::Up => cur.saturating_sub(1),
+        KeyCode::PageDown => cur.saturating_add(page.max(1)).min(last),
+        KeyCode::PageUp => cur.saturating_sub(page.max(1)),
+        KeyCode::Home => 0,
+        KeyCode::End => last,
+        _ => return None,
+    })
+}
+
 /// `shift` distinguishes Shift-→/Shift-← inside the picker's growth field.
 pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     // A result stays until the next key, and only a key removes it: no
@@ -68,18 +84,15 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         return;
     }
     if let Some(lines) = &app.cargo_inspection {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => app.cargo_inspection = None,
-            KeyCode::Down => {
-                app.cargo_inspection_scroll = app
-                    .cargo_inspection_scroll
-                    .saturating_add(1)
-                    .min(lines.len().saturating_sub(1).min(u16::MAX as usize) as u16)
-            }
-            KeyCode::Up => {
-                app.cargo_inspection_scroll = app.cargo_inspection_scroll.saturating_sub(1)
-            }
-            _ => {}
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.cargo_inspection = None;
+        } else if let Some(at) = scrolled(
+            app.cargo_inspection_scroll as usize,
+            code,
+            app.page.get(),
+            lines.len().saturating_sub(1).min(u16::MAX as usize),
+        ) {
+            app.cargo_inspection_scroll = at as u16;
         }
         return;
     }
@@ -87,6 +100,8 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         match code {
             KeyCode::Up => p.up(),
             KeyCode::Down => p.down(),
+            KeyCode::Home | KeyCode::PageUp => p.first(),
+            KeyCode::End | KeyCode::PageDown => p.last(),
             KeyCode::Char(' ') => p.flip_op(),
             KeyCode::Right => p.cycle(1),
             KeyCode::Left => p.cycle(-1),
@@ -115,21 +130,30 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         return;
     }
     if app.help_open {
-        if matches!(code, KeyCode::Char('?') | KeyCode::Esc) {
+        if matches!(code, KeyCode::Char('?' | 'q') | KeyCode::Esc) {
             app.toggle_help();
+        } else if let Some(at) =
+            scrolled(app.help_scroll.get(), code, app.page.get(), usize::MAX / 2)
+        {
+            // The drawer clamps this to the real end of the text.
+            app.help_scroll.set(at);
         }
         return;
     }
     if app.blocked_open {
         // The blocked list is read-only: nothing under it can be marked.
         match code {
-            KeyCode::Esc | KeyCode::Char('b' | 'd') => app.blocked_open = false,
-            KeyCode::Down => {
-                app.blocked_scroll =
-                    (app.blocked_scroll + 1).min(app.blocked.len().saturating_sub(1))
+            KeyCode::Esc | KeyCode::Char('b' | 'd' | 'q') => app.blocked_open = false,
+            _ => {
+                if let Some(at) = scrolled(
+                    app.blocked_scroll,
+                    code,
+                    app.page.get(),
+                    app.blocked.len().saturating_sub(1),
+                ) {
+                    app.blocked_scroll = at;
+                }
             }
-            KeyCode::Up => app.blocked_scroll = app.blocked_scroll.saturating_sub(1),
-            _ => {}
         }
         return;
     }
@@ -139,6 +163,10 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('d') if app.confirm_open => app.open_blocked(),
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
+        KeyCode::PageUp => app.page_selection(-1),
+        KeyCode::PageDown => app.page_selection(1),
+        KeyCode::Home => app.select_first(),
+        KeyCode::End => app.select_last(),
         // Traversal, the way every file tree does it: right goes in,
         // left comes back out. Enter and Esc still do the same, so the
         // muscle memory either way works.

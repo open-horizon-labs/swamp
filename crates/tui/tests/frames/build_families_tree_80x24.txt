@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · 2 projects · 11.6GB attributed             "
-"view: tree of mole  (Esc back) · filter: none                                   "
+"view: tree of mole (2 of 10 · Esc: projects) · filter: none                     "
 "Name                                   Size* Cleanup advice / consequence       "
 "* allocated incl. shared links; not additive with report totals. Age = modified "
 "└─ ▾ main /Users/dev/src/mole          3.5GB clean                              "
@@ -21,4 +21,4 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ? help  q quit "
+"/ filter  v view  R refresh  ⌫ delete  Space mark  A mark all  ? help  q quit   "

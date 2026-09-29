@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed  "
-"view: agents  (Esc back) · filter: growth > 100MB in 7d                         "
+"view: agents (10 of 10 · v next · Esc: projects) · filter: growth > 100MB in 7d "
 "Name                                                          Size     Change   "
 "Claude…ed-config · settings.json · tool-wide [protected]     4.1KB          —   "
 "                                                                                "
@@ -21,4 +21,4 @@
 "                                                                                "
 "refused: nothing to propose: no actionable agent-storage unit matched (1        "
 "refused: /Users/dev/.claude/settings.json — protected: global settings)         "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ? help  q quit "
+"/ filter  v view  R refresh  ⌫ delete  Space mark  A mark all  ? help  q quit   "

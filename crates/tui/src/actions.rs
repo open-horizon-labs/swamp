@@ -396,13 +396,6 @@ pub fn trash_root() -> PathBuf {
     swamp_core::actions::trash_root()
 }
 
-/// Free space on the volume containing `path`, in bytes, via `df -k`.
-/// Returns `None` if `df` cannot be read (kept read-only/advisory: a
-/// missing measurement never blocks or fakes the reported result).
-pub fn free_space_bytes(path: &Path) -> Option<u64> {
-    swamp_core::actions::free_space_bytes(path)
-}
-
 /// Human summary for the confirm banner: current facts, shown once,
 /// before Enter -- never re-checked afterward.
 ///

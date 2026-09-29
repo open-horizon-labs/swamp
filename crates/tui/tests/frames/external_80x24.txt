@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed  "
-"view: external  (Esc back) · filter: growth > 100MB in 7d                       "
+"view: external (9 of 10 · v next · Esc: projects) · filter: growth > 100MB in 7d"
 "Name                                                          Size     Change   "
 "Cache …rgo/registry (cargo-home) · no declared consumers     2.5GB    +50.0MB   "
 "                                                                                "
@@ -21,4 +21,4 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ? help  q quit "
+"/ filter  v view  R refresh  ⌫ delete  Space mark  A mark all  ? help  q quit   "

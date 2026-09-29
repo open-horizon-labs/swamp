@@ -591,16 +591,14 @@ fn evidence_detail_area_frames() {
         app.set_view(ViewKind::Deps);
         app.selected = 0;
         let frame = capture(&app, w, h);
-        assert!(frame.contains("activity"), "{frame}");
-        assert!(frame.contains("consumer"), "{frame}");
-        assert!(frame.contains("recovery"), "{frame}");
+        assert!(frame.contains("Last changed 1h ago"), "{frame}");
         assert!(
-            frame.contains("mole") && frame.contains("swamp"),
+            frame.contains("Used by 2 projects: mole, swamp"),
             "multiple consumers must both be visible: {frame}"
         );
         assert!(
-            frame.contains("unknown"),
-            "missing/unknown evidence must render explicitly, not be silently dropped: {frame}"
+            frame.contains("Unknown: how to get it back"),
+            "missing evidence must render explicitly, not be silently dropped: {frame}"
         );
         check(&format!("evidence_detail_{w}x{h}"), &frame);
     }
@@ -1110,7 +1108,10 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     app.width = 200;
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
-    assert!(before.contains("view: projects · filter: none"), "{before}");
+    assert!(
+        before.contains("view: projects (1 of 10 · v next) · filter: none"),
+        "{before}"
+    );
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
     let tree = capture(&app, 200, 60);
@@ -1118,7 +1119,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
         tree.contains("view: tree of "),
         "second line must name the scope:\n{tree}"
     );
-    assert!(tree.contains("(Esc back)"), "{tree}");
+    assert!(tree.contains("2 of 10 · Esc: projects"), "{tree}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
@@ -2094,4 +2095,209 @@ fn the_selected_row_is_reverse_video_and_sets_no_background_color() {
             assert_eq!(c.bg, Color::Reset, "{w}x{h}: no fixed background");
         }
     }
+}
+
+fn many_rows_app(n: usize) -> App {
+    let mut report = fixture_report();
+    let wt = &mut report.projects[0].worktrees[0];
+    let base = wt.path.clone();
+    for i in 0..n {
+        wt.artifacts.push(art(
+            ArtifactKind::DependencyTree,
+            base.join(format!("pkg{i:03}/node_modules"))
+                .to_str()
+                .unwrap(),
+            1_000_000 + i as u64,
+            None,
+        ));
+    }
+    let mut app = App::new(report, "/Users/dev/src".into());
+    app.clear_filter();
+    app.drill_into_selected();
+    assert_eq!(app.view, ViewKind::Tree);
+    app
+}
+
+/// PgDn, PgUp, Home and End move the list by a screenful and to its ends,
+/// and the selected row stays on screen.
+#[test]
+fn page_and_home_end_keys_move_the_list() {
+    use crossterm::event::KeyCode;
+    let mut app = many_rows_app(80);
+    let total = app.rows().len();
+    let _ = capture(&app, 80, 24); // the draw tells the app its page size
+    let page = app.page.get();
+    assert!((10..24).contains(&page), "one screenful, got {page}");
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    assert_eq!(app.selected, page);
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    assert_eq!(app.selected, 2 * page);
+    swamp_tui::handle_key(&mut app, KeyCode::PageUp);
+    assert_eq!(app.selected, page);
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    assert_eq!(app.selected, total - 1);
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("pkg000"), "End shows the last row:\n{f}");
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    assert_eq!(app.selected, total - 1, "PgDn stops at the end");
+    swamp_tui::handle_key(&mut app, KeyCode::Home);
+    assert_eq!(app.selected, 0);
+    swamp_tui::handle_key(&mut app, KeyCode::PageUp);
+    assert_eq!(app.selected, 0, "PgUp stops at the top");
+}
+
+/// Help at 80x24: every entry on its own row (the A and Backspace entries
+/// no longer run together), nothing cut, and the rest reachable by
+/// scrolling to the very last line.
+#[test]
+fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    swamp_tui::handle_key(&mut app, KeyCode::Char('?'));
+    let first = capture(&app, 80, 24);
+    let row_with = |f: &str, needle: &str| f.lines().position(|l| l.contains(needle));
+    let a = row_with(&first, "mark every row here").expect("A entry");
+    let bs = row_with(&first, "Backspace  move what is under the cursor").expect("Backspace");
+    assert_ne!(a, bs, "A and Backspace on separate rows:\n{first}");
+    assert!(first.contains("1-2"), "position is shown:\n{first}");
+    assert!(!first.contains("mark every row here the tool can act on  Ba"));
+    // Scroll a page at a time to the end: the last line of the text shows.
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    let second = capture(&app, 80, 24);
+    assert_ne!(first, second, "PgDn scrolls the help");
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    let end = capture(&app, 80, 24);
+    assert!(end.contains("Activity evidence"), "{end}");
+    let top_after_end = app.help_scroll.get();
+    swamp_tui::handle_key(&mut app, KeyCode::Down);
+    let _ = capture(&app, 80, 24);
+    assert_eq!(app.help_scroll.get(), top_after_end, "End is the real end");
+    swamp_tui::handle_key(&mut app, KeyCode::Up);
+    let _ = capture(&app, 80, 24);
+    assert_eq!(
+        app.help_scroll.get(),
+        top_after_end - 1,
+        "Up moves one line"
+    );
+    swamp_tui::handle_key(&mut app, KeyCode::Home);
+    assert_eq!(app.help_scroll.get(), 0);
+    swamp_tui::handle_key(&mut app, KeyCode::Char('q'));
+    assert!(!app.help_open && !app.quit, "q closes help before it quits");
+    // 50 columns wraps instead of cutting.
+    swamp_tui::handle_key(&mut app, KeyCode::Char('?'));
+    let narrow = capture(&app, 50, 24);
+    assert!(narrow.contains("Backspace  move what is under"), "{narrow}");
+}
+
+/// PgUp/PgDn/Home/End page the blocked list by whole items.
+#[test]
+fn the_blocked_list_pages_and_jumps() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.blocked = (0..20)
+        .map(|i| swamp_tui::app::BlockedItem {
+            name: format!("project-{i}"),
+            reason: "nothing reclaimable in this project".into(),
+            next: "open the project with Enter".into(),
+        })
+        .collect();
+    swamp_tui::handle_key(&mut app, KeyCode::Char('b'));
+    let _ = capture(&app, 80, 24);
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    assert!(app.blocked_scroll >= 3, "{}", app.blocked_scroll);
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    assert_eq!(app.blocked_scroll, 19);
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("project-19"), "{f}");
+    swamp_tui::handle_key(&mut app, KeyCode::Home);
+    assert_eq!(app.blocked_scroll, 0);
+}
+
+/// `k` states the new value and what it means; the legend keeps filter,
+/// view, refresh and delete at 80 columns.
+#[test]
+fn k_says_what_it_changed_and_the_legend_keeps_the_common_keys() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    swamp_tui::handle_key(&mut app, KeyCode::Char('k'));
+    assert!(app.keep_executables);
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("Keep executables is now on"), "{f}");
+    assert!(f.contains("Remembered for next time"), "{f}");
+    swamp_tui::handle_key(&mut app, KeyCode::Char('k'));
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("Keep executables is now off"), "{f}");
+    swamp_tui::handle_key(&mut app, KeyCode::Down);
+    let f = capture(&app, 80, 24);
+    assert!(
+        f.contains("/ filter  v view  R refresh  ⌫ delete"),
+        "the four keys people reach for stay at 80 columns:\n{f}"
+    );
+    assert!(f.contains("? help  q quit"), "{f}");
+    let f50 = capture(&app, 50, 24);
+    assert!(f50.contains("/ filter  v view  R refresh"), "{f50}");
+    assert!(f50.contains("? help  q quit"), "{f50}");
+}
+
+/// Leaving a view and coming back lands on the row you left; the view
+/// list is named; an empty list says what to do.
+#[test]
+fn views_keep_their_cursor_are_named_and_empty_states_teach() {
+    use crossterm::event::KeyCode;
+    let mut app = many_rows_app(30);
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    let at = app.selected;
+    assert!(at > 5);
+    swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
+    assert_eq!(app.view, ViewKind::Builds);
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("builds of mole (3 of 10 · v next"), "{f}");
+    swamp_tui::handle_key(&mut app, KeyCode::Char('2'));
+    assert_eq!(app.view, ViewKind::Tree);
+    assert_eq!(app.selected, at, "the tree cursor came back");
+    // Esc to projects and back to the same project row.
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+    assert_eq!(app.view, ViewKind::Projects);
+    // No agent storage in the fixture: the empty view teaches.
+    app.set_view(ViewKind::Agents);
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("No AI-tool storage found"), "{f}");
+    assert!(!f.contains("no rows match"), "{f}");
+    assert!(f.contains("Press v for another view"), "{f}");
+    // A filter that matches nothing names itself and both ways out.
+    swamp_tui::handle_key(&mut app, KeyCode::Char('1'));
+    app.filter_text = "growth > 900GB in 7d".into();
+    app.commit_filter();
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("Nothing matches the filter"), "{f}");
+    assert!(f.contains("Press / to change it, or 0"), "{f}");
+}
+
+/// The picker prints its keys once (the footer); the box holds the form.
+#[test]
+fn the_picker_shows_its_key_hints_once() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    swamp_tui::handle_key(&mut app, KeyCode::Char('/'));
+    for w in [80u16, 120] {
+        let f = capture(&app, w, 24);
+        assert_eq!(f.matches("Enter apply").count(), 1, "{f}");
+        assert_eq!(f.matches("e edit as text").count(), 1, "{f}");
+    }
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    assert_eq!(app.picker.as_ref().unwrap().field, 9);
+    swamp_tui::handle_key(&mut app, KeyCode::Home);
+    assert_eq!(app.picker.as_ref().unwrap().field, 0);
+}
+
+/// The header's right side says what its number measures.
+#[test]
+fn the_header_net_change_names_its_window() {
+    let mut report = fixture_report();
+    report.total_series = vec![Some(100_000_000), Some(50_000_000)];
+    report.series_window_secs = 7 * 86_400;
+    let app = App::new(report, "/Users/dev/src".into());
+    let f = capture(&app, 120, 24);
+    let head = f.lines().next().unwrap();
+    assert!(head.contains("-50.0MB in 1w"), "{head}");
 }

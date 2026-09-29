@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · 2 projects · 11.6GB attributed · 209.7MB unowned · docker 0B unowned                                                                                               "
-"view: tree of mole  (Esc back) · filter: none                                                                                                                                                           "
+"view: tree of mole (2 of 10 · Esc: projects) · filter: none                                                                                                                                             "
 "Name                                                                 Size*     Change Cleanup advice / consequence                                                                                      "
 "* allocated incl. shared links; not additive with report totals. Age = modified                                                                                                                         "
 "└─ ▾ main /Users/dev/src/mole                                        3.5GB     +1.3GB clean                                                                                                             "
@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / filter  v view  g/s/n/t/a sort  r reverse  R refresh  ? help  q quit                                                       "
+"/ filter  v view  R refresh  ⌫ delete  Space mark  A mark all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                                           "
