@@ -848,8 +848,7 @@ mod tests {
     fn delete_result_and_key_legend_are_both_visible_at_80_columns() {
         let mut app = App::new(empty_report(), "/root".into());
         app.set_result(
-            "Moved 3 items (1.3GB) to Trash. Space is freed when Trash is emptied. Free space changed by -10.5MB."
-                .into(),
+            "Moved 3 items (1.3GB) to Trash. Space is freed when Trash is emptied.".into(),
         );
         let s = buffer_text(&app, 80, 24);
         assert!(s.contains("Moved 3 items (1.3GB) to Trash."), "{s}");

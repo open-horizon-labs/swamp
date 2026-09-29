@@ -1902,8 +1902,7 @@ fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
         app.blocked_open = false;
         app.confirm_open = false;
         app.set_result(
-            "Moved 338 items (17.0GB) to Trash. Space is freed when Trash is emptied. Free space changed by 0B."
-                .into(),
+            "Moved 338 items (17.0GB) to Trash. Space is freed when Trash is emptied.".into(),
         );
         states.push(("result", capture(&app, w, 24)));
         app.last_result = None;
