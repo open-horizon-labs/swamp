@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 /// Every program swamp may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Program {
-    /// Occupancy probe (`lsof -- <path>`, `lsof +D <dir>`).
+    /// Occupancy probe (`lsof -- <path>`, `lsof +D <dir>`, and the one
+    /// machine-wide `lsof -F n` snapshot a review pass shares).
     Lsof,
     /// Xcode `Info.plist` → XML (`plutil -convert xml1 -o - <plist>`),
     /// read-only, output to stdout.
@@ -186,7 +187,12 @@ enum Slot {
 fn shapes(program: Program) -> &'static [&'static [Slot]] {
     use Slot::*;
     match program {
-        Program::Lsof => &[&[Lit("--"), AbsPath], &[Lit("+D"), AbsPath]],
+        Program::Lsof => &[
+            &[Lit("--"), AbsPath],
+            &[Lit("+D"), AbsPath],
+            // One machine-wide open-file listing, names only: no tree walk.
+            &[Lit("-F"), Lit("n")],
+        ],
         Program::Plutil => &[&[Lit("-convert"), Lit("xml1"), Lit("-o"), Lit("-"), AbsPath]],
         Program::Xcrun => &[&[Lit("simctl"), Lit("list"), Lit("devices"), Lit("-j")]],
         Program::Du => &[&[Lit("-skPx"), AbsPath]],
@@ -829,6 +835,7 @@ mod tests {
         for (program, args) in [
             (Program::Lsof, vec!["+D", "/tmp"]),
             (Program::Lsof, vec!["--", "/tmp/x"]),
+            (Program::Lsof, vec!["-F", "n"]),
             (
                 Program::Docker,
                 vec![

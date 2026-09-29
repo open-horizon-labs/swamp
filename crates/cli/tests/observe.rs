@@ -749,3 +749,24 @@ fn observe_no_enrich_makes_no_gh_calls() {
     let calls = observe_with_gh_shim(&["--no-enrich"]);
     assert_eq!(calls, "", "--no-enrich must not run gh");
 }
+
+#[test]
+fn observe_enrich_flag_forces_a_github_refresh() {
+    let calls = observe_with_gh_shim(&["--enrich"]);
+    assert!(
+        calls.contains("auth status"),
+        "--enrich must run gh; gh calls: {calls:?}"
+    );
+}
+
+#[test]
+fn observe_enrich_conflicts_with_no_enrich() {
+    let store = tempfile::tempdir().expect("store");
+    let output = Command::new(bin())
+        .args(["observe", "--enrich", "--no-enrich"])
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("run observe");
+    assert!(!output.status.success());
+}

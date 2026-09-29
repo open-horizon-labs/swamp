@@ -138,7 +138,7 @@ swamp collect ~/src                # Linux: watch in the foreground until Ctrl-C
 swamp collect --status --json ~/src
 ```
 
-`observe` records data without rendering and enriches worktrees from GitHub (`--no-enrich` skips it). Scheduling runs that observation command; it does not delete anything.
+`observe` records data without rendering and enriches worktrees from GitHub (`--no-enrich` skips it; `--enrich` forces a refetch of every worktree now, ignoring the cache rules). Scheduling runs that observation command; it does not delete anything.
 
 `swamp schedule` installs a per-user LaunchAgent on macOS. On Linux it installs `systemd --user` units instead: a timer that runs `swamp observe` on the interval and, with `--collector`, the collector as a user service. Neither needs root; lingering is never enabled for you, so without `loginctl enable-linger` both stop at logout and resume at the next login, and `swamp schedule` (status) says which. Where no systemd user manager is reachable -- a container, WSL without systemd, a shell outside a login session -- the command refuses, says so, and writes nothing; schedule `swamp observe` from cron instead. `--off` stops and removes only the units swamp wrote. `--collector` is refused on macOS, which does not need one.
 
@@ -771,7 +771,7 @@ swamp observe ~/src
 swamp report ~/src --view worktrees
 ```
 
-Reports use the GitHub facts the last `observe` cached. `observe` queries GitHub unless given `--no-enrich`, and reuses a cache entry that is still valid. GitHub cache validity uses the tip SHA and a six-hour TTL.
+Reports use the GitHub facts the last `observe` cached. `observe` queries GitHub unless given `--no-enrich`, and reuses a cache entry that is still valid. GitHub cache validity uses the tip SHA: a worktree whose branch is already merged is terminal and is never re-enriched automatically, and every other row is refreshed after a 24-hour TTL. `observe --enrich` is the on-demand override: it refetches everything, ignoring the TTL and the merged rule.
 
 Docker facts are cached for five minutes, with fresh reads during enrichment. Docker must be installed and its daemon reachable. Unavailable Docker data is reported in notes.
 

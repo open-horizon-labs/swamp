@@ -1604,11 +1604,15 @@ impl App {
         self.refusal = None;
         self.last_result = None;
         crate::worker::spawn(move || {
-            if all {
-                worker.mark_all_in_view();
-            } else if let Some(row) = row {
-                worker.mark_row(&row);
-            }
+            // One open-file snapshot serves every group in this pass,
+            // instead of one directory-tree walk per group.
+            swamp_core::occupancy::OccupancySnapshot::scoped(|| {
+                if all {
+                    worker.mark_all_in_view();
+                } else if let Some(row) = row {
+                    worker.mark_row(&row);
+                }
+            });
             let _ = tx.send(OperationEvent::Reviewed {
                 marked: worker.marked,
                 refusal: worker.refusal.map(|(msg, _)| msg),

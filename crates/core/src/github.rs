@@ -36,9 +36,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Cache freshness window: re-query only when the tip changed or the
-/// cached row is older than this (setting `github_ttl` in
-/// `config.toml`, same file `growth.rs` reads).
-pub const DEFAULT_GITHUB_TTL_SECS: u64 = 6 * 3600;
+/// cached row is older than this. A row whose branch is
+/// already merged is terminal and never expires for the same tip; see
+/// [`row_is_fresh`]. An explicit `swamp observe --enrich` ignores both.
+pub const DEFAULT_GITHUB_TTL_SECS: u64 = 24 * 3600;
+
+/// Set by `swamp observe --enrich`: the next enrichment run refetches
+/// every row, ignoring the TTL and the merged-is-terminal rule.
+static FORCE_REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask this process's enrichment runs to ignore cache freshness (the
+/// on-demand path). Off by default; only the CLI flag turns it on.
+pub fn set_force_refresh(on: bool) {
+    FORCE_REFRESH.store(on, Ordering::Relaxed);
+}
+
+/// Whether [`set_force_refresh`] is on for this process.
+pub fn force_refresh() -> bool {
+    FORCE_REFRESH.load(Ordering::Relaxed)
+}
 /// Bound on any single `gh api graphql` call.
 const PER_CALL_TIMEOUT: Duration = Duration::from_secs(8);
 /// Overall wall-clock budget for a `swamp observe` (or
@@ -513,6 +529,12 @@ fn cache_schema() -> Arc<Schema> {
     ]))
 }
 
+/// A merged branch is terminal: for the same tip SHA it will not change
+/// again, so it is fresh forever. Everything else is fresh for `ttl_secs`.
+fn row_is_fresh(row: &CacheRow, observed_at: u64, ttl_secs: u64) -> bool {
+    row.merged_status == "yes" || observed_at.saturating_sub(row.observed_at) < ttl_secs
+}
+
 fn cache_path(swamp_dir: &Path, volume_id: u64) -> PathBuf {
     swamp_dir.join(volume_id.to_string()).join("enrich.parquet")
 }
@@ -844,7 +866,7 @@ pub fn read_cached(
         match cache.get(&key) {
             Some(row) => {
                 let age = observed_at.saturating_sub(row.observed_at);
-                if age < ttl_secs {
+                if row_is_fresh(row, observed_at, ttl_secs) {
                     out.insert(input.worktree_id.to_string(), row_to_facts(row));
                 } else {
                     stale += 1;
@@ -900,6 +922,11 @@ pub struct ObserveSummary {
 /// not dispatched before the deadline gets `Unknown` for its worktrees
 /// instead of blocking the run. Writes every result (live or
 /// budget-cut) back into `enrich.parquet`.
+///
+/// Rows whose branch is merged (same tip SHA) are never refetched, and
+/// are never overwritten by an `Unknown` written because `gh` is
+/// unavailable or a lookup failed. [`observe_all_forced`] ignores the
+/// freshness rules and refetches everything.
 #[allow(clippy::too_many_arguments)]
 pub fn observe_all(
     responder: &(dyn GithubResponder + Sync),
@@ -910,6 +937,33 @@ pub fn observe_all(
     ttl_secs: u64,
     budget_secs: u64,
     concurrency: usize,
+) -> ObserveSummary {
+    observe_all_forced(
+        responder,
+        swamp_dir,
+        volume_id,
+        inputs,
+        observed_at,
+        ttl_secs,
+        budget_secs,
+        concurrency,
+        false,
+    )
+}
+
+/// [`observe_all`] with an explicit `force`: when true, every row is
+/// refetched regardless of TTL or merged state (`swamp observe --enrich`).
+#[allow(clippy::too_many_arguments)]
+pub fn observe_all_forced(
+    responder: &(dyn GithubResponder + Sync),
+    swamp_dir: &Path,
+    volume_id: u64,
+    inputs: &[EnrichInput],
+    observed_at: u64,
+    ttl_secs: u64,
+    budget_secs: u64,
+    concurrency: usize,
+    force: bool,
 ) -> ObserveSummary {
     let path = cache_path(swamp_dir, volume_id);
     let mut cache: HashMap<(String, String, String), CacheRow> = read_cache(&path)
@@ -932,6 +986,9 @@ pub fn observe_all(
                 input.branch.unwrap_or("").to_string(),
                 input.tip_sha.to_string(),
             );
+            if cache.get(&key).is_some_and(|r| r.merged_status == "yes") {
+                continue; // terminal: keep the merged row.
+            }
             cache.insert(
                 key,
                 facts_to_row(
@@ -969,8 +1026,9 @@ pub fn observe_all(
             branch.to_string(),
             input.tip_sha.to_string(),
         );
-        if let Some(row) = cache.get(&key)
-            && observed_at.saturating_sub(row.observed_at) < ttl_secs
+        if !force
+            && let Some(row) = cache.get(&key)
+            && row_is_fresh(row, observed_at, ttl_secs)
         {
             continue; // already fresh: no call needed for this worktree.
         }
@@ -1049,6 +1107,9 @@ pub fn observe_all(
                 }
                 for (worktree_id, branch, tip_sha) in &group.entries {
                     let key = (worktree_id.clone(), branch.clone(), tip_sha.clone());
+                    if cache.get(&key).is_some_and(|r| r.merged_status == "yes") {
+                        continue; // terminal: a failed lookup never clobbers it.
+                    }
                     cache.insert(
                         key,
                         facts_to_row(
@@ -1068,6 +1129,9 @@ pub fn observe_all(
                 }
                 for (worktree_id, branch, tip_sha) in &group.entries {
                     let key = (worktree_id.clone(), branch.clone(), tip_sha.clone());
+                    if cache.get(&key).is_some_and(|r| r.merged_status == "yes") {
+                        continue; // terminal: a failed lookup never clobbers it.
+                    }
                     cache.insert(
                         key,
                         facts_to_row(
@@ -1459,6 +1523,107 @@ mod tests {
         inputs[0].tip_sha = "sha2";
         observe_all(&responder, tmp.path(), 0, &inputs, 1050, 3600, 20, 4);
         assert!(*responder.calls.lock().unwrap() > calls_after_first);
+    }
+
+    fn merged_inputs() -> Vec<EnrichInput<'static>> {
+        vec![EnrichInput {
+            worktree_id: "wt1",
+            tip_sha: "sha1",
+            branch: Some("feature"),
+            owner: "acme",
+            repo: "widgets",
+        }]
+    }
+
+    fn responder_with(state: Option<PrState>) -> FakeResponder {
+        let responder = FakeResponder::default();
+        responder.set_batch(
+            "acme",
+            "widgets",
+            RepoBatchResult {
+                default_branch: Some("main".to_string()),
+                branches: HashMap::from([(
+                    "feature".to_string(),
+                    BranchResult {
+                        exists: true,
+                        pr: state.map(|s| pr(42, s)),
+                        merged_at: None,
+                    },
+                )]),
+            },
+        );
+        responder
+    }
+
+    const DAY: u64 = 24 * 3600;
+
+    #[test]
+    fn merged_row_is_never_refetched_even_when_ancient() {
+        let responder = responder_with(Some(PrState::Merged));
+        let inputs = merged_inputs();
+        let tmp = tempfile::tempdir().unwrap();
+        observe_all(&responder, tmp.path(), 0, &inputs, 1000, DAY, 20, 4);
+        assert_eq!(*responder.calls.lock().unwrap(), 1);
+        let ancient = 1000 + 10_000 * DAY;
+        let s = observe_all(&responder, tmp.path(), 0, &inputs, ancient, DAY, 20, 4);
+        assert_eq!(s.calls_made, 0);
+        assert_eq!(*responder.calls.lock().unwrap(), 1);
+        let (facts, notes) = read_cached(tmp.path(), 0, &inputs, ancient, DAY);
+        assert!(matches!(facts["wt1"].merged, MergedStatus::Yes { .. }));
+        assert!(
+            notes.is_empty(),
+            "no stale note for a merged row: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn unmerged_row_refetches_after_ttl_but_not_before() {
+        let responder = responder_with(Some(PrState::Open));
+        let inputs = merged_inputs();
+        let tmp = tempfile::tempdir().unwrap();
+        observe_all(&responder, tmp.path(), 0, &inputs, 1000, DAY, 20, 4);
+        observe_all(
+            &responder,
+            tmp.path(),
+            0,
+            &inputs,
+            1000 + DAY - 1,
+            DAY,
+            20,
+            4,
+        );
+        assert_eq!(*responder.calls.lock().unwrap(), 1, "younger than 24h");
+        observe_all(&responder, tmp.path(), 0, &inputs, 1000 + DAY, DAY, 20, 4);
+        assert_eq!(*responder.calls.lock().unwrap(), 2, "at 24h");
+        let (_, notes) = read_cached(tmp.path(), 0, &inputs, 1000 + 2 * DAY + 5, DAY);
+        assert!(!notes.is_empty(), "stale unmerged row is noted");
+    }
+
+    #[test]
+    fn forced_observe_refetches_even_merged_rows() {
+        let responder = responder_with(Some(PrState::Merged));
+        let inputs = merged_inputs();
+        let tmp = tempfile::tempdir().unwrap();
+        observe_all(&responder, tmp.path(), 0, &inputs, 1000, DAY, 20, 4);
+        let s = observe_all_forced(&responder, tmp.path(), 0, &inputs, 1001, DAY, 20, 4, true);
+        assert_eq!(s.calls_made, 1);
+        assert_eq!(*responder.calls.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn unavailable_gh_does_not_clobber_a_merged_row() {
+        let ok = responder_with(Some(PrState::Merged));
+        let inputs = merged_inputs();
+        let tmp = tempfile::tempdir().unwrap();
+        observe_all(&ok, tmp.path(), 0, &inputs, 1000, DAY, 20, 4);
+        let down = FakeResponder {
+            unready_reason: Some("not logged in".to_string()),
+            ..Default::default()
+        };
+        observe_all_forced(&down, tmp.path(), 0, &inputs, 5000, DAY, 20, 4, true);
+        observe_all(&down, tmp.path(), 0, &inputs, 5000 + 9 * DAY, DAY, 20, 4);
+        let (facts, _) = read_cached(tmp.path(), 0, &inputs, 5000 + 9 * DAY, DAY);
+        assert!(matches!(facts["wt1"].merged, MergedStatus::Yes { .. }));
     }
 
     #[test]

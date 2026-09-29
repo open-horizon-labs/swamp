@@ -10,6 +10,20 @@ observations, not general performance guarantees. See the README for current use
   error or panic, on TUI cancel or quit, on SIGINT/SIGTERM/SIGHUP and on process
   exit. Children run with git/gh pagers and credential prompts disabled, so none can
   block waiting for a terminal (#156).
+- `swamp ui` review no longer walks each group's directory tree. It used to run one
+  `lsof +D <dir>` per cleanup group, so reviewing 1,239 groups in a 35 GB cargo `target/`
+  took about an hour and timed-out probes showed as unknown open-file evidence. A review
+  pass now takes one machine-wide open-file snapshot (`lsof -F n`, no tree walk) and
+  answers every group from it by path prefix. If that snapshot fails, times out, is
+  unreadable or was permission-limited, groups it cannot find open report unknown, never
+  free. Single-path probes are unchanged.
+- GitHub enrichment is now re-fetched far less often. A worktree whose branch is already
+  merged is terminal and is never re-enriched automatically for the same tip commit, and
+  a `gh` outage no longer overwrites its merged state with `unknown`. Every other row is
+  refreshed only after a 24-hour cache window (was six hours). `swamp observe --enrich`
+  is back as the on-demand override: it refetches every worktree now, ignoring the
+  window and the merged rule. `--no-enrich` still skips GitHub. This does not speed up
+  `observe` itself; the time is the filesystem scan.
 
 ## v0.7.3
 

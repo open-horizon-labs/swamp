@@ -89,7 +89,7 @@ impl Consumer for GithubConsumer {
                 let t_github = std::time::Instant::now();
                 let (facts, notes, summary) = if ctx.enrich {
                     let responder = crate::github::GhCliResponder;
-                    let summary = crate::github::observe_all(
+                    let summary = crate::github::observe_all_forced(
                         &responder,
                         &dir,
                         volume_id,
@@ -98,6 +98,7 @@ impl Consumer for GithubConsumer {
                         crate::github::DEFAULT_GITHUB_TTL_SECS,
                         crate::github::DEFAULT_RUN_BUDGET_SECS,
                         crate::github::DEFAULT_CONCURRENCY,
+                        crate::github::force_refresh(),
                     );
                     let (facts, mut read_notes) = crate::github::read_cached(
                         &dir,
