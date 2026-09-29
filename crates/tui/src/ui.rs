@@ -308,7 +308,7 @@ fn footer_legend(width: usize) -> String {
 /// cannot come back next, then what a bulk mark skipped (all of it, counted),
 /// then names and warnings. Tail lines are the ones dropped when the screen
 /// is short, never the numbers.
-fn confirm_lines(app: &App) -> Vec<(String, Color)> {
+fn confirm_lines(app: &App, area: Rect) -> Vec<(String, Color)> {
     let summary = app.confirm_summary();
     let mut lines: Vec<(String, Color)> = summary
         .lines()
@@ -323,7 +323,31 @@ fn confirm_lines(app: &App) -> Vec<(String, Color)> {
             .count();
         lines.insert(head, (msg.to_string(), Color::Red));
     }
-    lines
+    // Whole lines only: a warning cut mid-sentence reads as the whole
+    // warning. What does not fit is counted instead.
+    let cap = confirm_cap(area);
+    let mut used = 0usize;
+    let mut fit: Vec<(String, Color)> = Vec::new();
+    for (i, (l, c)) in lines.iter().enumerate() {
+        let rows = wrapped_rows(l, area.width as usize);
+        let left = lines.len() - i - 1;
+        // Keep one row for the "+N more" line when something is left over.
+        let reserve = usize::from(left > 0);
+        if used + rows + reserve > cap && !fit.is_empty() {
+            fit.push((
+                format!("+{} more lines (Esc, then check the rows)", left + 1),
+                Color::Yellow,
+            ));
+            return fit;
+        }
+        used += rows;
+        fit.push((l.clone(), *c));
+    }
+    fit
+}
+
+fn confirm_cap(area: Rect) -> usize {
+    ((area.height as usize).saturating_sub(4) / 2).max(2)
 }
 
 /// Rows a greedy word wrap of `text` takes at `width` columns.
@@ -356,14 +380,13 @@ fn confirm_height(lines: &[(String, Color)], area: Rect) -> u16 {
         .iter()
         .map(|(l, _)| wrapped_rows(l, area.width as usize))
         .sum();
-    let cap = (area.height as usize).saturating_sub(4) / 2;
-    need.min(cap.max(2)).max(1) as u16
+    need.min(confirm_cap(area)).max(1) as u16
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let size = frame.area();
     let confirm = if app.confirm_open && app.operation.is_none() {
-        confirm_lines(app)
+        confirm_lines(app, size)
     } else {
         Vec::new()
     };

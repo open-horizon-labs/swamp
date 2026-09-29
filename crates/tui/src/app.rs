@@ -11,6 +11,17 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use swamp_core::report::Report;
 
+/// What pressing a mark key on a projects-view row did.
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectMark {
+    /// The project has nothing that can be marked.
+    Nothing,
+    /// Everything markable was already marked; the press unmarked it.
+    Cleared,
+    /// This many units were newly marked.
+    Marked(usize),
+}
+
 /// Every distinct refusal with how many rows it covered, so a bulk mark
 /// that skipped rows says how many and why, not only the first reason.
 fn summarize_refusals(reasons: &[String]) -> Option<String> {
@@ -1081,11 +1092,13 @@ impl App {
                     // Bulk marking never reaches for a checkout: `A` over
                     // a screen of projects would otherwise queue every
                     // checkout under the root behind one Enter.
-                    let n = self.mark_project(&project, false);
-                    if n == 0 {
-                        refused.push("nothing reclaimable in this project".into());
+                    match self.mark_project(&project, false) {
+                        ProjectMark::Nothing => {
+                            refused.push("nothing reclaimable in this project".into())
+                        }
+                        ProjectMark::Cleared => {}
+                        ProjectMark::Marked(n) => marked += n,
                     }
-                    marked += n;
                 } else if row.unit.is_some() {
                     // `mark_row` already knows how to refuse a
                     // protected/unsupported/active agent-storage row
@@ -1153,10 +1166,10 @@ impl App {
     /// on the whole project rather than on whatever the current filter
     /// happens to show. Returns how many units it newly marked; a second
     /// press on a fully marked project clears it and returns 0.
-    fn mark_project(&mut self, project: &str, include_checkouts: bool) -> usize {
+    fn mark_project(&mut self, project: &str, include_checkouts: bool) -> ProjectMark {
         let units = self.project_units(project, include_checkouts);
         if units.is_empty() {
-            return 0;
+            return ProjectMark::Nothing;
         }
         let marked_already = |app: &Self, r: &Row| {
             r.unit
@@ -1169,7 +1182,7 @@ impl App {
                     self.marked.remove(&u.0);
                 }
             }
-            return 0;
+            return ProjectMark::Cleared;
         }
         let mut newly = 0usize;
         for r in units {
@@ -1179,7 +1192,7 @@ impl App {
             self.mark_row(&r);
             newly += 1;
         }
-        newly
+        ProjectMark::Marked(newly)
     }
 
     /// How many of a project's markable units are marked, and how many it
@@ -1317,7 +1330,7 @@ impl App {
             // path. Marking it means marking what that project can give
             // back, so the human does not have to open it first.
             if let Some(project) = row.project.clone() {
-                if self.mark_project(&project, true) == 0 {
+                if self.mark_project(&project, true) == ProjectMark::Nothing {
                     self.set_refusal("nothing reclaimable in this project");
                 }
                 return;

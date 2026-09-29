@@ -1705,7 +1705,9 @@ fn space_on_a_project_row_shows_marks_and_a_result() {
     swamp_tui::handle_key(&mut app, KeyCode::Char(' '));
     wait_idle(&mut app);
     assert!(app.marked.is_empty());
-    assert!(capture(&app, 80, 24).contains("Nothing is marked"));
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("Nothing is marked"), "{f}");
+    assert!(!f.contains("refused:"), "unmarking is not a refusal:\n{f}");
 }
 
 /// Backspace, Esc, move, Backspace elsewhere: the second confirm is about
@@ -1777,4 +1779,23 @@ fn a_checkout_is_named_as_a_checkout() {
     let f = capture(&app, 120, 50);
     assert!(!f.contains("source stay"), "{f}");
     assert!(f.contains("checkout"), "{f}");
+}
+
+/// On a short screen the confirm drops whole tail lines and says so; it
+/// never cuts a warning mid-sentence, and the numbers stay.
+#[test]
+fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    for i in 0..4 {
+        let mut u = plain_unit(&format!("/Users/dev/src/p/dir{i}"), 1_000_000_000);
+        u.warnings = vec![format!(
+            "warning number {i} which is long enough to wrap across a few rows on a narrow screen ok"
+        )];
+        app.marked.insert(u.path.display().to_string(), u);
+    }
+    app.confirm_open = true;
+    let f = capture(&app, 40, 14);
+    assert!(f.contains("Move 4 items (4.0GB) → Trash"), "{f}");
+    assert!(f.contains("more lines"), "{f}");
+    assert!(f.contains("Enter yes · Esc no"), "{f}");
 }
