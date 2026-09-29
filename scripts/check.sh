@@ -98,6 +98,7 @@ done
 # `gh`: a gate that passes when it should not is worse than a slow one.
 step gate-scripts
 ./scripts/verify-gates.test.sh
+./scripts/sweep-needed.test.sh
 
 step greps
 # These checks intentionally fail obvious safety regressions in source

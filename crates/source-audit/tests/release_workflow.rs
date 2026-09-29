@@ -93,8 +93,36 @@ fn the_full_tier_runs_on_main_so_a_tag_finds_it_already_done() {
         .split("\n  macos-arm64-check-full:")
         .next()
         .unwrap();
+    // Linux skips the sweep only when it already passed for this clippy
+    // version and these inputs: the key must carry both, the marker must be
+    // saved only after the tier passed, and there is no schedule.
     assert!(
-        !linux.contains("SWAMP_SKIP_MUTATION_SWEEP"),
-        "Linux must run the sweep"
+        linux.contains("cargo clippy --version"),
+        "the key must include the clippy version"
+    );
+    assert!(
+        linux.contains("crates/source-audit/**"),
+        "the key must hash the audit crate"
+    );
+    assert!(
+        linux.contains("Cargo.lock"),
+        "the key must hash the lockfile"
+    );
+    assert!(linux.contains("scripts/sweep-needed.sh"));
+    assert!(
+        linux.contains("SWAMP_SKIP_MUTATION_SWEEP: ${{ steps.sweep.outputs.verdict == 'skip'"),
+        "Linux may skip the sweep only on the script's verdict, never unconditionally"
+    );
+    let check = linux
+        .find("scripts/check-full.sh\n")
+        .expect("check-full step");
+    let save = linux.find("actions/cache/save@").expect("marker save step");
+    assert!(
+        save > check,
+        "the marker must be saved only after the tier ran"
+    );
+    assert!(
+        !CHECK_FULL.contains("schedule:"),
+        "the sweep has no schedule"
     );
 }
