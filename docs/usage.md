@@ -1005,6 +1005,7 @@ since = "24h"
 retention_days = 30
 large_file_min_bytes = 1048576
 observe_timeout_sec = 1800
+# min_free_bytes = 1073741824   # unset: the greater of 1 GiB and 1% of the volume; 0 disables
 
 [scan]
 defaults = true
@@ -1013,6 +1014,22 @@ exclude = []
 disabled_detectors = []
 enabled_detectors = []
 ```
+
+### Full-disk guard
+
+Before any walking, `swamp observe` does one `statfs` on the volume that
+holds the swamp store. If free space is below `min_free_bytes` (unset:
+the greater of 1 GiB and 1% of the volume; `0` disables the check; TOML
+integers top out at 2^63-1), it exits with **code 3**, printing the free
+bytes, the threshold, the volume's store path and that nothing was
+written. It runs before the scope is persisted and before the writer lock
+is taken, so an aborted run changes no store file and no coverage fact
+(roots are never marked missing because of it). The scheduled LaunchAgent
+run logs that one line and exits; there is no retry loop. `swamp ui` does
+not wait on it: it shows the last stored report at once with a
+`disk nearly full: refresh skipped (X free)` banner, and starts no
+refresh or live watch. With no stored report yet, it exits with the same
+message instead.
 
 `config init`'s `[scan]` table is not a frozen copy of the built-in
 default roots or the detector catalog -- it documents the five keys

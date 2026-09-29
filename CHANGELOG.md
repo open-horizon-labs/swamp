@@ -3,6 +3,14 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.4
+
+- `swamp observe` now aborts before walking when the volume holding the swamp store is
+  nearly full (below `min_free_bytes`; default the greater of 1 GiB and 1% of the
+  volume). It exits with code 3 and a stderr message, writes nothing, takes no lock and
+  changes no coverage fact. `swamp ui` shows the last stored report immediately with a
+  "disk nearly full: refresh skipped" banner instead of walking.
+
 ## v0.7.3
 
 - `swamp observe` now enriches worktrees from GitHub by default, as its help and the

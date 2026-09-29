@@ -150,6 +150,7 @@ fn header_line(app: &App, width: usize) -> String {
     // Clauses in priority order; the renderer drops trailing clauses that
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
+        app.disk_banner.clone().unwrap_or_default(),
         if stale
             || app
                 .report

@@ -749,3 +749,78 @@ fn observe_no_enrich_makes_no_gh_calls() {
     let calls = observe_with_gh_shim(&["--no-enrich"]);
     assert_eq!(calls, "", "--no-enrich must not run gh");
 }
+
+fn tree_listing(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            let rel = e.path().strip_prefix(base).unwrap().display().to_string();
+            let len = e.metadata().unwrap().len();
+            out.push(format!("{rel} {len}"));
+            if e.file_type().unwrap().is_dir() {
+                walk(base, &e.path(), out);
+            }
+        }
+    }
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// A `min_free_bytes` no volume can satisfy stands in for a full disk:
+/// the abort must come before any store file is created or changed and
+/// exit with the documented code 3.
+#[test]
+fn observe_aborts_before_touching_the_store_when_free_space_is_below_the_minimum() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
+    let store = tempfile::tempdir().expect("store");
+    std::fs::write(
+        store.path().join("config.toml"),
+        format!("min_free_bytes = {}\n", i64::MAX),
+    )
+    .unwrap();
+    let before = tree_listing(store.path());
+
+    let output = Command::new(bin())
+        .arg("observe")
+        .arg(root.path())
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("run observe");
+
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for needle in [
+        "disk nearly full",
+        "free",
+        "minimum",
+        "did not write to the store",
+    ] {
+        assert!(stderr.contains(needle), "missing {needle:?}: {stderr}");
+    }
+    assert!(
+        stderr.contains(&store.path().display().to_string()),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "no observe line on abort");
+    assert_eq!(tree_listing(store.path()), before, "store changed on abort");
+}
+
+#[test]
+fn min_free_bytes_zero_disables_the_check() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
+    let store = tempfile::tempdir().expect("store");
+    std::fs::write(store.path().join("config.toml"), "min_free_bytes = 0\n").unwrap();
+    let output = Command::new(bin())
+        .arg("observe")
+        .arg(root.path())
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("run observe");
+    assert!(output.status.success(), "{output:?}");
+}

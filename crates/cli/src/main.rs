@@ -1328,6 +1328,20 @@ fn main() -> Result<()> {
             no_enrich,
         } => {
             let store_dir = swamp_dir();
+            // One statfs, before the scope is resolved, persisted, or the
+            // writer lock taken: an abort leaves the store (coverage
+            // facts included) exactly as the last observation left it.
+            let min_free = swamp_core::growth::load_config(&store_dir).min_free_bytes;
+            if let swamp_core::disk_guard::DiskDecision::Abort {
+                free, threshold, ..
+            } = swamp_core::disk_guard::check(&store_dir, min_free)
+            {
+                eprintln!(
+                    "{}",
+                    swamp_core::disk_guard::abort_message(&store_dir, free, threshold)
+                );
+                std::process::exit(swamp_core::disk_guard::EXIT_DISK_FULL);
+            }
             let scope = resolve_scope(&roots)?;
             if scope.scan_paths().is_empty() {
                 if scope.is_empty_scope() {

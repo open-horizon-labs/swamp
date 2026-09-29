@@ -41,6 +41,7 @@ pub mod consumer_wiring;
 pub mod consumers;
 pub mod continuity;
 pub mod coverage;
+pub mod disk_guard;
 pub mod docker;
 pub mod ecosystem;
 pub mod entities;
