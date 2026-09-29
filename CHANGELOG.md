@@ -17,24 +17,25 @@ observations, not general performance guarantees. See the README for current use
 - **The header always says how old the data is and whether anyone is scanning.** It
   shows `observed 4m ago`, counting up while the UI is open. Older than 15 minutes it
   turns yellow and says so, with a hint to press `R`. While the UI scans it shows
-  `observing…` with bytes, directories, roots and elapsed time. While another swamp
+  `⠋ observing 12s` first on the line, with the bytes seen after it. While another swamp
   process (the scheduled `swamp observe`) holds the observation lock it shows
-  `scheduled observation running (pid N, 1m 12s)`, never waiting on the lock, and it
-  reloads the stored report when that run ends.
+  `scheduled observation running (pid N, 1m 12s)`, shortened to `observation running
+  1m 12s` on a narrow terminal, never waiting on the lock, and it reloads the stored
+  report when that run ends.
 - **Quitting is instant.** Exit used to wait several seconds joining the file-watch
   threads. There are none now (8.6 seconds before, about 0.01 seconds after).
 - **Reviewing a mark or delete no longer waits about 16 seconds.** The open-file check
   ran `lsof` with name resolution on, so it looked up a host or port name for every
   network socket. It now runs `lsof -n -P -F n`, which lists the same files: 0.2 seconds
   instead of 16.3 here. A failed or partial listing is still reported as unknown, never
-  free. While the check runs, the overlay reads `Checking which files are open…` with
-  elapsed time and no promised duration.
+  free. While the check runs, the status rows read `Checking what is in use` with elapsed
+  time and no promised duration.
 - **The delete confirmation leads with what matters and no longer clips it.** It used to
   be one line that ended in the size, the count and where the files go, so a long warning
   pushed them off the screen at any width. It now wraps onto rows: `Move 5 items (15.0GB)
   → Trash. Space is freed when Trash is emptied.`, then any docker items named as
   `Remove 2 docker items (1.2GB) for good, no Trash.`, then the names, then each warning on
-  its own line. `Enter yes · Esc no` stays on the bottom row even while a refusal shows.
+  its own line. `Enter confirm · Esc back` stays on the bottom row.
   A bulk mark that skipped rows now says how many and why, not only the first reason.
 - **Marks are visible and Esc no longer leaves hidden ones.** A project row shows `✗` when
   everything in it is marked and `~2/6` when some is. Space on a project says how many are
@@ -42,10 +43,35 @@ observations, not general performance guarantees. See the README for current use
   you made with Space stay, drawn on their rows), so a later Backspace on another row asks
   about that row. When a project has nothing rebuildable, Backspace names its `checkout`
   in the confirmation, and the help no longer says the checkout always stays.
-- **The key legend no longer disappears after a delete.** The result of a delete now
-  shows on its own line above the legend for 20 seconds instead of replacing it, and
-  says the files were moved to Trash, so space is freed only when Trash is emptied. The
-  legend is shortened to fit narrow terminals and always keeps `? help  q quit`.
+- **The key legend no longer disappears after a delete.** The result of a delete shows
+  above the legend instead of replacing it. The legend is shortened to fit narrow
+  terminals and always keeps `? help  q quit`.
+- **The screen no longer jumps.** Starting a check, opening the confirmation, finishing
+  a delete and dismissing the result used to add and remove rows under the table, so the
+  whole list slid up and down (2 to 3 rows each time). The table now stays exactly where
+  it is: the bottom of the screen is always two status rows and the key legend, and the
+  confirmation is a fixed 10-row sheet drawn over the bottom of the list. The result of
+  a delete or a check stays until your next key instead of vanishing on a 20-second
+  timer with a repaint.
+- **One Down key moves one row.** The detail pane under the list used to change height
+  with the selected row, so a single Down could move the selection 6 or 7 rows on an 80x24
+  screen. The pane is now a fixed 4 rows, one fact per row, and the list scrolls only
+  when the selection leaves the window.
+- **A running check never looks frozen.** The status rows show a moving glyph and the
+  elapsed time first, at any width: `⠋ 18s  Checked 41 of 342 · 184 ready · 2 blocked`,
+  then the project and item being checked by name. The old percent, which disappeared
+  partway through, is gone. Item names are plain (`swamp · swamp_tui incremental build
+  (target/debug)`), not build hash directories.
+- **A check says it changes nothing, and what happens next.** Checking no longer shows
+  `successful` and `refused` counters, which read as a delete in progress. It shows ready
+  and blocked, `Nothing has been changed`, and `Next: review, then Enter to move to
+  Trash`. The confirmation is now a plan: ready and blocked counts, the plan by project,
+  what is removed for good, then names and warnings. `d` (or `b` after a check) lists
+  each blocked item with its reason and the next step.
+- **The delete result says what happened in plain words.** `Moved 338 items (17.0GB) to
+  Trash. Space is freed when Trash is emptied. Free space changed by 0B.` replaces the
+  line with `planned` and `measured` figures, and docker items removed for good are
+  counted separately.
 
 ## v0.7.4
 

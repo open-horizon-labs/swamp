@@ -117,39 +117,16 @@ fn header_line(app: &App, width: usize) -> String {
         .map(|u| u.bytes)
         .sum::<u64>()
         .saturating_sub(docker_unowned);
+    // While our own walk runs, the chip carries the state and elapsed
+    // time; the only detail after it is how much has been seen.
     let obs = if app.observing.is_some() {
-        // Live counters from the walk thread; percent against the last
-        // observation's walked total (an incremental walk stops early, so
-        // the percent is a floor, never a promise).
-        let (bytes, dirs, _) = swamp_core::walk::progress::snapshot();
-        let total = app.report.reconciliation.walked_total;
-        // The percentage compares against the last observation's total,
-        // so it is an estimate; an incremental walk visits a fraction and
-        // a grown tree can exceed it. Show it only while it means
-        // something.
-        let pct = match total {
-            0 => String::new(),
-            t if bytes <= t => format!(" · {}%", bytes * 100 / t),
-            _ => String::new(),
-        };
-        let elapsed = app
-            .observing_started
-            .map(|t| {
-                format!(
-                    " · {}",
-                    swamp_core::schedule::format_elapsed(t.elapsed().as_secs())
-                )
-            })
-            .unwrap_or_default();
+        let (bytes, _, _) = swamp_core::walk::progress::snapshot();
         let roots = if app.roots.len() > 1 {
             format!(" · {} roots", app.roots.len())
         } else {
             String::new()
         };
-        format!(
-            "observing… {} · {dirs} dirs{pct}{roots}{elapsed}",
-            human_bytes(bytes)
-        )
+        format!("{} seen{roots}", human_bytes(bytes))
     } else {
         // The age comes from the report itself, so it keeps counting
         // while the UI stays open.
@@ -163,16 +140,6 @@ fn header_line(app: &App, width: usize) -> String {
     // do not fit the terminal width rather than truncating mid-word.
     let clauses = vec![
         app.disk_banner.clone().unwrap_or_default(),
-        app.external_observer
-            .map(|h| {
-                let secs = swamp_core::entities::now().saturating_sub(h.since);
-                format!(
-                    "scheduled observation running (pid {}, {})",
-                    h.pid,
-                    swamp_core::schedule::format_elapsed(secs)
-                )
-            })
-            .unwrap_or_default(),
         app.status.clone().unwrap_or_default(),
         warn.clone().unwrap_or_default(),
         if stale
@@ -214,7 +181,53 @@ fn header_line(app: &App, width: usize) -> String {
         format!("docker {} unowned", human_bytes(docker_unowned)),
         app.scope_note.clone().unwrap_or_default(),
     ];
-    fit_clauses(&clauses, width)
+    // The chip owns the left edge at every width; the clauses share what
+    // is left and are the ones that give way.
+    match activity_chip(app, width) {
+        Some(chip) => {
+            let room = width.saturating_sub(crate::model::display_width(&chip) + 3);
+            if room >= 8 {
+                format!("{chip} · {}", fit_clauses(&clauses, room))
+            } else {
+                chip
+            }
+        }
+        None => fit_clauses(&clauses, width),
+    }
+}
+
+/// One braille frame per redraw (`App::frame` counts them): the event
+/// loop redraws every 200 ms, so a busy screen is never still.
+fn spinner_frame(app: &App) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(app.frame % 10) as usize]
+}
+
+/// The header's fixed activity slot: something is scanning, and for how
+/// long. It is the first thing on the line and comes in shorter forms, so
+/// it fits at any width instead of being dropped with the tail.
+fn activity_chip(app: &App, width: usize) -> Option<String> {
+    let sp = spinner_frame(app);
+    let tiers: Vec<String> = if app.observing.is_some() {
+        let secs = app.observing_started.map_or(0, |t| t.elapsed().as_secs());
+        let e = swamp_core::schedule::format_elapsed(secs);
+        vec![format!("{sp} observing {e}"), format!("{sp} {e}")]
+    } else {
+        let h = app.external_observer?;
+        let secs = swamp_core::entities::now().saturating_sub(h.since);
+        let e = swamp_core::schedule::format_elapsed(secs);
+        vec![
+            format!("{sp} scheduled observation running (pid {}, {e})", h.pid),
+            format!("{sp} observation running {e}"),
+            format!("{sp} observing {e}"),
+            format!("{sp} {e}"),
+        ]
+    };
+    let last = tiers.last().cloned();
+    tiers
+        .into_iter()
+        .find(|t| crate::model::display_width(t) <= width)
+        .or(last)
 }
 
 /// Joins clauses with " · " while the result fits in `width`; always keeps
@@ -272,8 +285,8 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 
 /// The key legend, shortened to fit `width` cells. `? help  q quit`
 /// is always kept: it is how you find every other key.
-fn footer_legend(width: usize) -> String {
-    const ITEMS: [&str; 12] = [
+fn footer_legend(width: usize, blocked: bool) -> String {
+    const BASE: [&str; 12] = [
         "↑↓ move",
         "→/← in/out",
         "Enter open/confirm",
@@ -288,12 +301,18 @@ fn footer_legend(width: usize) -> String {
         "? help",
     ];
     const TAIL: &str = "q quit";
-    let mut n = ITEMS.len();
+    let mut items: Vec<&str> = BASE.to_vec();
+    if blocked {
+        // What the last check could not include, one key from the list.
+        items.insert(4, "b blocked");
+    }
+    let all_items = items;
+    let mut n = all_items.len();
     loop {
-        let mut parts: Vec<&str> = ITEMS[..n].to_vec();
+        let mut parts: Vec<&str> = all_items[..n].to_vec();
         // Keep `? help` even when the middle is cut.
-        if n < ITEMS.len() {
-            parts.push(ITEMS[ITEMS.len() - 1]);
+        if n < all_items.len() {
+            parts.push(all_items[all_items.len() - 1]);
         }
         parts.push(TAIL);
         let line = parts.join("  ");
@@ -304,32 +323,40 @@ fn footer_legend(width: usize) -> String {
     }
 }
 
-/// The confirm region as lines: count, size and destination first, what
-/// cannot come back next, then what a bulk mark skipped (all of it, counted),
-/// then names and warnings. Tail lines are the ones dropped when the screen
-/// is short, never the numbers.
-fn confirm_lines(app: &App, area: Rect) -> Vec<(String, Color)> {
-    let summary = app.confirm_summary();
-    let mut lines: Vec<(String, Color)> = summary
-        .lines()
-        .map(|l| (l.to_string(), Color::Yellow))
-        .collect();
-    if let Some(msg) = app.refusal_active() {
-        let head = lines
-            .iter()
-            .take_while(|(l, _)| {
-                l.starts_with("Move ") || l.starts_with("Remove ") || l.starts_with("Gone for good")
-            })
-            .count();
-        lines.insert(head, (msg.to_string(), Color::Red));
+/// Rows the status region always takes: what is happening, or what just
+/// happened, or what is about to. Never more, never fewer.
+const STATUS_ROWS: u16 = 2;
+/// Rows of the plan and blocked sheets, borders included. A sheet covers
+/// the bottom of the table; it never changes the table's height.
+const SHEET_ROWS: u16 = 10;
+/// Rows of the detail pane under the table, whichever row is selected.
+const DETAIL_ROWS: u16 = 4;
+
+/// Cuts `s` to `width` cells at the end, marking the cut with `…`.
+fn clip_end(s: &str, width: usize) -> String {
+    if crate::model::display_width(s) <= width {
+        return s.to_string();
     }
-    // Whole lines only: a warning cut mid-sentence reads as the whole
-    // warning. What does not fit is counted instead.
-    let cap = confirm_cap(area);
+    let mut out = String::new();
+    for c in s.chars() {
+        if crate::model::display_width(&out) + crate::model::display_width(&c.to_string()) + 1
+            > width
+        {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// Whole lines that fit `cap` rows once wrapped at `width`; what does not
+/// fit is counted in a last line instead of being cut mid-sentence.
+fn fit_lines(lines: &[(String, Color)], width: usize, cap: usize) -> Vec<(String, Color)> {
     let mut used = 0usize;
     let mut fit: Vec<(String, Color)> = Vec::new();
     for (i, (l, c)) in lines.iter().enumerate() {
-        let rows = wrapped_rows(l, area.width as usize);
+        let rows = wrapped_rows(l, width);
         let left = lines.len() - i - 1;
         // Keep one row for the "+N more" line when something is left over.
         let reserve = usize::from(left > 0);
@@ -344,10 +371,6 @@ fn confirm_lines(app: &App, area: Rect) -> Vec<(String, Color)> {
         fit.push((l.clone(), *c));
     }
     fit
-}
-
-fn confirm_cap(area: Rect) -> usize {
-    ((area.height as usize).saturating_sub(4) / 2).max(2)
 }
 
 /// Rows a greedy word wrap of `text` takes at `width` columns.
@@ -373,156 +396,316 @@ fn wrapped_rows(text: &str, width: usize) -> usize {
     rows
 }
 
-/// Height of the confirm region: every line wrapped, capped so the table
-/// keeps at least half the screen.
-fn confirm_height(lines: &[(String, Color)], area: Rect) -> u16 {
-    let need: usize = lines
-        .iter()
-        .map(|(l, _)| wrapped_rows(l, area.width as usize))
-        .sum();
-    need.min(confirm_cap(area)).max(1) as u16
+fn items(n: usize) -> String {
+    if n == 1 {
+        "1 item".to_string()
+    } else {
+        format!("{n} items")
+    }
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    let size = frame.area();
-    let confirm = if app.confirm_open && app.operation.is_none() {
-        confirm_lines(app, size)
-    } else {
-        Vec::new()
-    };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // filter line
-            Constraint::Min(1),    // body
-            Constraint::Length(if app.operation.is_some() {
-                3
-            } else if app.confirm_open {
-                confirm_height(&confirm, size)
-            } else if app.result_active().is_some() {
-                // The result gets its own lines; the legend below stays.
-                2
-            } else {
-                0
-            }),
-            Constraint::Length(1), // footer
-        ])
-        .split(size);
-
-    draw_header(frame, app, chunks[0]);
-
-    draw_filter_line(frame, app, chunks[1]);
-    draw_body(frame, app, chunks[2]);
-
-    if let Some(op) = &app.operation {
-        let cancelling = op.cancel.load(std::sync::atomic::Ordering::SeqCst);
-        let ratio = if op.total == 0 {
-            0.0
+/// The plan sheet: what is ready and what is blocked, the plan by project,
+/// what cannot come back, then names and warnings. `summary` is the
+/// confirm text; its first line is the headline shown in the status rows.
+fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
+    let rest: &[String] = summary.get(1..).unwrap_or(&[]);
+    let irreversible = rest
+        .iter()
+        .take_while(|l| l.starts_with("Remove ") || l.starts_with("Gone for good"))
+        .count();
+    let yellow = |l: &String| (l.clone(), Color::Yellow);
+    let mut out: Vec<(String, Color)> = rest[..irreversible].iter().map(yellow).collect();
+    let ready = app.marked.len();
+    let blocked = app.blocked.len();
+    out.push((
+        if blocked == 0 {
+            format!("{ready} ready · none blocked")
         } else {
-            (op.completed as f64 / op.total as f64).min(1.0)
-        };
-        let label = if cancelling {
-            "Cancelling after current group".to_string()
-        } else if op.checking_open_files.is_some() {
-            "Checking which files are open…".to_string()
-        } else {
-            op.label.to_string()
-        };
-        let count = if op.checking_open_files.is_some() {
-            "no groups yet".to_string()
-        } else if op.total == 0 {
-            format!("{} checked", op.completed)
-        } else {
-            format!("{}/{} groups", op.completed, op.total)
-        };
-        let area = chunks[3];
-        frame.render_widget(
-            ratatui::widgets::Gauge::default()
-                .ratio(ratio)
-                .label(format!(
-                    "{label} · {count} · {}s",
-                    op.checking_open_files
-                        .unwrap_or(op.started)
-                        .elapsed()
-                        .as_secs()
-                ))
-                .gauge_style(Style::default().fg(Color::Yellow)),
-            Rect { height: 1, ..area },
-        );
-        frame.render_widget(
-            Paragraph::new(format!(
-                "{} successful · {} refused · {}",
-                op.succeeded,
-                op.failed,
-                op.current.display()
-            )),
-            Rect {
-                y: area.y + 1,
-                height: area.height.saturating_sub(1).min(1),
-                ..area
-            },
-        );
-        frame.render_widget(
-            Paragraph::new(if op.label == "Reviewing" {
-                "Review only; no files are changed. Cancellation preserves previous marks."
-            } else {
-                "Filesystem cleanup moves to Trash; allocated bytes are not freed space."
-            }),
-            Rect {
-                y: area.y + 2,
-                height: area.height.saturating_sub(2).min(1),
-                ..area
-            },
-        );
-    } else if app.confirm_open {
-        let text: Vec<Line> = confirm
+            format!("{ready} ready · {blocked} blocked (d to see why)")
+        },
+        Color::Reset,
+    ));
+    if let Some(first) = app.blocked.first() {
+        let more = app
+            .blocked
             .iter()
-            .map(|(l, c)| Line::styled(l.clone(), Style::default().fg(*c)))
-            .collect();
+            .filter(|b| b.reason != first.reason)
+            .map(|b| &b.reason)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let more = if more > 0 {
+            format!(" (+{more} more reasons)")
+        } else {
+            String::new()
+        };
+        out.push((format!("Blocked: {}{more}", first.reason), Color::Red));
+    }
+    let in_use = app
+        .marked
+        .values()
+        .filter(|u| u.warnings.iter().any(|w| w == "currently in use"))
+        .count();
+    if in_use > 0 {
+        out.push((
+            format!(
+                "{} in use: a process has them open. Close them and check again.",
+                items(in_use)
+            ),
+            Color::Yellow,
+        ));
+    }
+    out.extend(project_breakdown(app));
+    out.extend(rest[irreversible..].iter().map(yellow));
+    out
+}
+
+/// The plan by project, largest first, the tail folded into one line.
+fn project_breakdown(app: &App) -> Vec<(String, Color)> {
+    let mut by: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
+    for u in app.marked.values() {
+        let name = if u.docker.is_some() {
+            "docker".to_string()
+        } else {
+            crate::names::project_of(&app.report, &u.path).unwrap_or_else(|| "other".to_string())
+        };
+        let e = by.entry(name).or_default();
+        e.0 += u.bytes;
+        e.1 += 1;
+    }
+    let mut v: Vec<(String, (u64, usize))> = by.into_iter().collect();
+    v.sort_by_key(|(_, (b, _))| std::cmp::Reverse(*b));
+    let mut out: Vec<(String, Color)> = v
+        .iter()
+        .take(3)
+        .map(|(n, (b, c))| {
+            (
+                format!("  {n}  {}  {}", human_bytes(*b), items(*c)),
+                Color::Reset,
+            )
+        })
+        .collect();
+    if v.len() > 3 {
+        let (b, c) = v[3..]
+            .iter()
+            .fold((0u64, 0usize), |a, (_, (b, c))| (a.0 + b, a.1 + c));
+        out.push((
+            format!("  + {} more  {}  {}", v.len() - 3, human_bytes(b), items(c)),
+            Color::Reset,
+        ));
+    }
+    out
+}
+
+/// The blocked sheet: each item, why, and what to do next.
+fn blocked_sheet(app: &App) -> Vec<(String, Color)> {
+    let mut out = Vec::new();
+    for b in &app.blocked {
+        out.push((format!("{}  {}", b.name, b.reason), Color::Reset));
+        out.push((format!("  next: {}", b.next), Color::Yellow));
+    }
+    out
+}
+
+/// A sheet over the bottom of the body: bordered, fixed height, whole
+/// lines with a count of what did not fit.
+fn draw_sheet(frame: &mut Frame, body: Rect, title: &str, lines: &[(String, Color)]) {
+    let h = SHEET_ROWS.min(body.height);
+    if h < 3 {
+        return;
+    }
+    let area = Rect {
+        y: body.y + body.height - h,
+        height: h,
+        ..body
+    };
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {title} "));
+    let inner = block.inner(area);
+    let fit = fit_lines(lines, inner.width as usize, inner.height as usize);
+    let text: Vec<Line> = fit
+        .iter()
+        .map(|(l, c)| Line::styled(l.clone(), Style::default().fg(*c)))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        area,
+    );
+}
+
+/// The two status rows while something runs: elapsed and a moving glyph
+/// first, then what is happening, then the item being worked on.
+fn operation_rows(app: &App, op: &crate::app::Operation) -> [String; 2] {
+    let elapsed = op.started.elapsed();
+    let chip = format!(
+        "{} {}",
+        spinner_frame(app),
+        swamp_core::schedule::format_elapsed(elapsed.as_secs())
+    );
+    let cancelling = op.cancel.load(std::sync::atomic::Ordering::SeqCst);
+    let current = if op.current.is_empty() {
+        "starting…".to_string()
+    } else {
+        op.current.clone()
+    };
+    match op.label {
+        "Reviewing" if cancelling => [
+            format!("{chip}  Stopping after this item"),
+            "Marks are kept. Nothing has been changed.".to_string(),
+        ],
+        "Reviewing" if op.checking_open_files.is_some() => [
+            format!("{chip}  Checking what is in use"),
+            "Marks are kept. Nothing has been changed.".to_string(),
+        ],
+        "Reviewing" => {
+            let counts = if op.total > 0 {
+                format!("Checked {} of {}", op.completed, op.total)
+            } else {
+                format!("Checked {}", op.completed)
+            };
+            [
+                format!(
+                    "{chip}  {counts} · {} ready · {} blocked",
+                    op.succeeded, op.failed
+                ),
+                current,
+            ]
+        }
+        "Deleting" => [
+            format!(
+                "{chip}  {}  {} of {} · {} of {}",
+                if cancelling {
+                    "Stopping after this item"
+                } else {
+                    "Moving to Trash"
+                },
+                op.completed,
+                op.total,
+                human_bytes(op.bytes_done),
+                human_bytes(op.bytes_total)
+            ),
+            current,
+        ],
+        _ => [format!("{chip}  {}", op.label), {
+            let _ = app;
+            current
+        }],
+    }
+}
+
+fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
+    let w = area.width as usize;
+    if let Some(op) = &app.operation {
+        let rows = operation_rows(app, op);
+        let lines: Vec<Line> = rows.iter().map(|r| Line::from(clip_end(r, w))).collect();
+        frame.render_widget(Paragraph::new(lines), area);
+    } else if app.confirm_open {
+        if let Some(headline) = summary.first() {
+            frame.render_widget(
+                Paragraph::new(headline.clone())
+                    .wrap(ratatui::widgets::Wrap { trim: true })
+                    .style(Style::default().fg(Color::Yellow)),
+                area,
+            );
+        }
+    } else if let Some(msg) = app.refusal_active() {
         frame.render_widget(
-            Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: true }),
-            chunks[3],
+            Paragraph::new(msg.to_string())
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .style(Style::default().fg(Color::Red)),
+            area,
         );
     } else if let Some(r) = app.result_active() {
         frame.render_widget(
             Paragraph::new(r.to_string())
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .style(Style::default().fg(Color::Cyan)),
-            chunks[3],
+            area,
         );
     }
+}
 
-    // The footer is the key legend for the state you are actually in.
+pub fn draw(frame: &mut Frame, app: &App) {
+    let size = frame.area();
+    let summary: Vec<String> = if app.confirm_open && app.operation.is_none() {
+        app.confirm_summary().lines().map(str::to_string).collect()
+    } else {
+        Vec::new()
+    };
+    // Chrome is the same five rows in every state: header, filter line,
+    // two status rows, keys. Sheets overlay the body; nothing resizes it.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header
+            Constraint::Length(1), // filter line
+            Constraint::Min(1),    // body
+            Constraint::Length(STATUS_ROWS),
+            Constraint::Length(1), // keys
+        ])
+        .split(size);
+
+    draw_header(frame, app, chunks[0]);
+    draw_filter_line(frame, app, chunks[1]);
+    draw_body(frame, app, chunks[2]);
+    if app.operation.is_none() {
+        if app.blocked_open {
+            draw_sheet(
+                frame,
+                chunks[2],
+                &format!("Blocked: {}", app.blocked.len()),
+                &blocked_sheet(app),
+            );
+        } else if app.confirm_open {
+            draw_sheet(
+                frame,
+                chunks[2],
+                "Plan · nothing has changed yet",
+                &plan_sheet(app, &summary),
+            );
+        }
+    }
+    draw_status(frame, app, &summary, chunks[3]);
+
+    // The keys row is the legend for the state you are actually in, and
+    // nothing else ever replaces it.
     let footer_text = if let Some(op) = &app.operation {
-        if op.label == "Reviewing" {
-            "Esc / Ctrl-C: cancel review after current check".into()
+        match op.label {
+            "Reviewing" => {
+                "Esc cancel · Nothing has been changed · Next: review, then Enter to move to Trash"
+                    .to_string()
+            }
+            "Deleting" => "Esc stop after this item · moved items stay in Trash".to_string(),
+            _ => "Esc cancel".to_string(),
+        }
+    } else if app.blocked_open {
+        if app.confirm_open {
+            "Esc back to the plan".to_string()
         } else {
-            "Esc / Ctrl-C: stop after current group · completed moves remain in Trash".into()
+            "Esc close".to_string()
         }
     } else if app.confirm_open {
-        // The keys stay put whatever else is showing; refusals live in the
-        // confirm region above.
-        if app.keep_executables {
-            "Enter yes · Esc no · keep executables → bin/ (k)".to_string()
-        } else {
-            "Enter yes · Esc no · k keep executables".to_string()
+        let mut clauses = vec!["Enter confirm".to_string(), "Esc back".to_string()];
+        if !app.blocked.is_empty() {
+            clauses.push("d blocked".to_string());
         }
-    } else if let Some(msg) = app.refusal_active() {
-        msg.to_string()
+        clauses.push(if app.keep_executables {
+            "keep executables → bin/ (k)".to_string()
+        } else {
+            "k keep executables".to_string()
+        });
+        fit_clauses(&clauses, size.width as usize)
     } else if app.picker.is_some() {
         "↑↓ field · ←→ value · Space grew/shrank · type to narrow project · Enter apply · Esc cancel · e edit as text · 0 clear".to_string()
     } else if app.editing_filter {
         "Tab complete · Enter apply · Esc cancel".to_string()
     } else {
-        footer_legend(size.width as usize)
+        footer_legend(size.width as usize, !app.blocked.is_empty())
     };
-    let footer_style = if app.refusal_active().is_some() && !app.confirm_open {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default()
-    };
-    frame.render_widget(Paragraph::new(footer_text).style(footer_style), chunks[4]);
+    frame.render_widget(Paragraph::new(footer_text), chunks[4]);
 
     if app.help_open {
         draw_help(frame, size);
@@ -971,27 +1154,22 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             lines
         })
         .unwrap_or_default();
-    let base_detail = if cleanup_view { 3 } else { 2 };
-    // Each evidence line can itself wrap to several physical rows at a
-    // narrow width (`Wrap { trim: true }` below), so sizing by logical
-    // fact count alone would silently clip real content -- estimate
-    // wrapped rows instead. Capped at half the body height: a unit with
-    // many facts must not push the row table itself off screen.
-    let content_width = (area.width as usize).max(1);
-    let wrapped_rows =
-        |s: &str| -> u16 { (s.chars().count().max(1)).div_ceil(content_width) as u16 };
-    let evidence_rows: u16 = selected_evidence_lines
-        .iter()
-        .take(6)
-        .map(|l| wrapped_rows(l))
-        .sum();
-    let detail_height = (base_detail + evidence_rows)
-        .min(area.height.saturating_sub(2))
-        .min((area.height / 2).max(base_detail));
+    // The detail pane is the same height whichever row is selected, so
+    // the table never resizes under the cursor.
+    let detail_height = DETAIL_ROWS.min(area.height / 3);
     let table_height = area.height.saturating_sub(detail_height);
     let header_count = if cleanup_view { 2 } else { 1 };
     let visible = table_height.saturating_sub(header_count) as usize;
-    let offset = app.selected.saturating_sub(visible.saturating_sub(1));
+    // Stateful window: it moves only when the selection leaves it, so one
+    // keypress moves the selection one row.
+    let mut offset = app.scroll_offset.get();
+    if app.selected < offset {
+        offset = app.selected;
+    } else if visible > 0 && app.selected >= offset + visible {
+        offset = app.selected + 1 - visible;
+    }
+    offset = offset.min(rows.len().saturating_sub(visible));
+    app.scroll_offset.set(offset);
     let headers: Vec<_> = lines.drain(..header_count as usize).collect();
     let shown = headers
         .into_iter()
@@ -1103,8 +1281,18 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .map(|l| Line::styled(l.clone(), Style::default().add_modifier(Modifier::DIM))),
         );
+        // One fact per row, cut at the edge: the front of each fact is
+        // the part that decides, and the pane never grows.
+        let clipped: Vec<Line> = detail_lines
+            .into_iter()
+            .take(detail_height as usize)
+            .map(|l| {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                Line::styled(clip_end(&text, width), l.style)
+            })
+            .collect();
         frame.render_widget(
-            Paragraph::new(detail_lines).wrap(ratatui::widgets::Wrap { trim: true }),
+            Paragraph::new(clipped),
             Rect {
                 y: area.y + table_height,
                 height: detail_height,

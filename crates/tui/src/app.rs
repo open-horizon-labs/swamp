@@ -5,9 +5,10 @@
 use crate::actions::{self, MarkedUnit};
 use crate::filter::{self, Filter};
 use crate::model::{self, Row, Sort};
+use crate::names;
 use crate::units::UnitId;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use swamp_core::report::Report;
 
@@ -57,8 +58,6 @@ fn summarize_refusals(reasons: &[String]) -> Option<String> {
 }
 
 pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
-/// How long a finished operation's result line stays on screen.
-pub const RESULT_DISPLAY: Duration = Duration::from_secs(20);
 /// An index older than this is called stale in the header (a warning,
 /// not an error): the schedule is meant to keep it younger.
 pub const STALE_AFTER_SECS: u64 = 15 * 60;
@@ -220,8 +219,18 @@ pub struct App {
     operation_rx: Option<std::sync::mpsc::Receiver<OperationEvent>>,
     review_progress: Option<std::sync::mpsc::Sender<OperationEvent>>,
     review_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    reviewed: usize,
-    review_total: usize,
+    /// Worker side: what this check could not include.
+    blocked_log: Vec<BlockedItem>,
+    /// Worker side: the row being marked, for naming a refusal.
+    refusal_ctx: Option<String>,
+    /// What the last check could not include (`b` lists it).
+    pub blocked: Vec<BlockedItem>,
+    pub blocked_open: bool,
+    /// First body row shown; moves only when the selection leaves the
+    /// window, so one keypress moves the selection one row.
+    pub scroll_offset: std::cell::Cell<usize>,
+    /// Redraws so far; drives the busy glyph.
+    pub frame: u64,
     pub report: Report,
     /// Primary root: the first entry of `roots`, kept for every call
     /// site that only ever needed one representative path (a "resize
@@ -300,8 +309,6 @@ pub struct App {
     lock_poll_rx: Option<std::sync::mpsc::Receiver<LockPollMsg>>,
     /// Last operation outcome or refusal worth one header clause.
     pub last_result: Option<String>,
-    /// When `last_result` was set; it stops showing `RESULT_DISPLAY` later.
-    pub last_result_at: Option<Instant>,
     pub observed_label: String,
     /// False only while the very first observation has not landed.
     pub has_index: bool,
@@ -389,13 +396,48 @@ pub struct App {
     pub scope: Option<swamp_core::scope::EffectiveScope>,
 }
 
+/// One thing a check could not include, and what to do about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedItem {
+    pub name: String,
+    pub reason: String,
+    pub next: String,
+}
+
+/// The next step for a reason a check gave. Unknown reasons still get a
+/// safe one: refresh and check again.
+pub fn blocked_next_step(reason: &str) -> &'static str {
+    let r = reason.to_lowercase();
+    if r.contains("human-protected") {
+        "remove the protection (swamp protect), then check again"
+    } else if r.contains("protection state could not be read") {
+        "fix the protect file in the swamp store, then check again"
+    } else if r.contains("nothing reclaimable") {
+        "open the project with Enter and mark what you want inside it"
+    } else if r.contains("category total") {
+        "open the category and mark one of its items"
+    } else if r.contains("inspection-only") {
+        "nothing to do here: swamp only shows this, it cannot clean it"
+    } else if r.contains("agent-storage") || r.contains("active") {
+        "close the agent session that uses it, then check again"
+    } else {
+        "press R to refresh, then check again"
+    }
+}
+
 pub struct Operation {
     pub label: &'static str,
+    /// Items checked (review) or moved (delete) so far.
     pub completed: usize,
     pub total: usize,
+    /// Review: ready. Delete: moved.
     pub succeeded: usize,
+    /// Review: blocked. Delete: not moved.
     pub failed: usize,
-    pub current: PathBuf,
+    /// Plain name of the item being worked on.
+    pub current: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
     pub started: Instant,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A review's one open-file snapshot (`lsof`) is being taken;
@@ -406,6 +448,14 @@ pub struct Operation {
 enum OperationEvent {
     /// The review's open-file snapshot started (`true`) or finished.
     OpenFileCheck(bool),
+    /// How many items this check will look at.
+    ReviewTotal(usize),
+    /// The check is looking at this path now.
+    ReviewStep(PathBuf),
+    /// One item is ready.
+    ReviewReady,
+    /// One item is blocked.
+    ReviewBlocked,
     Inspected(Vec<String>),
     Progress {
         completed: usize,
@@ -415,13 +465,13 @@ enum OperationEvent {
     },
     Reviewed {
         marked: BTreeMap<String, MarkedUnit>,
+        blocked: Vec<BlockedItem>,
         refusal: Option<String>,
         confirm: bool,
         cancelled: bool,
     },
     Deleted {
         results: Vec<actions::UnitResult>,
-        planned: u64,
         measured: Option<i64>,
         total: usize,
     },
@@ -502,8 +552,12 @@ impl App {
             operation_rx: None,
             review_progress: None,
             review_cancel: None,
-            reviewed: 0,
-            review_total: 0,
+            blocked_log: Vec::new(),
+            refusal_ctx: None,
+            blocked: Vec::new(),
+            blocked_open: false,
+            scroll_offset: std::cell::Cell::new(0),
+            frame: 0,
             report,
             root,
             roots,
@@ -531,7 +585,6 @@ impl App {
             external_observer: None,
             lock_poll_rx: None,
             last_result: None,
-            last_result_at: None,
             observed_label: "just now".to_string(),
             has_index: true,
             live_age: false,
@@ -1094,7 +1147,10 @@ impl App {
                     // checkout under the root behind one Enter.
                     match self.mark_project(&project, false) {
                         ProjectMark::Nothing => {
-                            refused.push("nothing reclaimable in this project".into())
+                            let why = "nothing reclaimable in this project";
+                            let name = self.row_display_name(&row);
+                            self.note_blocked(name, why);
+                            refused.push(why.into())
                         }
                         ProjectMark::Cleared => {}
                         ProjectMark::Marked(n) => marked += n,
@@ -1123,7 +1179,11 @@ impl App {
                         marked += 1;
                     }
                 }
-                Err(why) => refused.push(why.into()),
+                Err(why) => {
+                    let name = self.row_display_name(&row);
+                    self.note_blocked(name, why);
+                    refused.push(why.into())
+                }
             }
         }
         if agent_skipped > 0 {
@@ -1263,6 +1323,39 @@ impl App {
     /// Enter. Docker objects are the one exception: there is no
     /// implementation to remove them yet, so marking one would be a lie.
     pub fn mark_row(&mut self, row: &Row) {
+        let name = self.row_display_name(row);
+        let outer = self.refusal_ctx.replace(name);
+        self.mark_row_inner(row);
+        self.refusal_ctx = outer;
+    }
+
+    /// A row's plain name: a unit by what it is, anything else by its label.
+    fn row_display_name(&self, row: &Row) -> String {
+        match &row.unit {
+            Some(u) => names::friendly_unit_name(&self.report, Path::new(&u.0)),
+            None => row.label.trim().to_string(),
+        }
+    }
+
+    /// A refusal that also counts as blocked in the check in progress.
+    fn refuse(&mut self, msg: &str) {
+        let name = self.refusal_ctx.clone().unwrap_or_default();
+        self.note_blocked(name, msg);
+        self.set_refusal(msg);
+    }
+
+    fn note_blocked(&mut self, name: String, reason: &str) {
+        self.blocked_log.push(BlockedItem {
+            name,
+            reason: reason.to_string(),
+            next: blocked_next_step(reason).to_string(),
+        });
+        if let Some(tx) = &self.review_progress {
+            let _ = tx.send(OperationEvent::ReviewBlocked);
+        }
+    }
+
+    fn mark_row_inner(&mut self, row: &Row) {
         if self
             .review_cancel
             .as_ref()
@@ -1280,7 +1373,7 @@ impl App {
                 .cloned()
                 .collect();
             if members.is_empty() {
-                self.set_refusal("No supported cleanup members remain; refresh the report.");
+                self.refuse("No supported cleanup members remain; refresh the report.");
                 return;
             }
             if members
@@ -1315,13 +1408,11 @@ impl App {
         }
         let Some(unit_id) = row.unit.clone() else {
             if row.signals.iter().any(|s| s == "category") {
-                self.set_refusal(
-                    "Category total: select an unchecked child group. Nothing changed.",
-                );
+                self.refuse("Category total: select an unchecked child group. Nothing changed.");
                 return;
             }
             if row.signals.iter().any(|s| s == "blocked") {
-                self.set_refusal(
+                self.refuse(
                     "Inspection-only: this output cannot be selected for cleanup. Nothing changed.",
                 );
                 return;
@@ -1331,20 +1422,15 @@ impl App {
             // back, so the human does not have to open it first.
             if let Some(project) = row.project.clone() {
                 if self.mark_project(&project, true) == ProjectMark::Nothing {
-                    self.set_refusal("nothing reclaimable in this project");
+                    self.refuse("nothing reclaimable in this project");
                 }
                 return;
             }
-            self.set_refusal("nothing to delete on this row");
+            self.refuse("nothing to delete on this row");
             return;
         };
         if let Some(tx) = &self.review_progress {
-            let _ = tx.send(OperationEvent::Progress {
-                completed: self.reviewed,
-                total: self.review_total,
-                path: PathBuf::from(&unit_id.0),
-                outcome: None,
-            });
+            let _ = tx.send(OperationEvent::ReviewStep(PathBuf::from(&unit_id.0)));
         }
         // The ignored/untracked rows report bytes scattered across a
         // checkout under the worktree's own path. Marking one would
@@ -1357,7 +1443,7 @@ impl App {
             )
             && let Err(why) = crate::units::markable(kind)
         {
-            self.set_refusal(why);
+            self.refuse(why);
             return;
         }
         // A Docker object is removed through the daemon, not moved to
@@ -1400,7 +1486,7 @@ impl App {
             match swamp_core::agents::load_protect(&store) {
                 Ok(protected) => {
                     if let Some(reason) = protected.conflict(&candidate) {
-                        self.set_refusal(&format!(
+                        self.refuse(&format!(
                             "human-protected path (swamp protect): {reason}; remove protection \
                              first if this unit should be actionable"
                         ));
@@ -1408,7 +1494,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.set_refusal(&format!(
+                    self.refuse(&format!(
                         "protection state could not be read, so nothing may be marked: {e}"
                     ));
                     return;
@@ -1511,7 +1597,7 @@ impl App {
                     units.into_iter().next()
                 }
                 Err(e) => {
-                    self.set_refusal(&e.to_string());
+                    self.refuse(&e.to_string());
                     return;
                 }
             }
@@ -1542,7 +1628,7 @@ impl App {
                     units.into_iter().next()
                 }
                 Err(e) => {
-                    self.set_refusal(&e.to_string());
+                    self.refuse(&e.to_string());
                     return;
                 }
             }
@@ -1585,14 +1671,8 @@ impl App {
                 warnings,
             },
         );
-        self.reviewed += 1;
         if let Some(tx) = &self.review_progress {
-            let _ = tx.send(OperationEvent::Progress {
-                completed: self.reviewed,
-                total: self.review_total,
-                path: PathBuf::from(&unit_id.0),
-                outcome: Some(true),
-            });
+            let _ = tx.send(OperationEvent::ReviewReady);
         }
     }
 
@@ -1640,7 +1720,9 @@ impl App {
             total: 1,
             succeeded: 0,
             failed: 0,
-            current: profile.clone(),
+            current: names::friendly_unit_name(&self.report, &profile),
+            bytes_done: 0,
+            bytes_total: 0,
             started: Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
@@ -1699,14 +1781,6 @@ impl App {
         if !all && row.is_none() {
             return;
         }
-        let total = if all {
-            0
-        } else {
-            row.as_ref()
-                .and_then(|r| r.expansion_key.as_deref())
-                .map(|k| model::cleanup_members(&self.report, k).len())
-                .unwrap_or(0)
-        };
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut worker = App::new(self.report.clone(), self.root.clone());
@@ -1716,16 +1790,17 @@ impl App {
         worker.selected_project = self.selected_project.clone();
         worker.collapsed = self.collapsed.clone();
         worker.track = self.track.clone();
-        worker.review_total = total;
         worker.review_cancel = Some(cancel.clone());
         worker.review_progress = Some(tx.clone());
         self.operation = Some(Operation {
             label: "Reviewing",
             completed: 0,
-            total,
+            total: 0,
             succeeded: 0,
             failed: 0,
-            current: PathBuf::new(),
+            current: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
             started: Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
@@ -1733,9 +1808,17 @@ impl App {
         self.operation_rx = Some(rx);
         self.refusal = None;
         self.last_result = None;
+        self.blocked.clear();
+        self.blocked_open = false;
         crate::worker::spawn(move || {
-            // One open-file snapshot serves every group in this pass,
-            // instead of one directory-tree walk per group.
+            let total = if all {
+                worker.count_targets(None)
+            } else {
+                row.as_ref().map_or(0, |r| worker.count_targets(Some(r)))
+            };
+            let _ = tx.send(OperationEvent::ReviewTotal(total));
+            // One open-file snapshot serves every item in this pass,
+            // instead of one directory-tree walk per item.
             let phase_tx = tx.clone();
             swamp_core::occupancy::OccupancySnapshot::scoped_observed(
                 move |phase| {
@@ -1753,11 +1836,37 @@ impl App {
             );
             let _ = tx.send(OperationEvent::Reviewed {
                 marked: worker.marked,
+                blocked: worker.blocked_log,
                 refusal: worker.refusal.map(|(msg, _)| msg),
                 confirm: confirm || all,
                 cancelled: cancel.load(std::sync::atomic::Ordering::SeqCst),
             });
         });
+    }
+
+    /// How many items a check of `row` (or of every row in the view, for
+    /// `None`) will look at: what "checked N of M" counts against.
+    fn count_targets(&self, only: Option<&Row>) -> usize {
+        let one = |row: &Row, checkouts: bool| -> usize {
+            if let Some(key) = row
+                .expansion_key
+                .as_deref()
+                .filter(|k| model::is_cleanup_selection(&self.report, k))
+            {
+                return model::cleanup_members(&self.report, key).len().max(1);
+            }
+            if row.unit.is_some() {
+                return 1;
+            }
+            match row.project.as_deref() {
+                Some(p) if row.kind.is_none() => self.project_units(p, checkouts).len().max(1),
+                _ => 0,
+            }
+        };
+        match only {
+            Some(row) => one(row, true),
+            None => self.rows().iter().map(|r| one(r, false)).sum(),
+        }
     }
 
     pub fn poll_operation(&mut self) {
@@ -1782,18 +1891,47 @@ impl App {
                         op.checking_open_files = active.then(Instant::now);
                     }
                 }
+                OperationEvent::ReviewTotal(n) => {
+                    if let Some(op) = &mut self.operation {
+                        op.total = n;
+                    }
+                }
+                OperationEvent::ReviewStep(path) => {
+                    let name = names::friendly_unit_name(&self.report, &path);
+                    if let Some(op) = &mut self.operation {
+                        op.current = name;
+                    }
+                }
+                OperationEvent::ReviewReady => {
+                    if let Some(op) = &mut self.operation {
+                        op.succeeded += 1;
+                        op.completed = op.succeeded + op.failed;
+                    }
+                }
+                OperationEvent::ReviewBlocked => {
+                    if let Some(op) = &mut self.operation {
+                        op.failed += 1;
+                        op.completed = op.succeeded + op.failed;
+                    }
+                }
                 OperationEvent::Progress {
                     completed,
                     total,
                     path,
                     outcome,
                 } => {
+                    let name = names::friendly_unit_name(&self.report, &path);
+                    let bytes = self
+                        .marked
+                        .get(&path.display().to_string())
+                        .map_or(0, |u| u.bytes);
                     if let Some(op) = &mut self.operation {
                         op.completed = completed;
                         op.total = total;
-                        op.current = path;
+                        op.current = name;
                         if outcome == Some(true) {
                             op.succeeded += 1;
+                            op.bytes_done += bytes;
                         }
                         if outcome == Some(false) {
                             op.failed += 1;
@@ -1802,10 +1940,15 @@ impl App {
                 }
                 OperationEvent::Reviewed {
                     marked,
+                    blocked,
                     refusal,
                     confirm,
                     cancelled,
                 } => {
+                    let (done, of) = self
+                        .operation
+                        .as_ref()
+                        .map_or((0, 0), |op| (op.completed, op.total));
                     let cancelled = cancelled
                         || self
                             .operation
@@ -1820,6 +1963,7 @@ impl App {
                             .collect();
                         let removed = before.keys().filter(|k| !marked.contains_key(*k)).count();
                         self.marked = marked;
+                        self.blocked = blocked;
                         self.refusal = refusal.map(|msg| (msg, Instant::now()));
                         self.confirm_open = confirm && !self.marked.is_empty();
                         if self.confirm_open {
@@ -1833,10 +1977,18 @@ impl App {
                             self.set_result(msg);
                         }
                     } else {
-                        self.set_result(
-                            "Review cancelled; previous selection preserved; nothing deleted"
-                                .into(),
-                        );
+                        let progress = if of > 0 {
+                            format!("at {done} of {of}")
+                        } else {
+                            format!("after {done}")
+                        };
+                        let kept = match self.marked.len() {
+                            0 => String::new(),
+                            k => format!(" {k} still marked."),
+                        };
+                        self.set_result(format!(
+                            "Check stopped {progress}. Nothing was moved.{kept}"
+                        ));
                     }
                     self.operation = None;
                     self.operation_rx = None;
@@ -1844,13 +1996,12 @@ impl App {
                 }
                 OperationEvent::Deleted {
                     results,
-                    planned,
                     measured,
                     total,
                 } => {
                     self.operation = None;
                     self.operation_rx = None;
-                    self.finish_delete(results, planned, measured, total);
+                    self.finish_delete(results, measured, total);
                     break;
                 }
                 OperationEvent::Failed(msg) => {
@@ -1870,16 +2021,12 @@ impl App {
 
     pub fn set_result(&mut self, msg: String) {
         self.last_result = Some(msg);
-        self.last_result_at = Some(Instant::now());
     }
 
-    /// The last operation's result while it is still worth showing.
+    /// The last operation's result. It stays until the next key: a timer
+    /// that erased it would repaint the screen while nobody is looking.
     pub fn result_active(&self) -> Option<&str> {
-        let msg = self.last_result.as_deref()?;
-        match self.last_result_at {
-            Some(at) if at.elapsed() >= RESULT_DISPLAY => None,
-            _ => Some(msg),
-        }
+        self.last_result.as_deref()
     }
 
     pub fn refusal_active(&self) -> Option<&str> {
@@ -1892,6 +2039,13 @@ impl App {
                 None
             }
         })
+    }
+
+    /// Lists what the last check could not include, with reasons.
+    pub fn open_blocked(&mut self) {
+        if !self.blocked.is_empty() {
+            self.blocked_open = true;
+        }
     }
 
     pub fn open_confirm(&mut self) {
@@ -1941,15 +2095,19 @@ impl App {
         self.set_result(msg);
     }
 
-    /// One line on where the marks stand after a Space, for the result row.
+    /// Where the marks stand after a Space, for the result rows.
     fn mark_state_line(&self, added: usize, removed: usize) -> String {
         let total = self.marked.len();
         let bytes: u64 = self.marked.values().map(|u| u.bytes).sum();
+        let blocked = match self.blocked.len() {
+            0 => String::new(),
+            n => format!(" {n} blocked (b to see why)."),
+        };
         if total == 0 {
             return if removed > 0 {
-                format!("Unmarked {removed}. Nothing is marked.")
+                format!("Unmarked {removed}. Nothing is marked.{blocked}")
             } else {
-                "Nothing marked.".to_string()
+                format!("Nothing marked.{blocked}")
             };
         }
         let change = if added > 0 {
@@ -1960,7 +2118,7 @@ impl App {
             String::new()
         };
         format!(
-            "{change}{total} marked in all ({}). Backspace deletes them (asks first); Space on a row unmarks.",
+            "{change}{total} marked in all ({}). Nothing has been moved. Backspace moves them to Trash after you confirm.{blocked}",
             model::human_bytes(bytes)
         )
     }
@@ -2006,7 +2164,9 @@ impl App {
             total,
             succeeded: 0,
             failed: 0,
-            current: PathBuf::new(),
+            current: String::new(),
+            bytes_done: 0,
+            bytes_total: planned,
             started: Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
@@ -2016,6 +2176,8 @@ impl App {
         self.confirm_added.clear();
         self.last_result = None;
         self.refusal = None;
+        self.blocked.clear();
+        self.blocked_open = false;
         crate::worker::spawn(move || {
             let ledger = swamp_core::ledger::Ledger::resolved(&store);
             let free_before = actions::free_space_bytes(&trash);
@@ -2040,7 +2202,6 @@ impl App {
             };
             let _ = tx.send(OperationEvent::Deleted {
                 results,
-                planned,
                 measured,
                 total,
             });
@@ -2050,11 +2211,9 @@ impl App {
     fn finish_delete(
         &mut self,
         results: Vec<actions::UnitResult>,
-        planned: u64,
         measured: Option<i64>,
         total: usize,
     ) {
-        let ok = results.iter().filter(|r| r.outcome.is_ok()).count();
         let failed: Vec<String> = results
             .iter()
             .filter_map(|r| {
@@ -2064,6 +2223,23 @@ impl App {
                     .map(|e| format!("{}: {e}", r.path.display()))
             })
             .collect();
+        // What moved to Trash and what was removed for good (docker), with
+        // sizes, read before the marks of finished units are dropped.
+        let (mut trash_n, mut trash_bytes, mut docker_n, mut docker_bytes) =
+            (0usize, 0u64, 0usize, 0u64);
+        for r in results.iter().filter(|r| r.outcome.is_ok()) {
+            match self.marked.get(&r.path.display().to_string()) {
+                Some(u) if u.docker.is_some() => {
+                    docker_n += 1;
+                    docker_bytes += u.bytes;
+                }
+                Some(u) => {
+                    trash_n += 1;
+                    trash_bytes += u.bytes;
+                }
+                None => trash_n += 1,
+            }
+        }
         // Retain refused and unprocessed selections for explicit review/retry.
         for r in &results {
             if r.outcome.is_ok() {
@@ -2071,26 +2247,49 @@ impl App {
             }
         }
         self.confirm_open = false;
-        let measured_txt = measured
-            .map(model::human_signed_bytes)
-            .unwrap_or_else(|| "unmeasured".into());
+        let items = |n: usize| {
+            if n == 1 {
+                "1 item".to_string()
+            } else {
+                format!("{n} items")
+            }
+        };
+        let mut moved = format!(
+            "Moved {} ({}) to Trash.",
+            items(trash_n),
+            model::human_bytes(trash_bytes)
+        );
+        if docker_n > 0 {
+            moved.push_str(&format!(
+                " Removed {} docker {} ({}) for good.",
+                docker_n,
+                if docker_n == 1 { "item" } else { "items" },
+                model::human_bytes(docker_bytes)
+            ));
+        }
+        if trash_n == 0 && docker_n > 0 {
+            moved = moved.replacen("Moved 0 items (0B) to Trash. ", "", 1);
+        }
         self.set_result(if results.len() < total {
             format!(
-                "Cancelled · {ok} completed · {} refused · {} not attempted; completed filesystem moves are in Trash; an in-flight docker/git command was killed and may still have completed",
+                "Stopped. {moved} {} blocked, {} not attempted. Items moved to Trash stay there. A docker or git command that was running was stopped and may still have finished.",
                 failed.len(),
                 total - results.len()
             )
         } else if failed.is_empty() {
-            format!(
-                "{ok} deleted · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
-                model::human_bytes(planned)
-            )
+            let space = measured
+                .map(|m| format!(" Free space changed by {}.", model::human_signed_bytes(m)))
+                .unwrap_or_default();
+            if trash_n > 0 {
+                format!("{moved} Space is freed when Trash is emptied.{space}")
+            } else {
+                format!("{moved}{space}")
+            }
         } else {
             format!(
-                "{ok} deleted, {} refused (first: {}) · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
+                "{moved} {} blocked (first: {}). Space is freed when Trash is emptied.",
                 failed.len(),
-                failed[0],
-                model::human_bytes(planned)
+                failed[0]
             )
         });
         // What just left the disk leaves the screen now; the store and the
@@ -2651,7 +2850,7 @@ mod tests {
         wait_operation(&mut app);
         assert!(app.marked.is_empty());
         assert!(!app.confirm_open);
-        assert!(app.last_result.as_ref().unwrap().contains("cancelled"));
+        assert!(app.last_result.as_ref().unwrap().contains("Check stopped"));
     }
 
     #[test]
@@ -2692,7 +2891,6 @@ mod tests {
                     outcome: Err("busy".into()),
                 },
             ],
-            3,
             None,
             3,
         );
@@ -2741,7 +2939,7 @@ mod tests {
         wait_operation(&mut app);
         assert!(!path.exists());
         assert!(app.marked.is_empty());
-        assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
+        assert!(app.last_result.as_ref().unwrap().contains("Moved 1 item"));
         assert_eq!(
             swamp_core::ledger::Ledger::open(tmp.path().join("ledger.parquet"))
                 .unwrap()
@@ -2853,7 +3051,7 @@ mod tests {
         wait_operation(&mut app);
         assert!(!cache_path.exists(), "marked cache dir must be trashed");
         assert!(app.marked.is_empty());
-        assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
+        assert!(app.last_result.as_ref().unwrap().contains("Moved 1 item"));
         // Untouched: the protected settings.json survives the same pass.
         assert!(claude_home.path().join("settings.json").exists());
     }

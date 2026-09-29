@@ -12,6 +12,7 @@ pub mod actions;
 pub mod app;
 pub mod filter;
 pub mod model;
+pub mod names;
 pub mod picker;
 pub mod ui;
 pub mod units;
@@ -55,6 +56,11 @@ pub fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
 
 /// `shift` distinguishes Shift-→/Shift-← inside the picker's growth field.
 pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
+    // A result stays until the next key, and only a key removes it: no
+    // timer repaints the screen while nobody is looking.
+    if app.operation.is_none() {
+        app.last_result = None;
+    }
     if app.operation.is_some() {
         if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
             app.cancel_operation();
@@ -114,8 +120,17 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         return;
     }
+    if app.blocked_open {
+        // The blocked list is read-only: nothing under it can be marked.
+        if matches!(code, KeyCode::Esc | KeyCode::Char('b' | 'd')) {
+            app.blocked_open = false;
+        }
+        return;
+    }
     match code {
         KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('b') => app.open_blocked(),
+        KeyCode::Char('d') if app.confirm_open => app.open_blocked(),
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
         // Traversal, the way every file tree does it: right goes in,
@@ -520,6 +535,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         if let Ok(sz) = terminal.size() {
             app.width = sz.width;
         }
+        app.frame = app.frame.wrapping_add(1);
         terminal.draw(|f| ui::draw(f, app))?;
         if app.quit {
             return Ok(());
@@ -607,6 +623,8 @@ mod tests {
             succeeded: 1,
             failed: 0,
             current: "/tmp/fixture".into(),
+            bytes_done: 0,
+            bytes_total: 0,
             started: std::time::Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
@@ -734,30 +752,32 @@ mod tests {
     fn delete_result_and_key_legend_are_both_visible_at_80_columns() {
         let mut app = App::new(empty_report(), "/root".into());
         app.set_result(
-            "3 deleted · moved to Trash: space is freed only when Trash is emptied · planned 1.3GB · measured free-space change -10.5MB"
+            "Moved 3 items (1.3GB) to Trash. Space is freed when Trash is emptied. Free space changed by -10.5MB."
                 .into(),
         );
         let s = buffer_text(&app, 80, 24);
-        assert!(s.contains("3 deleted"), "{s}");
-        assert!(
-            s.contains("space is freed only when Trash is emptied"),
-            "{s}"
-        );
+        assert!(s.contains("Moved 3 items (1.3GB) to Trash."), "{s}");
+        assert!(s.contains("Space is freed when Trash is emptied"), "{s}");
         assert!(s.contains("? help  q quit"), "{s}");
     }
 
     #[test]
-    fn expired_result_disappears_and_legend_stays() {
+    fn a_result_stays_until_the_next_key_and_time_alone_never_erases_it() {
         let mut app = App::new(empty_report(), "/root".into());
-        app.set_result("2 deleted".into());
-        app.last_result_at = Some(std::time::Instant::now() - app::RESULT_DISPLAY);
+        app.set_result("Moved 2 items (1MB) to Trash.".into());
+        assert!(buffer_text(&app, 80, 24).contains("Moved 2 items"));
+        std::thread::sleep(Duration::from_millis(1100));
         let s = buffer_text(&app, 80, 24);
-        assert!(!s.contains("2 deleted"), "{s}");
+        assert!(s.contains("Moved 2 items"), "{s}");
+        assert!(s.contains("? help  q quit"), "{s}");
+        handle_key(&mut app, KeyCode::Down);
+        let s = buffer_text(&app, 80, 24);
+        assert!(!s.contains("Moved 2 items"), "{s}");
         assert!(s.contains("? help  q quit"), "{s}");
     }
 
     #[test]
-    fn review_overlay_names_the_open_file_check() {
+    fn review_status_names_the_open_file_check_then_the_item_count() {
         let mut app = App::new(empty_report(), "/root".into());
         app.operation = Some(crate::app::Operation {
             label: "Reviewing",
@@ -765,18 +785,24 @@ mod tests {
             total: 284,
             succeeded: 0,
             failed: 0,
-            current: "/tmp/x".into(),
+            current: "swamp · incremental build (target/debug)".into(),
+            bytes_done: 0,
+            bytes_total: 0,
             started: std::time::Instant::now(),
             cancel: Default::default(),
             checking_open_files: Some(std::time::Instant::now()),
         });
         let s = buffer_text(&app, 100, 24);
-        assert!(s.contains("Checking which files are open"), "{s}");
-        assert!(s.contains("Review only; no files are changed."), "{s}");
+        assert!(s.contains("Checking what is in use"), "{s}");
+        assert!(s.contains("Nothing has been changed"), "{s}");
         app.operation.as_mut().unwrap().checking_open_files = None;
         let s = buffer_text(&app, 100, 24);
-        assert!(s.contains("0/284 groups"), "{s}");
-        assert!(!s.contains("Checking which files are open"), "{s}");
+        assert!(s.contains("Checked 0 of 284"), "{s}");
+        assert!(
+            s.contains("swamp · incremental build (target/debug)"),
+            "{s}"
+        );
+        assert!(!s.contains("Checking what is in use"), "{s}");
     }
 
     /// A stored report plus a resolved scope, in a scratch store.
@@ -806,7 +832,7 @@ mod tests {
         assert!(app.scan_if_no_index(false));
         assert!(app.pending.is_some() && app.observing.is_some());
         let s = buffer_text(&app, 120, 24);
-        assert!(s.contains("observing…"), "{s}");
+        assert!(s.contains("observing"), "{s}");
         assert!(!s.contains("press R"), "{s}");
     }
 
@@ -871,7 +897,7 @@ mod tests {
         assert!(header_of(&app).contains("press R to refresh"));
         app.observing = Some((0, 0));
         let h = header_of(&app);
-        assert!(h.contains("observing…") && !h.contains("press R"), "{h}");
+        assert!(h.contains("observing") && !h.contains("press R"), "{h}");
         app.observing = None;
         app.external_observer = Some(swamp_core::schedule::LockHolder {
             pid: 4242,

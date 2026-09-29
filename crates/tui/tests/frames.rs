@@ -512,20 +512,23 @@ fn deleting_progress_and_cancellation_frames() {
         total: 617,
         succeeded: 11,
         failed: 1,
-        current: "/Users/dev/src/mole/target/debug/incremental/crate-a".into(),
+        current: "mole · crate-a incremental build (target/debug)".into(),
+        bytes_done: 3_100_000_000,
+        bytes_total: 17_200_000_000,
         started: std::time::Instant::now(),
         cancel: cancel.clone(),
         checking_open_files: None,
     });
     for (w, h) in [(80, 24), (200, 60)] {
         let frame = capture(&app, w, h);
-        assert!(frame.contains("Deleting · 12/617 groups"), "{frame}");
-        assert!(frame.contains("11 successful · 1 refused"));
-        assert!(frame.contains("Ctrl-C"));
+        assert!(frame.contains("Moving to Trash  12 of 617"), "{frame}");
+        assert!(frame.contains("3.1GB of 17.2GB"), "{frame}");
+        assert!(frame.contains("crate-a incremental build"), "{frame}");
+        assert!(frame.contains("moved items stay in Trash"), "{frame}");
         check(&format!("deleting_{w}x{h}"), &frame);
         cancel.store(true, Ordering::SeqCst);
         let frame = capture(&app, w, h);
-        assert!(frame.contains("Cancelling after current group"));
+        assert!(frame.contains("Stopping after this item"), "{frame}");
         cancel.store(false, Ordering::SeqCst);
     }
 }
@@ -1146,7 +1149,7 @@ fn checkout_without_a_remote_marks_and_the_confirm_line_warns() {
         f.contains("no remote to restore from"),
         "warning expected:\n{f}"
     );
-    assert!(f.contains("Enter yes"), "{f}");
+    assert!(f.contains("Enter confirm"), "{f}");
 }
 
 #[test]
@@ -1648,7 +1651,7 @@ fn confirm_keeps_count_size_and_destination_at_every_width() {
             "w={w}\n{f}"
         );
         assert!(top.contains("redis:7 (docker image)"), "w={w}\n{f}");
-        assert!(f.contains("Enter yes · Esc no"), "w={w}\n{f}");
+        assert!(f.contains("Enter confirm · Esc back"), "w={w}\n{f}");
         // Count, size and destination are on the first confirm row itself.
         let first = rows
             .iter()
@@ -1661,24 +1664,44 @@ fn confirm_keeps_count_size_and_destination_at_every_width() {
     }
 }
 
-/// A refusal toast must not replace the confirm keys, and a bulk mark says
-/// how many rows it skipped and why (all reasons, counted).
+/// What a check could not include is counted on the plan, listed with a
+/// reason and a next step on `d`, and the keys never go away.
 #[test]
-fn a_refusal_during_confirm_keeps_the_keys_and_counts_every_reason() {
+fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
+    use crossterm::event::KeyCode;
     let mut app = App::new(fixture_report(), "/Users/dev/src".into());
     let u = plain_unit("/Users/dev/src/p/dir", 1_000_000);
     app.marked.insert(u.path.display().to_string(), u);
     app.confirm_open = true;
-    app.refusal = Some((
-        "refused: 3 rows skipped: nothing reclaimable in this project (x2); protected (x1)".into(),
-        std::time::Instant::now() - std::time::Duration::from_secs(30),
-    ));
+    app.blocked = vec![
+        swamp_tui::app::BlockedItem {
+            name: "p".into(),
+            reason: "nothing reclaimable in this project".into(),
+            next: swamp_tui::app::blocked_next_step("nothing reclaimable").into(),
+        },
+        swamp_tui::app::BlockedItem {
+            name: "q".into(),
+            reason: "protected".into(),
+            next: swamp_tui::app::blocked_next_step("protected").into(),
+        },
+    ];
     for w in [50u16, 80, 120] {
         let f = capture(&app, w, 24);
-        assert!(f.contains("Enter yes · Esc no"), "w={w}\n{f}");
-        assert!(f.contains("3 rows skipped"), "w={w}\n{f}");
+        assert!(f.contains("Enter confirm · Esc back"), "w={w}\n{f}");
+        assert!(f.contains("1 ready · 2 blocked"), "w={w}\n{f}");
         assert!(f.contains("Move 1 item"), "w={w}\n{f}");
     }
+    swamp_tui::handle_key(&mut app, KeyCode::Char('d'));
+    assert!(app.blocked_open);
+    let f = capture(&app, 80, 24);
+    assert!(f.contains("Blocked: 2"), "{f}");
+    assert!(f.contains("next: open the project"), "{f}");
+    assert!(f.contains("Esc back to the plan"), "{f}");
+    // Enter cannot move anything while the list is open.
+    swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    assert!(app.operation.is_none() && app.confirm_open && app.blocked_open);
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+    assert!(!app.blocked_open && app.confirm_open);
 }
 
 /// Space on a project row: the row shows a mark state and a result line
@@ -1797,5 +1820,227 @@ fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
     let f = capture(&app, 40, 14);
     assert!(f.contains("Move 4 items (4.0GB) → Trash"), "{f}");
     assert!(f.contains("more lines"), "{f}");
-    assert!(f.contains("Enter yes · Esc no"), "{f}");
+    assert!(f.contains("Enter confirm · Esc back"), "{f}");
+}
+
+// ---- steady layout: nothing moves, nothing goes quiet ----------------
+
+fn busy_review(phase_one: bool, completed: usize) -> swamp_tui::app::Operation {
+    swamp_tui::app::Operation {
+        label: "Reviewing",
+        completed,
+        total: 40,
+        succeeded: completed.saturating_sub(1),
+        failed: 1.min(completed),
+        current: "mole · node_modules".into(),
+        bytes_done: 0,
+        bytes_total: 0,
+        started: std::time::Instant::now(),
+        cancel: Default::default(),
+        checking_open_files: phase_one.then(std::time::Instant::now),
+    }
+}
+
+fn line_of(frame: &str, i: usize) -> String {
+    frame.lines().nth(i).unwrap_or("").trim().to_string()
+}
+
+/// The table's own rows sit at the same screen rows in every state:
+/// idle, checking, confirm, blocked list, result, and back. A sheet
+/// covers the bottom of the body; it never resizes it.
+#[test]
+fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
+    for w in [50u16, 80, 120] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.width = w;
+        app.clear_filter();
+        let idle = capture(&app, w, 24);
+        let header = idle
+            .lines()
+            .position(|l| l.trim_start_matches('"').starts_with("Name"))
+            .unwrap();
+        assert_eq!(header, 2, "w={w}\n{idle}");
+        let table = |f: &str| (1..=4).map(|i| line_of(f, i)).collect::<Vec<_>>();
+        let want = table(&idle);
+
+        let mut states: Vec<(&str, String)> = Vec::new();
+        app.operation = Some(busy_review(true, 0));
+        states.push(("checking what is in use", capture(&app, w, 24)));
+        app.operation = Some(busy_review(false, 3));
+        states.push(("checking items", capture(&app, w, 24)));
+        app.operation = None;
+        // A mark outside the listed projects: a mark on a listed row is a
+        // deliberate change of that row's text, not a shift of position.
+        let u = plain_unit("/elsewhere/node_modules", 1_000_000);
+        app.marked.insert(u.path.display().to_string(), u);
+        app.confirm_open = true;
+        app.blocked = vec![swamp_tui::app::BlockedItem {
+            name: "swamp".into(),
+            reason: "nothing reclaimable in this project".into(),
+            next: "open the project".into(),
+        }];
+        states.push(("confirm", capture(&app, w, 24)));
+        app.blocked_open = true;
+        states.push(("blocked list", capture(&app, w, 24)));
+        app.blocked_open = false;
+        app.confirm_open = false;
+        app.set_result(
+            "Moved 338 items (17.0GB) to Trash. Space is freed when Trash is emptied. Free space changed by 0B."
+                .into(),
+        );
+        states.push(("result", capture(&app, w, 24)));
+        app.last_result = None;
+        states.push(("result gone", capture(&app, w, 24)));
+        for (name, f) in &states {
+            assert_eq!(table(f), want, "w={w} state={name}\n{f}");
+            assert_eq!(f.lines().count(), 24, "w={w} state={name}");
+        }
+    }
+}
+
+/// One Down moves the selection exactly one screen row (or none, when the
+/// window scrolls), whatever the rows above and below carry as evidence.
+#[test]
+fn one_down_moves_the_selection_one_row_at_80x24() {
+    use ratatui::style::Color;
+    use swamp_core::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+    let mut report = fixture_report();
+    let evidence = vec![
+        Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Modified,
+            FactValue::Timestamp(1_726_000_000 - 3600),
+            EvidenceSource::FilesystemMetadata {
+                detail: "newest recorded modification among measured children".into(),
+            },
+            1_726_000_000,
+        ),
+        Evidence::unknown(
+            FactKind::Recovery,
+            FactSubtype::UnknownPrerequisites,
+            EvidenceSource::Inferred {
+                basis: "no sourced restoration evidence found".into(),
+            },
+            1_726_000_000,
+            "no lockfile found declaring this dependency tree's origin",
+        ),
+    ];
+    let wt = &mut report.projects[0].worktrees[0];
+    let base = wt.path.clone();
+    for i in 0..40 {
+        let mut a = art(
+            ArtifactKind::DependencyTree,
+            base.join(format!("pkg{i:02}/node_modules"))
+                .to_str()
+                .unwrap(),
+            1_000_000 + i as u64,
+            None,
+        );
+        // Detail heights differ row to row: none, two facts.
+        if i % 3 == 0 {
+            a.evidence = evidence.clone();
+        }
+        wt.artifacts.push(a);
+    }
+    let mut app = App::new(report, "/Users/dev/src".into());
+    app.clear_filter();
+    app.drill_into_selected();
+    assert_eq!(app.view, ViewKind::Tree);
+    let selected_row = |app: &App| -> usize {
+        let backend = TestBackend::new(80, 24);
+        let mut t = Terminal::new(backend).unwrap();
+        t.draw(|f| ui::draw(f, app)).unwrap();
+        let buf = t.backend().buffer().clone();
+        (0..24u16)
+            .find(|y| buf[(0, *y)].bg == Color::Indexed(236))
+            .expect("a selected row is drawn") as usize
+    };
+    let mut prev = selected_row(&app);
+    let mut moves = 0;
+    for _ in 0..30 {
+        swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Down);
+        let now = selected_row(&app);
+        assert!(
+            now == prev || now == prev + 1,
+            "one Down moved the selection from screen row {prev} to {now}"
+        );
+        moves += usize::from(now != prev);
+        prev = now;
+    }
+    assert!(moves >= 5, "the selection never walked down the screen");
+    for _ in 0..30 {
+        swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Up);
+        let now = selected_row(&app);
+        assert!(
+            now + 1 == prev || now == prev,
+            "one Up moved the selection from screen row {prev} to {now}"
+        );
+        prev = now;
+    }
+}
+
+/// The activity chip is on the header at 50, 80 and 120 columns while our
+/// own walk runs, and while another process holds the lock.
+#[test]
+fn the_activity_chip_is_present_at_every_width_when_busy() {
+    for w in [50u16, 80, 120] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.width = w;
+        app.observing = Some((0, 0));
+        app.observing_started = Some(std::time::Instant::now());
+        let head = line_of(&capture(&app, w, 24), 0);
+        assert!(head.contains("observing 0s"), "w={w}: {head}");
+        app.observing = None;
+        app.external_observer = Some(swamp_core::schedule::LockHolder {
+            pid: 4242,
+            since: swamp_core::entities::now() - 72,
+        });
+        let head = line_of(&capture(&app, w, 24), 0);
+        assert!(head.contains("1m 12s"), "w={w}: {head}");
+        assert!(head.contains("observ"), "w={w}: {head}");
+    }
+}
+
+/// While a check runs the status rows show elapsed time, the count of
+/// items looked at, and ready and blocked, at every width. A check
+/// changes nothing, so nothing on screen may call it successful or
+/// refused.
+#[test]
+fn the_review_status_has_elapsed_progress_and_no_verdict_counters() {
+    for w in [50u16, 80, 120] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.width = w;
+        for op in [busy_review(true, 0), busy_review(false, 12)] {
+            let phase_one = op.checking_open_files.is_some();
+            app.operation = Some(op);
+            let f = capture(&app, w, 24);
+            let lines: Vec<&str> = f.lines().collect();
+            let status = lines[lines.len() - 3].trim().to_string();
+            assert!(status.contains("0s"), "w={w}: {status}");
+            if phase_one {
+                assert!(
+                    status.contains("Checking what is in use"),
+                    "w={w}: {status}"
+                );
+            } else {
+                assert!(status.contains("Checked 12 of 40"), "w={w}: {status}");
+                assert!(status.contains("ready") || w == 50, "w={w}: {status}");
+            }
+            let lower = f.to_lowercase();
+            assert!(!lower.contains("successful"), "w={w}\n{f}");
+            assert!(!lower.contains("refused"), "w={w}\n{f}");
+            assert!(f.contains("Nothing has been changed"), "w={w}\n{f}");
+        }
+    }
+}
+
+/// The busy glyph is a different character on the next redraw.
+#[test]
+fn the_busy_glyph_moves_between_redraws() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.operation = Some(busy_review(false, 1));
+    let a = capture(&app, 80, 24);
+    app.frame += 1;
+    let b = capture(&app, 80, 24);
+    assert_ne!(a, b);
 }
