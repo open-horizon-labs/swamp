@@ -21,4 +21,4 @@
 "clean                                                                           "
 "                                                                                "
 "                                                                                "
-"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ⌫ delete  / fil"
+"↑↓ move  →/← in/out  Enter open/confirm  Space mark  A mark all  ? help  q quit "

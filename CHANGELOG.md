@@ -3,6 +3,35 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.5
+
+- **`swamp ui` opens immediately and no longer scans on its own.** v0.7.4 said `swamp ui`
+  opened without waiting on a full observation; that was only true when the disk was
+  nearly full. In the normal case it still ran a complete observation before drawing
+  anything (about 9 to 30 seconds here, longer on a big tree). Now it paints the last
+  stored report at once (about 0.4 seconds against a real 67 GB store) and scans only
+  when there is no stored report yet, in the background, with progress in the header.
+  An existing report is shown at any age. The schedule keeps it current, and `R`
+  refreshes it on demand. The file-watch that used to re-scan the UI on every change is
+  gone from the UI.
+- **The header always says how old the data is and whether anyone is scanning.** It
+  shows `observed 4m ago`, counting up while the UI is open. Older than 15 minutes it
+  turns yellow and says so, with a hint to press `R`. While the UI scans it shows
+  `observing…` with bytes, directories, roots and elapsed time. While another swamp
+  process (the scheduled `swamp observe`) holds the observation lock it shows
+  `scheduled observation running (pid N, 1m 12s)`, never waiting on the lock, and it
+  reloads the stored report when that run ends.
+- **Quitting is instant.** Exit used to wait several seconds joining the file-watch
+  threads. There are none now (8.6 seconds before, about 0.01 seconds after).
+- **The review overlay says what it is waiting for.** Before the first group can
+  finish, a review takes one machine-wide open-file snapshot (about 15 seconds). The
+  overlay now reads `Checking which files are open (one pass, ~15 s)…` with elapsed
+  time, then switches to the per-group count.
+- **The key legend no longer disappears after a delete.** The result of a delete now
+  shows on its own line above the legend for 20 seconds instead of replacing it, and
+  says the files were moved to Trash, so space is freed only when Trash is emptied. The
+  legend is shortened to fit narrow terminals and always keeps `? help  q quit`.
+
 ## v0.7.4
 
 - **Reviewing cleanup candidates is fast again.** `swamp ui` used to run one

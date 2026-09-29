@@ -351,10 +351,10 @@ storage from every present root are all visible together, including a
 root that has no Git checkout in it at all. The header shows a short
 coverage clause whenever any root's own walk this pass was not cleanly
 `complete` (e.g. `2 roots (1 missing)`, `2 roots (1 partial: 2 path(s)
-unreadable during this walk)`); the live FSEvents watch and the
-cached-startup/background refresh both cover every included root
-independently, so a change under one root is reflected without ever
-touching another root's rows. Passing an explicit root
+unreadable during this walk)`). The UI opens on the last stored report at
+once and scans only when there is no stored report yet; otherwise the
+schedule keeps the index current and `R` refreshes on demand (see the
+v0.7.5 changelog). Passing an explicit root
 (`swamp ui ~/other-tree`) keeps the single-root path unchanged.
 
 ### Observation regions

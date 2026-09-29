@@ -515,6 +515,7 @@ fn deleting_progress_and_cancellation_frames() {
         current: "/Users/dev/src/mole/target/debug/incremental/crate-a".into(),
         started: std::time::Instant::now(),
         cancel: cancel.clone(),
+        checking_open_files: None,
     });
     for (w, h) in [(80, 24), (200, 60)] {
         let frame = capture(&app, w, h);

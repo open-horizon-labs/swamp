@@ -248,6 +248,16 @@ impl OccupancySnapshot {
     /// the probe is not `lsof` (Linux's single-pass procfs) this is a
     /// no-op and each call answers as before.
     pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
+        Self::scoped_observed(|_| {}, f)
+    }
+
+    /// [`scoped`](Self::scoped), telling `on_phase` when the one slow
+    /// `lsof` starts and finishes (the snapshot is taken lazily, on the
+    /// first evidence call inside `f`), so a UI can say what the wait is.
+    pub fn scoped_observed<R>(
+        on_phase: impl Fn(SnapshotPhase) + 'static,
+        f: impl FnOnce() -> R,
+    ) -> R {
         if crate::platform::OccupancyProbe::for_os(crate::platform::Os::current())
             != crate::platform::OccupancyProbe::Lsof
         {
@@ -262,8 +272,33 @@ impl OccupancySnapshot {
             }
         }
         let _restore = Restore(prev);
+        let prev_hook = PHASE_HOOK.with(|h| h.replace(Some(std::rc::Rc::new(on_phase))));
+        struct RestoreHook(Option<PhaseHook>);
+        impl Drop for RestoreHook {
+            fn drop(&mut self) {
+                let prev = self.0.take();
+                PHASE_HOOK.with(|h| *h.borrow_mut() = prev);
+            }
+        }
+        let _restore_hook = RestoreHook(prev_hook);
         f()
     }
+}
+
+/// Where a scoped open-file snapshot is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPhase {
+    /// The one `lsof` is running.
+    Capturing,
+    /// It returned (or failed); per-path answers are now instant.
+    Captured,
+}
+
+type PhaseHook = std::rc::Rc<dyn Fn(SnapshotPhase)>;
+
+thread_local! {
+    static PHASE_HOOK: std::cell::RefCell<Option<PhaseHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 type ScopedSnapshot = std::rc::Rc<std::cell::OnceCell<OccupancySnapshot>>;
@@ -278,7 +313,19 @@ thread_local! {
 fn probe_for_evidence(path: &Path) -> OccupancyState {
     let cell = SCOPED.with(|s| s.borrow().clone());
     match cell {
-        Some(cell) => cell.get_or_init(OccupancySnapshot::capture).state_for(path),
+        Some(cell) => cell
+            .get_or_init(|| {
+                let hook = PHASE_HOOK.with(|h| h.borrow().clone());
+                if let Some(h) = &hook {
+                    h(SnapshotPhase::Capturing);
+                }
+                let snap = OccupancySnapshot::capture();
+                if let Some(h) = &hook {
+                    h(SnapshotPhase::Captured);
+                }
+                snap
+            })
+            .state_for(path),
         None => probe_path(path),
     }
 }

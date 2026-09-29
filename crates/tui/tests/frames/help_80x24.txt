@@ -12,7 +12,7 @@
 "│  g/s/n/t/a sort by growth / size / name / type / age · r reverses (remembered│"
 "│  k         keep executables: copy target/{release,debug} binaries, dist/*.whl│"
 "│  i         inspect selected Cargo profile dependencies (on demand)           │"
-"│  ?         toggle this help                                                  │"
+"│  ?         toggle this help · R refresh now (background scan)                │"
 "│  q         quit                                                              │"
 "│                                                                              │"
 "│Columns: bytes · growth in window, then its bar around the centre axis: left g│"
