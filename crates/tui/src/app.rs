@@ -348,7 +348,7 @@ pub struct Operation {
     pub current: PathBuf,
     pub started: Instant,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// A review's one open-file snapshot (`lsof`, ~15 s) is being taken;
+    /// A review's one open-file snapshot (`lsof`) is being taken;
     /// no group can finish until it returns. When it began.
     pub checking_open_files: Option<Instant>,
 }

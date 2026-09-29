@@ -121,8 +121,13 @@ pub fn probe_paths(paths: &[&Path]) -> OccupancyState {
 /// exists so a wedged `lsof` becomes `Unknown` for every anchor.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The snapshot's `lsof` argv. `-n` and `-P` stop `lsof` resolving host and
+/// port names for every socket: the listing is identical but took 16 s
+/// instead of 0.2 s on the machine it was measured on.
+const SNAPSHOT_ARGS: [&str; 4] = ["-n", "-P", "-F", "n"];
+
 /// One listing of every open file path on the machine, taken with a
-/// single `lsof -F n` (no `+D`, so no directory tree is walked), against
+/// single `lsof -n -P -F n` (no `+D`, so no directory tree is walked), against
 /// which any number of anchors are answered in memory. A review pass over
 /// N cleanup groups therefore costs one process-table walk, not N tree
 /// walks.
@@ -140,11 +145,11 @@ pub struct OccupancySnapshot {
 }
 
 impl OccupancySnapshot {
-    /// Run the one `lsof -F n`.
+    /// Run the one `lsof -n -P -F n`.
     pub fn capture() -> Self {
         match crate::fs_gate::spawn::run(
             crate::fs_gate::spawn::Program::Lsof,
-            ["-F", "n"],
+            SNAPSHOT_ARGS,
             SNAPSHOT_TIMEOUT,
         ) {
             Ok(out) => Self::from_lsof_run(
@@ -164,7 +169,7 @@ impl OccupancySnapshot {
         }
     }
 
-    /// Pure interpretation of a finished `lsof -F n` run.
+    /// Pure interpretation of a finished `lsof -n -P -F n` run.
     pub(crate) fn from_lsof_run(
         code: Option<i32>,
         timed_out: bool,
@@ -665,6 +670,25 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// Reverting to a plain `lsof -F n` costs 16 s instead of 0.2 s (name
+    /// resolution per socket), so the argv is pinned, and the allow-list
+    /// must accept exactly this shape (a refusal would make every anchor
+    /// `Unknown`).
+    #[test]
+    fn snapshot_argv_disables_name_resolution_and_is_allow_listed() {
+        assert!(SNAPSHOT_ARGS.contains(&"-n"), "{SNAPSHOT_ARGS:?}");
+        assert!(SNAPSHOT_ARGS.contains(&"-P"), "{SNAPSHOT_ARGS:?}");
+        let (r, counted) = crate::work_counters::measured(|| {
+            crate::fs_gate::spawn::run(
+                crate::fs_gate::spawn::Program::Lsof,
+                ["-F", "n"],
+                Duration::from_secs(5),
+            )
+        });
+        assert!(r.is_err(), "plain -F n is no longer an allowed shape");
+        assert_eq!(counted.subprocess_spawns, 0);
+    }
 
     fn probe(code: Option<i32>, stdout: &str, stderr: &str) -> OccupancyState {
         classify_lsof_exit(code, stdout, stderr, Path::new("/x"))

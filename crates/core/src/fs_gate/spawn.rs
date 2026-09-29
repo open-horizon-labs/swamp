@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Program {
     /// Occupancy probe (`lsof -- <path>`, `lsof +D <dir>`, and the one
-    /// machine-wide `lsof -F n` snapshot a review pass shares).
+    /// machine-wide `lsof -n -P -F n` snapshot a review pass shares).
     Lsof,
     /// Xcode `Info.plist` → XML (`plutil -convert xml1 -o - <plist>`),
     /// read-only, output to stdout.
@@ -190,8 +190,10 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
         Program::Lsof => &[
             &[Lit("--"), AbsPath],
             &[Lit("+D"), AbsPath],
-            // One machine-wide open-file listing, names only: no tree walk.
-            &[Lit("-F"), Lit("n")],
+            // One machine-wide open-file listing, names only: no tree walk,
+            // and no DNS or port-name resolution (`-n -P`; without them the
+            // same listing took 16 s instead of 0.2 s).
+            &[Lit("-n"), Lit("-P"), Lit("-F"), Lit("n")],
         ],
         Program::Plutil => &[&[Lit("-convert"), Lit("xml1"), Lit("-o"), Lit("-"), AbsPath]],
         Program::Xcrun => &[&[Lit("simctl"), Lit("list"), Lit("devices"), Lit("-j")]],
@@ -835,7 +837,7 @@ mod tests {
         for (program, args) in [
             (Program::Lsof, vec!["+D", "/tmp"]),
             (Program::Lsof, vec!["--", "/tmp/x"]),
-            (Program::Lsof, vec!["-F", "n"]),
+            (Program::Lsof, vec!["-n", "-P", "-F", "n"]),
             (
                 Program::Docker,
                 vec![

@@ -341,7 +341,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         let label = if cancelling {
             "Cancelling after current group".to_string()
         } else if op.checking_open_files.is_some() {
-            "Checking which files are open (one pass, ~15 s)…".to_string()
+            "Checking which files are open…".to_string()
         } else {
             op.label.to_string()
         };

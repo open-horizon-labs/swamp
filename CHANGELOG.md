@@ -23,10 +23,12 @@ observations, not general performance guarantees. See the README for current use
   reloads the stored report when that run ends.
 - **Quitting is instant.** Exit used to wait several seconds joining the file-watch
   threads. There are none now (8.6 seconds before, about 0.01 seconds after).
-- **The review overlay says what it is waiting for.** Before the first group can
-  finish, a review takes one machine-wide open-file snapshot (about 15 seconds). The
-  overlay now reads `Checking which files are open (one pass, ~15 s)…` with elapsed
-  time, then switches to the per-group count.
+- **Reviewing a mark or delete no longer waits about 16 seconds.** The open-file check
+  ran `lsof` with name resolution on, so it looked up a host or port name for every
+  network socket. It now runs `lsof -n -P -F n`, which lists the same files: 0.2 seconds
+  instead of 16.3 here. A failed or partial listing is still reported as unknown, never
+  free. While the check runs, the overlay reads `Checking which files are open…` with
+  elapsed time and no promised duration.
 - **The key legend no longer disappears after a delete.** The result of a delete now
   shows on its own line above the legend for 20 seconds instead of replacing it, and
   says the files were moved to Trash, so space is freed only when Trash is emptied. The
