@@ -75,6 +75,10 @@ pub struct GrowthConfig {
     pub large_file_min_bytes: u64,
     /// Watchdog budget for one `observe` invocation (item 3 of #31).
     pub observe_timeout_sec: u64,
+    /// Minimum free bytes on the store's volume below which `observe`
+    /// (and the TUI's refresh) refuse to run. `None` = the greater of
+    /// 1 GiB and 1% of the volume; `Some(0)` disables the check.
+    pub min_free_bytes: Option<u64>,
     /// The `[scan]` table: built-in defaults, includes, excludes, and
     /// disabled detectors (#41). See `crate::scope`.
     pub scan: crate::scope::ScanConfig,
@@ -87,6 +91,7 @@ impl Default for GrowthConfig {
             since: DEFAULT_SINCE.to_string(),
             large_file_min_bytes: DEFAULT_LARGE_FILE_MIN_BYTES,
             observe_timeout_sec: DEFAULT_OBSERVE_TIMEOUT_SEC,
+            min_free_bytes: None,
             scan: crate::scope::ScanConfig::default(),
         }
     }
@@ -107,11 +112,19 @@ retention_days = {}\n\
 large_file_min_bytes = {}\n\
 # Watchdog budget for one `observe` run, in seconds.\n\
 observe_timeout_sec = {}\n\
+# Abort `observe` (exit 3) and skip the TUI refresh when the store's volume has less\n\
+# than this many bytes free. Default (unset): the greater of 1 GiB and 1% of the volume.\n\
+# 0 disables the check.\n\
+{}\
 {}",
             self.since,
             self.retention_days,
             self.large_file_min_bytes,
             self.observe_timeout_sec,
+            match self.min_free_bytes {
+                Some(n) => format!("min_free_bytes = {n}\n"),
+                None => "# min_free_bytes = 1073741824\n".to_string(),
+            },
             self.scan.to_toml_table(),
         )
     }
@@ -130,6 +143,7 @@ struct RawConfig {
     retention_days: u64,
     large_file_min_bytes: u64,
     observe_timeout_sec: u64,
+    min_free_bytes: Option<u64>,
     scan: crate::scope::ScanConfig,
 }
 
@@ -141,6 +155,7 @@ impl Default for RawConfig {
             retention_days: d.retention_days,
             large_file_min_bytes: d.large_file_min_bytes,
             observe_timeout_sec: d.observe_timeout_sec,
+            min_free_bytes: d.min_free_bytes,
             scan: d.scan,
         }
     }
@@ -153,6 +168,7 @@ impl From<RawConfig> for GrowthConfig {
             retention_days: r.retention_days,
             large_file_min_bytes: r.large_file_min_bytes,
             observe_timeout_sec: r.observe_timeout_sec,
+            min_free_bytes: r.min_free_bytes,
             scan: r.scan,
         }
     }

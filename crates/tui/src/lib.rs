@@ -194,6 +194,40 @@ fn resolved_scope(
     ))
 }
 
+/// `Some(banner)` when the store's volume is too full to observe: one
+/// `statfs`, no walk, nothing written. The TUI then shows the stored
+/// report and skips every refresh (startup, background, live).
+fn disk_full_banner(store: &Path) -> Option<String> {
+    let min_free = swamp_core::growth::load_config(store).min_free_bytes;
+    match swamp_core::disk_guard::check(store, min_free) {
+        swamp_core::disk_guard::DiskDecision::Proceed => None,
+        swamp_core::disk_guard::DiskDecision::Abort { free, .. } => Some(format!(
+            "disk nearly full: refresh skipped ({} free)",
+            swamp_core::disk_guard::human(free)
+        )),
+    }
+}
+
+/// The multi-root TUI state built from the last stored observation
+/// only: no walk, no observation worker, no live watch. `None` when the
+/// store holds no observation for this scope.
+pub fn app_from_stored_multi_root(
+    scope: &swamp_core::scope::EffectiveScope,
+    store: &Path,
+    banner: String,
+) -> Option<App> {
+    let snapshot = swamp_core::report::report_scope_from_store(scope, store).ok()?;
+    let mut app = App::new_multi_root(snapshot.report, scope.scan_paths());
+    app.set_external_units(snapshot.external_units);
+    app.set_store_interiors(snapshot.store_interiors);
+    app.set_agent_units(snapshot.agent_units);
+    app.scope = Some(scope.clone());
+    app.observed_label = "from last observation".into();
+    app.disk_banner = Some(banner);
+    finish_startup(&mut app, store, Some(&snapshot.coverage));
+    Some(app)
+}
+
 /// The resolved swamp dir: the gate's one resolver.
 fn store_dir() -> PathBuf {
     swamp_core::fs_gate::StoreDir::resolved()
@@ -220,6 +254,7 @@ pub fn run(root: &Path) -> Result<()> {
     let cached = scope
         .as_ref()
         .and_then(|s| swamp_core::report::report_scope_from_store(s, &store).ok());
+    let banner = disk_full_banner(&store);
     let mut app = match cached {
         Some(snapshot) => {
             let mut a = App::new(snapshot.report, root.clone());
@@ -232,53 +267,65 @@ pub fn run(root: &Path) -> Result<()> {
             let (tx, rx) = std::sync::mpsc::channel();
             let (scope2, store2) = (scope.clone(), store.clone());
             let (roots, cache) = (a.roots.clone(), a.reports_by_root.clone());
-            crate::worker::spawn(move || {
-                let Some(scope2) = scope2 else {
-                    let _ = tx.send(Ok(app::RefreshedObservation::merged_on_worker(
-                        &roots,
-                        cache,
-                        Vec::new(),
+            if banner.is_none() {
+                crate::worker::spawn(move || {
+                    let Some(scope2) = scope2 else {
+                        let _ = tx.send(Ok(app::RefreshedObservation::merged_on_worker(
+                            &roots,
+                            cache,
+                            Vec::new(),
+                            None,
+                            None,
+                            None,
+                        )));
+                        return;
+                    };
+                    // include_dirs: the Source row expands into its own
+                    // directories, so the startup observe must produce them
+                    // too or the first report shows `source` with no children.
+                    let res = swamp_core::report::observe_scope(
+                        &scope2,
+                        swamp_core::report::ObservationParts::ALL,
                         None,
                         None,
+                        false,
+                        Some(&store2),
                         None,
-                    )));
-                    return;
-                };
-                // include_dirs: the Source row expands into its own
-                // directories, so the startup observe must produce them
-                // too or the first report shows `source` with no children.
-                let res = swamp_core::report::observe_scope(
-                    &scope2,
-                    swamp_core::report::ObservationParts::ALL,
-                    None,
-                    None,
-                    false,
-                    Some(&store2),
-                    None,
-                    true,
-                    true,
-                    false,
-                    false,
-                    swamp_core::fs_events::platform_source().as_ref(),
-                    30,
-                    24 * 3600,
-                )
-                .map(|o| {
-                    app::RefreshedObservation::merged_on_worker(
-                        &roots,
-                        cache,
-                        o.per_root.into_iter().collect(),
-                        Some(o.external_units),
-                        Some(o.agent_units),
-                        Some(o.store_interiors),
+                        true,
+                        true,
+                        false,
+                        false,
+                        swamp_core::fs_events::platform_source().as_ref(),
+                        30,
+                        24 * 3600,
                     )
+                    .map(|o| {
+                        app::RefreshedObservation::merged_on_worker(
+                            &roots,
+                            cache,
+                            o.per_root.into_iter().collect(),
+                            Some(o.external_units),
+                            Some(o.agent_units),
+                            Some(o.store_interiors),
+                        )
+                    });
+                    let _ = tx.send(res);
                 });
-                let _ = tx.send(res);
-            });
-            a.pending = Some(rx);
+            }
+            if let Some(b) = &banner {
+                // Stored report only: no observation worker was started.
+                a.observing = None;
+                a.observed_label = "from last observation".into();
+                a.disk_banner = Some(b.clone());
+            } else {
+                a.pending = Some(rx);
+            }
             a
         }
         None => {
+            if let Some(b) = &banner {
+                anyhow::bail!("{b}, and there is no stored observation to show yet");
+            }
             let scope_now = scope.clone().ok_or_else(|| {
                 anyhow::anyhow!("could not resolve a scope for {}", root.display())
             })?;
@@ -360,6 +407,15 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
         !present_roots.is_empty(),
         "swamp_tui::run_scope requires at least one present root in scope"
     );
+    if let Some(banner) = disk_full_banner(&store) {
+        // Never block startup on a walk the disk cannot take: paint the
+        // last stored report with the banner, or say why there is none.
+        let mut app =
+            app_from_stored_multi_root(scope, &store, banner.clone()).ok_or_else(|| {
+                anyhow::anyhow!("{banner}, and there is no stored observation to show yet")
+            })?;
+        return run_terminal_loop(&mut app);
+    }
     let observation = swamp_core::report::observe_scope(
         scope,
         swamp_core::report::ObservationParts::ALL,
@@ -447,7 +503,9 @@ fn finish_startup(
     if let Some(c) = coverage {
         app.set_scope_note(c);
     }
-    app.start_watch();
+    if app.disk_banner.is_none() {
+        app.start_watch();
+    }
     // Multi-root history windows are bounded by the *primary* root's own
     // history for now (`App::root`, `roots[0]`) -- a per-root history
     // bound is a real, named simplification (see this chunk's session
