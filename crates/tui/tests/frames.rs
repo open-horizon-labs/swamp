@@ -2301,3 +2301,35 @@ fn the_header_net_change_names_its_window() {
     let head = f.lines().next().unwrap();
     assert!(head.contains("-50.0MB in 1w"), "{head}");
 }
+
+/// Every help line survives every width: nothing is cut at the right edge,
+/// including the badge legend and the long evidence entries.
+#[test]
+fn no_help_line_is_cut_at_any_width() {
+    use crossterm::event::KeyCode;
+    for w in [50u16, 80, 120] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        swamp_tui::handle_key(&mut app, KeyCode::Char('?'));
+        let mut seen = String::new();
+        for _ in 0..40 {
+            seen.push_str(&capture(&app, w, 24));
+            swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+        }
+        // Words that sit at the end of a long line: a wrapped line keeps
+        // them on the next row instead of cutting them off.
+        for word in ["net", "ue", "worktrees", "atime", "timestamp", "Trash."] {
+            assert!(
+                seen.split_whitespace().any(|t| t.trim_matches('│') == word),
+                "{w} cols lost the word {word:?}"
+            );
+        }
+        // No line ends in the middle of a border: the frame is intact.
+        for l in seen.lines().filter(|l| l.starts_with('"')) {
+            let l = l.split("\" Hidden by").next().unwrap_or(l);
+            let l = l.trim_start_matches('"').trim_end_matches('"');
+            if l.starts_with('│') {
+                assert!(l.ends_with('│'), "{w}: {l}");
+            }
+        }
+    }
+}

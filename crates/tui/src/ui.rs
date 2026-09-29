@@ -1584,7 +1584,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "  💎 rb  💧 ex  🐘 php  λ hs  🎯 dart  ⚡ zig  🌍 tf  🐳 docker  🎲 unity  🎮 ue",
         "  🔨 has build output   ⎇ N  N linked worktrees",
     ] {
-        out.push((l.to_string(), false));
+        plain(&mut out, l, 2);
     }
     // The activity-evidence inventory (#54): which domains this pass can
     // establish a real activity fact for, and which it reports as
