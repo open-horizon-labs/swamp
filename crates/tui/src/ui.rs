@@ -231,7 +231,7 @@ fn activity_chip(app: &App, width: usize) -> Option<String> {
         let secs = swamp_core::entities::now().saturating_sub(h.since);
         let e = swamp_core::schedule::format_elapsed(secs);
         vec![
-            format!("{sp} scheduled observation running (pid {}, {e})", h.pid),
+            format!("{sp} another observation running (pid {}, {e})", h.pid),
             format!("{sp} observation running {e}"),
             format!("{sp} observing {e}"),
             format!("{sp} {e}"),

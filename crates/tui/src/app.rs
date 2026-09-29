@@ -1526,7 +1526,7 @@ impl App {
         }
         let Some(unit_id) = row.unit.clone() else {
             if row.signals.iter().any(|s| s == "category") {
-                self.refuse("Category total: select an unchecked child group. Nothing changed.");
+                self.refuse("Category total: pick one of the items inside it. Nothing changed.");
                 return;
             }
             if row.signals.iter().any(|s| s == "blocked") {
@@ -2837,6 +2837,18 @@ impl App {
         if self.pending.is_some() {
             return;
         }
+        // Another process (often the schedule) is already observing: say
+        // so rather than start a second walk that would only be refused,
+        // and promise what will happen (its result loads here).
+        if let Some(h) = self.external_observer {
+            let secs = swamp_core::entities::now().saturating_sub(h.since);
+            self.set_result(format!(
+                "An observation is already running (pid {}, {}). Its result loads here when it finishes.",
+                h.pid,
+                swamp_core::schedule::format_elapsed(secs)
+            ));
+            return;
+        }
         if let Some(b) = &self.disk_banner {
             self.status = Some(format!("refresh skipped: {b}"));
             return;
@@ -3026,6 +3038,25 @@ mod tests {
                 .contains("1 not attempted")
         );
         assert!(!app.confirm_open);
+        // The unit that could not move is recallable with `b`, with its
+        // reason, instead of vanishing after the result line.
+        assert_eq!(app.blocked.len(), 1);
+        assert_eq!(app.blocked[0].reason, "busy");
+        assert!(
+            app.last_result
+                .as_ref()
+                .unwrap()
+                .contains("1 could not be moved (b to see why)")
+        );
+        assert!(
+            !app.last_result
+                .as_ref()
+                .unwrap()
+                .contains("Free space changed"),
+            "no measured free-space figure: a move to Trash frees nothing yet"
+        );
+        app.open_blocked();
+        assert!(app.blocked_open);
     }
 
     #[test]

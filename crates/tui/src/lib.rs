@@ -932,8 +932,7 @@ mod tests {
         });
         let h = header_of(&app);
         assert!(
-            h.contains("scheduled observation running (pid 4242, 1m 12s)")
-                && !h.contains("press R"),
+            h.contains("another observation running (pid 4242, 1m 12s)") && !h.contains("press R"),
             "{h}"
         );
     }
@@ -978,6 +977,28 @@ mod tests {
     }
 
     #[test]
+    fn r_while_another_observation_runs_says_so_and_starts_nothing() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 3600);
+        app.external_observer = Some(swamp_core::schedule::LockHolder {
+            pid: 4242,
+            since: now - 32,
+        });
+        handle_key(&mut app, KeyCode::Char('R'));
+        assert!(app.pending.is_none(), "no second walk");
+        let s = buffer_text(&app, 80, 24);
+        assert!(
+            s.contains("An observation is already running (pid 4242, 32s)"),
+            "{s}"
+        );
+        assert!(s.contains("Its result loads here"), "{s}");
+        assert!(
+            !s.contains("scheduled"),
+            "a manual `swamp observe` is not 'scheduled': {s}"
+        );
+    }
+
+    #[test]
     fn lock_poll_shows_and_clears_an_external_observer() {
         let (s, _r, mut app) = stored_app(0);
         let guard = match swamp_core::schedule::acquire_lock(s.path()).unwrap() {
@@ -994,7 +1015,7 @@ mod tests {
         }
         assert_eq!(app.external_observer.unwrap().pid, std::process::id());
         let s = buffer_text(&app, 200, 24);
-        assert!(s.contains("scheduled observation running"), "{s}");
+        assert!(s.contains("another observation running"), "{s}");
         drop(guard);
         while app.external_observer.is_some() {
             assert!(std::time::Instant::now() < deadline, "holder never cleared");
