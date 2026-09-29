@@ -3,6 +3,16 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.7.4
+
+- `swamp ui` review no longer walks each group's directory tree. It used to run one
+  `lsof +D <dir>` per cleanup group, so reviewing 1,239 groups in a 35 GB cargo `target/`
+  took about an hour and timed-out probes showed as unknown open-file evidence. A review
+  pass now takes one machine-wide open-file snapshot (`lsof -F n`, no tree walk) and
+  answers every group from it by path prefix. If that snapshot fails, times out, is
+  unreadable or was permission-limited, groups it cannot find open report unknown, never
+  free. Single-path probes are unchanged.
+
 ## v0.7.3
 
 - `swamp observe` now enriches worktrees from GitHub by default, as its help and the
