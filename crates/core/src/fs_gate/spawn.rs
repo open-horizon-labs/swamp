@@ -19,6 +19,9 @@
 //!   [`super::destroy`], which takes a [`crate::recheck::RecheckProof`]
 //!   and an [`crate::authority::Authorized`].
 
+// killpg/signal/atexit for the child-lifetime guard (#156).
+#![allow(unsafe_code)]
+
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::process::{Command, Stdio};
@@ -473,15 +476,162 @@ pub(super) fn run_unchecked(
     args: &[OsString],
     timeout: Duration,
 ) -> io::Result<RunOutput> {
-    crate::work_counters::record_spawn();
+    run_command(program.binary(), args, timeout)
+}
+
+// ---- child lifetime (#156) ------------------------------------------
+//
+// Every child is its own process group leader, is registered in a
+// fixed-size table of live group ids, and is owned by a [`Running`]
+// guard, so it is killed (whole group, SIGKILL) and reaped on: the
+// deadline, an error, a panic unwinding through `run`, `Drop`,
+// SIGINT/SIGTERM/SIGHUP to swamp (signal handler walks the table), and
+// normal process exit (`atexit`, which also covers `process::exit`).
+// A child cannot outlive swamp except when swamp itself is SIGKILLed.
+
+const SLOTS: usize = 256;
+static LIVE: [std::sync::atomic::AtomicI32; SLOTS] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; SLOTS];
+
+/// SIGKILLs the process group of every registered child `keep` selects.
+/// Async-signal-safe (atomics and `killpg` only): the signal handler
+/// calls it.
+fn kill_registered(keep: impl Fn(i32) -> bool) {
+    for slot in &LIVE {
+        let pgid = slot.load(std::sync::atomic::Ordering::SeqCst);
+        if pgid > 0 && keep(pgid) {
+            // SAFETY: killpg on a group id this process created.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Kills every child swamp currently has running (whole process
+/// groups). The TUI calls it when the user cancels or quits; the run
+/// that owned each child sees it die and returns.
+pub fn kill_all_children() {
+    kill_registered(|_| true);
+}
+
+extern "C" fn on_exit() {
+    kill_registered(|_| true);
+}
+
+extern "C" fn on_fatal_signal(sig: libc::c_int) {
+    kill_registered(|_| true);
+    // SAFETY: restore the default action and re-deliver, so swamp dies
+    // of the same signal it would have without the handler.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+fn install_cleanup_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: registering plain `extern "C"` functions.
+        unsafe {
+            libc::atexit(on_exit);
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::signal(sig, on_fatal_signal as extern "C" fn(libc::c_int) as usize);
+            }
+        }
+    });
+}
+
+/// A started child, killed (group) and reaped when dropped unless it
+/// was already reaped.
+struct Running {
+    child: std::process::Child,
+    slot: Option<usize>,
+    reaped: bool,
+}
+
+impl Running {
+    fn start(
+        binary: &str,
+        args: &[OsString],
+        out: std::fs::File,
+        err: std::fs::File,
+    ) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        install_cleanup_once();
+        crate::work_counters::record_spawn();
+        let child = Command::new(binary)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
+            // Its own group: the deadline, cancel and signal paths kill
+            // the child *and* whatever it forked.
+            .process_group(0)
+            // A pager or a credential prompt can never be why a child
+            // blocks (stdin is null too).
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("GH_PAGER", "cat")
+            .env("SYSTEMD_PAGER", "cat")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GCM_INTERACTIVE", "never")
+            .spawn()?;
+        let pgid = child.id() as i32;
+        let slot = LIVE.iter().position(|s| {
+            s.compare_exchange(
+                0,
+                pgid,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        });
+        Ok(Running {
+            child,
+            slot,
+            reaped: false,
+        })
+    }
+
+    fn unregister(&mut self) {
+        if let Some(i) = self.slot.take() {
+            LIVE[i].store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let st = self.child.try_wait()?;
+        if st.is_some() {
+            self.reaped = true;
+            self.unregister();
+        }
+        Ok(st)
+    }
+
+    /// Kills the whole group and reaps the leader.
+    fn kill_and_reap(&mut self) {
+        if !self.reaped {
+            // SAFETY: the leader is unreaped, so the group id is ours.
+            unsafe { libc::killpg(self.child.id() as i32, libc::SIGKILL) };
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+        self.unregister();
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.kill_and_reap();
+    }
+}
+
+/// Runs `binary args…` under the lifetime rules above.
+fn run_command(binary: &str, args: &[OsString], timeout: Duration) -> io::Result<RunOutput> {
     let mut out_file = tempfile::tempfile()?;
     let mut err_file = tempfile::tempfile()?;
-    let mut child = Command::new(program.binary())
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(out_file.try_clone()?)
-        .stderr(err_file.try_clone()?)
-        .spawn()?;
+    let mut child = Running::start(binary, args, out_file.try_clone()?, err_file.try_clone()?)?;
     let started = Instant::now();
     let (code, timed_out) = loop {
         match child.try_wait() {
@@ -490,15 +640,10 @@ pub(super) fn run_unchecked(
                 std::thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.kill_and_reap();
                 break (None, true);
             }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(e);
-            }
+            Err(e) => return Err(e), // `Drop` kills and reaps
         }
     };
     let read_back = |f: &mut std::fs::File| -> Vec<u8> {
@@ -520,6 +665,110 @@ pub(super) fn run_unchecked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only probes.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// `sh` that backgrounds a `sleep 600` grandchild, prints its pid,
+    /// then hangs itself.
+    fn hung_tree() -> Vec<OsString> {
+        vec!["-c".into(), "sleep 600 & echo $!; sleep 600".into()]
+    }
+
+    fn wait_gone(pid: i32) -> bool {
+        for _ in 0..200 {
+            if !alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_hung_child_and_its_grandchild_are_gone_after_the_deadline() {
+        let t = Instant::now();
+        let out = run_command("sh", &hung_tree(), Duration::from_millis(600)).unwrap();
+        assert!(out.timed_out && t.elapsed() < Duration::from_secs(10));
+        let grand: i32 = out.stdout_lossy().trim().parse().unwrap();
+        assert!(wait_gone(grand), "grandchild {grand} survived the deadline");
+    }
+
+    #[test]
+    fn dropping_the_guard_kills_the_group() {
+        let out = tempfile::tempfile().unwrap();
+        let err = tempfile::tempfile().unwrap();
+        let mut r = Running::start("sh", &hung_tree(), out.try_clone().unwrap(), err).unwrap();
+        let leader = r.child.id() as i32;
+        std::thread::sleep(Duration::from_millis(300));
+        let mut buf = String::new();
+        let mut f = out;
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_to_string(&mut buf).unwrap();
+        let grand: i32 = buf.trim().parse().unwrap();
+        assert!(alive(leader) && alive(grand));
+        // A panic unwinding through `run` drops the guard the same way.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _keep = &mut r;
+            panic!("worker panic");
+        }));
+        assert!(wait_gone(leader), "leader survived the drop");
+        assert!(wait_gone(grand), "grandchild survived the drop");
+    }
+
+    #[test]
+    fn cancel_and_signal_paths_kill_the_registered_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grand.pid");
+        let script = format!("sleep 600 & echo $! > {}; sleep 600", pidfile.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let r = run_command(
+                "sh",
+                &["-c".into(), script.into()],
+                Duration::from_secs(600),
+            );
+            tx.send(r.unwrap()).unwrap();
+        });
+        // The grandchild shares the leader's group; its pid names this
+        // test's group (other tests run in parallel, so only it is hit).
+        let mut grand = 0;
+        for _ in 0..300 {
+            std::thread::sleep(Duration::from_millis(10));
+            if let Ok(t) = std::fs::read_to_string(&pidfile)
+                && let Ok(p) = t.trim().parse::<i32>()
+            {
+                grand = p;
+                break;
+            }
+        }
+        assert!(grand > 0, "grandchild never started");
+        // SAFETY: getpgid only reads.
+        let pgid = unsafe { libc::getpgid(grand) };
+        assert!(
+            LIVE.iter()
+                .any(|s| s.load(std::sync::atomic::Ordering::SeqCst) == pgid)
+        );
+        // What the TUI cancel, the exit hook and the signal handler run.
+        kill_registered(|p| p == pgid);
+        let out = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("run returns");
+        assert!(!out.timed_out && out.code.is_none());
+        assert!(wait_gone(grand) && wait_gone(pgid));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn stdin_is_null_and_pagers_and_prompts_are_disabled() {
+        let script = "cat; printf '%s|%s|%s' \"$GIT_PAGER\" \"$GIT_TERMINAL_PROMPT\" \"$GH_PROMPT_DISABLED\"";
+        let out =
+            run_command("sh", &["-c".into(), script.into()], Duration::from_secs(10)).unwrap();
+        assert!(!out.timed_out);
+        assert_eq!(out.stdout_lossy(), "cat|0|1");
+    }
 
     #[test]
     fn a_run_counts_one_spawn() {

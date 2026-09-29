@@ -5,6 +5,11 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.7.4
 
+- Every subprocess swamp starts (`git`, `gh`, `lsof`, `xcrun`, `docker`, ...) is now
+  its own process group and is killed with its descendants and reaped on timeout, on
+  error or panic, on TUI cancel or quit, on SIGINT/SIGTERM/SIGHUP and on process
+  exit. Children run with git/gh pagers and credential prompts disabled, so none can
+  block waiting for a terminal (#156).
 - `swamp observe` now aborts before walking when the volume holding the swamp store is
   nearly full (below `min_free_bytes`; default the greater of 1 GiB and 1% of the
   volume). It exits with code 3 and a stderr message, writes nothing, takes no lock and
