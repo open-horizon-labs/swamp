@@ -116,6 +116,173 @@ pub fn probe_paths(paths: &[&Path]) -> OccupancyState {
     }
 }
 
+/// How long the one machine-wide snapshot may run. It walks the process
+/// table, not any directory tree, so seconds to tens of seconds is typical (16s measured on a busy dev Mac); the bound only
+/// exists so a wedged `lsof` becomes `Unknown` for every anchor.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One listing of every open file path on the machine, taken with a
+/// single `lsof -F n` (no `+D`, so no directory tree is walked), against
+/// which any number of anchors are answered in memory. A review pass over
+/// N cleanup groups therefore costs one process-table walk, not N tree
+/// walks.
+///
+/// Tri-state is preserved: a snapshot that failed, timed out, was
+/// unparseable or was only partially readable answers `Unknown` for every
+/// anchor it cannot positively find open. It never answers `Free` from a
+/// listing it could not fully read.
+#[derive(Debug)]
+pub struct OccupancySnapshot {
+    /// Absolute paths reported open (files, cwd, txt, ...).
+    open: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Why the listing is not trustworthy for a negative answer.
+    gap: Option<String>,
+}
+
+impl OccupancySnapshot {
+    /// Run the one `lsof -F n`.
+    pub fn capture() -> Self {
+        match crate::fs_gate::spawn::run(
+            crate::fs_gate::spawn::Program::Lsof,
+            ["-F", "n"],
+            SNAPSHOT_TIMEOUT,
+        ) {
+            Ok(out) => Self::from_lsof_run(
+                out.code,
+                out.timed_out,
+                &out.stdout_lossy(),
+                &out.stderr_lossy(),
+            ),
+            Err(e) => Self::failed(format!("lsof could not be started: {e}")),
+        }
+    }
+
+    fn failed(why: String) -> Self {
+        Self {
+            open: Default::default(),
+            gap: Some(why),
+        }
+    }
+
+    /// Pure interpretation of a finished `lsof -F n` run.
+    pub(crate) fn from_lsof_run(
+        code: Option<i32>,
+        timed_out: bool,
+        stdout: &str,
+        stderr: &str,
+    ) -> Self {
+        if timed_out {
+            return Self::failed(format!(
+                "lsof did not answer within {}s",
+                SNAPSHOT_TIMEOUT.as_secs()
+            ));
+        }
+        // 0 = listed; 1 = listed with some complaint. Anything else
+        // (signal, 2, ...) is a run that did not complete.
+        if !matches!(code, Some(0) | Some(1)) {
+            return Self::failed(format!("lsof exited with {code:?}"));
+        }
+        let mut open = std::collections::BTreeSet::new();
+        let mut saw_process = false;
+        for line in stdout.lines().filter(|l| !l.is_empty()) {
+            let mut chars = line.chars();
+            let id = chars.next().unwrap_or(' ');
+            if !id.is_ascii_alphanumeric() {
+                return Self::failed(format!("unparseable lsof output line: {line:.40}"));
+            }
+            match id {
+                'p' => saw_process = true,
+                'n' => {
+                    let name = chars.as_str();
+                    if name.starts_with('/') {
+                        open.insert(std::path::PathBuf::from(name));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A machine always has at least this process's own descriptors
+        // open; an empty listing means lsof did not really look.
+        if !saw_process {
+            return Self::failed("lsof listed no processes".into());
+        }
+        let gap = stderr
+            .to_lowercase()
+            .contains("permission denied")
+            .then(|| "permission denied listing some open files".to_string());
+        Self { open, gap }
+    }
+
+    /// Answer one anchor from the snapshot. Occupied if any open path is
+    /// the anchor or lies under it (component-wise, so `/a/target2` is
+    /// not under `/a/target`). Free only from a complete listing.
+    pub fn state_for(&self, path: &Path) -> OccupancyState {
+        match crate::fs_gate::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OccupancyState::Free,
+            Err(e) => {
+                return OccupancyState::Unknown(format!("cannot stat {}: {e}", path.display()));
+            }
+        }
+        let canonical = crate::fs_gate::canonicalize(path).ok();
+        for anchor in std::iter::once(path).chain(canonical.as_deref()) {
+            // Path ordering is component-wise, so everything under
+            // `anchor` sorts contiguously right after it.
+            if let Some(hit) = self.open.range(anchor.to_path_buf()..).next()
+                && hit.starts_with(anchor)
+            {
+                return OccupancyState::Occupied(hit.clone());
+            }
+        }
+        match &self.gap {
+            None => OccupancyState::Free,
+            Some(why) => OccupancyState::Unknown(format!(
+                "open-file snapshot incomplete ({why}) for {}",
+                path.display()
+            )),
+        }
+    }
+
+    /// Run `f` with one lazily-taken snapshot serving every
+    /// [`open_file_evidence`] call made on this thread inside it. Where
+    /// the probe is not `lsof` (Linux's single-pass procfs) this is a
+    /// no-op and each call answers as before.
+    pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
+        if crate::platform::OccupancyProbe::for_os(crate::platform::Os::current())
+            != crate::platform::OccupancyProbe::Lsof
+        {
+            return f();
+        }
+        let prev = SCOPED.with(|s| s.replace(Some(std::rc::Rc::new(std::cell::OnceCell::new()))));
+        struct Restore(Option<std::rc::Rc<std::cell::OnceCell<OccupancySnapshot>>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let prev = self.0.take();
+                SCOPED.with(|s| *s.borrow_mut() = prev);
+            }
+        }
+        let _restore = Restore(prev);
+        f()
+    }
+}
+
+type ScopedSnapshot = std::rc::Rc<std::cell::OnceCell<OccupancySnapshot>>;
+
+thread_local! {
+    static SCOPED: std::cell::RefCell<Option<ScopedSnapshot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The state for `path`: from this thread's scoped snapshot when a review
+/// pass installed one, otherwise a fresh [`probe_path`].
+fn probe_for_evidence(path: &Path) -> OccupancyState {
+    let cell = SCOPED.with(|s| s.borrow().clone());
+    match cell {
+        Some(cell) => cell.get_or_init(OccupancySnapshot::capture).state_for(path),
+        None => probe_path(path),
+    }
+}
+
 /// Whether an `lsof` is on `PATH` at all -- present, not necessarily
 /// runnable. A present `lsof` that cannot be run is a second reader
 /// that could not answer, which is `Unknown`, exactly as on macOS.
@@ -221,7 +388,7 @@ pub fn open_file_evidence(path: &Path) -> Evidence {
     let source = EvidenceSource::ProcessQuery {
         tool: probe_tool().into(),
     };
-    match probe_path(path) {
+    match probe_for_evidence(path) {
         OccupancyState::Occupied(open_at) => Evidence::known(
             FactKind::CurrentUse,
             FactSubtype::OpenFile,
@@ -912,5 +1079,138 @@ mod tests {
             matches!(got, OccupancyState::Unknown(ref w) if w.contains("did not finish")),
             "{got:?}"
         );
+    }
+
+    // ---- OccupancySnapshot -------------------------------------------
+
+    fn snap(stdout: &str) -> OccupancySnapshot {
+        OccupancySnapshot::from_lsof_run(Some(0), false, stdout, "")
+    }
+
+    fn anchor_dir(root: &Path, name: &str) -> PathBuf {
+        let d = root.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn snapshot_matches_anchor_and_descendants_but_not_shared_prefix_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let target = anchor_dir(&root, "target");
+        let target2 = anchor_dir(&root, "target2");
+        let other = anchor_dir(&root, "other");
+        let open_file = target.join("debug/x.o");
+        let listing = format!(
+            "p10\nfcwd\nn{}\nf3\nn{}\np11\nf4\nn/dev/null\nn*:8080\n",
+            other.join("gone-not-under-target").display(),
+            open_file.display()
+        );
+        let s = snap(&listing);
+        // descendant of the anchor
+        assert_eq!(s.state_for(&target), OccupancyState::Occupied(open_file));
+        // sibling sharing a string prefix must not match
+        assert_eq!(s.state_for(&target2), OccupancyState::Free);
+        assert!(matches!(s.state_for(&other), OccupancyState::Occupied(_)));
+    }
+
+    #[test]
+    fn snapshot_matches_the_anchor_itself_and_cwd_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = anchor_dir(&root, "proj");
+        let s = snap(&format!("p1\nfcwd\nn{}\n", dir.display()));
+        assert_eq!(s.state_for(&dir), OccupancyState::Occupied(dir.clone()));
+    }
+
+    #[test]
+    fn snapshot_of_a_vanished_anchor_is_free_like_the_per_path_probe() {
+        let s = snap("p1\nn/somewhere\n");
+        assert_eq!(
+            s.state_for(Path::new("/definitely/not/here")),
+            OccupancyState::Free
+        );
+    }
+
+    #[test]
+    fn snapshot_free_only_from_a_complete_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = anchor_dir(&root, "d");
+        assert_eq!(
+            snap("p1\nn/elsewhere\n").state_for(&dir),
+            OccupancyState::Free
+        );
+    }
+
+    #[test]
+    fn snapshot_fails_closed_on_timeout_signal_garbage_and_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = anchor_dir(&root, "d");
+        let cases = [
+            OccupancySnapshot::from_lsof_run(None, true, "p1\nn/x\n", ""),
+            OccupancySnapshot::from_lsof_run(None, false, "p1\nn/x\n", ""),
+            OccupancySnapshot::from_lsof_run(Some(2), false, "p1\nn/x\n", ""),
+            OccupancySnapshot::from_lsof_run(Some(0), false, "\u{1}garbage\n", ""),
+            OccupancySnapshot::from_lsof_run(Some(0), false, "not lsof output at all\n", ""),
+            OccupancySnapshot::from_lsof_run(Some(0), false, "", ""),
+            OccupancySnapshot::from_lsof_run(Some(1), false, "", ""),
+        ];
+        for (i, s) in cases.iter().enumerate() {
+            assert!(
+                matches!(s.state_for(&dir), OccupancyState::Unknown(_)),
+                "case {i} must be Unknown, got {:?}",
+                s.state_for(&dir)
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_permission_denied_partial_listing_is_never_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = anchor_dir(&root, "d");
+        let busy = anchor_dir(&root, "busy");
+        let listing = format!("p1\nn{}\n", busy.join("f").display());
+        for code in [0, 1] {
+            let s = OccupancySnapshot::from_lsof_run(
+                Some(code),
+                false,
+                &listing,
+                "lsof: WARNING: can't stat() x\nlsof: Permission denied\n",
+            );
+            assert!(matches!(s.state_for(&dir), OccupancyState::Unknown(_)));
+            // A positive find is still a positive find.
+            assert!(matches!(s.state_for(&busy), OccupancyState::Occupied(_)));
+        }
+    }
+
+    /// N anchors, one `lsof`: the review-pass cost is O(open files), not
+    /// O(groups x tree). Counted through the gate's own spawn counter, so
+    /// there is no process-wide PATH fake to race sibling tests.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn n_anchors_in_a_scope_cost_exactly_one_lsof_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let anchors: Vec<PathBuf> = (0..40)
+            .map(|i| anchor_dir(&root, &format!("g{i}")))
+            .collect();
+        let (_, counted) = crate::work_counters::measured(|| {
+            OccupancySnapshot::scoped(|| {
+                for a in &anchors {
+                    let _ = open_file_evidence(a);
+                }
+            })
+        });
+        assert_eq!(counted.subprocess_spawns, 1);
+        // Outside a scope the old per-path probe is unchanged: one each.
+        let (_, counted) = crate::work_counters::measured(|| {
+            for a in anchors.iter().take(3) {
+                let _ = open_file_evidence(a);
+            }
+        });
+        assert_eq!(counted.subprocess_spawns, 3);
     }
 }
