@@ -4501,4 +4501,68 @@ mod tests {
         // pending for a subsequent call.
         assert_eq!(app.live_changes.len(), 1, "{:?}", app.live_changes);
     }
+
+    // ---- adversarial review (audit/v0.7.5-adversarial) ----
+
+    /// Backspace with nothing marked, then `r` (check again) from the
+    /// blocked list, then Esc: every mark the Backspace made must go.
+    #[test]
+    fn adv_esc_after_check_again_undoes_every_mark_the_opening_press_made() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open && !app.marked.is_empty());
+        app.blocked = vec![BlockedItem {
+            name: "x".into(),
+            reason: "in use".into(),
+            next: "close it".into(),
+        }];
+        app.open_blocked();
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('r'));
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(
+            app.marked.is_empty(),
+            "nothing was marked before the press; Esc left {} marked: {:?}",
+            app.marked.len(),
+            app.marked.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// `A` pressed again while its own confirm is open, then Esc.
+    #[test]
+    fn adv_esc_after_a_repeated_while_confirm_open_undoes_the_marks() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('A'));
+        wait_operation(&mut app);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(
+            app.marked.is_empty(),
+            "Esc left {} marks made by the confirm's own press",
+            app.marked.len()
+        );
+    }
+
+    /// Evidence: plain Backspace then Esc leaves nothing; an earlier Space
+    /// mark survives.
+    #[test]
+    fn adv_esc_keeps_earlier_space_marks_and_drops_its_own() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(false, false);
+        wait_operation(&mut app);
+        let space: Vec<String> = app.marked.keys().cloned().collect();
+        assert!(!space.is_empty());
+        app.review_in_background(false, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        app.cancel_confirm();
+        assert_eq!(app.marked.keys().cloned().collect::<Vec<_>>(), space);
+    }
 }

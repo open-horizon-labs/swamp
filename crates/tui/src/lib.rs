@@ -1142,4 +1142,143 @@ mod tests {
             terminal.draw(|f| ui::draw(f, &app)).unwrap();
         }
     }
+
+    // ---- adversarial review (audit/v0.7.5-adversarial) ----
+
+    fn test_op() -> crate::app::Operation {
+        crate::app::Operation {
+            label: "Reviewing",
+            completed: 3,
+            total: 3,
+            succeeded: 3,
+            failed: 0,
+            current: "/tmp/x".into(),
+            bytes_done: 0,
+            bytes_total: 0,
+            started: std::time::Instant::now(),
+            cancel: Default::default(),
+            checking_open_files: None,
+        }
+    }
+
+    /// The event loop calls `poll_operation` (which may end the operation
+    /// and open the confirm) and then asks the gate. The iteration where
+    /// the operation ends is not busy and nothing touched the gate, so
+    /// the finished state (confirm, result line) must still be painted.
+    #[test]
+    fn adv_the_frame_after_an_operation_finishes_is_painted() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 30);
+        let mut gate = RedrawGate::default();
+        app.operation = Some(test_op());
+        assert!(gate.due(&app), "busy: painted");
+        // What poll_operation does when `Reviewed` arrives.
+        app.operation = None;
+        app.set_result("Marked 3 more. 3 marked in all (1MB).".into());
+        assert!(
+            gate.due(&app),
+            "operation ended (result/confirm now on screen) but the gate did not paint: stale 'Reviewing' frame stays up"
+        );
+    }
+
+    fn unit(path: &str, bytes: u64, docker: bool) -> crate::actions::MarkedUnit {
+        crate::actions::MarkedUnit {
+            cargo_unit: None,
+            agent_unit: None,
+            path: path.into(),
+            docker: docker.then(|| swamp_core::docker::Removal::Volume {
+                name: "pgdata".into(),
+            }),
+            worktree_path: "/root/p".into(),
+            bytes,
+            observed_at: 0,
+            worktree: None,
+            label: if docker {
+                "pgdata".into()
+            } else {
+                String::new()
+            },
+            warnings: vec![],
+        }
+    }
+
+    /// A plan with a Trash part and a permanent docker part: whatever the
+    /// terminal size, if the confirm keys are on screen the permanent
+    /// removal must be too (Enter removes it for good).
+    #[test]
+    fn adv_permanent_docker_removal_is_visible_whenever_enter_confirm_is() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.marked.insert(
+            "/root/p/node_modules".into(),
+            unit("/root/p/node_modules", 1 << 30, false),
+        );
+        app.marked
+            .insert("docker:pgdata".into(), unit("docker:pgdata", 5 << 30, true));
+        app.confirm_open = true;
+        let mut bad = Vec::new();
+        for (w, h) in [
+            (200u16, 60u16),
+            (80, 24),
+            (80, 12),
+            (60, 10),
+            (40, 10),
+            (40, 8),
+            (20, 5),
+        ] {
+            let s = buffer_text(&app, w, h);
+            let keys = s.contains("Enter");
+            let permanent = s.contains("for good") || s.contains("docker");
+            if keys && !permanent {
+                bad.push(format!("{w}x{h}:\n{s}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "Enter offered without the permanent part:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn adv_tiny_and_degenerate_terminals_never_panic() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 30);
+        for (w, h) in [
+            (1u16, 1u16),
+            (0, 0),
+            (1, 0),
+            (0, 5),
+            (20, 5),
+            (40, 10),
+            (300, 60),
+            (2, 2),
+        ] {
+            for state in 0..5 {
+                app.help_open = state == 1;
+                app.operation = (state == 2).then(test_op);
+                app.confirm_open = state == 3;
+                app.set_result(if state == 4 {
+                    "x".repeat(500)
+                } else {
+                    String::new()
+                });
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| ui::draw(f, &app)).unwrap();
+            }
+        }
+        app.help_open = false;
+        app.operation = None;
+        app.confirm_open = false;
+        for k in [
+            KeyCode::PageDown,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::Home,
+            KeyCode::Down,
+            KeyCode::Up,
+        ] {
+            handle_key(&mut app, k);
+            let _ = buffer_text(&app, 20, 5);
+        }
+    }
 }
