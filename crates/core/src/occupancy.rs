@@ -141,7 +141,7 @@ pub struct OccupancySnapshot {
 
 impl OccupancySnapshot {
     /// Run the one `lsof -F n`.
-    pub fn take() -> Self {
+    pub fn capture() -> Self {
         match crate::fs_gate::spawn::run(
             crate::fs_gate::spawn::Program::Lsof,
             ["-F", "n"],
@@ -278,7 +278,7 @@ thread_local! {
 fn probe_for_evidence(path: &Path) -> OccupancyState {
     let cell = SCOPED.with(|s| s.borrow().clone());
     match cell {
-        Some(cell) => cell.get_or_init(OccupancySnapshot::take).state_for(path),
+        Some(cell) => cell.get_or_init(OccupancySnapshot::capture).state_for(path),
         None => probe_path(path),
     }
 }
