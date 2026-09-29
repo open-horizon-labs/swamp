@@ -470,7 +470,6 @@ pub(super) fn run_unchecked(
     args: &[OsString],
     timeout: Duration,
 ) -> io::Result<RunOutput> {
-    crate::work_counters::record_spawn();
     run_command(program.binary(), args, timeout)
 }
 
@@ -552,6 +551,7 @@ impl Running {
     ) -> io::Result<Self> {
         use std::os::unix::process::CommandExt;
         install_cleanup_once();
+        crate::work_counters::record_spawn();
         let child = Command::new(binary)
             .args(args)
             .stdin(Stdio::null())
