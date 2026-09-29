@@ -69,7 +69,7 @@ swamp observe --since 24h
 swamp ui
 ```
 
-`swamp ui` opens on the last stored report at once and scans only when none exists; the schedule keeps it fresh and `R` refreshes on demand.
+`swamp ui` opens on the last stored report at once and scans only when none exists; the schedule keeps it fresh and `R` refreshes on demand. It never watches the filesystem, so the header's `observed 4m ago` is the true age of what you see. Idle, it draws nothing.
 
 Without explicit roots, Swamp uses built-in locations, enabled tool-location detectors, and your configured additions and exclusions. Homebrew discovery is opt-in. `swamp scope` explains what is included, missing, excluded, or disabled; [scope configuration](docs/usage.md#scope-and-coverage) controls it.
 
@@ -81,7 +81,7 @@ swamp report ~/src ~/work --view grown --json
 swamp ui ~/src ~/work
 ```
 
-In the UI, arrow keys navigate and open projects. Press `0` to clear the initial `growth > 100MB in 7d` filter and see projects that have not grown. Saved filter and sort choices take precedence on later runs.
+In the UI, arrow keys, PgUp, PgDn, Home and End navigate, and `?` opens a help you can scroll. Press `0` to clear the initial `growth > 100MB in 7d` filter and see projects that have not grown. Saved filter and sort choices take precedence on later runs.
 
 History starts with your first observation. To collect it while the UI is closed:
 
@@ -95,7 +95,7 @@ This uses a per-user LaunchAgent on macOS or a systemd user timer on Linux. It o
 
 Git status, unpushed commits, cached PR information, modification age, and removal consequences sit alongside usage. These are evidence for a decision, not a universal “safe to delete” verdict.
 
-Space marks supported rows in the TUI. Backspace opens confirmation; Enter confirms. A build profile selects its supported cleanup groups, not the entire profile directory. Other views can select whole checkouts or worktrees: read the actual paths and warnings.
+Space marks supported rows in the TUI and changes nothing; a check says `ready` or `blocked` for each item, and `b` lists what is blocked with the reason and the next step. Backspace opens the plan (count, size, destination, and what is removed for good); Enter confirms. The result stays on screen until your next key. A build profile selects its supported cleanup groups, not the entire profile directory. Other views can select whole checkouts or worktrees: read the actual paths and warnings.
 
 Filesystem removals move paths to Trash. **Space is not reclaimed until Trash is emptied.** Docker image and volume removals use the daemon and are not recoverable through Trash. Shared stores and unsupported units remain inspection-only. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery).
 

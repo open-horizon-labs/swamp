@@ -33,7 +33,7 @@ Compiler caches, Compiled tests & examples, and Build-script output. Groups
 contain only present, nonempty supported members in that profile. Tests and
 Examples are expandable subgroups. Space marks the exact members for review;
 profile rows also select their supported descendants, never the whole profile
-directory. Profile advice says Review supported groups only.
+directory. Profile advice says Open it and pick items.
 Marking a fully marked group clears its members. A failed member review rolls
 back newly added marks, preserving earlier selections. No virtual group is a
 directory deletion target. Age ordering applies within groups; individual members
@@ -70,9 +70,9 @@ Growth sorts descending by signed change. Other sorts cover size, name, ecosyste
 
 ## Color
 
-Growth is red, shrink is green, and secondary information is dim. The selected row uses a dark background (`Color::Indexed(236)`) and bold text. Marked rows use yellow and an `✗` prefix. Refusals use red text. Signed values and bar direction carry information independently of color.
+Growth is red, shrink is green, and secondary information is dim. The selected row is one full-width bar in reverse video (with bold), and no span inside it sets a color: reverse video follows the terminal's own foreground and background on any theme, survives `NO_COLOR`, and does not depend on telling two colors apart. Marked rows are bold with an `✗` prefix. Warnings and the confirmation headline are bold, not yellow, and results are plain, because yellow and cyan are close to unreadable on many light themes (about 1.7 and 2.0 to 1 against white). Refusals use red text and begin with the word `refused:`. Zero and unknown changes are dim, never dark gray. Signed values and bar direction carry information independently of color.
 
-The renderer uses terminal colors and an indexed selection color. Committed frames exercise 80×24 and 200×60 layouts; visual behavior on a particular terminal and palette still needs inspection.
+The renderer uses the terminal's own colors and attributes. Committed frames exercise 50, 80, 120 and 200 column layouts; the light-theme contrast figures are computed, not observed on a particular terminal.
 
 ## Navigation and filters
 
@@ -82,9 +82,9 @@ The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take
 
 ## Header, progress, and history
 
-The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals. A cached report can appear while an observation runs in the background; the first run needs an observation before it can display data. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
+The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals, but the activity chip (`⠋ observing 12s`, or `⠋ another observation running (pid N, 1m 12s)`) owns the left edge at every width. The UI opens on the stored report at any age and never scans when one exists; with none, the first scan runs in the background and its progress shows in the header. `R` refreshes on demand, and says so, rather than starting a second walk, when another process already holds the observation lock. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
 
-Observation progress shows walked bytes and directories. Its percentage is an estimate against the previous walked total. A live watch -- FSEvents on macOS, inotify on Linux -- batches changes after 400 ms of quiet. On Linux the first live refresh of each root after the watch opens is one full walk (the time before the watch is covered by nothing), a watch that loses coverage (queue overflow, unmount, a removed watch) makes the next refresh a full walk naming why, and a watch limit or an unreadable directory turns live refresh off for that root with the reason in the status line; the background refresh still covers it. The header can display a history sparkline; body rows use change bars.
+Observation progress shows the elapsed time and the bytes seen; there is no percentage, because the total is not known. The TUI opens no filesystem watch: nothing scans on a file event, so a stored report is exactly as old as the header says. A lock poll only notices when another process observes, shows it, and reloads the stored report when that run ends. The right side of the header is the history sparkline with the net change it covers and the window it is over (`-41.4GB in 1w`); body rows use change bars.
 
 ### External and Agents rows, and a scope-coverage header clause
 
@@ -120,7 +120,7 @@ chunk; all three now ship:
   and with no re-check between marking and moving. A protected row, or
   one whose category has no Trash move at all, cannot be marked:
   `propose_agents`'s own refusal (protected category, no Trash move for
-  this category, database-like file) becomes the footer text, never a
+  this category, database-like file) becomes the status text, never a
   generic "nothing to delete." Bulk marking (`Shift+A`,
   `mark_all_in_view`) reaches agent rows too: since `model::agent_rows`
   sets `Row.unit` but never `Row.kind` (there is no `ArtifactKind` for
@@ -128,7 +128,7 @@ chunk; all three now ship:
   alongside its `row.kind`/`ArtifactKind` and projects-view
   `row.project` ones -- when a row has neither but does carry `unit`, it
   reuses `mark_row`'s own per-row refusal rather than duplicating that
-  logic, and counts a skip instead of a hard stop. The footer names how
+  logic, and counts a skip instead of a hard stop. The status rows name how
   many agent rows were skipped and why whenever at least one row *was*
   marked, never silently proceeding as if the skipped rows were not on
   screen.
@@ -161,7 +161,7 @@ chunk; all three now ship:
   `Complete` region. The common case (one `Complete` region) shows no
   clause at all, matching ordinary single-project usage.
 
-### Multi-root reports, coverage inspection, and live refresh (#51)
+### Multi-root reports, coverage inspection, and refresh (#51)
 
 `swamp ui` with no explicit root opens the TUI over the *whole*
 configured scope, not just its first present root: `swamp_tui::run_scope`
@@ -176,21 +176,15 @@ used to resolve the whole scope only to throw it away and hand the TUI
 exactly one present root, which is all `swamp_tui::run` -- kept as-is
 for the `swamp ui <explicit-root>` case -- has ever rendered).
 
-Live refresh preserves this per-root separation instead of ever
-replacing the whole merged report at once:
+Refresh preserves this per-root separation instead of ever
+replacing the whole merged report at once. The TUI opens no filesystem
+watch: a refresh is the first scan (only when there is no index), `R`,
+or the observe after a delete.
 
-- `App::start_watch` opens one FSEvents stream per root in `App::roots`,
-  all feeding one shared channel through cloned senders (`App::watches`
-  is a `Vec`, not a single `Option<Watcher>`).
-- `App::observe_live` handles one root's pending changes per call --
-  whichever root owns the first pending changed path -- draining only
-  that root's paths from `live_changes` and leaving any other root's
-  changes queued for the next tick, so two roots going quiet in the
-  same beat are never merged into one re-walk.
-- `App::observe_in_background` (the cached-startup and post-delete
-  refresh path) re-observes every root in `App::roots`, sequentially,
-  in one worker thread.
-- Both report their result(s) as `(root, Report)` pairs; `App::
+- `App::observe_in_background` (the first scan, `R` and the post-delete
+  refresh) re-observes every root in `App::roots`, sequentially, in one
+  worker thread.
+- It reports its result(s) as `(root, Report)` pairs; `App::
   replace_report_for_root` updates exactly that root's entry in
   `reports_by_root` and rebuilds `report` from the *whole* map
   (`report::merge_reports`) -- a refresh of one root can never erase,
@@ -220,7 +214,7 @@ Space marks a row. Backspace opens the confirmation for the current row or marke
 Human keep/protect intent (`swamp protect`) is checked before **any**
 row is marked, in both directions: a row beneath a protected path, and a
 row that *contains* one. Protecting a single file inside a build
-directory therefore refuses the directory, in the footer, at the moment
+directory therefore refuses the directory, in the status rows, at the moment
 you press Space -- not silently at execution. Protection state that
 cannot be read is *unknown*, so it refuses too. This used to be reached
 only for the two row kinds that happened to propose through core, which
@@ -229,17 +223,18 @@ is how a one-directional protection bug survived every test; see
 
 Project rows expand to actionable artifacts. If none exist, a direct project action may offer the checkout. Bulk marking with `A` skips that fallback. Worktree and source-directory selections carry their own warnings; the `ignored` and `untracked` summary buckets are not individual paths to delete.
 
-Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals appear temporarily in the footer.
+Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals show in the status rows with their reason; what a check or a delete could not include is listed with `b` (or `d` on the plan), each with its whole reason and a next step, and `r` there checks again.
 
 The selected row's own decision evidence (#53/#60) renders below the
-table, in the existing signals/detail area: one line per fact
-(`render::render_evidence_lines`, shared with the CLI text output),
-ordered activity/consumer/current-use/recovery/reclaimability so a
-short terminal shows the most decision-relevant facts first if it
-cannot show them all. The detail area's height grows to fit (estimated
-by wrapped-row count at the terminal's actual width, not raw fact
-count), capped at half the body height so a unit with many facts can
-never push the row table itself off screen. The confirmation row's
+table, in a fixed four-row detail pane (`crates/tui/src/detail.rs`): what
+the row is and what rebuilding costs, then one plain sentence per fact that
+changes a decision (in use now, may be the only copy, used by, last
+changed), then one line naming what could not be established, so a missing
+fact never reads as nothing to worry about. The sources, freshness and
+coverage of every fact stay in `swamp report` and `--json`
+(`render::render_evidence_lines`). The space-freed caveat (files shared
+with other copies count once) shows only where the gap is at least 1MB.
+The pane never changes height, so a keypress never moves the table. The confirmation row's
 warnings line adds `render::evidence_warnings(&row.evidence)` --
 a declared consumer, current use, or an uncertain recovery/
 reclaimability fact, stated selectively rather than every fact restated
@@ -249,17 +244,46 @@ own `evidence` field, populated from the same `ArtifactRow`/
 `ExternalUnit`/`AgentUnit` every other row field already comes from, so
 there is no second, presentation-only evidence path to keep in sync.
 
-## Review
+## Layout, review and plan
 
-Review and deletion run on background workers. During an operation, replace the
-confirmation row with a three-line progress area: processed/total group gauge,
-success/refusal counts and current path, then phase-specific consequences.
-Elapsed time advances even while one group is being checked. Never imply byte
-reclamation progress. Unknown review totals show checked count rather than a
-fabricated percentage. Esc/Ctrl-C/q request cancellation between groups, with a
-visible Cancelling state; no second action starts while busy. Completed outcomes
-are retained and refused/unattempted marks remain for explicit retry. Idle Ctrl-C
-exits. Observation results are held while busy and pre-deletion results discarded
-so a stale report cannot resurrect removed rows.
+The chrome is the same rows in every state: header, view and filter line, the
+body, two status rows, and the key legend. Nothing resizes the body. A plan or
+blocked list is a fixed 10-row sheet drawn over the bottom of the list, and a
+result stays in the status rows until the next key. A detail pane of fixed
+height sits under the list, and the list scrolls only when the selection leaves
+its window, so one Down moves the selection one row.
+
+Marking builds a plan and changes nothing. Check, ready and blocked are the
+words (never successful and refused), with `Nothing has been changed` while a
+check runs and the plan sheet after it. Review and deletion run on background
+workers. During an operation the status rows show a moving glyph and the elapsed
+time first, at any width, then `Checked 41 of 342` (or the count alone when the
+total is unknown; never a fabricated percentage) and the item by plain name.
+Never imply byte reclamation progress. Esc, Ctrl-C and q request cancellation
+between items, with a visible Stopping state; no second action starts while
+busy. Completed outcomes are retained and blocked or unattempted marks remain for
+explicit retry. Idle Ctrl-C exits. Observation results are held while busy and
+pre-deletion results discarded so an out-of-date report cannot resurrect removed
+rows. A result says what moved to Trash and what was removed for good, and that
+space is freed when Trash is emptied; it carries no measured free-space figure,
+because a move to Trash on the same volume frees nothing yet.
+
+Keys move by row, by page (PgUp, PgDn) and to the ends (Home, End) in the list,
+the help, the blocked list, the cargo popup and the picker. `v` names the view
+and its place (`builds of mole (3 of 10 · v next · Esc: projects)`), each view
+remembers its cursor, and an empty list says why and what to press. `k` says
+which way it flipped and what that means, since it is remembered. The key legend
+keeps `/ filter  v view  R refresh  ⌫ delete  ? help  q quit` at 80 columns and
+drops movement keys first.
+
+The UI paints only when something changed: a key, a resize, a worker's result,
+anything busy (every 200 ms, for the glyph and the clock), or a clock-driven part
+of the screen reading differently (the age of the index, a refusal that ran
+out). Idle it writes nothing. Sort, filter and `k` are written to `ui_state.json`
+on a worker, newest wins, and flushed on exit.
+
+The terminal is put back however the program ends: on return, on a panic on the
+UI thread (the message prints on the normal screen), and on SIGTERM, SIGHUP or
+SIGINT (`fs_gate::terminal`, chained to the child-kill handlers).
 
 Keep the footer visible. Use overlays for help and the filter form, with inline action confirmation. The help overlay ends with the activity-evidence inventory (which domains this pass can establish a real activity fact for, and which it reports as unknown), the same table `docs/usage.md` carries. Check empty results, narrow layouts, long paths, mixed filesystem/Docker selections, and missing history. The frame tests cover rendered text and layout; they do not establish readability on every font or color theme.

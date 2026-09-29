@@ -16,10 +16,10 @@ observations, not general performance guarantees. See the README for current use
   gone from the UI.
 - **The header always says how old the data is and whether anyone is scanning.** It
   shows `observed 4m ago`, counting up while the UI is open. Older than 15 minutes it
-  turns yellow and says so, with a hint to press `R`. While the UI scans it shows
+  turns bold and says so, with a hint to press `R`. While the UI scans it shows
   `⠋ observing 12s` first on the line, with the bytes seen after it. While another swamp
   process (the scheduled `swamp observe`) holds the observation lock it shows
-  `scheduled observation running (pid N, 1m 12s)`, shortened to `observation running
+  `another observation running (pid N, 1m 12s)`, shortened to `observation running
   1m 12s` on a narrow terminal, never waiting on the lock, and it reloads the stored
   report when that run ends.
 - **Quitting is instant.** Exit used to wait several seconds joining the file-watch
@@ -69,9 +69,80 @@ observations, not general performance guarantees. See the README for current use
   what is removed for good, then names and warnings. `d` (or `b` after a check) lists
   each blocked item with its reason and the next step.
 - **The delete result says what happened in plain words.** `Moved 338 items (17.0GB) to
-  Trash. Space is freed when Trash is emptied. Free space changed by 0B.` replaces the
-  line with `planned` and `measured` figures, and docker items removed for good are
-  counted separately.
+  Trash. Space is freed when Trash is emptied.` replaces the line with `planned` and
+  `measured` figures, and docker items removed for good are counted separately. There is no
+  free-space figure any more: a move to Trash on the same volume frees nothing until Trash
+  is emptied, so the measured change was noise (the `-10.5MB` people saw). Anything that
+  could not be moved is counted (`2 could not be moved (b to see why)`) and listed with `b`,
+  each with its reason, instead of naming only the first.
+- **The growth filter picker shows your history.** It said `growth off, no observations yet`
+  next to a header that showed weeks of history, because it looked for history in the wrong
+  directory. It now reads the same store as the header, so the growth and window fields
+  offer the windows your history covers.
+- **The selected row is readable on any theme.** It was a fixed dark gray bar
+  (`#303030`) with your normal text color on it, unreadable on a light terminal theme. It is
+  now one full-width bar in reverse video, which follows the terminal's own colors and
+  survives `NO_COLOR`. Warnings and the confirmation are bold instead of yellow, results
+  are plain instead of cyan (both were close to unreadable on light themes), and dim
+  replaces dark gray for zero change.
+- **PgUp, PgDn, Home and End work.** They move a screenful or to the ends in the list, the
+  help, the blocked list, the cargo inspection popup and the filter picker. Before, they did
+  nothing, in a list where `A` can mark 342 items.
+- **Help is readable and scrolls.** The `A` and Backspace entries used to run together on
+  one row and clip; each key now has its own row, long entries wrap under themselves at 50,
+  80 and 120 columns, the badge legend wraps, and the whole text scrolls (`↑↓`, PgUp, PgDn,
+  Home, End; `Esc` or `q` closes). The title shows where you are, `22-43 of 68`.
+- **`k` says what it did.** It flips a setting that is remembered between sessions and
+  used to do it in silence. The result line now reads `Keep executables is now on: release
+  and debug programs are copied to bin/ before their folder goes to Trash. Remembered for
+  next time. k turns it off.`, the confirmation shows the current value, and the help and
+  usage table document it.
+- **The key legend keeps what you reach for.** At 80 columns it reads `/ filter  v view  R
+  refresh  ⌫ delete  Space mark  A mark all  ↑↓ move  ? help  q quit`. Movement keys go
+  first when space runs out, not filter, view, refresh and delete.
+- **Views keep their place and say where you are.** `v` and Esc used to send the cursor to
+  the top; each view now remembers its cursor. The view line reads `builds of mole (3 of 10
+  · v next · Esc: projects)`. An empty list says why and what to press: `Nothing matches
+  the filter "growth > 900GB in 7d". Press / to change it, or 0 to clear it and see
+  everything.`, or `No Docker images, containers or volumes found. Press v for another
+  view.` instead of `no rows match` under `filter: none`.
+- **The detail pane is plain.** Every row used to show `reclaimability (estimated
+  reclaimable): conflicting [0B, 24.6KB] (APFS clone/snapshot extent sharing outside this
+  selection is not queried ...)`. It now says what the row is and what getting it back
+  costs (`440.4MB · Installed dependencies. Installing again brings them back, usually over
+  the network.`), then only the facts that change a decision (`In use right now.`, `Used by
+  2 projects: mole, swamp.`, `Last changed 1h ago.`), and one line naming what could not be
+  established (`Unknown: how to get it back.`). The space-freed caveat shows only when the
+  possible gap is at least 1MB. `groups`, `units` and `occupancy` are gone from the screen.
+  The full evidence, with sources, is still in `swamp report` and `--json`.
+- **The header's net change is labeled.** `-41.4GB` next to the history sparkline now reads
+  `-41.4GB in 1w`.
+- **The picker prints its keys once.** They were in the box and again in the footer; they
+  are in the footer only.
+- **`d` shows the whole blocked reason, and `r` checks again.** In the blocked list, each
+  item's reason and next step wrap in full instead of being cut, and `r` runs the same
+  check again from a fresh look at the disk (a process that held an item open may have
+  exited). It replaces the marks that check added and keeps marks you made another way.
+- **`R` says so when another observation is running.** With the schedule (or a manual
+  `swamp observe`) already holding the lock, `R` used to look like nothing happened. It now
+  says `An observation is already running (pid N, 32s). Its result loads here when it
+  finishes.` and starts nothing. The header no longer calls a manual run `scheduled`.
+- **The terminal always comes back.** A panic on the UI thread, SIGTERM, SIGHUP or SIGINT
+  used to leave your shell in raw mode on the alternate screen with no cursor (measured:
+  after SIGTERM, echo and line mode stayed off). The terminal is now restored on every way
+  out, and a panic message prints on the normal screen where you can read it. The restore
+  runs before the child-process cleanup that v0.7.4 added; both still happen.
+- **The screen is no longer blank while the index loads.** It shows `swamp · reading the
+  last observation…` from the first moment instead of an empty terminal for about half a
+  second.
+- **An idle UI draws nothing.** It used to repaint five times a second, a 25-byte burst
+  each time (49 writes in 10 seconds over ssh or tmux). It now paints when a key, a
+  resize or a result arrives, every 200 ms while something is busy, and when the age in the
+  header reads differently: 0 writes and no measurable CPU in 10 idle seconds.
+  Sort, filter and `k` choices are saved on a worker thread, so a slow or full disk cannot
+  stall a keypress; the last choice is flushed on exit.
+- **Long tree rows keep their outline.** Truncating a long name no longer cuts the tree
+  rail (`│  │ … ├─ node-server`); only the name gives way.
 
 ## v0.7.4
 
