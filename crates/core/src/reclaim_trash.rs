@@ -257,6 +257,15 @@ fn canonical_of(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("{} is not an absolute path", path.display()));
     }
+    // A trailing slash makes the OS follow a symlink (`link/` is the
+    // target): the path must be the one its components spell.
+    let spelled: PathBuf = path.components().collect();
+    if spelled.as_os_str() != path.as_os_str() {
+        return Err(format!(
+            "{} is not written in its plain form (a trailing or doubled slash would make the OS follow a symlink to its target)",
+            path.display()
+        ));
+    }
     if path
         .components()
         .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
@@ -700,7 +709,23 @@ pub fn review_in(t: &ReclaimTarget, around: &Surroundings<'_>) -> Result<Review,
         c == me || c.starts_with(&me)
     };
     let resolved_store = crate::fs_gate::StoreDir::resolved();
-    if store.is_some_and(own) || own(resolved_store.path()) {
+    // The store wherever this run resolved it, and the places swamp's
+    // store lives by default (a TUI started with another SWAMP_DIR still
+    // has its usual store under the home folder).
+    let env_home = std::env::var_os("HOME").map(PathBuf::from);
+    let usual = |h: &Path, n: &str| h.join(".local/share").join(n);
+    let by_default = around
+        .home
+        .into_iter()
+        .chain(env_home.as_deref())
+        .flat_map(|h| [usual(h, "swamp"), usual(h, "swamp-preview")])
+        // Only as ancestors: when the run's own store is elsewhere, the
+        // usual folder itself is just a folder, but what holds it is not.
+        .any(|p| {
+            let held = crate::scope::comparable(&t.path);
+            own(&p) && crate::scope::comparable(&p) != held
+        });
+    if store.is_some_and(own) || own(resolved_store.path()) || by_default {
         return Err("this holds swamp's own ledger, which records this move; move it yourself in Finder if you want it gone".to_string());
     }
     if around.trash_root.is_some_and(own) {
@@ -787,7 +812,9 @@ pub fn review_in(t: &ReclaimTarget, around: &Surroundings<'_>) -> Result<Review,
 /// turn every Enter into "review again".
 fn occupancy_key(line: Option<&str>) -> String {
     match line {
-        Some(l) if l.starts_with("in use right now") => format!("held:{l}"),
+        // Held or not: never which file, because a churning cache (journal
+        // files) names a different first file every time it is read.
+        Some(l) if l.starts_with("in use right now") => "held".to_string(),
         _ => "not held".to_string(),
     }
 }

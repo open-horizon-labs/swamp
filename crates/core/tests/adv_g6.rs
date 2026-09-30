@@ -161,6 +161,10 @@ fn adv_the_protect_remove_named_in_the_refusal_takes_a_descendant_mark_off() {
 #[test]
 fn adv_the_home_folder_itself_is_named_on_the_confirm() {
     let f = fx();
+    // The fixture store sits in the usual place under the fixture home,
+    // which swamp now always protects; move it out so this test reads the
+    // facts about the folder, not the refusal.
+    std::fs::rename(&f.store, f.root.join("store-moved")).unwrap();
     // The store sits inside the fixture home, and a folder holding swamp's
     // ledger is refused (review M3), so the facts are read with a store
     // elsewhere: this test is about what the confirm says of the home folder.
@@ -184,6 +188,10 @@ fn adv_the_home_folder_itself_is_named_on_the_confirm() {
 #[test]
 fn adv_a_folder_that_contains_home_is_not_called_outside_it() {
     let f = fx();
+    // The fixture store sits in the usual place under the fixture home,
+    // which swamp now always protects; move it out so this test reads the
+    // facts about the folder, not the refusal.
+    std::fs::rename(&f.store, f.root.join("store-moved")).unwrap();
     let r = review(
         &target(&f.root),
         Some(&f.root.join("nostore")),
