@@ -676,7 +676,10 @@ fn adv_append_to_an_unreadable_ledger_never_drops_history() {
 #[ignore]
 fn adv_write_tool_remove_row_into_store_copy() {
     let dir = PathBuf::from(std::env::var_os("ADV_LEDGER_DIR").expect("ADV_LEDGER_DIR"));
-    assert!(dir.starts_with("/private/tmp") || dir.starts_with("/tmp"), "a copy only");
+    assert!(
+        dir.starts_with("/private/tmp") || dir.starts_with("/tmp"),
+        "a copy only"
+    );
     let sb = Sandbox::new();
     sb.standard_mise();
     sb.go_uninstall_removes(0);
@@ -703,7 +706,9 @@ fn adv_untrusted_developer_dir_never_reaches_xcrun() {
     let evil = sb.root.join("evil");
     fs::create_dir_all(evil.join("usr/bin")).unwrap();
     fs::set_permissions(&evil, fs::Permissions::from_mode(0o777)).unwrap();
-    let host = sb.host().with_parent_env(&[("DEVELOPER_DIR", evil.to_str().unwrap())]);
+    let host = sb
+        .host()
+        .with_parent_env(&[("DEVELOPER_DIR", evil.to_str().unwrap())]);
     let bin = ToolResolver::sandboxed(&sb.root)
         .with_parent_env(vec![("DEVELOPER_DIR".into(), evil.clone().into())])
         .resolve(Program::Xcrun)
@@ -713,5 +718,27 @@ fn adv_untrusted_developer_dir_never_reaches_xcrun() {
         bin.env_value("DEVELOPER_DIR").is_none(),
         "a world-writable DEVELOPER_DIR ({}) is handed to xcrun",
         evil.display()
+    );
+}
+
+/// Attack 4: an install directory that is itself a symlink out of mise's
+/// data dir, with no `symlinked_to` in the listing (a hand-made or
+/// migrated install). Tempting wrong patch: "trust `symlinked_to` to flag
+/// every link". What mise would remove through that link was never
+/// reviewed: must refuse.
+#[test]
+fn adv_install_dir_that_is_a_symlink_out_refuses() {
+    let sb = Sandbox::new();
+    sb.standard_mise();
+    let dir = sb.install_dir("go", "1.23.5");
+    fs::remove_dir(&dir).unwrap();
+    let outside = sb.root.join("Documents-important");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &dir).unwrap();
+    let r = review(&sb, &go());
+    assert!(
+        r.is_err(),
+        "previewed a removal through a symlink to {}",
+        outside.display()
     );
 }
