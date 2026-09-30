@@ -884,7 +884,7 @@ pub(crate) fn clean_line(line: &str) -> String {
                 }
             }
             '\t' => out.push(' '),
-            c if c.is_control() => {}
+            c if c.is_control() || invisible(c) => {}
             c => out.push(c),
         }
     }
@@ -892,6 +892,14 @@ pub(crate) fn clean_line(line: &str) -> String {
         out = out.chars().take(300).collect::<String>() + "...";
     }
     out
+}
+
+/// Bidi controls, zero-width characters and line/paragraph separators: a
+/// manager line holding one could reorder or hide text on the confirm.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{061C}' | '\u{00AD}')
 }
 
 /// A whole stream as cleaned lines, bounded to [`SHOWN_OUTPUT_LINES`].
