@@ -5,6 +5,7 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.8.0
 
+- **Homebrew works on a standard Mac again.** The program resolver refused `brew` because `/opt/homebrew/bin` is writable by the `admin` group, so Homebrew detection and the brew manager pass never ran on most Macs. A directory swamp runs a program from must be owned by you or root and not writable by everyone; it may be group-writable only for the macOS `admin` group, because admin members can already use sudo, so this grants no power they lack (standard Homebrew on Apple Silicon keeps `/opt/homebrew/bin` that way). Any other group, any other owner, or any group-write on Linux refuses, and the refusal names the group ("/opt/homebrew/bin is writable by group staff"). The program file itself must still be owned by you or root and not group- or world-writable.
 - **Fresh files no longer read as near-empty, and one unreadable entry no longer collapses a directory (Linux).**
   On Docker's overlayfs a 5 MB tree written a moment earlier measured 204,800 bytes,
   then 5.97 MB after the kernel flushed it. Recent files that report almost no blocks

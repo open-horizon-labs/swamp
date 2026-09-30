@@ -389,26 +389,8 @@ fn a_disabled_detector_must_not_probe_its_tool() {
     );
 }
 
-/// The instrument the test above rests on, checked rather than assumed.
-///
-/// A spawn counter that nothing increments would make
-/// `a_disabled_detector_must_not_probe_its_tool` pass vacuously -- which
-/// is precisely the failure mode the 2026-09-22 re-review found in the
-/// work counters themselves ("a 20,000-file traversal reporting 2 dirs
-/// listed"). So: a command that really does spawn must be counted, and
-/// it must be counted in the scoped sink, not only globally.
-#[test]
-fn the_spawn_counter_counts_a_real_spawn() {
-    use swamp_core::locations::{CommandRunner, SystemCommandRunner};
-    let (_, counted) = swamp_core::work_counters::measured(|| {
-        // Allow-listed, read-only, and harmless if absent: a failure to
-        // spawn is still a spawn attempt for every purpose this counter
-        // has, and `brew --prefix` is the query the detector registry
-        // itself makes.
-        let _ = SystemCommandRunner.run("brew", &["--prefix"], std::time::Duration::from_secs(5));
-    });
-    assert_eq!(
-        counted.subprocess_spawns, 1,
-        "the spawn counter must count an allow-listed command runner spawn"
-    );
-}
+// The instrument check that used to live here (`the_spawn_counter_counts_a_real_spawn`)
+// moved to `tests/spawn_counter_counts_a_real_spawn.rs`: it needs a real
+// `brew` to start, which since the manager pass's program resolver means a
+// fixture binary named through `SWAMP_TEST_PROGRAM_DIR`, a process-wide
+// variable that only a single-test binary may set.

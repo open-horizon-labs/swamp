@@ -62,10 +62,14 @@ The managers do not protect the human themselves (verified read-only
    list (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`,
    `~/.cargo/bin` for mise; `/usr/bin/xcrun`), never on `PATH`. The first
    candidate that exists must be (canonically) a file owned by the user
-   or root, writable by nobody else, in a directory with the same
-   property, or it refuses: it is never skipped for a later one. The
-   child's `PATH` starts with the candidate's directory only when that is
-   trusted too.
+   or root, writable by nobody else, in a trusted directory, or it
+   refuses: it is never skipped for a later one. A trusted directory is
+   owned by the user or root, not world-writable, and group-writable only
+   for the macOS `admin` group (looked up by name): admin members can
+   already use sudo, so that grants no new power, and it is how standard
+   Homebrew keeps `/opt/homebrew/bin`. Any other group, another owner, or
+   group-write on Linux refuses, naming the group. The child's `PATH`
+   starts with the candidate's directory only when that is trusted too.
 2. **A config requests the version** (`source` in `mise ls`): the global
    config (mise's config dir from its own env, or
    `MISE_GLOBAL_CONFIG_FILE`) is named as such.
