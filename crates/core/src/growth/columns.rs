@@ -4598,7 +4598,7 @@ table! {
     /// v0.7.5 reads and no store-format bump is needed. A row applies only
     /// to the `external_units` row with the same `observed_at`: a pass by
     /// another swamp version rewrites the units and leaves this table
-    /// behind, and a stale row must not be shown as a current fact.
+    /// behind, and an out-of-date row must not be shown as a current fact.
     StoredUnitMetaRow, write_unit_meta_rows, read_unit_meta_rows {
         scope_key: String,
         unit_id: String,

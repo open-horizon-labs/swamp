@@ -102,8 +102,9 @@ observation produced: the project, worktree and artifact rows
 `artifact_shape.parquet` + `artifact_shape_lists.parquet`, and the
 per-volume current-artifact table); external and agent-tool storage
 units (`external_units.parquet`/`agent_units.parquet` +
-`unit_consumers.parquet`/`agent_unit_members.parquet`, and
-`unit_children.parquet` for an external unit's depth-2 rows); a volume's
+`unit_consumers.parquet`/`agent_unit_members.parquet`, and the sibling
+tables `unit_meta.parquet` for an external unit's last-used and overlap and
+`unit_children.parquet` for its depth-2 rows); a volume's
 unowned rows (`unowned.parquet` + lists/evidence, and
 `docker_unowned.parquet` for the Docker objects no project claims);
 nested build-artifact units (`nested_artifacts.parquet` + lists/
@@ -576,7 +577,7 @@ time stays in the JSON. A unit that declares no source shows no record.
 | Homebrew Cellar | file access time | `Cellar/<formula>/<version>/bin/*` | layout yes; the detector is off by default, so the default report does not exercise it |
 | Android SDK packages | file access time | `<package>/<version>/bin/*` (`cmdline-tools`, `cmake`); a package with no `bin` (system images, platforms, emulator, platform-tools, build-tools) shows no record | yes |
 | ESP-IDF tools | file access time | `tools/<tool>/<version>/<tool>/bin/*` | yes |
-| Cargo registry cache and sources, git databases and checkouts | tool-native: `~/.cargo/.global-cache` | the newest `timestamp` in the table for that subtree (`registry_crate`, `registry_src`, `git_db`, `git_checkout`), opened read-only | yes: the database and its values were read on this machine (SQLite `user_version` 7) |
+| Cargo registry cache and sources, git databases and checkouts | tool-native: `~/.cargo/.global-cache`, shown as "last used by cargo" | the newest `timestamp` in the table for that subtree (`registry_crate`, `registry_src`, `git_db`, `git_checkout`), opened with SQLite's immutable read-only mode: no file created beside cargo's database (no `-shm`/`-wal`), no lock taken; a read torn by a checkpoint is "unavailable", and a change still in a WAL is not seen | yes: the database and its values were read on this machine (SQLite `user_version` 7) |
 | Xcode DerivedData | tool-native: each project folder's `info.plist` `LastAccessedDate` | the existing bounded `plutil` read; a project shows its own, the unit the newest | yes |
 | CoreSimulator devices | not implemented | `device.plist` has no last-booted key on this machine (keys seen: `deviceType`, `isDeleted`, `isEphemeral`, `name`, `runtime`, `runtimePolicy`, `state`, `UDID`; no device was booted) | unverified |
 | Docker and OrbStack | build-cache entries keep the daemon's own `last_used` (an existing fact); images and volumes report none | the daemon | existing |
@@ -586,7 +587,9 @@ time stays in the JSON. A unit that declares no source shows no record.
 Access time is a weak signal and the docs say so where it is used:
 
 - **Backup tools, antivirus and indexers touch it.** A unit can show a
-  recent date because something scanned it.
+  recent date because something scanned it: a later access date may be an
+  indexer or a backup reading the file, not you. It is therefore an upper
+  bound on how recently the unit was used, never proof of use.
 - **`--version` counts.** So does any read; a shell completion that runs a
   tool counts as a run.
 - **Mounts.** On a `noatime` mount nothing updates it; on `relatime` (Linux
@@ -595,13 +598,18 @@ Access time is a weak signal and the docs say so where it is used:
 - **Aliases are not double counted.** Symlinks (mise's `latest`, Homebrew's
   `bin` links) are skipped, so an alias never lends its target's time to
   another unit.
+- **A date in the future is not shown.** A tool-native record dated after now
+  (a tracker written in milliseconds reads as the year 58,000, a copied plist
+  as 2099) is set aside as `no record (ignored: date in the future)`. A scan
+  that hits its listing limit says `no record (probe limit reached)`, not a
+  bare `no record`.
 - **It is read on every observation, not replayed.** Reading a file raises
   no filesystem event, so an unchanged unit that is replayed without a walk
   would report an access time that is only as new as its last walk. Swamp
   lists the declared `bin` directories and takes one `lstat` per key file
   each observation instead: bounded (a unit that would need more than 4,096
   listings shows no record), counted in the observation's work counters,
-  and it opens nothing. `swamp report` never does this: it reads the stored
+  and it opens nothing (justification: `docs/architecture.md`). `swamp report` never does this: it reads the stored
   value.
 
 ### What is inside a big root
@@ -649,9 +657,21 @@ regular `.rustc_info.json` beside it. It shows in the unowned view as
 and the consequence "rebuild with `cargo build`".
 
 - A directory with only the tag (pytest, uv and others write the same
-  signature) is not called Cargo's.
-- Nothing in the directory records which project built it (its `.d` files
-  use relative paths), so none is named and none is guessed.
+  signature) is not called Cargo's, and neither is a `target/` sitting next
+  to a `Cargo.toml` (a Cargo project that is not a git checkout keeps its
+  build directory there).
+- Swamp does not link it to a project and guesses none. Whether the
+  directory itself records one varies, and was checked here: a target built
+  from a git worktree records absolute workspace source paths in
+  `<profile>/deps/*.d` (`/private/tmp/swamp-cli-brokenpipe-target-145` records
+  `/private/tmp/swamp-fix-cli-defects/crates/...`), while targets built in
+  place record relative ones and `.fingerprint/*` records only hashes. When
+  absolute paths are there the row shows their common directory as a
+  **recorded link** (second tier, labelled "recorded in dep-info, not checked
+  to exist"); it is never used to select, order or authorize anything.
+- It has its own section in `swamp report --view external` (and
+  `standalone_cargo_targets` in `--json`, and rows in the TUI's External view),
+  counted under unowned and not in the external total.
 - A project's own `target/` is a build artifact of that project and is
   counted once there, never also as a standalone target.
 - It is plannable through the same reviewed Trash flow as any build output:

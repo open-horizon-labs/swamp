@@ -110,7 +110,7 @@ chunk; all three now ship:
   source, and an unclassified root of 1 GiB or more, also opens onto its
   depth-2 rows first (its top 15 child folders largest first, then one
   remainder row that makes the rows sum to the unit's total; a folder that
-  could not be read says "not measured" and never shows `0B`). Every such
+  could not be read draws `unmeasured` in the Size cell, a signed correction draws `-50MB adj`, and neither ever draws a size; a unit that also has an identified interior holds it under one closed "identified interior" header so no byte is listed twice). Every such
   row is `blocked`, no `UnitId`, and the table layout is unchanged: the
   last-used fact (`Last run or opened: Jul 8 (file access time)`) is the
   first line under the signals in the selected-row detail pane, not a

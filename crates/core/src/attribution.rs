@@ -264,16 +264,12 @@ pub(crate) fn recorded_source_root(target: &Path) -> Option<std::path::PathBuf> 
         .take(PROFILES_SAMPLED * 4)
     {
         let deps = target.join(&profile.name).join("deps");
-        let mut sampled = 0;
         for f in crate::locations::shallow_list(&deps)
             .entries
             .iter()
             .filter(|e| !e.is_dir && e.name.ends_with(".d"))
+            .take(FILES_PER_PROFILE)
         {
-            if sampled >= FILES_PER_PROFILE {
-                break;
-            }
-            sampled += 1;
             let Ok(bytes) = crate::fs_gate::read::bounded_read(
                 deps.join(&f.name),
                 crate::fs_gate::read::BoundedCap::POINTER,
