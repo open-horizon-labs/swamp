@@ -1,7 +1,9 @@
 //! #190 end to end on the built binary (scratch SWAMP_DIR, HOME and
 //! SWAMP_LOG_DIR): a pass parked in one directory is stopped, releases
 //! the writer lock, names phase and path in the log, and the next pass
-//! skips that path as not measured instead of parking again.
+//! skips that path as not measured instead of parking again. It replaces
+//! the auditor's `a_parked_pass_stops_releases_the_lock_and_names_the_path`,
+//! whose FIFO loose ref no longer parks a pass at all.
 //!
 //! The park is the `SWAMP_TEST_PARK_DIR` test hook: the real blocking
 //! kinds (FIFOs, dataless files) no longer park a pass at all, so the
@@ -59,6 +61,7 @@ fn a_parked_pass_is_stopped_named_and_skipped_next_time() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(!store.join("observe.lock").exists(), "writer lock left behind");
     let log = std::fs::read_to_string(logs.join("observe.log")).unwrap();
     assert!(
         log.contains(&format!("in walk at {}", stuck.display())),
