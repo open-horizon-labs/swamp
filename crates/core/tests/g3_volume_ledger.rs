@@ -1970,3 +1970,175 @@ fn a_pass_that_measured_nothing_says_which_locations_are_not_measured_yet() {
             .all(|r| r.bytes.is_none())
     );
 }
+
+// ======================= verification round (audit/v080-g3b) =======================
+
+fn ver_file_hash(p: &Path) -> Option<Vec<u8>> {
+    std::fs::read(p).ok()
+}
+
+#[test]
+fn ver_one_unreadable_folder_must_not_make_a_99_percent_undercount_reconcile() {
+    // Tempting wrong patch (head 98e0ba5): gate the elimination estimate on
+    // "anything unreadable or pending" only. Every real Mac has protected
+    // folders, so the estimate is always present and absorbs any walk
+    // undercount: the "check that can fail" cannot fail from the walk.
+    let mut s = Setup::new();
+    // The Data volume claims 100x what the fixture holds; the walk misses 99%.
+    s.probe = FakeProbe {
+        apfs: Ok(apfs_xml(&[
+            ("Macintosh HD", "System", Some(SYSTEM_BYTES)),
+            ("Preboot", "Preboot", Some(PREBOOT_BYTES)),
+            ("Data", "Data", Some(DATA_BYTES * 100)),
+        ])),
+        ..good_probe()
+    };
+    s.space = FakeSpace(Some((
+        100_000_000_000,
+        100_000_000_000 - (SYSTEM_BYTES + PREBOOT_BYTES + DATA_BYTES * 100),
+    )));
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    let measured = a.accounted.bytes + a.everything_else.bytes;
+    assert!(measured * 50 < DATA_BYTES * 100, "fixture: walk sees < 2%");
+    assert!(
+        a.not_measured.count > 0,
+        "fixture has Mail and Pictures denied"
+    );
+    assert_ne!(
+        a.residual.within_one_percent,
+        Some(true),
+        "walk measured {measured} of {} Data bytes, 2 folders unreadable, yet residual {:?} is 'within 1%' and residual_flag={}",
+        DATA_BYTES * 100,
+        a.residual.bytes,
+        a.residual.residual_flag
+    );
+}
+
+#[test]
+fn ver_a_detached_worker_that_finishes_later_writes_nothing_and_a_second_pass_can_run() {
+    // Tempting wrong patch: the late worker pushing its result into a
+    // ledger write, or the pass lock being held by the detached thread.
+    let s = Setup::new();
+    s.fs.block_forever_on("/Users/me/Downloads");
+    let t = Instant::now();
+    ran(&s.run_at(NOW, true, Duration::from_millis(400), Some(0)));
+    let took = t.elapsed();
+    let rows_p = s.store.path().join("volume_ledger.parquet");
+    let meta_p = s.store.path().join("volume_ledger_meta.parquet");
+    let (r1, m1) = (ver_file_hash(&rows_p), ver_file_hash(&meta_p));
+    // A second pass while the first pass's worker is still stuck.
+    let second = s.run_at(NOW + 1, true, Duration::from_millis(400), Some(0));
+    assert!(matches!(second, PassOutcome::Ran(_)), "{second:?}");
+    let (r2, m2) = (ver_file_hash(&rows_p), ver_file_hash(&meta_p));
+    s.fs.release.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(ver_file_hash(&rows_p), r2, "late worker rewrote rows");
+    assert_eq!(ver_file_hash(&meta_p), m2, "late worker rewrote meta");
+    let _ = (r1, m1);
+    // The documented bound: at most 2 budgets (plan is instant here).
+    assert!(
+        took < Duration::from_millis(1100),
+        "took {took:?} > 2 x 400 ms + slack"
+    );
+}
+
+#[test]
+fn ver_a_stuck_folder_is_measured_by_the_next_run_once_it_answers() {
+    // Tempting wrong patch: recording a stuck task as fresh for the cycle,
+    // so after the mount recovers the folder stays "not measured" until the
+    // next full cycle (24 h), although the summary says "the next run continues".
+    let s = Setup::new();
+    s.fs.block_forever_on("/Users/me/Downloads");
+    ran(&s.run_at(NOW, true, Duration::from_millis(400), Some(0)));
+    s.fs.release.store(true, Ordering::SeqCst);
+    ran(&s.run_at(NOW + 1, false, Duration::from_secs(30), Some(0)));
+    let row = s.row("/Users/me/Downloads").expect("row");
+    assert!(
+        row.bytes.is_some(),
+        "after the hang cleared, the next run left Downloads as {:?} / {:?}",
+        row.method,
+        row.note
+    );
+}
+
+#[test]
+fn ver_logical_path_edge_cases() {
+    use swamp_core::volume_ledger::pass::logical_path;
+    let d = Path::new("/System/Volumes/Data");
+    let lp = |p: &str| logical_path(Path::new(p), d);
+    assert_eq!(lp("/System/Volumes/Data"), PathBuf::from("/"));
+    assert_eq!(
+        lp("/System/Volumes/Data/Users/me"),
+        PathBuf::from("/Users/me")
+    );
+    assert_eq!(
+        lp("/System/Volumes/DataX/a"),
+        PathBuf::from("/System/Volumes/DataX/a")
+    );
+    assert_eq!(lp("/Users/me/tmp/x"), PathBuf::from("/Users/me/tmp/x"));
+    assert_eq!(lp("/tmp"), PathBuf::from("/private/tmp"));
+    assert_eq!(
+        lp("/var/folders/x"),
+        PathBuf::from("/private/var/folders/x")
+    );
+    assert_eq!(
+        lp("/private/var/folders/x"),
+        PathBuf::from("/private/var/folders/x")
+    );
+    assert_eq!(
+        lp("/System/Volumes/Data/tmp/a"),
+        PathBuf::from("/private/tmp/a")
+    );
+}
+
+#[test]
+fn ver_logical_path_normalizes_case_of_the_data_mount() {
+    // Low: APFS is case-insensitive by default; prune matching is exact.
+    use swamp_core::volume_ledger::pass::logical_path;
+    let lp = |p: &str| logical_path(Path::new(p), Path::new("/System/Volumes/Data"));
+    assert_eq!(
+        lp("/system/volumes/data/Users/me"),
+        PathBuf::from("/Users/me"),
+        "case spelling of the data mount is not normalized"
+    );
+}
+
+#[test]
+fn ver_a_negative_residual_is_flagged_and_huge_values_do_not_panic() {
+    use swamp_core::growth::VolumeMetaRow;
+    let meta = VolumeMetaRow {
+        measured_at: NOW,
+        cycle_started_at: NOW,
+        cycle_complete_at: NOW,
+        complete: true,
+        budget_secs: 60,
+        budget_used_ms: 1,
+        statfs_at: NOW,
+        container_total: Some(2_000),
+        container_used: Some(1_000),
+        container_free: Some(1_000),
+        data_volume_used: Some(1_000),
+    };
+    let mk = |p: &str, b: u64| Row {
+        path: p.into(),
+        category: Category::Other,
+        bytes: Some(b),
+        overlap_bytes: 0,
+        entries: Some(1),
+        unreadable: 0,
+        measured_at: NOW,
+        method: "walk".into(),
+        exactness: Exactness::Exact,
+        note: None,
+    };
+    // Clones counted per file: 1011 measured on 1000 used.
+    let a = account(&[mk("/a", 1_011)], &meta);
+    assert_eq!(a.residual.bytes, Some(-11));
+    assert!(a.residual.residual_flag, "a -1.1% residual must flag");
+    let a = account(&[mk("/a", 1_010)], &meta);
+    assert!(!a.residual.residual_flag, "exactly 1% is within");
+    let a = account(&[mk("/a", u64::MAX), mk("/b", u64::MAX)], &meta);
+    assert!(a.residual.residual_flag);
+    assert_eq!(a.residual.bytes, Some(i64::MIN));
+}
