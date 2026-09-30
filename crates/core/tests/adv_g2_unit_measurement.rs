@@ -198,19 +198,24 @@ fn adv_a_huge_bin_is_bounded_and_never_a_sampled_newest() {
     let fx = rustup_fixture();
     let bin = fx.rustup.join("toolchains/huge/bin");
     fs::create_dir_all(&bin).unwrap();
-    for i in 0..10_000 {
+    // One entry over the listing cap is enough to make the listing a
+    // sample (10,000 files took 97 s on the fleet's ZFS).
+    let over = swamp_core::locations::SHALLOW_LIST_CAP + 1;
+    for i in 0..over {
         let p = bin.join(format!("f{i:05}"));
         fs::write(&p, b"").unwrap();
         set_times(&p, OLD, OLD);
     }
     // The newest one sorts last, beyond the shallow-list cap.
-    set_times(&bin.join("f09999"), NEWER, NEWER);
+    set_times(&bin.join(format!("f{:05}", over - 1)), NEWER, NEWER);
     let started = Instant::now();
     let (units, work) = swamp_core::work_counters::measured(|| measure(&fx.scope, fx.store.path()));
     let unit = toolchains_of(&units);
     assert!(started.elapsed() < Duration::from_secs(60));
+    // Never a value at all: which entries a capped listing keeps depends
+    // on the filesystem's directory order, so even NEWER would be luck.
     assert!(
-        unit.last_used.at.is_none() || unit.last_used.at == Some(NEWER as u64),
+        unit.last_used.at.is_none(),
         "a sample's newest was reported as the unit's: {:?}",
         unit.last_used
     );
