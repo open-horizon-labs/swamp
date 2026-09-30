@@ -14,7 +14,7 @@ observations, not general performance guarantees. See the README for current use
   when that is incomplete; a rustup default toolchain, a mise global tool and a
   formula installed on request are marked and held out of the regenerable total,
   and `unknown` when the manager's record could not be read. A scheduled `observe`
-  asks the managers two read-only questions each (dry runs only) into a new
+  asks the managers two read-only questions each (dry runs only, from fixed program paths, a scrubbed environment and one fixed directory) into a new
   `manager_facts.parquet` that older versions ignore; `report` and the TUI start
   no process.
 - **Each unit says when it was last run or opened, and where that comes from.**

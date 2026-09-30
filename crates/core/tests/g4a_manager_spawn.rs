@@ -90,7 +90,10 @@ fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn()
     // that fails the observation. Each attempt is counted, and each probe
     // says why it has no answer.
     let (rows, spawns, _) = run(Duration::from_secs(2));
-    assert_eq!(spawns, 0, "nothing is started for a program that is not there");
+    assert_eq!(
+        spawns, 0,
+        "nothing is started for a program that is not there"
+    );
     let notes = not_observed(&rows);
     assert!(notes.len() >= 4, "{notes:?}");
     assert!(

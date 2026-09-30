@@ -673,7 +673,7 @@ path. Each row says, as facts with their sources:
   such as Xcode's `WorkspacePath` or a standalone Cargo target's dep-info).
 - **What a package manager reports**, quoted verbatim and attributed:
   `Homebrew reports unneeded (brew autoremove): "Would autoremove 4 unneeded
-  formulae:"`, `mise reports prunable (mise prune --dry-run): "mise
+  formulae:"`, `mise reports prunable (mise prune --tools --dry-run): "mise
   poetry@2.1.3 is prunable: ..."`. Swamp never says a unit is unused, obsolete or
   safe; these are the manager's sentences.
 - **The removal path that exists.** A standalone Cargo target: Trash after
@@ -690,8 +690,15 @@ path. Each row says, as facts with their sources:
 | unclassified | not established | no detector says what is inside | none |
 | standalone-cargo-target | rebuild | rebuild with `cargo build` | Cargo's own consequence, stated on the row |
 
+When a build adapter's own text is used, it decides the class: text that names a
+download or reinstall is `download`, one that names a rebuild is `rebuild`, one that
+says the bytes are gone or unique is `not-regenerable`, one that says removal breaks
+something, or says nothing about cost, is `not-established` and stays out of the
+regenerable total.
+
 **Scope statement.** Every listing prints `consumer evidence checked against N
-projects in M declared roots`. If a declared root is missing, unreadable, only
+projects in M declared roots`; with no declared root it says `consumer evidence covers
+the built-in default roots only` and marks the evidence incomplete. If a declared root is missing, unreadable, only
 partly read or excluded, it says `incomplete` and names the root; an explicit
 root named on the command line says the declared roots were not used; with no
 declared roots it says only the built-in roots were checked. A row with no
@@ -712,8 +719,14 @@ the observation, and nowhere else: `report` and the TUI read what it stored and
 start no process. It asks only `brew autoremove --dry-run`, `brew list --formula
 --installed-on-request`, `mise prune --dry-run` and `mise ls --global --json`,
 and reads rustup's `settings.toml`. Each command is an allow-listed shape in the
-spawn layer, counted, killed after 20 seconds (the pass after 45), with pagers,
-colour and Homebrew's auto-update off; output over 1 MiB is refused. A missing
+spawn layer, counted, killed after 20 seconds (the pass after 45). The program is
+found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`,
+`~/.cargo/bin`), never through `PATH`; the child's environment is built from scratch
+(only `HOME`, a fixed `PATH`, colour, pager and Homebrew auto-update/analytics/cleanup
+off, and `MISE_GLOBAL_CONFIG_FILE` when you set it); and it runs from `/`, so a project
+directory cannot change what mise lists. Output over 1 MiB is refused. Every quote shows
+when it was recorded and says `older than this listing` when a later observation did not
+run the pass; a quote naming one version of a tool says so. A missing
 binary, a time-out, a non-zero exit or output that is not the expected shape is
 one `not observed` line in the view's coverage notes, never an error. The answers
 are stored in `manager_facts.parquet`, a table older versions ignore (the store

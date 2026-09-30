@@ -215,7 +215,6 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["github"]),
             (Krate::Core, &["actions"]),
             (Krate::Core, &["schedule"]),
-            (Krate::Core, &["manager_facts"]),
         ],
         why: "every module that starts a process is one of these",
     },
@@ -283,16 +282,16 @@ const GROUPS: &[Group] = &[
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Brew",
-        allowed: &[(Krate::Core, &["manager_facts"])],
+        allowed: &[],
         why: "brew runs as an allow-listed detector command (`Program::named` in `locations`) \
-              and, in a scheduled observe only, as the manager's two read-only reports \
-              (`manager_facts`)",
+              and, in a scheduled observe only, through `spawn::ManagerCommand` \
+              (`manager_facts`), which cannot name a non-dry-run",
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Mise",
-        allowed: &[(Krate::Core, &["manager_facts"])],
-        why: "mise runs only as the manager's two read-only reports in a scheduled observe \
-              (`manager_facts`)",
+        allowed: &[],
+        why: "mise runs only through `spawn::ManagerCommand` in a scheduled observe \
+              (`manager_facts`), which cannot name a non-dry-run",
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Defaults",

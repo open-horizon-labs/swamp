@@ -2761,10 +2761,22 @@ fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
         assert!(reclaim_footer.contains("v view"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("q quit"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("? help"), "{reclaim_footer}");
-        // The footer is the same text on every view.
+        // Reclaim shows no key that only refuses: nothing in it is
+        // markable, so no delete or mark keys.
+        for gone in ["⌫ delete", "Space mark", "A mark all"] {
+            assert!(!reclaim_footer.contains(gone), "{reclaim_footer}");
+        }
+        // Every other view keeps its footer, on the same screen row.
+        let external = {
+            app.set_view(ViewKind::External);
+            footer_of(&app)
+        };
         for v in ViewKind::ALL {
+            if v == ViewKind::Reclaim {
+                continue;
+            }
             app.set_view(v);
-            assert_eq!(footer_of(&app), reclaim_footer, "w={w} view={v:?}");
+            assert_eq!(footer_of(&app), external, "w={w} view={v:?}");
         }
         app.set_view(ViewKind::Reclaim);
         // The heading is on the row every flat view puts it on.

@@ -622,7 +622,9 @@ impl Running {
             super::program_paths::Plan::Inherit => Command::new(binary),
             super::program_paths::Plan::Scrubbed(s) => {
                 let mut c = Command::new(&s.exe);
-                c.env_clear().envs(s.env.iter().cloned()).current_dir(&s.cwd);
+                c.env_clear()
+                    .envs(s.env.iter().cloned())
+                    .current_dir(&s.cwd);
                 c
             }
         };
@@ -796,7 +798,7 @@ mod tests {
             &hung_tree(),
             out.try_clone().unwrap(),
             err,
-            &super::program_paths::Plan::Inherit,
+            &crate::fs_gate::program_paths::Plan::Inherit,
         )
         .unwrap();
         let leader = r.child.id() as i32;

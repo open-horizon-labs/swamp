@@ -332,7 +332,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 /// person reaches for first: filter, view, refresh and delete come before
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
-fn footer_legend(width: usize, blocked: bool) -> String {
+fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
     const BASE: [&str; 11] = [
         "/ filter",
         "v view",
@@ -348,9 +348,14 @@ fn footer_legend(width: usize, blocked: bool) -> String {
     ];
     const TAIL: &str = "q quit";
     let mut items: Vec<&str> = BASE.to_vec();
+    if !markable {
+        // A view whose rows cannot be marked shows no key that only
+        // answers with a refusal.
+        items.retain(|k| !matches!(*k, "⌫ delete" | "Space mark" | "A mark all"));
+    }
     if blocked {
         // What the last check could not include, one key from the list.
-        items.insert(4, "b blocked");
+        items.insert(items.len().min(4), "b blocked");
     }
     let all_items = items;
     let mut n = all_items.len();
@@ -829,7 +834,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else if app.editing_filter {
         "Tab complete · Enter apply · Esc cancel".to_string()
     } else {
-        footer_legend(size.width as usize, !app.blocked.is_empty())
+        footer_legend(
+            size.width as usize,
+            !app.blocked.is_empty(),
+            app.view != crate::app::ViewKind::Reclaim,
+        )
     };
     frame.render_widget(Paragraph::new(footer_text), chunks[4]);
 

@@ -79,7 +79,11 @@ fn migrated(program: Program) -> bool {
 fn test_override(program: Program) -> Option<Option<PathBuf>> {
     let dir = std::env::var_os("SWAMP_TEST_PROGRAM_DIR")?;
     let path = Path::new(&dir).join(program.binary());
-    Some(std::fs::metadata(&path).is_ok_and(|m| m.is_file()).then_some(path))
+    Some(
+        std::fs::metadata(&path)
+            .is_ok_and(|m| m.is_file())
+            .then_some(path),
+    )
 }
 
 #[cfg(not(feature = "testing"))]
@@ -93,7 +97,10 @@ fn is_file(path: &Path) -> bool {
 
 /// The environment a migrated program's child gets.
 fn scrubbed_env(program: Program, exe: &Path, home: &str) -> Vec<(String, String)> {
-    let dir = exe.parent().map(|d| d.display().to_string()).unwrap_or_default();
+    let dir = exe
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
     let mut env: Vec<(String, String)> = [
         ("PATH", format!("{dir}:/usr/bin:/bin")),
         ("HOME", home.to_string()),
@@ -157,7 +164,11 @@ mod tests {
 
     #[test]
     fn the_environment_is_built_from_scratch_and_names_only_what_is_documented() {
-        let env = scrubbed_env(Program::Brew, Path::new("/opt/homebrew/bin/brew"), "/Users/x");
+        let env = scrubbed_env(
+            Program::Brew,
+            Path::new("/opt/homebrew/bin/brew"),
+            "/Users/x",
+        );
         let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         for k in names.iter() {
             assert!(

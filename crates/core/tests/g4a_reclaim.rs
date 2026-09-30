@@ -1319,3 +1319,78 @@ fn building_the_view_does_no_io() {
     });
     assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
 }
+
+/// The tempting wrong patch: only `default_toolchain` is read, so a
+/// toolchain a project directory pins in `[overrides]` looks like any
+/// other and counts as regenerable.
+#[test]
+fn a_toolchain_pinned_by_an_override_is_held_out_as_pinned() {
+    let mut fake = Fake::new();
+    fake.settings = Some(
+        "default_toolchain = \"stable-aarch64-apple-darwin\"\n[overrides]\n\"/h/src/proj\" = \"nightly-2024-01-01-aarch64-apple-darwin\"\n"
+            .into(),
+    );
+    let rows = collect_within(
+        &rustup_units(),
+        &fake,
+        NOW,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    assert!(rows.iter().any(|f| f.kind == FactKind::PinnedByOverride));
+    let mut units = rustup_units();
+    units[1].children = vec![
+        entry("stable-aarch64-apple-darwin", 2 * GB as i64),
+        entry("nightly-2024-01-01-aarch64-apple-darwin", GB as i64),
+        entry("beta-aarch64-apple-darwin", GB as i64),
+    ];
+    units[1].bytes = 4 * GB;
+    let v = view_of(&units, &[], &facts(rows), &[present_root("/h/src")]);
+    let r = row(&v, "/h/.rustup/toolchains");
+    assert_eq!(r.held_bytes, 3 * GB);
+    assert_eq!(
+        r.children[1].hold.as_ref().map(|h| h.kind),
+        Some(HoldKind::PinnedByOverride)
+    );
+    assert!(r.children[2].hold.is_none());
+    assert!(render_text(&v).contains("pinned by override"));
+}
+
+/// The tempting wrong patch: a quote's age is only in the text, so an
+/// agent reading the JSON cannot tell a fresh verdict from a year-old one.
+#[test]
+fn a_manager_quote_carries_its_age_in_json() {
+    let mut f = fact(
+        "mise",
+        "prune-dry-run",
+        FactKind::ReportsPrunable,
+        Some("poetry@2.1.3"),
+        "mise poetry@2.1.3 is prunable: x",
+    );
+    f.observed_at = NOW - 10 * 86_400;
+    let mut checked = fact("mise", "prune-dry-run", FactKind::Checked, None, "");
+    checked.observed_at = NOW - 10 * 86_400;
+    let mut g = fact("mise", "global-tools", FactKind::Checked, None, "");
+    g.observed_at = NOW - 10 * 86_400;
+    let v = view_of(
+        &[{
+            let mut u = unit(
+                "mise",
+                StorageCategory::Installation,
+                "/h/.local/share/mise/installs",
+                GB,
+            );
+            u.children = vec![entry("poetry", GB as i64)];
+            u
+        }],
+        &[],
+        &facts(vec![pass(), f, checked, g]),
+        &[present_root("/h/src")],
+    );
+    let j = serde_json::to_value(&v).unwrap();
+    let q = &j["rows"][0]["children"][0]["manager"][0];
+    assert_eq!(q["days_before_listing"], 10);
+    assert_eq!(q["older_than_listing"], true);
+    assert!(q["covers"].as_str().unwrap().contains("version 2.1.3 only"));
+    assert!(render_text(&v).contains("10 days before this listing; older than this listing"));
+}

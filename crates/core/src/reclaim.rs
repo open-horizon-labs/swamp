@@ -208,7 +208,11 @@ impl ManagerQuote {
             format!(
                 "quoted {} day{} before this listing; older than this listing",
                 self.days_before_listing,
-                if self.days_before_listing == 1 { "" } else { "s" }
+                if self.days_before_listing == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             )
         } else {
             "quoted from the pass beside this listing".to_string()
@@ -580,7 +584,14 @@ fn regeneration_of(
 fn class_from_consequence(words: &str, category_class: RegenClass) -> RegenClass {
     let w = words.to_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|n| w.contains(n));
-    if has(&["are gone", "is gone", "cannot", "may be unique", "starts empty", "is lost"]) {
+    if has(&[
+        "are gone",
+        "is gone",
+        "cannot",
+        "may be unique",
+        "starts empty",
+        "is lost",
+    ]) {
         return RegenClass::NotRegenerable;
     }
     if has(&["breaks"]) {
@@ -643,7 +654,9 @@ fn quote(
     let older = f.observed_at + SAME_PASS_SLACK_SECS < listing_at;
     let subject = f.subject.clone().unwrap_or_default();
     let covers = match (decl.subject, subject.rsplit_once('@')) {
-        (crate::locations::SubjectShape::NameBeforeAt, Some((_, version))) if !version.is_empty() => {
+        (crate::locations::SubjectShape::NameBeforeAt, Some((_, version)))
+            if !version.is_empty() =>
+        {
             Some(format!(
                 "names version {version} only; other versions of this tool are not covered"
             ))
@@ -823,7 +836,9 @@ fn join_manager(
             .unwrap_or_default();
         join.unit_hold = Some(Hold {
             kind,
-            label: format!("{probe_label}; not separable from this unit (no listed folder matches)"),
+            label: format!(
+                "{probe_label}; not separable from this unit (no listed folder matches)"
+            ),
             subjects: join.unmatched_hold_subjects.clone(),
             whole_unit: true,
         });
@@ -951,17 +966,15 @@ fn unit_row(
     let u = &input.units[index];
     let now = input.observed_at;
     let regeneration = regeneration_of(u, input.interiors);
-    let join = managed
-        .contains_key(&index)
-        .then(|| {
-            join_manager(
-                input.units,
-                managed,
-                index,
-                input.manager_facts,
-                input.observed_at,
-            )
-        });
+    let join = managed.contains_key(&index).then(|| {
+        join_manager(
+            input.units,
+            managed,
+            index,
+            input.manager_facts,
+            input.observed_at,
+        )
+    });
     let (held, unit_quotes, unit_hold) = match &join {
         Some(j) => (
             held_bytes_of(u, j),
@@ -1433,6 +1446,55 @@ mod tests {
             assert!(!s.complete, "{roots:?}");
             assert!(s.statement.contains("incomplete"), "{}", s.statement);
         }
+    }
+
+    /// The tempting wrong patch: the category's class is used whatever
+    /// the tool's own text says, so a session scratch directory whose
+    /// removal "breaks that session" counts as regenerable by download.
+    #[test]
+    fn the_tools_own_words_decide_the_class() {
+        use RegenClass::*;
+        let c = class_from_consequence;
+        assert_eq!(
+            c(
+                "session scratch; removing it during a session breaks that session",
+                Download
+            ),
+            NotEstablished
+        );
+        assert_eq!(
+            c(
+                "this emulator's apps and data are gone; a recreated AVD starts empty",
+                NotEstablished
+            ),
+            NotRegenerable
+        );
+        assert_eq!(
+            c(
+                "iOS_23F77 is downloaded again when a simulator needs it",
+                Download
+            ),
+            Download
+        );
+        assert_eq!(c("the next simulator boot rebuilds it", Download), Rebuild);
+        assert_eq!(
+            c("reinstall `ndk;29` with sdkmanager: a download", Download),
+            Download
+        );
+        assert_eq!(c("something with no cost in it", Download), NotEstablished);
+    }
+
+    #[test]
+    fn no_declared_root_is_incomplete_and_says_how_to_fix_it() {
+        let s = scope_statement(40, &[], false);
+        assert!(!s.complete);
+        assert!(
+            s.statement.starts_with(
+                "consumer evidence covers the built-in default roots only (40 projects)"
+            )
+        );
+        assert!(s.statement.contains("swamp config add-root"));
+        assert!(!s.statement.contains("0 declared roots"));
     }
 
     #[test]

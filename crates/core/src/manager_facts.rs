@@ -906,6 +906,117 @@ mise poetry@2.1.3 [dryrun]  remove ~/.local/share/mise/installs/poetry/2.1.3\n";
         ));
     }
 
+    /// The tempting wrong patch: split the name at the first dash. Host
+    /// triples and dates contain dashes.
+    #[test]
+    fn toolchain_names_are_parsed_not_split_at_the_first_dash() {
+        let t = |n| parse_toolchain(n).unwrap();
+        assert_eq!(t("stable").host, None);
+        let x = t("nightly-2024-01-01-aarch64-apple-darwin");
+        assert_eq!(
+            (x.channel, x.date, x.host),
+            ("nightly", Some("2024-01-01"), Some("aarch64-apple-darwin"))
+        );
+        let x = t("1.90.0-x86_64-unknown-linux-gnu");
+        assert_eq!(
+            (x.channel, x.date, x.host),
+            ("1.90.0", None, Some("x86_64-unknown-linux-gnu"))
+        );
+        let x = t("1.90-aarch64-apple-darwin");
+        assert_eq!((x.channel, x.host), ("1.90", Some("aarch64-apple-darwin")));
+        assert_eq!(t("nightly-2024-01-01").host, None);
+        assert!(parse_toolchain("my-linked").is_none());
+        use SubjectShape::ChannelWithHostTriple as C;
+        assert!(subject_matches(
+            C,
+            "nightly-2024-01-01",
+            "nightly-2024-01-01-aarch64-apple-darwin"
+        ));
+        assert!(!subject_matches(
+            C,
+            "nightly-2024-01-01",
+            "nightly-2024-01-02-aarch64-apple-darwin"
+        ));
+        assert!(!subject_matches(
+            C,
+            "nightly",
+            "nightly-2024-01-01-aarch64-apple-darwin"
+        ));
+        assert!(subject_matches(
+            C,
+            "nightly",
+            "nightly-aarch64-apple-darwin"
+        ));
+        assert!(subject_matches(
+            C,
+            "stable-aarch64-apple-darwin",
+            "stable-aarch64-apple-darwin"
+        ));
+        assert!(!subject_matches(
+            C,
+            "stable-x86_64-apple-darwin",
+            "stable-aarch64-apple-darwin"
+        ));
+        assert!(subject_matches(C, "1.90", "1.90-aarch64-apple-darwin"));
+        assert!(!subject_matches(C, "1.9", "1.90-aarch64-apple-darwin"));
+    }
+
+    /// Each mise backend prefix maps to the folder mise itself makes.
+    #[test]
+    fn mise_backend_tools_join_their_install_folders() {
+        use SubjectShape::NameBeforeAt as N;
+        for (tool, folder) in [
+            ("npm:prettier", "npm-prettier"),
+            ("npm:@scope/pkg", "npm-@scope-pkg"),
+            ("cargo:ripgrep", "cargo-ripgrep"),
+            ("aqua:cli/cli", "aqua-cli-cli"),
+            ("github:owner/repo", "github-owner-repo"),
+            ("ubi:owner/repo", "ubi-owner-repo"),
+            ("pipx:black", "pipx-black"),
+            ("go:golang.org/x/tools/gopls", "go-golang.org-x-tools-gopls"),
+            ("gem:rubocop", "gem-rubocop"),
+            ("asdf:plugin", "asdf-plugin"),
+            ("node", "node"),
+        ] {
+            assert!(subject_matches(N, tool, folder), "{tool}");
+            assert!(
+                subject_matches(N, &format!("{tool}@1.2.3"), folder),
+                "{tool}@version"
+            );
+        }
+        assert!(!subject_matches(N, "npm:prettier", "npm-eslint"));
+    }
+
+    /// A tap formula is named in full and lives under its short name.
+    #[test]
+    fn tap_and_versioned_formulae_join_their_cellar_folder() {
+        use SubjectShape::FolderName as F;
+        assert!(subject_matches(F, "user/tap/foo", "foo"));
+        assert!(subject_matches(F, "llvm@20", "llvm@20"));
+        assert!(!subject_matches(F, "llvm@20", "llvm"));
+        assert!(!subject_matches(F, "user/tap/foo", "bar"));
+    }
+
+    /// The header is printed through Homebrew's `oh1` formatter, arrow
+    /// first, singular or plural, with or without colour.
+    #[test]
+    fn brew_autoremove_real_shapes() {
+        let (h, n) = parse_brew_autoremove(
+            b"==> Would autoremove 1 unneeded formula:
+libevent
+",
+        )
+        .unwrap();
+        assert_eq!(h, "Would autoremove 1 unneeded formula:");
+        assert_eq!(n, vec!["libevent"]);
+        let (_, n) = parse_brew_autoremove(
+            b"\x1b[34m==>\x1b[0m \x1b[1mWould autoremove 2 unneeded formulae:\x1b[0m\nuser/tap/foo\nunbound\n",
+        )
+        .unwrap();
+        assert_eq!(n, vec!["user/tap/foo", "unbound"]);
+        assert_eq!(parse_brew_autoremove(b"").unwrap().1, Vec::<String>::new());
+    }
+
     #[test]
     fn every_kind_label_round_trips() {
         for k in [

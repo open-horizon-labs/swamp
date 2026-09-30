@@ -21,4 +21,4 @@
 "cost from: category default                                                     "
 "                                                                                "
 "                                                                                "
-"/ filter  v view  R refresh  ⌫ delete  Space mark  A mark all  ? help  q quit   "
+"/ filter  v view  R refresh  ↑↓ move  →/← in/out  g/s/n/t/a sort  ? help  q quit"

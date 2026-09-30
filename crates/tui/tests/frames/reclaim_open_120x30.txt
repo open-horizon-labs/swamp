@@ -27,4 +27,4 @@
 "cost from: detector recovery hint                                                                                       "
 "                                                                                                                        "
 "                                                                                                                        "
-"/ filter  v view  R refresh  ⌫ delete  Space mark  A mark all  ↑↓ move  →/← in/out  g/s/n/t/a sort  ? help  q quit      "
+"/ filter  v view  R refresh  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                             "
