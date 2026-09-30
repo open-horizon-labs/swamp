@@ -15,7 +15,7 @@ use swamp_core::walk::resize_artifact;
 
 fn put(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 struct Fx {

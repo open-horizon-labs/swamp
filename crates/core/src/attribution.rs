@@ -761,7 +761,7 @@ mod tests {
 
     fn touch(path: &Path, bytes: u64) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, vec![b'x'; bytes as usize]).unwrap();
+        fs::write(path, crate::fs_gate::settle::noise(bytes as usize)).unwrap();
     }
 
     #[test]
@@ -1055,7 +1055,7 @@ mod tests {
     fn a_just_written_file_is_counted_at_what_the_filesystem_reports() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("fresh.bin");
-        fs::write(&p, vec![7u8; 20_480]).unwrap();
+        fs::write(&p, crate::fs_gate::settle::noise(20_480)).unwrap();
         let m = fs::symlink_metadata(&p).unwrap();
         assert_eq!(allocated_bytes(&m), m.blocks() * 512);
     }

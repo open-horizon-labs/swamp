@@ -2395,7 +2395,11 @@ mod registry_reach_tests {
         let pool = tmp.path().join("pool/task/proj");
         add_worktree(&main, &pool, "task");
         fs::create_dir_all(pool.join("target/debug")).unwrap();
-        fs::write(pool.join("target/debug/blob"), vec![7u8; 1 << 20]).unwrap();
+        fs::write(
+            pool.join("target/debug/blob"),
+            crate::fs_gate::settle::noise(1 << 20),
+        )
+        .unwrap();
 
         let (root, pool, main) = (canon(&root), canon(&pool), canon(&main));
         let (discovered, attribution, reach) = walk(&root);
@@ -2446,7 +2450,11 @@ mod registry_reach_tests {
         let main = root.join("proj");
         init_repo(&main);
         fs::create_dir_all(main.join("target")).unwrap();
-        fs::write(main.join("target/blob"), vec![1u8; 64 << 10]).unwrap();
+        fs::write(
+            main.join("target/blob"),
+            crate::fs_gate::settle::noise(64 << 10),
+        )
+        .unwrap();
         let root = canon(&root);
         let main_id = id_for(&canon(&main).display().to_string());
 
@@ -2454,7 +2462,11 @@ mod registry_reach_tests {
         let pool = tmp.path().join("pool/task/proj");
         add_worktree(&main, &pool, "task");
         fs::create_dir_all(pool.join("target")).unwrap();
-        fs::write(pool.join("target/blob"), vec![2u8; 1 << 20]).unwrap();
+        fs::write(
+            pool.join("target/blob"),
+            crate::fs_gate::settle::noise(1 << 20),
+        )
+        .unwrap();
         let (_, after, _) = walk(&root);
 
         // `git worktree add` itself writes the new entry's registry

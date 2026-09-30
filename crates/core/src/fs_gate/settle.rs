@@ -30,19 +30,31 @@ const PROBE_MIN_ALLOCATED: u64 = 32 * 1024;
 const POLL: Duration = Duration::from_millis(100);
 const CAP: Duration = Duration::from_secs(15);
 
-/// Blocks until everything written before this call reports its
-/// allocation. Panics, never continues silently, when the filesystem
-/// still reports the token allocation after the cap.
-pub fn settle() {
-    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ std::process::id() as u64;
-    let data: Vec<u8> = (0..PROBE_BYTES)
+/// `len` bytes that no filesystem compresses (deterministic xorshift).
+/// Fixture data for any test that asserts exact allocated bytes: on
+/// ZFS-backed storage `st_blocks` is the *compressed* size, so a run of
+/// one byte value or a repeating 0..255 pattern reports a small fraction
+/// of its length (measured on the fleet: 2 MiB of `b'a'` reported ~100 KB).
+pub fn noise<N: TryInto<usize>>(len: N) -> Vec<u8> {
+    let len = len
+        .try_into()
+        .unwrap_or_else(|_| panic!("noise: length out of range"));
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
             (state >> 24) as u8
         })
-        .collect();
+        .collect()
+}
+
+/// Blocks until everything written before this call reports its
+/// allocation. Panics, never continues silently, when the filesystem
+/// still reports the token allocation after the cap.
+pub fn settle() {
+    let data = noise(PROBE_BYTES);
     let probe = tempfile::Builder::new()
         .prefix("swamp-settle-probe-")
         .tempfile()

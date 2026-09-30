@@ -25,7 +25,11 @@ fn growth_appears_on_file_row_and_every_directory_in_the_chain() {
     // first observation, so a `FileRow` baseline exists to diff against;
     // below that threshold the file is never tracked as a row at all.
     let big_path = deep_dir.join("big.bin");
-    fixture::write_settled(&big_path, vec![b'x'; 2 * 1024 * 1024]).expect("write initial file");
+    fixture::write_settled(
+        &big_path,
+        swamp_core::fs_gate::settle::noise(2 * 1024 * 1024),
+    )
+    .expect("write initial file");
 
     // First observation: baseline.
     let first = report_with_dirs(&fx.root, None, false, Some(store.path()), Some("1h"), true)
@@ -38,7 +42,8 @@ fn growth_appears_on_file_row_and_every_directory_in_the_chain() {
     // Grow the file to 50 MiB, three levels deep in Source (not inside
     // any folded artifact).
     let big_bytes = 50 * 1024 * 1024;
-    fixture::write_settled(&big_path, vec![b'x'; big_bytes]).expect("write big file");
+    fixture::write_settled(&big_path, swamp_core::fs_gate::settle::noise(big_bytes))
+        .expect("write big file");
 
     let second = report_with_dirs(&fx.root, None, false, Some(store.path()), Some("1h"), true)
         .expect("second report");

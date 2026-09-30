@@ -718,7 +718,11 @@ fn a_sparse_unit_separates_apparent_length_from_allocated_blocks() {
     // A dense directory claims no sparseness.
     let dense = tmp.path().join("dense");
     fs::create_dir_all(&dense).unwrap();
-    fs::write(dense.join("blob"), vec![7u8; 64 * 1024]).unwrap();
+    fs::write(
+        dense.join("blob"),
+        swamp_core::fs_gate::settle::noise(64 * 1024),
+    )
+    .unwrap();
     swamp_core::fs_gate::settle::settle();
     let dense_unit = external_unit("synthetic", "Synthetic", StorageCategory::Cache, &dense);
     let dense_plan_unit = swamp_core::actions::unit_from_external(&dense_unit);

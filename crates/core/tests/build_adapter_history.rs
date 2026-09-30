@@ -38,7 +38,7 @@ fn git_init(root: &Path) {
 
 fn write(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 /// A Node checkout: an installed dependency, a build output and a

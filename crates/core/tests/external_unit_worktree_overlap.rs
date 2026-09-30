@@ -68,10 +68,18 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let home = tempfile::tempdir().unwrap();
     let scratch = home.path().join("scratch");
     fs::create_dir_all(&scratch).unwrap();
-    fs::write(scratch.join("session-note.json"), vec![1u8; 3 << 20]).unwrap();
+    fs::write(
+        scratch.join("session-note.json"),
+        swamp_core::fs_gate::settle::noise(3 << 20),
+    )
+    .unwrap();
     let wt = scratch.join("wt-feature");
     fs::create_dir_all(wt.join("target")).unwrap();
-    fs::write(wt.join("target/artifact.bin"), vec![2u8; 16 << 20]).unwrap();
+    fs::write(
+        wt.join("target/artifact.bin"),
+        swamp_core::fs_gate::settle::noise(16 << 20),
+    )
+    .unwrap();
     // 1 GiB apparent, almost nothing allocated: allocated accounting.
     let sparse = fs::File::create(wt.join("target/sparse.bin")).unwrap();
     sparse.set_len(1 << 30).unwrap();

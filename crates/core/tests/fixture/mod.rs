@@ -58,14 +58,8 @@ pub struct Fixture {
 /// creating parent directories as needed.
 fn write_pattern(path: &Path, size: u64) {
     fs::create_dir_all(path.parent().expect("path has parent")).expect("mkdir parent");
-    let pattern: Vec<u8> = (0..=255u8).collect();
-    let mut remaining = size as usize;
-    let mut buf = Vec::with_capacity(size as usize);
-    while remaining > 0 {
-        let take = remaining.min(pattern.len());
-        buf.extend_from_slice(&pattern[..take]);
-        remaining -= take;
-    }
+    // Incompressible: on ZFS-backed storage st_blocks is the compressed size.
+    let buf = swamp_core::fs_gate::settle::noise(size);
     fs::write(path, &buf).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 }
 

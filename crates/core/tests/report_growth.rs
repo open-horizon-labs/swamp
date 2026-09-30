@@ -76,7 +76,7 @@ fn byte_only_updates_persist_sequentially_and_noop_without_redundant_delta() {
     let first_update_bytes = 1024 * 1024;
     fixture::write_settled(
         fx.node_modules.join("persistence-probe"),
-        vec![b'a'; first_update_bytes],
+        swamp_core::fs_gate::settle::noise(first_update_bytes),
     )
     .expect("write first probe");
     let first_update = report_with(&fx.root, None, false, Some(store.path()), Some("24h"))
@@ -94,7 +94,7 @@ fn byte_only_updates_persist_sequentially_and_noop_without_redundant_delta() {
     let second_update_bytes = 2 * 1024 * 1024;
     fixture::write_settled(
         fx.node_modules.join("persistence-probe"),
-        vec![b'b'; second_update_bytes],
+        swamp_core::fs_gate::settle::noise(second_update_bytes),
     )
     .expect("write second probe");
     let second_update = report_with(&fx.root, None, false, Some(store.path()), Some("24h"))
@@ -148,8 +148,11 @@ fn growing_one_artifact_shows_growth_there_and_zero_elsewhere() {
 
     // Grow node_modules by exactly 5 MiB.
     let grow_bytes = 5 * 1024 * 1024;
-    fixture::write_settled(fx.node_modules.join("growth-probe"), vec![b'g'; grow_bytes])
-        .expect("write growth probe");
+    fixture::write_settled(
+        fx.node_modules.join("growth-probe"),
+        swamp_core::fs_gate::settle::noise(grow_bytes),
+    )
+    .expect("write growth probe");
 
     let second =
         report_with(&fx.root, None, false, Some(store.path()), Some("1h")).expect("second report");
@@ -214,8 +217,11 @@ fn deleting_and_recreating_target_counts_one_regrowth() {
     );
 
     fs::create_dir_all(&fx.target_dir).expect("recreate target/");
-    fixture::write_settled(fx.target_dir.join("rebuilt"), vec![b'x'; 4096])
-        .expect("write rebuilt file");
+    fixture::write_settled(
+        fx.target_dir.join("rebuilt"),
+        swamp_core::fs_gate::settle::noise(4096),
+    )
+    .expect("write rebuilt file");
 
     let after_recreate =
         report_with(&fx.root, None, false, Some(store.path()), Some("1h")).expect("third report");
@@ -368,7 +374,7 @@ fn no_observe_still_reports_growth_from_an_existing_store() {
     let grow_bytes = 3 * 1024 * 1024;
     fixture::write_settled(
         fx.node_modules.join("no-observe-probe"),
-        vec![b'g'; grow_bytes],
+        swamp_core::fs_gate::settle::noise(grow_bytes),
     )
     .expect("write growth probe");
 
@@ -383,7 +389,7 @@ fn no_observe_still_reports_growth_from_an_existing_store() {
     let grow_more = 1024 * 1024;
     fixture::write_settled(
         fx.node_modules.join("no-observe-probe-2"),
-        vec![b'h'; grow_more],
+        swamp_core::fs_gate::settle::noise(grow_more),
     )
     .expect("write second growth probe");
 

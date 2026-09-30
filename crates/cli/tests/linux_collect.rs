@@ -95,10 +95,14 @@ fn tree(root: &Path) {
     std::fs::write(root.join("proj/src/lib.rs"), "").unwrap();
     std::fs::write(
         root.join("proj/target/debug/deps/a.rlib"),
-        vec![1u8; 20_000],
+        swamp_core::fs_gate::settle::noise(20_000),
     )
     .unwrap();
-    std::fs::write(root.join("other/node_modules/x/i.js"), vec![2u8; 9_000]).unwrap();
+    std::fs::write(
+        root.join("other/node_modules/x/i.js"),
+        swamp_core::fs_gate::settle::noise(9_000),
+    )
+    .unwrap();
     // Real checkouts: the incremental merge is exercised where it is
     // used. (A root with no checkout at all -- every byte unowned -- does
     // not re-measure changed unowned directories incrementally on either
@@ -142,7 +146,7 @@ fn a_collector_makes_observations_incremental_only_while_it_runs() {
     std::thread::sleep(Duration::from_millis(1100));
     std::fs::write(
         root.join("proj/target/debug/deps/b.rlib"),
-        vec![3u8; 40_000],
+        swamp_core::fs_gate::settle::noise(40_000),
     )
     .unwrap();
     let second = observe(&root, &store, &home, false);
@@ -154,7 +158,7 @@ fn a_collector_makes_observations_incremental_only_while_it_runs() {
     drop(c1);
     std::fs::write(
         root.join("other/node_modules/x/while-stopped.js"),
-        vec![4u8; 30_000],
+        swamp_core::fs_gate::settle::noise(30_000),
     )
     .unwrap();
     let third = observe(&root, &store, &home, false);
@@ -173,7 +177,7 @@ fn a_collector_makes_observations_incremental_only_while_it_runs() {
     std::fs::create_dir_all(root.join("proj/target/debug/incremental/s1")).unwrap();
     std::fs::write(
         root.join("proj/target/debug/incremental/s1/q.bin"),
-        vec![5u8; 12_000],
+        swamp_core::fs_gate::settle::noise(12_000),
     )
     .unwrap();
     let fifth = observe(&root, &store, &home, false);

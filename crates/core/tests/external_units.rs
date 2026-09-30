@@ -43,7 +43,7 @@ fn only_cargo_home_config() -> ScanConfig {
 
 fn write_pattern(path: &std::path::Path, bytes: u64) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes as usize]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes as usize)).unwrap();
 }
 
 fn cargo_home_unit(units: &[ExternalUnit]) -> &ExternalUnit {

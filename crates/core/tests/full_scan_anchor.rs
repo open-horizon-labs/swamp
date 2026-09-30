@@ -13,7 +13,11 @@ impl FsEventsSource for Baseline {
     fn anchor_before_full(&self, root: &Path) -> Option<(u64, u64)> {
         self.0.fetch_add(1, Ordering::SeqCst);
         // If the hook moves after the walk this file is absent from its total.
-        std::fs::write(root.join("during-anchor"), vec![1u8; 512 * 1024]).unwrap();
+        std::fs::write(
+            root.join("during-anchor"),
+            swamp_core::fs_gate::settle::noise(512 * 1024),
+        )
+        .unwrap();
         // #197: the walk that follows must see this file's allocation.
         swamp_core::fs_gate::settle::settle();
         Some((71, std::fs::metadata(root).unwrap().dev()))
