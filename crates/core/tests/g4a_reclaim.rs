@@ -90,7 +90,13 @@ fn present_root(path: &str) -> DeclaredRoot {
     }
 }
 
-fn fact(manager: &str, probe: &str, kind: FactKind, subject: Option<&str>, text: &str) -> ManagerFact {
+fn fact(
+    manager: &str,
+    probe: &str,
+    kind: FactKind,
+    subject: Option<&str>,
+    text: &str,
+) -> ManagerFact {
     ManagerFact {
         manager: manager.to_string(),
         probe: probe.to_string(),
@@ -276,7 +282,12 @@ fn an_explicit_root_says_the_declared_roots_were_not_used() {
 
 #[test]
 fn every_listing_states_the_scope_in_the_documented_words() {
-    let v = view_of(&[], &[], &ManagerFacts::default(), &[present_root("/h/src")]);
+    let v = view_of(
+        &[],
+        &[],
+        &ManagerFacts::default(),
+        &[present_root("/h/src")],
+    );
     assert_eq!(
         v.scope.statement,
         "consumer evidence checked against 3 projects in 1 declared root"
@@ -327,7 +338,12 @@ fn rustup_default(name: &str) -> ManagerFacts {
 fn the_active_default_toolchain_is_held_out_by_channel_and_by_exact_name() {
     for spelling in ["stable", "stable-aarch64-apple-darwin"] {
         let units = rustup_units();
-        let v = view_of(&units, &[], &rustup_default(spelling), &[present_root("/h/src")]);
+        let v = view_of(
+            &units,
+            &[],
+            &rustup_default(spelling),
+            &[present_root("/h/src")],
+        );
         let r = row(&v, "/h/.rustup/toolchains");
         let stable = &r.children[0];
         assert_eq!(
@@ -407,15 +423,38 @@ fn a_mise_global_tool_and_an_on_request_formula_are_held_out() {
     );
     let mf = facts(vec![
         pass(),
-        fact("mise", "global-tools", FactKind::ActiveDefault, Some("node"), "listed in the global configuration /h/.config/mise/config.toml"),
+        fact(
+            "mise",
+            "global-tools",
+            FactKind::ActiveDefault,
+            Some("node"),
+            "listed in the global configuration /h/.config/mise/config.toml",
+        ),
         fact("mise", "global-tools", FactKind::Checked, None, ""),
         fact("mise", "prune-dry-run", FactKind::Checked, None, ""),
-        fact("brew", "installed-on-request", FactKind::InstalledOnRequest, Some("go"), "installed on request"),
-        fact("brew", "installed-on-request", FactKind::InstalledOnRequest, Some("ripgrep"), "installed on request"),
+        fact(
+            "brew",
+            "installed-on-request",
+            FactKind::InstalledOnRequest,
+            Some("go"),
+            "installed on request",
+        ),
+        fact(
+            "brew",
+            "installed-on-request",
+            FactKind::InstalledOnRequest,
+            Some("ripgrep"),
+            "installed on request",
+        ),
         fact("brew", "installed-on-request", FactKind::Checked, None, ""),
         fact("brew", "autoremove-dry-run", FactKind::Checked, None, ""),
     ]);
-    let v = view_of(&[installs, node, go, other], &[], &mf, &[present_root("/h/src")]);
+    let v = view_of(
+        &[installs, node, go, other],
+        &[],
+        &mf,
+        &[present_root("/h/src")],
+    );
     let mise = row(&v, "/h/.local/share/mise/installs");
     assert_eq!(mise.held_bytes, GB, "only the global tool is held");
     assert_eq!(
@@ -424,7 +463,10 @@ fn a_mise_global_tool_and_an_on_request_formula_are_held_out() {
     );
     assert!(mise.children[1].hold.is_none());
     let go = row(&v, "/opt/homebrew/Cellar/go");
-    assert_eq!(go.hold.as_ref().map(|h| h.kind), Some(HoldKind::InstalledOnRequest));
+    assert_eq!(
+        go.hold.as_ref().map(|h| h.kind),
+        Some(HoldKind::InstalledOnRequest)
+    );
     assert_eq!(go.held_bytes, GB);
     let node_brew = row(&v, "/opt/homebrew/Cellar/node");
     assert!(node_brew.hold.is_none(), "a dependency is not held");
@@ -472,7 +514,8 @@ fn rows_sum_to_the_unit_total_and_the_totals_partition() {
             assert_eq!(sum, r.bytes as i64, "{}", r.path);
         }
         assert_eq!(
-            r.regenerable_bytes + r.held_bytes
+            r.regenerable_bytes
+                + r.held_bytes
                 + match r.regeneration.class {
                     RegenClass::NotRegenerable | RegenClass::NotEstablished => r.bytes,
                     _ => 0,
@@ -508,7 +551,12 @@ fn a_folder_that_was_not_measured_is_never_shown_as_zero() {
     locked.bytes = None;
     locked.measure = ChildMeasure::NotMeasured;
     u.children = vec![entry("open", 100), locked];
-    let v = view_of(&[u], &[], &ManagerFacts::default(), &[present_root("/h/src")]);
+    let v = view_of(
+        &[u],
+        &[],
+        &ManagerFacts::default(),
+        &[present_root("/h/src")],
+    );
     let r = row(&v, "/h/.cache/x");
     let locked = &r.children[1];
     assert_eq!(locked.bytes, None);
@@ -554,7 +602,12 @@ fn sorting_is_deterministic_with_ties() {
     let big = unit("uv", StorageCategory::Cache, "/h/z", 2 * GB);
     let mut mixed = make(&["/h/c", "/h/a"]);
     mixed.push(big);
-    let m = view_of(&mixed, &[], &ManagerFacts::default(), &[present_root("/h/src")]);
+    let m = view_of(
+        &mixed,
+        &[],
+        &ManagerFacts::default(),
+        &[present_root("/h/src")],
+    );
     assert_eq!(paths(&m)[0], "/h/z", "bytes descending first");
 }
 
@@ -565,13 +618,21 @@ fn no_record_is_never_rendered_as_a_date() {
     let mut u = unit("uv", StorageCategory::Cache, "/h/.cache/uv", GB);
     u.mtime_max = NOW - 86_400;
     u.children = vec![entry("wheels", GB as i64)];
-    let v = view_of(&[u], &[], &ManagerFacts::default(), &[present_root("/h/src")]);
+    let v = view_of(
+        &[u],
+        &[],
+        &ManagerFacts::default(),
+        &[present_root("/h/src")],
+    );
     let r = row(&v, "/h/.cache/uv");
     assert_eq!(r.last_used_text, "no record");
     assert_eq!(r.children[0].last_used_text.as_deref(), Some("no record"));
     let text = render_text(&v);
     assert!(text.contains("last used: no record"));
-    for month in ["Jan ", "Feb ", "Mar ", "Apr ", "May ", "Jun ", "Jul ", "Aug ", "Sep ", "Oct ", "Nov ", "Dec ", "1970"] {
+    for month in [
+        "Jan ", "Feb ", "Mar ", "Apr ", "May ", "Jun ", "Jul ", "Aug ", "Sep ", "Oct ", "Nov ",
+        "Dec ", "1970",
+    ] {
         assert!(!text.contains(month), "{month} in\n{text}");
     }
     let json = serde_json::to_value(&v).unwrap();
@@ -583,13 +644,20 @@ fn no_record_is_never_rendered_as_a_date() {
 #[test]
 fn a_last_used_fact_shows_its_source() {
     let mut u = unit("xcode", StorageCategory::BuildOutput, "/h/DerivedData", GB);
-    u.last_used = LastUsed::default().with_tool_native(
-        swamp_core::last_used::XCODE_DERIVED_DATA,
-        NOW - 86_400 * 24,
+    u.last_used = LastUsed::default()
+        .with_tool_native(swamp_core::last_used::XCODE_DERIVED_DATA, NOW - 86_400 * 24);
+    let v = view_of(
+        &[u],
+        &[],
+        &ManagerFacts::default(),
+        &[present_root("/h/src")],
     );
-    let v = view_of(&[u], &[], &ManagerFacts::default(), &[present_root("/h/src")]);
     let r = row(&v, "/h/DerivedData");
-    assert!(r.last_used_text.contains("Xcode DerivedData record"), "{}", r.last_used_text);
+    assert!(
+        r.last_used_text.contains("Xcode DerivedData record"),
+        "{}",
+        r.last_used_text
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -624,11 +692,29 @@ fn manager_statements_are_verbatim_and_attributed_never_swamps_own() {
     let prune = "mise poetry@2.1.3 is prunable: no tracked config or tool stub requires poetry";
     let mf = facts(vec![
         pass(),
-        fact("brew", "autoremove-dry-run", FactKind::ReportsUnneeded, Some("llvm@20"), header),
-        fact("brew", "autoremove-dry-run", FactKind::ReportsUnneeded, Some("libevent"), header),
+        fact(
+            "brew",
+            "autoremove-dry-run",
+            FactKind::ReportsUnneeded,
+            Some("llvm@20"),
+            header,
+        ),
+        fact(
+            "brew",
+            "autoremove-dry-run",
+            FactKind::ReportsUnneeded,
+            Some("libevent"),
+            header,
+        ),
         fact("brew", "autoremove-dry-run", FactKind::Checked, None, ""),
         fact("brew", "installed-on-request", FactKind::Checked, None, ""),
-        fact("mise", "prune-dry-run", FactKind::ReportsPrunable, Some("poetry@2.1.3"), prune),
+        fact(
+            "mise",
+            "prune-dry-run",
+            FactKind::ReportsPrunable,
+            Some("poetry@2.1.3"),
+            prune,
+        ),
         fact("mise", "prune-dry-run", FactKind::Checked, None, ""),
         fact("mise", "global-tools", FactKind::Checked, None, ""),
     ]);
@@ -649,9 +735,16 @@ fn manager_statements_are_verbatim_and_attributed_never_swamps_own() {
         "mise reports prunable (mise prune --dry-run)"
     );
     let text = render_text(&v);
-    assert!(text.contains("Homebrew reports unneeded (brew autoremove): \"Would autoremove 2 unneeded formulae:\""));
+    assert!(text.contains(
+        "Homebrew reports unneeded (brew autoremove): \"Would autoremove 2 unneeded formulae:\""
+    ));
     assert!(text.contains(prune));
-    for verdict in ["safe to remove", "safe to delete", "can be removed", "should remove"] {
+    for verdict in [
+        "safe to remove",
+        "safe to delete",
+        "can be removed",
+        "should remove",
+    ] {
         assert!(!text.to_lowercase().contains(verdict), "{verdict}");
     }
 }
@@ -711,8 +804,18 @@ impl ProbeRunner for Fake {
 
 fn manager_units() -> Vec<ExternalUnit> {
     vec![
-        unit("homebrew-other", StorageCategory::Installation, "/opt/homebrew", GB),
-        unit("mise", StorageCategory::Installation, "/h/.local/share/mise/installs", GB),
+        unit(
+            "homebrew-other",
+            StorageCategory::Installation,
+            "/opt/homebrew",
+            GB,
+        ),
+        unit(
+            "mise",
+            StorageCategory::Installation,
+            "/h/.local/share/mise/installs",
+            GB,
+        ),
     ]
 }
 
@@ -732,11 +835,7 @@ fn kinds(rows: &[ManagerFact], manager: &str) -> Vec<(String, FactKind)> {
 fn a_manager_that_is_missing_slow_garbled_or_flooding_is_a_coverage_note() {
     let huge = vec![b'a'; manager_facts::MAX_OUTPUT + 1];
     let cases: Vec<(&str, Fake, &str)> = vec![
-        (
-            "missing",
-            Fake::new(),
-            "is not installed or not on PATH",
-        ),
+        ("missing", Fake::new(), "is not installed or not on PATH"),
         (
             "timeout",
             Fake::new()
@@ -747,7 +846,10 @@ fn a_manager_that_is_missing_slow_garbled_or_flooding_is_a_coverage_note() {
         (
             "garbage",
             Fake::new()
-                .answer("brew", Ok(out(Some(0), &[0xff, 0xfe, 0x00, 0x01], b"", false)))
+                .answer(
+                    "brew",
+                    Ok(out(Some(0), &[0xff, 0xfe, 0x00, 0x01], b"", false)),
+                )
                 .answer("mise", Ok(out(Some(0), b"\x00\x01garbage", b"", false))),
             "could not be read",
         ),
@@ -779,11 +881,16 @@ fn a_manager_that_is_missing_slow_garbled_or_flooding_is_a_coverage_note() {
             .filter(|f| f.kind == FactKind::NotObserved)
             .collect();
         assert!(!observed.is_empty(), "{name}");
-        assert!(observed.iter().all(|f| f.text.contains(why)), "{name}: {observed:?}");
+        assert!(
+            observed.iter().all(|f| f.text.contains(why)),
+            "{name}: {observed:?}"
+        );
         assert!(
             !rows.iter().any(|f| matches!(
                 f.kind,
-                FactKind::ReportsUnneeded | FactKind::ReportsPrunable | FactKind::InstalledOnRequest
+                FactKind::ReportsUnneeded
+                    | FactKind::ReportsPrunable
+                    | FactKind::InstalledOnRequest
             )),
             "{name}: a failed probe reports nothing"
         );
@@ -796,7 +903,11 @@ fn a_manager_that_is_missing_slow_garbled_or_flooding_is_a_coverage_note() {
             v.coverage_notes
         );
         let mise = row(&v, "/h/.local/share/mise/installs");
-        assert_eq!(mise.hold.as_ref().map(|h| h.kind), Some(HoldKind::Unknown), "{name}");
+        assert_eq!(
+            mise.hold.as_ref().map(|h| h.kind),
+            Some(HoldKind::Unknown),
+            "{name}"
+        );
         assert_eq!(mise.regenerable_bytes, 0, "{name}");
     }
 }
@@ -808,8 +919,19 @@ fn a_manager_that_lists_nothing_is_checked_not_absent() {
     let fake = Fake::new()
         .answer("brew autoremove", Ok(out(Some(0), b"", b"", false)))
         .answer("brew list", Ok(out(Some(0), b"", b"", false)))
-        .answer("mise prune", Ok(out(Some(0), b"", b"mise pruned configuration links [dryrun]\n", false)))
-        .answer("mise ls", Ok(out(Some(0), b"{}", b"mise WARN update available\n", false)));
+        .answer(
+            "mise prune",
+            Ok(out(
+                Some(0),
+                b"",
+                b"mise pruned configuration links [dryrun]\n",
+                false,
+            )),
+        )
+        .answer(
+            "mise ls",
+            Ok(out(Some(0), b"{}", b"mise WARN update available\n", false)),
+        );
     let rows = collect_within(
         &manager_units(),
         &fake,
@@ -820,7 +942,9 @@ fn a_manager_that_lists_nothing_is_checked_not_absent() {
     for (manager, probes) in [("brew", 2), ("mise", 2)] {
         let k = kinds(&rows, manager);
         assert_eq!(
-            k.iter().filter(|(_, kind)| *kind == FactKind::Checked).count(),
+            k.iter()
+                .filter(|(_, kind)| *kind == FactKind::Checked)
+                .count(),
             probes,
             "{manager}: {k:?}"
         );
@@ -911,13 +1035,19 @@ fn the_pass_asks_only_dry_runs_and_stores_the_answers_it_read() {
         .filter_map(|f| f.subject.as_deref())
         .collect();
     assert_eq!(unneeded, vec!["libevent", "libnghttp2", "unbound", "usage"]);
-    let prune = rows.iter().find(|f| f.kind == FactKind::ReportsPrunable).unwrap();
+    let prune = rows
+        .iter()
+        .find(|f| f.kind == FactKind::ReportsPrunable)
+        .unwrap();
     assert_eq!(prune.subject.as_deref(), Some("poetry@2.1.3"));
     assert_eq!(
         prune.text,
         "mise poetry@2.1.3 is prunable: no tracked config or tool stub requires poetry"
     );
-    assert!(rows.iter().any(|f| f.kind == FactKind::ActiveDefault && f.subject.as_deref() == Some("node")));
+    assert!(
+        rows.iter()
+            .any(|f| f.kind == FactKind::ActiveDefault && f.subject.as_deref() == Some("node"))
+    );
 }
 
 /// The settings-file probe for a default toolchain reads the file the
@@ -925,7 +1055,8 @@ fn the_pass_asks_only_dry_runs_and_stores_the_answers_it_read() {
 #[test]
 fn rustup_default_comes_from_the_settings_file_the_detector_declared() {
     let mut fake = Fake::new();
-    fake.settings = Some("version = \"12\"\ndefault_toolchain = \"stable-aarch64-apple-darwin\"\n".into());
+    fake.settings =
+        Some("version = \"12\"\ndefault_toolchain = \"stable-aarch64-apple-darwin\"\n".into());
     let rows = collect_within(
         &rustup_units(),
         &fake,
@@ -933,8 +1064,14 @@ fn rustup_default_comes_from_the_settings_file_the_detector_declared() {
         Duration::from_secs(60),
         Duration::from_secs(1),
     );
-    assert!(fake.seen.lock().unwrap().is_empty(), "no command runs for a settings file");
-    let d = rows.iter().find(|f| f.kind == FactKind::ActiveDefault).unwrap();
+    assert!(
+        fake.seen.lock().unwrap().is_empty(),
+        "no command runs for a settings file"
+    );
+    let d = rows
+        .iter()
+        .find(|f| f.kind == FactKind::ActiveDefault)
+        .unwrap();
     assert_eq!(d.subject.as_deref(), Some("stable-aarch64-apple-darwin"));
     // Unreadable or malformed settings are a note, not a guess.
     for settings in [None, Some("this is [ not toml".to_string())] {
@@ -963,7 +1100,12 @@ fn rustup_default_comes_from_the_settings_file_the_detector_declared() {
 fn removal_paths_are_only_the_ones_that_exist() {
     let v = view_of(
         &[
-            unit("rustup", StorageCategory::Installation, "/h/.rustup/toolchains", GB),
+            unit(
+                "rustup",
+                StorageCategory::Installation,
+                "/h/.rustup/toolchains",
+                GB,
+            ),
             unit("uv", StorageCategory::Cache, "/h/.cache/uv", GB),
             unit("codex", StorageCategory::LocalState, "/h/.codex", GB),
         ],
@@ -971,8 +1113,14 @@ fn removal_paths_are_only_the_ones_that_exist() {
         &ManagerFacts::default(),
         &[present_root("/h/src")],
     );
-    assert_eq!(row(&v, "/tmp/cargo-target").removal.kind, RemovalKind::TrashReviewed);
-    assert_eq!(row(&v, "/tmp/cargo-target").kind, KIND_STANDALONE_CARGO_TARGET);
+    assert_eq!(
+        row(&v, "/tmp/cargo-target").removal.kind,
+        RemovalKind::TrashReviewed
+    );
+    assert_eq!(
+        row(&v, "/tmp/cargo-target").kind,
+        KIND_STANDALONE_CARGO_TARGET
+    );
     assert_eq!(
         row(&v, "/h/.rustup/toolchains").removal.text,
         "tool command, not available yet"
@@ -1009,7 +1157,13 @@ fn local_state_and_models_cannot_be_regenerated() {
 fn declared_consumers_and_recorded_links_are_kept_apart() {
     let mut u = unit("xcode", StorageCategory::BuildOutput, "/h/DerivedData", GB);
     let ev = |sub: FactSubtype, who: &str, source: EvidenceSource| {
-        Evidence::known(EvKind::Consumer, sub, FactValue::Text(who.into()), source, NOW)
+        Evidence::known(
+            EvKind::Consumer,
+            sub,
+            FactValue::Text(who.into()),
+            source,
+            NOW,
+        )
     };
     u.evidence = vec![
         ev(
@@ -1035,7 +1189,12 @@ fn declared_consumers_and_recorded_links_are_kept_apart() {
             Reason::fixed("content-addressed: no entry can be joined"),
         ),
     ];
-    let v = view_of(&[u], &[], &ManagerFacts::default(), &[present_root("/h/src")]);
+    let v = view_of(
+        &[u],
+        &[],
+        &ManagerFacts::default(),
+        &[present_root("/h/src")],
+    );
     let c = &row(&v, "/h/DerivedData").consumers;
     assert_eq!(c.declared.len(), 1);
     assert_eq!(c.declared[0].label, "api");
@@ -1076,12 +1235,36 @@ fn no_verdict_words_and_no_em_dashes_anywhere_in_the_rendered_view() {
     units.extend(manager_units());
     let mf = facts(vec![
         pass(),
-        fact("rustup", "settings-default", FactKind::ActiveDefault, Some("stable"), "default_toolchain \"stable\" in settings.toml"),
+        fact(
+            "rustup",
+            "settings-default",
+            FactKind::ActiveDefault,
+            Some("stable"),
+            "default_toolchain \"stable\" in settings.toml",
+        ),
         fact("rustup", "settings-default", FactKind::Checked, None, ""),
-        fact("brew", "autoremove-dry-run", FactKind::ReportsUnneeded, Some("libevent"), "Would autoremove 1 unneeded formulae:"),
+        fact(
+            "brew",
+            "autoremove-dry-run",
+            FactKind::ReportsUnneeded,
+            Some("libevent"),
+            "Would autoremove 1 unneeded formulae:",
+        ),
         fact("brew", "autoremove-dry-run", FactKind::Checked, None, ""),
-        fact("brew", "installed-on-request", FactKind::NotObserved, None, "brew exited with status 1"),
-        fact("mise", "prune-dry-run", FactKind::NotObserved, None, "mise is not installed or not on PATH"),
+        fact(
+            "brew",
+            "installed-on-request",
+            FactKind::NotObserved,
+            None,
+            "brew exited with status 1",
+        ),
+        fact(
+            "mise",
+            "prune-dry-run",
+            FactKind::NotObserved,
+            None,
+            "mise is not installed or not on PATH",
+        ),
     ]);
     let roots = [
         present_root("/h/src"),
@@ -1096,13 +1279,20 @@ fn no_verdict_words_and_no_em_dashes_anywhere_in_the_rendered_view() {
     assert!(!blob.contains('\u{2014}'), "an em dash");
     assert!(!blob.contains('\u{2013}'), "an en dash");
     let lower = blob.to_lowercase();
-    for word in ["unused", "obsolete", "stale", "orphan", "junk", "garbage", "safe"] {
+    for word in [
+        "unused", "obsolete", "stale", "orphan", "junk", "garbage", "safe",
+    ] {
         let bad = lower
             .split(|c: char| !c.is_alphanumeric())
             .any(|w| w == word);
         assert!(!bad, "verdict word {word:?} in\n{blob}");
     }
-    for phrase in ["can be deleted", "can be removed", "should delete", "should remove"] {
+    for phrase in [
+        "can be deleted",
+        "can be removed",
+        "should delete",
+        "should remove",
+    ] {
         assert!(!lower.contains(phrase), "{phrase}");
     }
 }

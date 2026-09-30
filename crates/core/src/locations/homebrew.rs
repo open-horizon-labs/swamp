@@ -26,9 +26,9 @@
 //!   other two, so nothing is counted twice.
 
 use super::{
-    CommandOutcome, Detector, Environment, LastUseDecl, LastUseSource, LocationStatus,
-    ManagerDecl, ManagerProbe, Platform, ProposedLocation, Provenance, StorageCategory,
-    StoreAnchor, SubjectShape,
+    CommandOutcome, Detector, Environment, LastUseDecl, LastUseSource, LocationStatus, ManagerDecl,
+    ManagerProbe, Platform, ProposedLocation, Provenance, StorageCategory, StoreAnchor,
+    SubjectShape,
 };
 
 pub const HOMEBREW_DETECTOR_ID: &str = "homebrew";

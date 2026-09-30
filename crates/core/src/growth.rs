@@ -7665,11 +7665,7 @@ mod tests {
         let got = read_manager_fact_table(dir);
         assert!(got.observed);
         assert_eq!(got.facts.len(), 2, "{:?}", got.facts);
-        assert!(
-            got.facts
-                .iter()
-                .all(|f| f.subject.as_deref() != Some("x"))
-        );
+        assert!(got.facts.iter().all(|f| f.subject.as_deref() != Some("x")));
     }
     #[test]
     fn artifact_and_file_compaction_preserve_sources_on_publish_failure() -> anyhow::Result<()> {

@@ -2864,7 +2864,9 @@ fn reclaim_strings_carry_no_verdict_words_and_no_em_dashes() {
         }
     }
     let lower = blob.to_lowercase();
-    for word in ["unused", "obsolete", "stale", "orphan", "junk", "garbage", "safe"] {
+    for word in [
+        "unused", "obsolete", "stale", "orphan", "junk", "garbage", "safe",
+    ] {
         assert!(
             !lower
                 .split(|c: char| !c.is_alphanumeric())

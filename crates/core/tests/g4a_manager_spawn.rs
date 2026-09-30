@@ -44,7 +44,11 @@ fn shim(dir: &Path, name: &str, body: &str) {
 
 fn units() -> Vec<ExternalUnit> {
     vec![
-        unit("homebrew-other", StorageCategory::Installation, "/opt/homebrew"),
+        unit(
+            "homebrew-other",
+            StorageCategory::Installation,
+            "/opt/homebrew",
+        ),
         unit(
             "mise",
             StorageCategory::Installation,
@@ -56,7 +60,13 @@ fn units() -> Vec<ExternalUnit> {
 fn run(timeout: Duration) -> (Vec<swamp_core::manager_facts::ManagerFact>, u64, Duration) {
     let started = Instant::now();
     let (rows, work) = swamp_core::work_counters::measured(|| {
-        collect_within(&units(), &SystemProbeRunner, 1, Duration::from_secs(120), timeout)
+        collect_within(
+            &units(),
+            &SystemProbeRunner,
+            1,
+            Duration::from_secs(120),
+            timeout,
+        )
     });
     (rows, work.subprocess_spawns, started.elapsed())
 }
@@ -82,7 +92,12 @@ fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn()
     assert_eq!(spawns, 4, "every attempt is a counted spawn");
     let notes = not_observed(&rows);
     assert!(notes.len() >= 4, "{notes:?}");
-    assert!(notes.iter().all(|n| n.contains("not installed or not on PATH")), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .all(|n| n.contains("not installed or not on PATH")),
+        "{notes:?}"
+    );
 
     // A program that never answers: the tempting wrong patch waits for it.
     shim(dir.path(), "brew", "exec /bin/sleep 60");
@@ -91,7 +106,10 @@ fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn()
     assert!(took < Duration::from_secs(20), "{took:?}");
     assert_eq!(spawns, 4, "every probe is one counted spawn");
     let notes = not_observed(&rows);
-    assert!(notes.iter().all(|n| n.contains("did not answer within")), "{notes:?}");
+    assert!(
+        notes.iter().all(|n| n.contains("did not answer within")),
+        "{notes:?}"
+    );
 
     // A flood: the tempting wrong patch reads it all into memory and
     // parses it. The capture is bounded and the answer is a note.
@@ -100,7 +118,10 @@ fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn()
     shim(dir.path(), "mise", flood);
     let (rows, _, _) = run(Duration::from_secs(30));
     let notes = not_observed(&rows);
-    assert!(notes.iter().all(|n| n.contains("could not be read")), "{notes:?}");
+    assert!(
+        notes.iter().all(|n| n.contains("could not be read")),
+        "{notes:?}"
+    );
     assert!(
         !rows.iter().any(|f| f.kind == FactKind::ReportsUnneeded),
         "a flood reports nothing"
@@ -111,7 +132,11 @@ fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn()
     shim(dir.path(), "brew", garbage);
     shim(dir.path(), "mise", garbage);
     let (rows, _, _) = run(Duration::from_secs(10));
-    assert!(not_observed(&rows).iter().all(|n| n.contains("could not be read")));
+    assert!(
+        not_observed(&rows)
+            .iter()
+            .all(|n| n.contains("could not be read"))
+    );
 
     // The real answers, in the real shape, through the real spawn layer.
     shim(
@@ -133,8 +158,14 @@ fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn()
             .filter_map(|f| f.subject.clone())
             .collect()
     };
-    assert_eq!(subjects(FactKind::ReportsUnneeded), vec!["libevent", "unbound"]);
-    assert_eq!(subjects(FactKind::InstalledOnRequest), vec!["ansible", "atuin"]);
+    assert_eq!(
+        subjects(FactKind::ReportsUnneeded),
+        vec!["libevent", "unbound"]
+    );
+    assert_eq!(
+        subjects(FactKind::InstalledOnRequest),
+        vec!["ansible", "atuin"]
+    );
     assert_eq!(subjects(FactKind::ReportsPrunable), vec!["poetry@2.1.3"]);
     assert_eq!(subjects(FactKind::ActiveDefault), vec!["node"]);
 }

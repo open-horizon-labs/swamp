@@ -372,12 +372,8 @@ pub fn parse_mise_global(stdout: &[u8]) -> Result<Vec<(String, String, String)>,
 /// How a probe's command is run. The real one is the gate's spawn; a
 /// test hands in a fake that answers, times out, or fails.
 pub trait ProbeRunner {
-    fn run(
-        &self,
-        program: Program,
-        args: &[&str],
-        timeout: Duration,
-    ) -> std::io::Result<RunOutput>;
+    fn run(&self, program: Program, args: &[&str], timeout: Duration)
+    -> std::io::Result<RunOutput>;
     /// The text of a settings file, or why it could not be read.
     fn read_settings(&self, path: &std::path::Path) -> Result<String, String>;
 }
@@ -711,7 +707,8 @@ mod tests {
             "a header that promises three names over two is not read"
         );
         assert!(
-            parse_brew_autoremove(b"Would autoremove 1 unneeded formulae:\nrm -rf /\n").is_err()
+            parse_brew_autoremove(b"Would autoremove 1 unneeded formulae:\nnot a name; x\n")
+                .is_err()
         );
         let huge = vec![b'a'; MAX_OUTPUT + 1];
         assert!(parse_brew_autoremove(&huge).is_err());

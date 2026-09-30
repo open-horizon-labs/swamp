@@ -215,6 +215,7 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["github"]),
             (Krate::Core, &["actions"]),
             (Krate::Core, &["schedule"]),
+            (Krate::Core, &["manager_facts"]),
         ],
         why: "every module that starts a process is one of these",
     },

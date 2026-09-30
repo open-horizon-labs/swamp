@@ -1101,10 +1101,9 @@ pub fn regeneration_for_category(category: StorageCategory) -> (RegenClass, &'st
             RegenClass::Download,
             "downloaded or derived again by the tool on next use",
         ),
-        StorageCategory::BuildOutput => (
-            RegenClass::Rebuild,
-            "rebuilt by the tool's build command",
-        ),
+        StorageCategory::BuildOutput => {
+            (RegenClass::Rebuild, "rebuilt by the tool's build command")
+        }
         StorageCategory::Environments => (
             RegenClass::NotEstablished,
             "recreating restores what the manifest names, not data added later",

@@ -259,11 +259,7 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("--prefix")],
             // The manager's own dry run: it lists, it removes nothing.
             &[Lit("autoremove"), Lit("--dry-run")],
-            &[
-                Lit("list"),
-                Lit("--formula"),
-                Lit("--installed-on-request"),
-            ],
+            &[Lit("list"), Lit("--formula"), Lit("--installed-on-request")],
         ],
         Program::Mise => &[
             &[Lit("prune"), Lit("--dry-run")],

@@ -90,9 +90,7 @@ fn observed() -> Fixture {
     }
 }
 
-fn input<'a>(
-    snapshot: &'a swamp_core::growth::ReportSnapshot,
-) -> ReclaimInput<'a> {
+fn input<'a>(snapshot: &'a swamp_core::growth::ReportSnapshot) -> ReclaimInput<'a> {
     ReclaimInput {
         units: &snapshot.external_units,
         interiors: &snapshot.store_interiors,
@@ -148,7 +146,11 @@ fn reading_the_stored_view_does_no_listing_no_stat_and_no_spawn() {
         &fx.store,
         &[
             fact(FactKind::Pass, None, ""),
-            fact(FactKind::ReportsUnneeded, Some("libevent"), "Would autoremove 1 unneeded formulae:"),
+            fact(
+                FactKind::ReportsUnneeded,
+                Some("libevent"),
+                "Would autoremove 1 unneeded formulae:",
+            ),
             fact(FactKind::Checked, None, ""),
         ],
     )
@@ -193,11 +195,9 @@ fn the_pass_refuses_to_write_into_a_store_a_newer_swamp_owns() {
     let _lock = serial();
     let fx = observed();
     std::fs::write(fx.store.join("housekeeping.version"), "99\n").unwrap();
-    let err = swamp_core::growth::write_manager_fact_table(
-        &fx.store,
-        &[fact(FactKind::Pass, None, "")],
-    )
-    .expect_err("a newer store is not modified");
+    let err =
+        swamp_core::growth::write_manager_fact_table(&fx.store, &[fact(FactKind::Pass, None, "")])
+            .expect_err("a newer store is not modified");
     assert!(err.to_string().contains("newer swamp"), "{err}");
     assert!(!fx.store.join("manager_facts.parquet").exists());
 }

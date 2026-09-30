@@ -647,6 +647,110 @@ folders, largest first, with size, modification time and last-used:
   view's row opens (`Enter`) onto them; the selected row's detail line
   carries the last-used fact.
 
+### The Reclaim view
+
+```bash
+swamp report --view reclaim
+swamp report --view reclaim --json
+```
+
+One row per unit of developer storage (every external unit, and each
+standalone Cargo target directory), largest allocated size first, ties by
+path. Each row says, as facts with their sources:
+
+- **Size and growth**, and, for a unit that is drilled into, its folders
+  (bounded top rows plus one remainder, adding up to the unit's size; a folder
+  that could not be read is `not measured`, never `0B`).
+- **Regeneration cost.** In order of precedence: the consequence text a build
+  adapter stated for the unit's own interior ("reinstall is a download --
+  iOS_23F77 is downloaded again when a simulator needs it"); the detector's
+  recovery hint with its command (`brew reinstall <formula>`); the category
+  default below. `cannot be regenerated` is said for local state and models.
+- **Last used**, with its source (`Sep 6 (Xcode DerivedData record)`, `Jul 8
+  (file access time)`) or `no record`, exactly as in the section above.
+- **Consumers**, in two tiers: declared (a project's declaration, a lockfile, a
+  manager's global default) and recorded links (what the tool itself recorded,
+  such as Xcode's `WorkspacePath` or a standalone Cargo target's dep-info).
+- **What a package manager reports**, quoted verbatim and attributed:
+  `Homebrew reports unneeded (brew autoremove): "Would autoremove 4 unneeded
+  formulae:"`, `mise reports prunable (mise prune --dry-run): "mise
+  poetry@2.1.3 is prunable: ..."`. Swamp never says a unit is unused, obsolete or
+  safe; these are the manager's sentences.
+- **The removal path that exists.** A standalone Cargo target: Trash after
+  review, marked in the TUI's unowned view. An installation: `tool command, not
+  available yet`. Everything else: `view only`.
+
+| Storage category | Class | Words when nothing more specific exists | Source |
+|---|---|---|---|
+| installation | download | reinstall is a download | each manager documents a reinstall command; the detector's hint has the exact one |
+| downloads, cache | download | downloaded or derived again by the tool on next use | npm, pip, uv, Cargo and Gradle document their caches as refilled on use |
+| build-output | rebuild | rebuilt by the tool's build command | the tool's own build command |
+| environments | not established | recreating restores what the manifest names, not data added later | an emulator's apps and data are not in a manifest |
+| local-state, models | not regenerable | cannot be regenerated | state a tool wrote for the user; a model's source may be gone |
+| unclassified | not established | no detector says what is inside | none |
+| standalone-cargo-target | rebuild | rebuild with `cargo build` | Cargo's own consequence, stated on the row |
+
+**Scope statement.** Every listing prints `consumer evidence checked against N
+projects in M declared roots`. If a declared root is missing, unreadable, only
+partly read or excluded, it says `incomplete` and names the root; an explicit
+root named on the command line says the declared roots were not used; with no
+declared roots it says only the built-in roots were checked. A row with no
+declared consumer says `none found among N projects in M declared roots`, never
+that nothing needs it: a tool used only by a project outside those roots looks
+exactly the same.
+
+**Defaults and requested installs are held out.** A rustup default toolchain, a
+tool in mise's global configuration and a Homebrew formula installed on request
+are marked `active default` / `installed on request` and excluded from the
+regenerable total. A unit that cannot separate them (Homebrew's remainder unit)
+is held whole. If the manager's own record could not be read, the row says
+`unknown` and is held out too; before the first manager pass every such row is
+`unknown`.
+
+**The manager pass** runs in `swamp observe` (the scheduled run included) after
+the observation, and nowhere else: `report` and the TUI read what it stored and
+start no process. It asks only `brew autoremove --dry-run`, `brew list --formula
+--installed-on-request`, `mise prune --dry-run` and `mise ls --global --json`,
+and reads rustup's `settings.toml`. Each command is an allow-listed shape in the
+spawn layer, counted, killed after 20 seconds (the pass after 45), with pagers,
+colour and Homebrew's auto-update off; output over 1 MiB is refused. A missing
+binary, a time-out, a non-zero exit or output that is not the expected shape is
+one `not observed` line in the view's coverage notes, never an error. The answers
+are stored in `manager_facts.parquet`, a table older versions ignore (the store
+marker does not change); a store without it reads as "not observed yet".
+
+**JSON** (`result` of the `--view reclaim` envelope):
+
+```text
+observed_at
+scope        { projects, declared_roots, complete, incomplete_because[], statement }
+totals       { count, bytes, regenerable_bytes, held_bytes,
+               not_regenerable_bytes, not_established_bytes,
+               per_kind[ { kind, count, bytes, regenerable_bytes } ],
+               scope_statement }
+coverage_notes[]
+rows[]       { path, kind, detector, bytes, growth_bytes?,
+               regeneration { class, words, source },
+               last_used { at|null, source, atime? }, last_used_text,
+               consumers { declared[], recorded_links[], unknown[], summary },
+               manager[ { manager, subject, quote, attribution } ],
+               hold? { kind, label, subjects[], whole_unit },
+               removal { kind, text }, regenerable_bytes, held_bytes, note?,
+               children[ { kind, name, bytes|null, measure, last_used,
+                           last_used_text?, text, manager[], hold? } ] }
+```
+
+`bytes == regenerable_bytes + held_bytes + not_regenerable_bytes +
+not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
+is not measured). `totals` is the object the storage headline reuses.
+
+In the TUI, `v` reaches the Reclaim view (after External). It is built from the
+stored facts, scans nothing on open, and keeps the same layout as every view:
+the scope statement sits under the heading, the cost, last-used fact and removal
+path are the signals (and the detail pane's first lines at any width), `→` or
+`Enter` opens a unit onto its folders, and a default is flagged beside its
+name. `R` refreshes exactly as before.
+
 ### Standalone Cargo target directories
 
 A directory `CARGO_TARGET_DIR` builds into, inside a root you declared,

@@ -34,7 +34,9 @@
 //! its `totals` object is what the storage headline builds on.
 
 use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
-use crate::evidence::{EvidenceSource, FactKind as EvidenceKind, FactStatus, FactSubtype, FactValue};
+use crate::evidence::{
+    EvidenceSource, FactKind as EvidenceKind, FactStatus, FactSubtype, FactValue,
+};
 use crate::external::ExternalUnit;
 use crate::last_used::LastUsed;
 use crate::locations::{ManagerDecl, ManagerProbe, RegenClass, Registry, StorageCategory};
@@ -72,7 +74,13 @@ pub struct ScopeStatement {
 /// declared roots' states. `explicit` is true when the scope is a root
 /// named on the command line, which replaces the declared roots.
 pub fn scope_statement(projects: usize, roots: &[DeclaredRoot], explicit: bool) -> ScopeStatement {
-    let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            one.to_string()
+        } else {
+            many.to_string()
+        }
+    };
     let projects_word = plural(projects, "project", "projects");
     if explicit {
         return ScopeStatement {
@@ -455,9 +463,17 @@ fn consumers_for(
         parts.push(format!(
             "declared consumers: none found among {} {} in {} declared {}{}",
             scope.projects,
-            if scope.projects == 1 { "project" } else { "projects" },
+            if scope.projects == 1 {
+                "project"
+            } else {
+                "projects"
+            },
             scope.declared_roots,
-            if scope.declared_roots == 1 { "root" } else { "roots" },
+            if scope.declared_roots == 1 {
+                "root"
+            } else {
+                "roots"
+            },
             if scope.complete { "" } else { " (incomplete)" },
         ));
     } else {
@@ -480,7 +496,10 @@ fn consumers_for(
 /// The cost half of a unit's row: the tool's consequence text when a
 /// build adapter identified the unit's interior, else the detector's own
 /// recovery hint, else the category default.
-fn regeneration_of(u: &ExternalUnit, interiors: &[crate::artifact::NestedArtifact]) -> Regeneration {
+fn regeneration_of(
+    u: &ExternalUnit,
+    interiors: &[crate::artifact::NestedArtifact],
+) -> Regeneration {
     let (class, default_words) = crate::locations::regeneration_for_category(u.category);
     if let Some((words, adapter)) = tool_consequence(u, interiors) {
         return Regeneration {
@@ -498,9 +517,7 @@ fn regeneration_of(u: &ExternalUnit, interiors: &[crate::artifact::NestedArtifac
             | StorageCategory::Cache
             | StorageCategory::BuildOutput
     );
-    if hint_applies
-        && let Some(hint) = crate::locations::recovery_hint_of(&u.detector_id)
-    {
+    if hint_applies && let Some(hint) = crate::locations::recovery_hint_of(&u.detector_id) {
         let (hint_class, words) = crate::locations::recovery_words(u.category, hint);
         return Regeneration {
             class: hint_class,
@@ -545,7 +562,10 @@ fn tool_consequence(
     } else {
         text
     };
-    Some((words, root.adapter.clone().unwrap_or_else(|| "unknown".into())))
+    Some((
+        words,
+        root.adapter.clone().unwrap_or_else(|| "unknown".into()),
+    ))
 }
 
 fn quote(decl: &ManagerDecl, probe: ManagerProbe, f: &ManagerFact) -> ManagerQuote {
@@ -611,7 +631,11 @@ fn claimed_elsewhere(
     managed.iter().any(|(&j, d)| {
         j != index && d.manager == manager && {
             let other = &units[j];
-            let folder = other.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let folder = other
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
             (!folder.is_empty() && manager_facts::subject_matches(d.subject, subject, folder))
                 || other.children.iter().any(|c| {
                     c.kind == ChildKind::Entry
@@ -648,8 +672,8 @@ fn join_manager(
                 continue;
             };
             let label = manager_facts::attribution(decl.display, *probe);
-            let to_unit = !folder.is_empty()
-                && manager_facts::subject_matches(decl.subject, subject, folder);
+            let to_unit =
+                !folder.is_empty() && manager_facts::subject_matches(decl.subject, subject, folder);
             let matched: Vec<usize> = u
                 .children
                 .iter()
@@ -662,7 +686,13 @@ fn join_manager(
                 .collect();
             if to_unit {
                 if kind.holds() {
-                    merge_hold(&mut join.unit_hold, hold_kind_of(kind), label, subject, true);
+                    merge_hold(
+                        &mut join.unit_hold,
+                        hold_kind_of(kind),
+                        label,
+                        subject,
+                        true,
+                    );
                 } else {
                     join.unit_quotes.push(quote(decl, *probe, f));
                 }
@@ -723,7 +753,9 @@ fn join_manager(
         .filter(|p| p.kind().holds())
         .collect();
     if !hold_probes.is_empty() {
-        let missing = hold_probes.iter().find(|p| !facts.checked(decl.manager, **p));
+        let missing = hold_probes
+            .iter()
+            .find(|p| !facts.checked(decl.manager, **p));
         if let Some(p) = missing {
             let why = if !facts.observed {
                 "the manager's records have not been observed yet; `swamp observe` reads them"
@@ -839,7 +871,11 @@ fn unit_row(
         .contains_key(&index)
         .then(|| join_manager(input.units, managed, index, input.manager_facts));
     let (held, unit_quotes, unit_hold) = match &join {
-        Some(j) => (held_bytes_of(u, j), j.unit_quotes.clone(), j.unit_hold.clone()),
+        Some(j) => (
+            held_bytes_of(u, j),
+            j.unit_quotes.clone(),
+            j.unit_hold.clone(),
+        ),
         None => (0, Vec::new(), None),
     };
     let children: Vec<ReclaimChild> = u
@@ -857,7 +893,10 @@ fn unit_row(
             child_of(c, now, quotes, hold)
         })
         .collect();
-    let regenerable = matches!(regeneration.class, RegenClass::Download | RegenClass::Rebuild);
+    let regenerable = matches!(
+        regeneration.class,
+        RegenClass::Download | RegenClass::Rebuild
+    );
     let (regenerable_bytes, held_bytes) = if regenerable {
         (u.bytes - held.min(u.bytes), held.min(u.bytes))
     } else {
@@ -887,7 +926,11 @@ fn unit_row(
     }
 }
 
-fn standalone_row(row: &UnownedRow, input: &ReclaimInput<'_>, scope: &ScopeStatement) -> ReclaimRow {
+fn standalone_row(
+    row: &UnownedRow,
+    input: &ReclaimInput<'_>,
+    scope: &ScopeStatement,
+) -> ReclaimRow {
     let now = input.observed_at;
     ReclaimRow {
         path: row.path_or_object.clone(),
@@ -1044,9 +1087,13 @@ fn unjoined_notes(
                 .collect();
             let reached = |s: &str| {
                 rows.iter().any(|r| {
-                    r.manager.iter().any(|q| q.subject == s && q.manager == decl.manager)
+                    r.manager
+                        .iter()
+                        .any(|q| q.subject == s && q.manager == decl.manager)
                         || r.children.iter().any(|c| {
-                            c.manager.iter().any(|q| q.subject == s && q.manager == decl.manager)
+                            c.manager
+                                .iter()
+                                .any(|q| q.subject == s && q.manager == decl.manager)
                         })
                 })
             };
@@ -1103,7 +1150,10 @@ pub fn hold_line(h: &Hold) -> String {
             } else {
                 String::new()
             };
-            format!("{}: {shown}{more}; held out of the regenerable total", h.label)
+            format!(
+                "{}: {shown}{more}; held out of the regenerable total",
+                h.label
+            )
         }
     }
 }
@@ -1164,9 +1214,7 @@ pub fn render_text(view: &ReclaimView) -> String {
             );
             for c in &r.children {
                 let size = match c.bytes {
-                    Some(b) if c.kind == ChildKind::Adjustment || b < 0 => {
-                        human_bytes_signed(b)
-                    }
+                    Some(b) if c.kind == ChildKind::Adjustment || b < 0 => human_bytes_signed(b),
                     Some(b) => human_bytes_pub(b.max(0) as u64),
                     None => "not measured".to_string(),
                 };
