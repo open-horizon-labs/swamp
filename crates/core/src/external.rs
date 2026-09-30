@@ -278,6 +278,70 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
     (candidates, out_of_scope)
 }
 
+/// Replaces each candidate its detector proposed as a *container*
+/// (`Detector::select_children`: Homebrew's Cellar and Caskroom) with the
+/// subdirectories the detector selects, so those are measured as units of
+/// their own and the container's unselected remainder is never measured
+/// as a unit at all.
+///
+/// The one place a listing happens for this, and it is the observation
+/// pass's: the container is listed once through the capped
+/// `locations::shallow_list`. Returns the new candidates, the out-of-scope
+/// list extended with selected children the user excluded (so a parent
+/// that absorbs them subtracts them, as for any other excluded nested
+/// location), and the containers that could not be listed completely
+/// (unreadable, or cut at the listing cap), which the ownership sweep must
+/// leave alone: an unlistable directory is not an empty one, and units
+/// stored under it are not gone.
+fn expand_containers(
+    candidates: Vec<Candidate>,
+    mut out_of_scope: Vec<PathBuf>,
+    scope: &EffectiveScope,
+    detectors: &crate::locations::Registry,
+) -> (Vec<Candidate>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut partial: Vec<PathBuf> = Vec::new();
+    for c in candidates {
+        let detector = detectors
+            .detectors()
+            .iter()
+            .find(|d| d.id() == c.detector_id);
+        // Asking with no names first is how a detector says whether this
+        // path is a container at all, before anything is listed.
+        if !detector.is_some_and(|d| d.select_children(&c.path, &[]).is_some()) {
+            out.push(c);
+            continue;
+        }
+        let listing = crate::locations::shallow_list(&c.path);
+        if listing.truncation.is_truncated() {
+            partial.push(crate::fs_gate::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone()));
+        }
+        let names: Vec<String> = listing
+            .iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.name.clone())
+            .collect();
+        let selected = detector
+            .and_then(|d| d.select_children(&c.path, &names))
+            .unwrap_or_default();
+        for name in selected {
+            let child = c.path.join(&name);
+            if scope.exclusion_for(&child).is_some() {
+                out_of_scope.push(crate::fs_gate::canonicalize(&child).unwrap_or(child));
+                continue;
+            }
+            out.push(Candidate {
+                detector_id: c.detector_id.clone(),
+                detector_name: c.detector_name.clone(),
+                category: c.category,
+                provenance: c.provenance.clone(),
+                path: child,
+            });
+        }
+    }
+    (out, out_of_scope, partial)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "testing")]
 pub fn discover_and_measure_with_worktrees(
@@ -364,7 +428,10 @@ pub fn observe_external(
     // was exactly this loop reading `scope.detectors` and so never
     // seeing the user's exclusion
     // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
+    let detectors = crate::locations::Registry::with_builtins();
     let (candidates, out_of_scope) = authorized_candidates(scope);
+    let (candidates, out_of_scope, partial_containers) =
+        expand_containers(candidates, out_of_scope, scope, &detectors);
     // Detector display names, captured from the authorized scope before
     // the candidates are consumed: a coverage note for an unreadable
     // unit still needs a human-readable tool name, and must not reach
@@ -397,7 +464,6 @@ pub fn observe_external(
     // adapter identifies each: the detector's declaration against the
     // adapter's, nothing else (`crate::build_stores::containers_for`).
     let adapters = crate::build_adapters::registry::Registry::with_builtins();
-    let detectors = crate::locations::Registry::with_builtins();
     let store_containers: HashMap<usize, crate::build_adapters::BuildContainer> = {
         let located: Vec<crate::build_stores::Located> = canon_candidates
             .iter()
@@ -652,7 +718,13 @@ pub fn observe_external(
     )
     // Inside a covered root, outside this pass: an excluded nested
     // location keeps its stored row exactly as it is.
-    .excluding(out_of_scope.clone());
+    .excluding(
+        out_of_scope
+            .iter()
+            .cloned()
+            .chain(partial_containers)
+            .collect(),
+    );
     if let Some(dir) = swamp_dir
         && observe
     {

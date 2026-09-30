@@ -1053,6 +1053,26 @@ pub trait Detector: Send + Sync {
         true
     }
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation>;
+    /// For a location this detector proposes as a *container* rather than
+    /// a unit: which of its immediate subdirectories are measured, each as
+    /// its own unit, in place of the container as a whole. `None` (the
+    /// default) means `container` is an ordinary location measured as one
+    /// unit.
+    ///
+    /// Asked only by the observation pass (`external::observe_external`),
+    /// which lists the container once through the capped `shallow_list`;
+    /// scope resolution, `swamp scope`, `report` and the TUI never call it
+    /// and so never list anything. Pure: it sees the names, not the disk,
+    /// so the boundary it draws is testable without a filesystem. The
+    /// observation pass first asks with no names, to learn whether the
+    /// path is a container at all before listing it.
+    fn select_children(
+        &self,
+        _container: &std::path::Path,
+        _names: &[String],
+    ) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Static registration, mirroring `EventBus::with_builtins`: every
@@ -1070,6 +1090,8 @@ impl Registry {
                 Box::new(cargo_home::CargoHomeDetector),
                 Box::new(rustup::RustupDetector),
                 Box::new(homebrew::HomebrewDetector),
+                Box::new(homebrew::HomebrewDevToolsDetector),
+                Box::new(homebrew::HomebrewOtherDetector),
                 Box::new(claude_code::ClaudeCodeDetector),
                 Box::new(claude_code::ClaudeCodeScratchDetector),
                 Box::new(codex::CodexDetector),

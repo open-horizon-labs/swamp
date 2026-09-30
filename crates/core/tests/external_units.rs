@@ -296,7 +296,7 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
     }
 
     // Five detectors genuinely do this, and all are correct to:
-    // Homebrew's prefixes, ruby-install's `/opt/rubies`,
+    // Homebrew's prefixes (three detectors), ruby-install's `/opt/rubies`,
     // CoreSimulator's and Xcode's system-wide `/Library/Developer`
     // directories and Claude Code's `/private/tmp/claude-<uid>` scratch
     // are machine-wide conventions, not per-user paths, so no `HOME` can relocate them.
@@ -327,6 +327,22 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
         ("homebrew", "/opt/homebrew/Caskroom"),
         ("homebrew", "/usr/local/Cellar"),
         ("homebrew", "/usr/local/Caskroom"),
+        // The default-on halves of Homebrew (#174): the dev tooling
+        // containers and the remainder unit, under the same prefixes.
+        (
+            "homebrew-devtools",
+            "/opt/homebrew/share/android-commandlinetools",
+        ),
+        ("homebrew-devtools", "/opt/homebrew/Cellar"),
+        ("homebrew-devtools", "/opt/homebrew/Caskroom"),
+        (
+            "homebrew-devtools",
+            "/usr/local/share/android-commandlinetools",
+        ),
+        ("homebrew-devtools", "/usr/local/Cellar"),
+        ("homebrew-devtools", "/usr/local/Caskroom"),
+        ("homebrew-other", "/opt/homebrew"),
+        ("homebrew-other", "/usr/local"),
         ("ruby-install", "/opt/rubies"),
     ];
     let unexpected: Vec<&(String, String)> = escaping

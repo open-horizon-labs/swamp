@@ -8,6 +8,22 @@
 //! still be found after `brew` itself is gone from `PATH`. The tool
 //! query is a bonus corroboration, not the only path to resolution, and
 //! its failure is reported on its own entry rather than swallowed.
+//!
+//! Three detectors share the prefix, so a machine's Homebrew bytes are
+//! reported in two honest parts by default and can be reported in full
+//! (#174):
+//!
+//! * `homebrew-devtools` (on by default): only the unambiguous
+//!   developer tooling: language toolchains and build tools on
+//!   [`DEV_FORMULAE`], casks on [`DEV_CASKS`], and Homebrew's Android
+//!   command-line tools. Each such formula is its own unit.
+//! * `homebrew-other` (on by default): the rest of the prefix, measured
+//!   as one remainder unit with the dev units subtracted, so the two add
+//!   up to the prefix.
+//! * `homebrew` (off by default): the full detector, whole Cellar and
+//!   Caskroom. `[scan] enabled_detectors = ["homebrew"]` turns it on;
+//!   it then takes the prefix, Cellar and Caskroom paths over from the
+//!   other two, so nothing is counted twice.
 
 use super::{
     CommandOutcome, Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance,
@@ -15,6 +31,210 @@ use super::{
 };
 
 pub const HOMEBREW_DETECTOR_ID: &str = "homebrew";
+pub const HOMEBREW_DEVTOOLS_DETECTOR_ID: &str = "homebrew-devtools";
+pub const HOMEBREW_OTHER_DETECTOR_ID: &str = "homebrew-other";
+
+/// Formulae that are unambiguously developer tooling: language toolchains
+/// and build tools. Matched on the whole name after [`formula_base`]
+/// strips a `@version` suffix, never on a substring: `gopls` is not `go`.
+/// Documented row by row in `docs/locations.md` (a test keeps the two in
+/// step). Ambiguous tools (qemu, ansible, pandoc, duckdb, mlx) are
+/// deliberately absent: they land in `Homebrew (other)`.
+pub const DEV_FORMULAE: &[&str] = &[
+    "llvm",
+    "openjdk",
+    "dotnet",
+    "zig",
+    "go",
+    "rust",
+    "rustup",
+    "node",
+    "python",
+    "ruby",
+    "cmake",
+    "gradle",
+    "maven",
+    "ninja",
+    "mise",
+    "terraform",
+];
+
+/// Casks that are unambiguously developer tooling.
+pub const DEV_CASKS: &[&str] = &["android-platform-tools", "android-studio"];
+
+/// Where Homebrew puts the Android command-line tools, relative to a
+/// prefix. The `android` detector already measures the SDK directories
+/// inside it (`system-images`, `emulator`, ...); the observation pass
+/// subtracts those from this unit, so each byte is counted once.
+pub const ANDROID_CMDLINE_TOOLS: &str = "share/android-commandlinetools";
+
+/// A formula name without its `@version` suffix: `llvm@20` is `llvm`.
+pub fn formula_base(name: &str) -> &str {
+    name.split_once('@').map_or(name, |(base, _)| base)
+}
+
+fn is_dev_formula(name: &str) -> bool {
+    DEV_FORMULAE.contains(&formula_base(name))
+}
+
+fn is_dev_cask(name: &str) -> bool {
+    DEV_CASKS.contains(&name)
+}
+
+/// Every prefix this pass resolves without running a tool: the
+/// environment override, else the platform's conventions.
+fn prefixes(env: &Environment) -> Vec<(std::path::PathBuf, Provenance)> {
+    if let Some(prefix) = env.env_var("HOMEBREW_PREFIX").filter(|v| !v.is_empty()) {
+        return vec![(
+            std::path::PathBuf::from(prefix),
+            Provenance::EnvVar("HOMEBREW_PREFIX".to_string()),
+        )];
+    }
+    let conventional: &[&str] = match env.platform {
+        Platform::MacOS => &["/opt/homebrew", "/usr/local"],
+        Platform::Linux => &["/home/linuxbrew/.linuxbrew"],
+    };
+    conventional
+        .iter()
+        .map(|p| (std::path::PathBuf::from(p), Provenance::BuiltinConvention))
+        .collect()
+}
+
+/// Whether `prefix` is a Homebrew prefix rather than a directory Homebrew
+/// merely may share. `/opt/homebrew` and the Linux prefix are Homebrew's
+/// alone; `/usr/local` belongs to the system and is claimed as Homebrew's
+/// only where a Cellar or the Intel `Homebrew` directory exists.
+fn is_homebrew_prefix(prefix: &std::path::Path, provenance: &Provenance) -> bool {
+    if *provenance != Provenance::BuiltinConvention || prefix != std::path::Path::new("/usr/local")
+    {
+        return true;
+    }
+    crate::fs_gate::exists(prefix.join("Cellar")) || crate::fs_gate::exists(prefix.join("Homebrew"))
+}
+
+const REINSTALL: super::RecoveryHint = super::RecoveryHint {
+    command: "brew reinstall <formula>",
+    cost: super::RecoveryCost::NetworkRefetch,
+};
+
+/// The default-on part: unambiguous developer tooling only.
+pub struct HomebrewDevToolsDetector;
+
+impl Detector for HomebrewDevToolsDetector {
+    fn id(&self) -> &'static str {
+        HOMEBREW_DEVTOOLS_DETECTOR_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Homebrew (dev tooling)"
+    }
+
+    fn platforms(&self) -> &'static [Platform] {
+        &[Platform::MacOS, Platform::Linux]
+    }
+
+    fn version_note(&self) -> &'static str {
+        "Homebrew Cellar/Caskroom layout; allowlist in docs/locations.md"
+    }
+
+    fn recovery_hint(&self) -> Option<super::RecoveryHint> {
+        Some(REINSTALL)
+    }
+
+    fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
+        let mut out = Vec::new();
+        for (prefix, provenance) in prefixes(env) {
+            if !is_homebrew_prefix(&prefix, &provenance) {
+                continue;
+            }
+            for (rel, note) in [
+                (
+                    ANDROID_CMDLINE_TOOLS,
+                    "Android command-line tools installed by Homebrew; the android \
+                     detector's SDK directories inside it are counted there, once",
+                ),
+                (
+                    "Cellar",
+                    "installed formulae: only the allowlisted toolchains and build \
+                     tools are measured, each on its own",
+                ),
+                (
+                    "Caskroom",
+                    "installed casks: only the allowlisted developer casks are \
+                     measured, each on its own",
+                ),
+            ] {
+                out.push(ProposedLocation {
+                    detector_id: HOMEBREW_DEVTOOLS_DETECTOR_ID.to_string(),
+                    path: Some(prefix.join(rel)),
+                    category: StorageCategory::Installation,
+                    provenance: provenance.clone(),
+                    status: LocationStatus::Resolved,
+                    note: Some(note.to_string()),
+                });
+            }
+        }
+        out
+    }
+
+    fn select_children(
+        &self,
+        container: &std::path::Path,
+        names: &[String],
+    ) -> Option<Vec<String>> {
+        let keep: fn(&str) -> bool = match container.file_name()?.to_str()? {
+            "Cellar" => is_dev_formula,
+            "Caskroom" => is_dev_cask,
+            _ => return None,
+        };
+        Some(names.iter().filter(|n| keep(n)).cloned().collect())
+    }
+}
+
+/// The default-on remainder: the rest of the prefix as one unit.
+pub struct HomebrewOtherDetector;
+
+impl Detector for HomebrewOtherDetector {
+    fn id(&self) -> &'static str {
+        HOMEBREW_OTHER_DETECTOR_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Homebrew (other)"
+    }
+
+    fn platforms(&self) -> &'static [Platform] {
+        &[Platform::MacOS, Platform::Linux]
+    }
+
+    fn version_note(&self) -> &'static str {
+        "Homebrew prefix conventions; the remainder after the dev tooling units"
+    }
+
+    fn recovery_hint(&self) -> Option<super::RecoveryHint> {
+        Some(REINSTALL)
+    }
+
+    fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
+        prefixes(env)
+            .into_iter()
+            .filter(|(prefix, provenance)| is_homebrew_prefix(prefix, provenance))
+            .map(|(prefix, provenance)| ProposedLocation {
+                detector_id: HOMEBREW_OTHER_DETECTOR_ID.to_string(),
+                path: Some(prefix),
+                category: StorageCategory::Installation,
+                provenance,
+                status: LocationStatus::Resolved,
+                note: Some(
+                    "everything under the prefix not classified as dev tooling (other \
+                     formulae, casks, libraries); `[scan] enabled_detectors = \
+                     [\"homebrew\"]` reports Cellar and Caskroom whole instead"
+                        .to_string(),
+                ),
+            })
+            .collect()
+    }
+}
 
 pub struct HomebrewDetector;
 
@@ -171,6 +391,130 @@ impl Detector for HomebrewDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Tempting wrong patch: compare `@version` names literally, so
+    /// `llvm@20` and `llvm@21` miss `llvm`; or use `contains`/`starts_with`.
+    #[test]
+    fn versioned_names_match_and_substrings_never_do() {
+        let cellar = std::path::Path::new("/opt/homebrew/Cellar");
+        let picked = HomebrewDevToolsDetector
+            .select_children(
+                cellar,
+                &names(&[
+                    "llvm@20",
+                    "llvm@21",
+                    "openjdk@17",
+                    "zig@0.15",
+                    "go",
+                    "gopls",
+                    "zigbee2mqtt",
+                    "nodejs-foo",
+                    "node-build",
+                    "qemu",
+                    "pandoc",
+                    "duckdb",
+                    "mlx",
+                    "ansible",
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            picked,
+            names(&["llvm@20", "llvm@21", "openjdk@17", "zig@0.15", "go"])
+        );
+    }
+
+    /// Tempting wrong patch: one allowlist for formulae and casks, so a
+    /// cask named like a formula, or Outlook, leaks in.
+    #[test]
+    fn casks_use_their_own_allowlist() {
+        let caskroom = std::path::Path::new("/opt/homebrew/Caskroom");
+        let picked = HomebrewDevToolsDetector
+            .select_children(
+                caskroom,
+                &names(&[
+                    "android-platform-tools",
+                    "android-studio",
+                    "microsoft-outlook",
+                    "zoom",
+                    "go",
+                ]),
+            )
+            .unwrap();
+        assert_eq!(picked, names(&["android-platform-tools", "android-studio"]));
+    }
+
+    /// The observation pass asks with no names to learn whether a path is a
+    /// container; only Cellar and Caskroom are, everything else is a plain
+    /// location.
+    #[test]
+    fn only_cellar_and_caskroom_are_containers() {
+        let d = HomebrewDevToolsDetector;
+        assert!(
+            d.select_children(std::path::Path::new("/p/Cellar"), &[])
+                .is_some()
+        );
+        assert!(
+            d.select_children(std::path::Path::new("/p/Caskroom"), &[])
+                .is_some()
+        );
+        assert!(
+            d.select_children(
+                std::path::Path::new("/p/share/android-commandlinetools"),
+                &[]
+            )
+            .is_none()
+        );
+        assert!(
+            HomebrewOtherDetector
+                .select_children(std::path::Path::new("/p/Cellar"), &[])
+                .is_none()
+        );
+    }
+
+    /// Docs-matches-code: every allowlisted name is documented in
+    /// `docs/locations.md`, and the ambiguous tools the maintainer ruled
+    /// out are not on the list.
+    #[test]
+    fn every_allowlisted_name_is_documented_and_ambiguous_tools_are_absent() {
+        let docs = include_str!("../../../../docs/locations.md");
+        let section = docs
+            .split("### Homebrew dev-tooling allowlist")
+            .nth(1)
+            .expect("docs/locations.md has the Homebrew allowlist section")
+            .split("\n## ")
+            .next()
+            .unwrap();
+        for name in DEV_FORMULAE.iter().chain(DEV_CASKS) {
+            assert!(
+                section.contains(&format!("`{name}`")),
+                "{name} is allowlisted but not documented in docs/locations.md"
+            );
+        }
+        for ambiguous in ["qemu", "ansible", "pandoc", "duckdb", "mlx"] {
+            assert!(!DEV_FORMULAE.contains(&ambiguous));
+            assert!(!DEV_CASKS.contains(&ambiguous));
+        }
+        assert!(docs.contains(ANDROID_CMDLINE_TOOLS));
+    }
+
+    #[test]
+    fn a_shared_system_prefix_is_not_claimed_without_a_cellar() {
+        // /usr/local only counts as Homebrew's where a Cellar or Homebrew
+        // directory exists; an explicit or private prefix always counts.
+        assert!(is_homebrew_prefix(
+            std::path::Path::new("/opt/homebrew"),
+            &Provenance::BuiltinConvention
+        ));
+        assert!(is_homebrew_prefix(
+            std::path::Path::new("/usr/local"),
+            &Provenance::EnvVar("HOMEBREW_PREFIX".into())
+        ));
+    }
     use crate::locations::FakeCommandRunner;
     use std::collections::HashMap;
     use std::path::PathBuf;

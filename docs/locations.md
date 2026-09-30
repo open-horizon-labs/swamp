@@ -79,10 +79,37 @@ further, e.g. Maven's local repository).
 
 | Detector id | Locations | Overrides | Notes / source |
 |---|---|---|---|
-| `homebrew` | prefix (`installation`), `Cellar/` (`installation`, installed formula versions), `Caskroom/` (`installation`, installed cask apps) under every resolved prefix, `~/Library/Caches/Homebrew` (`downloads`) | `HOMEBREW_PREFIX`, else `/opt/homebrew` and `/usr/local` (both always proposed), optionally corroborated by the bounded, read-only `brew --prefix` query | https://docs.brew.sh/Manpage ; macOS only. **Off by default** (stack/26): a system-wide install tree, not a per-user one -- `swamp scope` reports it `disabled (default off)`; `[scan] enabled_detectors = ["homebrew"]` turns it on. |
+| `homebrew-devtools` | Homebrew's Android command-line tools (`share/android-commandlinetools`, `installation`), and, under every resolved prefix, each **allowlisted** `Cellar/<formula>` and `Caskroom/<cask>` as its own unit (`installation`). Allowlist below. | `HOMEBREW_PREFIX`, else `/opt/homebrew` and (only where a `Cellar` or `Homebrew` directory exists there) `/usr/local`; Linux `/home/linuxbrew/.linuxbrew`. No `brew --prefix` query (the full detector runs it) | https://docs.brew.sh/Manpage ; **On by default** (#174): only the unambiguous developer tooling. The Cellar and Caskroom listings happen in the scheduled `observe` pass only, never in `scope`, `report` or the TUI. Removal, if the human decides, is `brew reinstall <formula>` (a network re-download); swamp only reports. |
+| `homebrew-other` | The prefix as a whole (`installation`), measured with every dev-tooling unit above **subtracted**, so it is the rest: other formulae, other casks, libraries, `share`. Shown as `Homebrew (other)`. | as `homebrew-devtools` | **On by default** (#174). `dev + other = the prefix` within the measurement's own tolerance. `[scan] disabled_detectors = ["homebrew-other"]` drops the line; `[scan] enabled_detectors = ["homebrew"]` reports Cellar and Caskroom whole instead. |
+| `homebrew` | prefix (`installation`), `Cellar/` (`installation`, installed formula versions), `Caskroom/` (`installation`, installed cask apps) under every resolved prefix, `~/Library/Caches/Homebrew` (`downloads`) | `HOMEBREW_PREFIX`, else `/opt/homebrew` and `/usr/local` (both always proposed), optionally corroborated by the bounded, read-only `brew --prefix` query | https://docs.brew.sh/Manpage ; **The full detector, off by default** (stack/26): `swamp scope` reports it `disabled (default off)`; `[scan] enabled_detectors = ["homebrew"]` turns it on, and it then takes the prefix, `Cellar` and `Caskroom` over from the two default-on parts so nothing is counted twice. To turn all Homebrew reporting off: `disabled_detectors = ["homebrew-devtools", "homebrew-other"]`. |
 | `huggingface` | `HF_HOME` base (`local-state`), hub cache (`models`, blobs/snapshots -- blobs counted once because `resize_artifact` never follows symlinks), legacy datasets cache (`models`) | `HF_HOME` (default `~/.cache/huggingface`), `HF_HUB_CACHE` (default `$HF_HOME/hub`), `HF_DATASETS_CACHE` (default `$HF_HOME/datasets`) | https://huggingface.co/docs/huggingface_hub/guides/manage-cache |
 | `ollama` | `~/.ollama` base (`local-state`: config/logs/keys), models dir (`models`: `blobs/` + `manifests/`, blobs referenced by filename digest, not symlinked, so one whole-directory measurement already counts each once) | `OLLAMA_MODELS` (default `~/.ollama/models`) | https://docs.ollama.com/faq |
 | `docker-desktop` | VM backing-store directory (`local-state`, holding the sparse `Docker.raw`/`Docker.qcow2`; measured bytes are *allocated* disk blocks via the existing per-file `st_blocks * 512` accounting, never the much larger apparent/virtual disk size); OrbStack's data directory (`local-state`) | `~/Library/Containers/com.docker.docker/Data/vms/0/data`; `~/.orbstack/data` | https://docs.docker.com/desktop/troubleshoot-and-support/faqs/macfaqs/ -- **limit:** a disk image relocated via Docker Desktop's Settings > Resources > Advanced is not read (no reliably documented, version-stable settings-file field was found); never summed with `crate::docker`'s separate logical-object (image/container/volume) accounting; macOS only |
+
+### Homebrew dev-tooling allowlist (#174)
+
+A formula or cask is dev tooling only if its whole name, with any `@version`
+suffix removed (`llvm@20` is `llvm`), is on this list. Substrings never
+match: `gopls`, `zigbee2mqtt` and `nodejs-foo` are not `go`, `zig` or `node`.
+
+Formulae (`Cellar`): `llvm`, `openjdk`, `dotnet`, `zig`, `go`, `rust`,
+`rustup`, `node`, `python`, `ruby`, `cmake`, `gradle`, `maven`, `ninja`,
+`mise`, `terraform`.
+
+Casks (`Caskroom`): `android-platform-tools`, `android-studio`.
+
+Ambiguous tools (qemu, ansible, pandoc, duckdb, mlx, and every GUI cask such
+as an office or chat app) are not on the list and are reported in
+`Homebrew (other)`. Arguing one in needs evidence that it is developer
+tooling for essentially everyone; a project's `Brewfile` naming it would be
+such evidence, but reading `Brewfile`s is not implemented yet, so today
+nothing is promoted by declaration.
+
+The Android command-line tools that Homebrew installs
+(`share/android-commandlinetools`) are dev tooling. The `android` detector
+already measures the SDK directories inside them (`system-images`,
+`emulator`, ...); those are subtracted from the Homebrew unit, so each byte
+is reported once.
 
 ## The external-location double-measurement fix
 
