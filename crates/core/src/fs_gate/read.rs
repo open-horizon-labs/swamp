@@ -128,14 +128,22 @@ fn refused(path: &Path, what: &str) -> io::Error {
 /// end, which may be never: one `.git/config` FIFO parked a discovery
 /// worker in `__open` for good while every other worker idled in
 /// `Pool::next` at 0% CPU (#190). A dataless file provider placeholder
-/// blocks the same way while the provider downloads it. So: refuse a
-/// dataless file before opening it, open with `O_NONBLOCK` (a FIFO then
-/// opens at once instead of waiting for a writer), and refuse anything
-/// that `fstat` does not call a regular file. Symlinks are still followed,
-/// as before: a symlinked manifest is read, a symlink to a FIFO is not.
+/// blocks the same way while the provider downloads it.
+///
+/// So the refusal is a `stat`, never an open: opening a FIFO's read end,
+/// even with `O_NONBLOCK`, completes the rendezvous for a writer parked
+/// on it, and when swamp closes it that writer's next write fails with
+/// `EPIPE` and its data is lost. Only a path `stat` calls a regular,
+/// non-dataless file is opened, with `O_NONBLOCK` and an `fstat` as the
+/// backstop for a swap between the two calls. Symlinks are followed: a
+/// symlinked manifest is read, a symlink to a FIFO is not.
 fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    if std::fs::metadata(path).is_ok_and(|m| is_dataless(&m)) {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(refused(path, "not a regular file"));
+    }
+    if is_dataless(&meta) {
         return Err(refused(path, "a dataless file provider placeholder"));
     }
     let file = std::fs::OpenOptions::new()
