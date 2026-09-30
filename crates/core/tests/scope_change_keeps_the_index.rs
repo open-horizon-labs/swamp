@@ -189,3 +189,20 @@ fn an_empty_store_has_no_observation() {
     assert!(report::report_scope_from_store(&s, &f.store).is_err());
     assert!(!report::store_has_observation(&f.store));
 }
+
+/// Tempting wrong patch: apply the fallback to explicit roots too, so
+/// `swamp report ~/a` answers with the observation of `~/a ~/b`. A scope the
+/// user names is exactly that scope.
+#[test]
+fn an_explicit_root_never_falls_back_to_a_wider_observation() {
+    let _l = serial();
+    let f = fx();
+    let a = checkout(&f.root, "src");
+    let b = checkout(&f.root, "code");
+    let registry = Registry::with_builtins();
+    let cfg = ScanConfig::default();
+    let both = resolve_effective_scope(&f.env, &cfg, &[a.clone(), b.clone()], &registry, 1_000);
+    observe(&f, &both);
+    let only_a = resolve_effective_scope(&f.env, &cfg, std::slice::from_ref(&a), &registry, 1_000);
+    assert!(report::report_scope_from_store(&only_a, &f.store).is_err());
+}

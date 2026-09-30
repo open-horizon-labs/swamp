@@ -382,13 +382,15 @@ fn on_the_shared_usr_local_prefix_only_homebrews_own_directories_are_proposed() 
 fn the_family_id_disables_every_member_and_a_member_id_only_itself() {
     let f = fixture();
     let registry = Registry::with_builtins();
-    let mut cfg = ScanConfig::default();
-    cfg.disabled_detectors = registry
-        .detectors()
-        .iter()
-        .map(|d| d.id().to_string())
-        .filter(|id| id != "builtin-defaults" && !id.starts_with("homebrew"))
-        .collect();
+    let cfg = ScanConfig {
+        disabled_detectors: registry
+            .detectors()
+            .iter()
+            .map(|d| d.id().to_string())
+            .filter(|id| id != "builtin-defaults" && !id.starts_with("homebrew"))
+            .collect(),
+        ..ScanConfig::default()
+    };
     let mut family = cfg.clone();
     family.disabled_detectors.push("homebrew".into());
     assert!(measure(&env(&f, false), &family).is_empty());

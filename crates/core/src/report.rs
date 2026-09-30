@@ -3793,6 +3793,13 @@ fn stored_choice(scope: &crate::scope::EffectiveScope, store_dir: &Path) -> Opti
             previous: None,
         });
     }
+    // A scope the user named on the command line answers only for exactly
+    // the roots named: a narrower or wider snapshot is never passed off as
+    // it. The fallback is for the configured scope, whose roots change
+    // underneath the user (add-root, an upgrade).
+    if scope.explicit {
+        return None;
+    }
     let current: Vec<PathBuf> = scope.roots.iter().map(|r| r.path.clone()).collect();
     crate::growth::stored_scopes(store_dir)
         .into_iter()
