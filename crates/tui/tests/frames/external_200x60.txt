@@ -51,7 +51,7 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"                                                                                                                                                                                                        "
+"Last run or opened: no record                                                                                                                                                                           "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "

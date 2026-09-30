@@ -12,8 +12,8 @@
 
 use super::{
     ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
-    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
-    RecoveryHint, StorageCategory,
+    LastUseDecl, LastUseSource, LocationStatus, ManagerConvention, Platform, ProposedLocation,
+    Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
 };
 
 pub const MISE_DETECTOR_ID: &str = "mise";
@@ -66,6 +66,16 @@ impl Detector for MiseDetector {
             command: "mise install",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["installs"],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 3 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

@@ -433,6 +433,13 @@ fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveSco
 /// history: it is coverage bookkeeping only, per
 /// `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
 fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::EffectiveScope) {
+    if swamp_core::fs_gate::StoreDir::at(store_dir)
+        .and_then(|store| store.is_newer_generation())
+        .unwrap_or(false)
+    {
+        eprintln!("store written by a newer swamp; not modifying it");
+        return;
+    }
     let current_store = swamp_core::fs_gate::StoreDir::at(store_dir)
         .and_then(|store| store.has_current_format())
         .unwrap_or(false);
@@ -848,6 +855,10 @@ fn report_json_envelope(
                 serde_json::json!(units)
             }
             View::External => serde_json::json!({
+                // Standalone Cargo targets are their own kind: listed here
+                // beside the units, counted under `unowned` (never in
+                // `total_bytes`, which is the external units alone).
+                "standalone_cargo_targets": swamp_core::render::standalone_cargo_targets(&rr.unowned),
                 "units": external_units,
                 "total_bytes": swamp_core::external::total_bytes(external_units),
                 // Each machine-wide build store's identified interior,
@@ -1297,12 +1308,13 @@ fn main() -> Result<()> {
                     Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
                         safe_print!(
-                            "{}",
+                            "{}{}",
                             swamp_core::render::render_view_external_with(
                                 &external_units,
                                 &store_interiors,
                                 r.observed_at,
-                            )
+                            ),
+                            swamp_core::render::render_standalone_targets(&r.unowned)
                         )
                     }
                     Some(View::Agents) => {
@@ -1346,12 +1358,13 @@ fn main() -> Result<()> {
                     Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
                         safe_print!(
-                            "{}",
+                            "{}{}",
                             swamp_core::render::render_view_external_with(
                                 &external_units,
                                 &store_interiors,
                                 r.observed_at,
-                            )
+                            ),
+                            swamp_core::render::render_standalone_targets(&r.unowned)
                         )
                     }
                     Some(View::Agents) => {

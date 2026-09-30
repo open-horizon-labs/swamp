@@ -1,4 +1,4 @@
-"/Users/dev/src · observed just now · since 1w · 2 pr┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-54 of 54 ───────────────────────────────┐                                                    "
+"/Users/dev/src · observed just now · since 1w · 2 pr┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-55 of 55 ───────────────────────────────┐                                                    "
 "view: projects (1 of 10 · v next) · filter: growth >│Keys                                                                                          │                                                    "
 "Name                                                │  ↑ ↓        move the cursor                                                                  │nup / facts                                         "
 "mole  🔨                                            │  PgUp PgDn  move a screenful · Home and End jump to the first and last row                   │                                                    " Hidden by multi-width symbols: [(7, " ")]
@@ -52,8 +52,8 @@
 "                                                    │  agent-tool session/category units: modification age of the session/category's own recorded  │                                                    "
 "                                                    │    mtime_max; no tool reports a distinct use timestamp                                       │                                                    "
 "                                                    │  external location detectors (version managers, package caches, SDKs): modification age of   │                                                    "
-"                                                    │    the measured directory only; no per-tool invocation history is read                       │                                                    "
-"                                                    │                                                                                              │                                                    "
+"                                                    │    the measured directory; plus a separate last-used fact where a source is declared (tool   │                                                    "
+"                                                    │    record, else key-file access time, else none)                                             │                                                    "
 "                                                    │                                                                                              │                                                    "
 "                                                    │                                                                                              │                                                    "
 "                                                    │                                                                                              │                                                    "

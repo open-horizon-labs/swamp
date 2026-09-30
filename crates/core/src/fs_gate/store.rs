@@ -42,6 +42,13 @@ use std::path::{Path, PathBuf};
 pub struct StoreDir(PathBuf);
 
 impl StoreDir {
+    /// The store-format generation. Bumped only for a change v0.7.x could
+    /// not read around: an installed older swamp resets the store on any
+    /// marker it does not know, so two installs sharing one store (a
+    /// scheduled observe on one, the terminal on the other) would reset it
+    /// on every alternation. v0.8.0's additions are therefore new sibling
+    /// tables (`unit_meta`, `unit_children`) that older versions ignore,
+    /// and the marker stays 2.
     const FORMAT: &'static str = "2\n";
     /// `$SWAMP_DIR`, else `$HOME/.local/share/swamp`: the one resolver.
     pub fn resolved() -> StoreDir {
@@ -122,18 +129,42 @@ impl StoreDir {
         }
     }
 
-    /// Whether derived tables belong to the current store generation.
-    /// The marker read is bounded and never follows links or blocks on a FIFO.
-    pub fn has_current_format(&self) -> io::Result<bool> {
-        let marker = self.0.join("housekeeping.version");
-        Ok(read_housekeeping_marker(&marker)?.as_deref() == Some(Self::FORMAT))
+    fn marker_state(&self) -> io::Result<MarkerState> {
+        let marker = read_housekeeping_marker(&self.0.join("housekeeping.version"))?;
+        Ok(match marker {
+            None => MarkerState::Absent,
+            Some(m) if m == Self::FORMAT => MarkerState::Current,
+            Some(m) => match m.trim().parse::<u32>() {
+                Ok(n) if n > Self::FORMAT.trim().parse::<u32>().unwrap_or(0) => MarkerState::Newer,
+                // Older, or a marker no swamp wrote: nothing to read.
+                _ => MarkerState::Older,
+            },
+        })
     }
 
-    /// True for an explicit but incompatible generation marker. A missing
-    /// marker is the ordinary first-use case once recognized caches reset.
+    /// Whether derived tables can be read: the current generation, or a
+    /// newer one (read-only: a report may read what it can, and never
+    /// modifies it). The marker read is bounded and never follows links or
+    /// blocks on a FIFO.
+    pub fn has_current_format(&self) -> io::Result<bool> {
+        Ok(matches!(
+            self.marker_state()?,
+            MarkerState::Current | MarkerState::Newer
+        ))
+    }
+
+    /// True for an explicit marker of an OLDER (or unrecognized)
+    /// generation. A missing marker is the ordinary first-use case once
+    /// recognized caches reset; a newer marker is not incompatible, it is
+    /// somebody else's and is left alone.
     pub fn has_incompatible_marker(&self) -> io::Result<bool> {
-        let marker = read_housekeeping_marker(&self.0.join("housekeeping.version"))?;
-        Ok(marker.is_some() && marker.as_deref() != Some(Self::FORMAT))
+        Ok(self.marker_state()? == MarkerState::Older)
+    }
+
+    /// True when a newer swamp wrote this store. This swamp reads what it
+    /// can and does not modify it: no reset, no derived-table write.
+    pub fn is_newer_generation(&self) -> io::Result<bool> {
+        Ok(self.marker_state()? == MarkerState::Newer)
     }
 
     /// Resets recognized Swamp-derived state for an absent/older generation.
@@ -141,8 +172,12 @@ impl StoreDir {
     /// tables. Durable human intent, action history, live enrichment, and
     /// unknown user files are deliberately outside this ownership set.
     pub fn reset_incompatible_format(&self) -> io::Result<bool> {
-        let marker = read_housekeeping_marker(&self.0.join("housekeeping.version"))?;
-        if marker.as_deref() == Some(Self::FORMAT) {
+        // Only an older (or absent, or unrecognized) generation is reset. A
+        // newer one is never touched.
+        if matches!(
+            self.marker_state()?,
+            MarkerState::Current | MarkerState::Newer
+        ) {
             return Ok(false);
         }
         self.create()?;
@@ -176,11 +211,22 @@ impl StoreDir {
     /// has persisted successfully. Keep this separate from reset so errors
     /// are retryable and cannot bless a partial scan.
     pub fn mark_current_format(&self) -> io::Result<()> {
+        if self.marker_state()? == MarkerState::Newer {
+            return Ok(());
+        }
         write_atomic(
             &self.0.join("housekeeping.version"),
             Self::FORMAT.as_bytes(),
         )
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerState {
+    Absent,
+    Older,
+    Current,
+    Newer,
 }
 
 fn read_housekeeping_marker(path: &Path) -> io::Result<Option<String>> {
@@ -262,7 +308,8 @@ fn is_derived_table(name: &str) -> bool {
         | "docker_images" | "docker_build_cache" | "docker_volumes" | "docker_builders"
         | "docker_values" | "docker_containers" | "runs" | "coverage" | "projects"
         | "worktrees" | "worktree_facts" | "artifact_shape" | "artifact_shape_lists"
-        | "external_units" | "agent_units" | "agent_unit_members" | "unit_consumers"
+        | "external_units" | "unit_children" | "unit_meta" | "agent_units" | "agent_unit_members"
+        | "unit_consumers"
         | "agent_identifications" | "agent_containers" | "nested_artifacts"
         | "nested_artifact_lists" | "nested_artifact_evidence" | "evidence"
         // Historical rendered caches and removed derived views.
@@ -327,6 +374,7 @@ fn clean_external_generation(dir: &Path) -> io::Result<()> {
     remove_known_file(&dir.join("current.parquet"))?;
     let volume_stamps = dir.join("volume_stamps.parquet");
     remove_known_file(&volume_stamps)?;
+    remove_known_file(&dir.join("overlap_marks.parquet"))?;
     let deltas = dir.join("deltas");
     if std::fs::symlink_metadata(&deltas).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
         clean_delta_generation(&deltas)?;

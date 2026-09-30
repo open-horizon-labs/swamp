@@ -283,6 +283,10 @@ fn external_unit(path: &Path) -> swamp_core::external::ExternalUnit {
         consumers: Vec::new(),
         note: None,
         evidence: Vec::new(),
+        bytes_counted_elsewhere: 0,
+        overlap_count: 0,
+        last_used: Default::default(),
+        children: Vec::new(),
     }
 }
 

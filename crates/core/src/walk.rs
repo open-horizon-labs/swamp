@@ -1385,6 +1385,60 @@ fn push_unowned_dir(dir_path: &Path, bytes: u64, shared: &AttrShared) {
     ));
 }
 
+/// [`unowned_row`] for a directory the walk folded as one unit (a
+/// classified artifact outside every checkout): a Cargo target
+/// directory, recognized by Cargo's own signature, is a
+/// `StandaloneCargoTarget` -- its consequence and age said on the row,
+/// no project named. Only here, where the directory was already read as
+/// a unit; every other unowned row keeps its reason without a probe.
+fn folded_unowned_row(
+    dir_path: &Path,
+    bytes: u64,
+    measurement: crate::report::UnownedMeasurement,
+    mtime_max: u64,
+    observed_at: u64,
+) -> UnownedRow {
+    let mut row = unowned_row(dir_path, bytes, measurement);
+    mark_standalone_cargo_target(&mut row, dir_path, mtime_max, observed_at);
+    row
+}
+
+fn mark_standalone_cargo_target(
+    row: &mut UnownedRow,
+    dir_path: &Path,
+    mtime_max: u64,
+    observed_at: u64,
+) {
+    if row.reason == UnownedReason::NoContainingRepo
+        && crate::attribution::is_standalone_cargo_target(dir_path)
+    {
+        row.reason = UnownedReason::StandaloneCargoTarget;
+        row.note = Some(crate::attribution::STANDALONE_CARGO_TARGET_NOTE.to_string());
+        row.evidence.push(crate::activity::modification_evidence(
+            mtime_max,
+            observed_at,
+        ));
+        if let Some(root) = crate::attribution::recorded_source_root(dir_path) {
+            row.evidence.push(
+                crate::evidence::Evidence::known(
+                    crate::evidence::FactKind::Consumer,
+                    crate::evidence::FactSubtype::RecordedLink,
+                    crate::evidence::FactValue::Text(root.display().to_string()),
+                    crate::evidence::EvidenceSource::BuildMetadata {
+                        path: "deps/*.d".to_string(),
+                    },
+                    observed_at,
+                )
+                .with_note(
+                    "source files recorded in this directory's dep-info; a recorded path, \
+                     not checked to exist or to be the project, and never used to select \
+                     or authorize anything",
+                ),
+            );
+        }
+    }
+}
+
 fn unowned_row(
     dir_path: &Path,
     bytes: u64,
@@ -1654,7 +1708,7 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
             } else {
                 UnownedReason::NoContainingRepo
             };
-            shared.unowned.lock().unwrap().push(UnownedRow {
+            let mut row = UnownedRow {
                 measurement: Some(if group.local_seen.lock().unwrap().is_empty() {
                     crate::report::UnownedMeasurement::Subtree
                 } else {
@@ -1671,7 +1725,14 @@ fn finish_size_job(group: &Arc<SizeGroup>, shared: &AttrShared) {
                 dangling: false,
                 docker_kind: None,
                 evidence: Vec::new(),
-            });
+            };
+            mark_standalone_cargo_target(
+                &mut row,
+                &group.root_path,
+                group.mtime_max.load(Ordering::Acquire),
+                shared.observed_at,
+            );
+            shared.unowned.lock().unwrap().push(row);
         }
     }
 }
@@ -1824,7 +1885,7 @@ pub(crate) fn refresh_unowned(
             }
             sharing |= measured.hardlinked;
             rows.retain(|r| !Path::new(&r.path_or_object).starts_with(&path));
-            rows.push(unowned_row(
+            rows.push(folded_unowned_row(
                 &path,
                 measured.bytes,
                 if sharing || measured.hardlinked {
@@ -1832,6 +1893,8 @@ pub(crate) fn refresh_unowned(
                 } else {
                     Subtree
                 },
+                measured.mtime_max,
+                observed_at,
             ));
             continue;
         }
@@ -1929,7 +1992,7 @@ pub(crate) fn refresh_unowned(
                 if !complete {
                     return None;
                 }
-                vec![unowned_row(
+                vec![folded_unowned_row(
                     &child,
                     measured.bytes,
                     if sharing || measured.hardlinked {
@@ -1937,6 +2000,8 @@ pub(crate) fn refresh_unowned(
                     } else {
                         Subtree
                     },
+                    measured.mtime_max,
+                    observed_at,
                 )]
             } else {
                 attribute_parallel_carrying(

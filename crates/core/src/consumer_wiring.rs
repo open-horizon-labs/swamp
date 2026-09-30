@@ -1048,7 +1048,7 @@ fn attach_global_default(
 /// Every detector that declares a per-project build-output store gets
 /// its subfolders joined back to the projects that produced them.
 fn attach_build_output_associations(
-    units: &[ExternalUnit],
+    units: &mut [ExternalUnit],
     project_roots: &[PathBuf],
     unit_evidence: &mut HashMap<usize, Vec<crate::evidence::Evidence>>,
     cache: &mut CacheMap,
@@ -1060,8 +1060,30 @@ fn attach_build_output_associations(
                 continue;
             };
             for idx in anchored_units(units, detector.id(), anchor) {
-                attach_workspace_index(units, idx, project_roots, unit_evidence, cache);
+                let accessed =
+                    attach_workspace_index(units, idx, project_roots, unit_evidence, cache);
+                apply_derived_data_last_used(&mut units[idx], &accessed);
             }
+        }
+    }
+}
+
+/// Folds Xcode's own `LastAccessedDate` records into a DerivedData unit
+/// and its per-project drilldown rows. The unit shows the newest of its
+/// folders'; a folder shows its own. Tool-native beats the key files'
+/// access time under the shared precedence rule.
+fn apply_derived_data_last_used(unit: &mut ExternalUnit, accessed: &[(String, u64)]) {
+    let name = crate::last_used::XCODE_DERIVED_DATA;
+    let Some(newest) = accessed.iter().map(|(_, at)| *at).max() else {
+        return;
+    };
+    unit.last_used = unit.last_used.with_tool_native(name, newest);
+    for child in &mut unit.children {
+        if child.kind != crate::drilldown::ChildKind::Entry {
+            continue;
+        }
+        if let Some((_, at)) = accessed.iter().find(|(n, _)| *n == child.name) {
+            child.last_used = child.last_used.with_tool_native(name, *at);
         }
     }
 }
@@ -1069,7 +1091,7 @@ fn attach_build_output_associations(
 /// The build-output-store -> workspace join, cached by each subfolder's
 /// own `info.plist` `(size, mtime)`.
 ///
-/// `read_workspace_path` spawns `plutil`. Uncached, that is one
+/// `read_plist_facts` spawns `plutil`. Uncached, that is one
 /// subprocess per locally-built Xcode project on *every* `report --view
 /// external`, every unified `propose` and every TUI refresh -- fifty
 /// spawns for fifty projects that did not change, which is what the PR
@@ -1081,8 +1103,9 @@ fn attach_workspace_index(
     project_roots: &[PathBuf],
     unit_evidence: &mut HashMap<usize, Vec<crate::evidence::Evidence>>,
     cache: &mut CacheMap,
-) {
+) -> Vec<(String, u64)> {
     let derived_data_path = units[idx].path.clone();
+    let mut accessed: Vec<(String, u64)> = Vec::new();
     for subfolder in external_associations::list_derived_data_subfolders(&derived_data_path) {
         let info_plist = subfolder.join("info.plist");
         let Ok(meta) = crate::fs_gate::symlink_metadata(&info_plist) else {
@@ -1100,39 +1123,49 @@ fn attach_workspace_index(
             format!("info.plist:{}", meta.len()),
             mtime_secs(&meta),
         )]);
-        let cached: Option<(String, String)> = cache
+        // A row is `[outcome, detail, last accessed]`; one an older
+        // build stored has no third column and is read again.
+        let cached: Option<(String, String, String)> = cache
             .get(&key)
             .filter(|e| e.fingerprint == fp)
             .and_then(|e| e.rows.first())
-            .map(|row| {
-                (
-                    row.first().cloned().unwrap_or_default(),
-                    row.get(1).cloned().unwrap_or_default(),
-                )
-            });
-        let (outcome, detail) = match cached {
+            .filter(|row| row.len() >= 3)
+            .map(|row| (row[0].clone(), row[1].clone(), row[2].clone()));
+        let (outcome, detail, last_accessed) = match cached {
             Some(hit) => {
                 crate::work_counters::record_cache_hit();
                 hit
             }
             None => {
                 crate::work_counters::record_cache_miss();
-                let fresh = match external_associations::read_workspace_path(&info_plist) {
-                    Ok(Some(path)) => ("workspace".to_string(), path),
-                    Ok(None) => ("no-workspace".to_string(), String::new()),
-                    Err(e) => ("error".to_string(), e),
+                let fresh = match external_associations::read_plist_facts(&info_plist) {
+                    Ok(facts) => (
+                        match facts.workspace_path {
+                            Some(_) => "workspace".to_string(),
+                            None => "no-workspace".to_string(),
+                        },
+                        facts.workspace_path.unwrap_or_default(),
+                        facts
+                            .last_accessed
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                    ),
+                    Err(e) => ("error".to_string(), e, String::new()),
                 };
                 cache.insert(
                     key,
                     crate::assoc_store::CachedRows {
                         fingerprint: fp,
                         observed_at: 0,
-                        rows: vec![vec![fresh.0.clone(), fresh.1.clone()]],
+                        rows: vec![vec![fresh.0.clone(), fresh.1.clone(), fresh.2.clone()]],
                     },
                 );
                 fresh
             }
         };
+        if let Ok(at) = last_accessed.parse::<u64>() {
+            accessed.push((name.clone(), at));
+        }
         let ev = match outcome.as_str() {
             "error" => crate::evidence::Evidence::unavailable(
                 crate::evidence::FactKind::Consumer,
@@ -1154,6 +1187,7 @@ fn attach_workspace_index(
             .or_default()
             .push(ev.with_note(format!("DerivedData/{name}")));
     }
+    accessed
 }
 
 #[cfg(test)]
@@ -1205,7 +1239,66 @@ mod tests {
             consumers: Vec::new(),
             note: None,
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         }
+    }
+
+    /// DerivedData's own `LastAccessedDate` goes onto the unit (the newest
+    /// of its projects) and onto each project's own row by folder name,
+    /// and beats a newer key-file access time.
+    #[test]
+    fn xcode_last_accessed_beats_a_newer_access_time_and_lands_on_its_own_folder() {
+        use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
+        let child = |name: &str| UnitChild {
+            kind: ChildKind::Entry,
+            name: name.into(),
+            bytes: Some(10),
+            measure: ChildMeasure::Complete,
+            mtime_max: 5,
+            entries: 0,
+            not_measured: 0,
+            // The folder was read today.
+            last_used: crate::last_used::resolve(None, Some(1_790_000_000)),
+        };
+        let mut unit = external_unit(
+            "xcode",
+            StorageCategory::BuildOutput,
+            Path::new("/fixture/DerivedData"),
+        );
+        unit.last_used = crate::last_used::resolve(None, Some(1_790_000_000));
+        unit.children = vec![
+            child("App-abc"),
+            child("Other-def"),
+            child("Unrecorded-ghi"),
+        ];
+        apply_derived_data_last_used(
+            &mut unit,
+            &[
+                ("App-abc".to_string(), 1_788_652_800),
+                ("Other-def".to_string(), 1_788_000_000),
+            ],
+        );
+        let xcode = crate::last_used::LastUsedSource::ToolNative(
+            crate::last_used::XCODE_DERIVED_DATA.to_string(),
+        );
+        assert_eq!(unit.last_used.at, Some(1_788_652_800), "the newest record");
+        assert_eq!(unit.last_used.source, xcode);
+        assert_eq!(unit.last_used.atime, Some(1_790_000_000), "atime kept");
+        assert_eq!(unit.children[0].last_used.at, Some(1_788_652_800));
+        assert_eq!(unit.children[1].last_used.at, Some(1_788_000_000));
+        // A folder with no record keeps only what it had: its access time,
+        // labelled as such, never the unit's record.
+        assert_eq!(
+            unit.children[2].last_used.source,
+            crate::last_used::LastUsedSource::FileAtime
+        );
+        // Nothing recorded at all leaves the unit untouched.
+        let before = unit.last_used.clone();
+        apply_derived_data_last_used(&mut unit, &[]);
+        assert_eq!(unit.last_used, before);
     }
 
     fn empty_report(root: &Path, projects: Vec<ProjectRow>) -> Report {

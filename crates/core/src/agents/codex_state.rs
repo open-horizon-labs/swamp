@@ -8,11 +8,9 @@
 //! parsing.
 
 use super::IdentifyCtx;
-use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 const CONFIG_READ_BYTES: usize = 64 * 1024;
 
@@ -205,9 +203,9 @@ fn read_session_rows(
     ctx: &IdentifyCtx,
 ) -> Option<HashMap<PathBuf, Option<PathBuf>>> {
     let _step = crate::beacon::enter("agent units", db_path);
-    // Reject non-SQLite files before SQLite gets a chance to initialize or
-    // resize a WAL shared-memory sidecar beside a damaged/renamed file.
-    // This is the 16-byte SQLite file signature, not transcript content.
+    // The shared read-only opener checks the 16-byte SQLite signature
+    // (not transcript content) before SQLite can initialize or resize a
+    // WAL shared-memory sidecar beside a damaged/renamed file.
     let signature = ctx.read_header(db_path, 16)?;
     if signature.as_bytes() != b"SQLite format 3\0" {
         return None;
@@ -222,30 +220,9 @@ fn read_session_rows(
             return None;
         }
     }
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let connection = Connection::open_with_flags(db_path, flags).ok()?;
-    connection.busy_timeout(Duration::from_millis(25)).ok()?;
+    let connection = crate::sqlite_ro::open_read_only(db_path, signature.as_bytes())?;
 
-    let has_threads_table: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'threads')",
-            [],
-            |row| row.get(0),
-        )
-        .ok()?;
-    if !has_threads_table {
-        return None;
-    }
-
-    let mut columns = HashSet::new();
-    let mut table_info = connection.prepare("PRAGMA table_info(threads)").ok()?;
-    let names = table_info
-        .query_map([], |row| row.get::<_, String>(1))
-        .ok()?;
-    for name in names {
-        columns.insert(name.ok()?);
-    }
-    drop(table_info);
+    let columns = crate::sqlite_ro::table_columns(&connection, "threads")?;
     if !columns.contains("rollout_path") || !columns.contains("cwd") {
         return None;
     }
@@ -290,6 +267,7 @@ fn read_session_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use std::fs;
 
     fn read_rows(db: &Path) -> Option<HashMap<PathBuf, Option<PathBuf>>> {

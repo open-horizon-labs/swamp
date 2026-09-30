@@ -4577,6 +4577,68 @@ table! {
 }
 
 table! {
+    /// `<store>/external/overlap_marks.parquet`: per external-unit key, how
+    /// many project worktrees the last observation subtracted from it and
+    /// when that number last changed. Registering or unregistering a
+    /// worktree inside a unit moves the unit's bytes without any storage
+    /// changing: a coverage change, so growth is not shown across it
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    StoredOverlapMarkRow, write_overlap_mark_rows, read_overlap_mark_rows {
+        key: String,
+        count: u32,
+        changed_at: u64,
+    }
+}
+
+table! {
+    /// `<store>/unit_meta.parquet` (#176, #185): what an external unit
+    /// carries beyond the v0.7.5 `external_units.parquet` columns -- its
+    /// last-used fact and the structured overlap. A sibling table, keyed by
+    /// the unit's id, so `external_units.parquet` keeps exactly the schema
+    /// v0.7.5 reads and no store-format bump is needed. A row applies only
+    /// to the `external_units` row with the same `observed_at`: a pass by
+    /// another swamp version rewrites the units and leaves this table
+    /// behind, and an out-of-date row must not be shown as a current fact.
+    StoredUnitMetaRow, write_unit_meta_rows, read_unit_meta_rows {
+        scope_key: String,
+        unit_id: String,
+        observed_at: u64,
+        last_used: Option<u64>,
+        last_used_source: Option<String>,
+        last_used_atime: Option<u64>,
+        bytes_counted_elsewhere: u64,
+        overlap_count: u32,
+    }
+}
+
+table! {
+    /// `<store>/unit_children.parquet` (#178): one row per line of an
+    /// external unit's depth-2 drilldown -- the top child folders, one
+    /// remainder row, and a signed adjustment when hardlinks make the
+    /// rows differ from the walk's total. `unit_id` joins to
+    /// `external_units.parquet`'s `id` within the same `scope_key`; the
+    /// rows sum to the total the walk reported (`drilldown::rows_total`).
+    /// `bytes` is null exactly for a folder that could not be listed
+    /// (`measure = not_measured`): not measured, never zero.
+    StoredUnitChildRow, write_unit_child_rows, read_unit_child_rows {
+        scope_key: String,
+        unit_id: String,
+        observed_at: u64,
+        seq: u32,
+        kind: String,
+        name: String,
+        bytes: Option<i64>,
+        measure: String,
+        mtime_max: u64,
+        entries: u32,
+        not_measured: u32,
+        last_used: Option<u64>,
+        last_used_source: Option<String>,
+        last_used_atime: Option<u64>,
+    }
+}
+
+table! {
     /// `<store>/scope.parquet`: the last resolved effective scope's
     /// scalars (coverage bookkeeping only, never byte history --
     /// `coverage_changes` compares root sets). Replaces `scope.json`.

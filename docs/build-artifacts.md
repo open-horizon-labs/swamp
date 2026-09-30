@@ -155,6 +155,17 @@ would observe the same bytes twice:
    one folded walk; when its units cannot be replayed, that walk keeps the
    per-directory rows it produces and hands them to the adapter. No
    second traversal.
+   The same rows give a unit its **depth-2 drilldown** (`drilldown.rs`:
+   the top child folders and a remainder that sum to the walk's total),
+   and a second capability, `Detector::last_use_sources`, says where a
+   location's last use is recorded (a tool's own database, else the access
+   time of the files directly inside a `bin` directory): evaluated the
+   same way, by anchor against what the detector published
+   (`last_used::declared_sources`), never by detector id. A stored unit is
+   replayed only when the swamp version, the detector catalog version and
+   a digest of every adapter's source match the ones that wrote it, so
+   editing an adapter under an unchanged catalog version cannot replay its
+   old wording (`build_stores::adapter_revision`).
 3. **Replay under the same window.** An unchanged store's folded total
    is replayed under the pass's event window, and so are its identified
    units, from `associations/build_stores.parquet` (one row per unit and

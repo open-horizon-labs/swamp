@@ -28,7 +28,7 @@ fn now() -> u64 {
 /// ...</string>`). Deliberately not a binary-plist parser: real
 /// binary-format `info.plist` files are converted to XML first via the
 /// bounded, read-only, output-only `plutil -convert xml1 -o - <path>`
-/// (see [`read_workspace_path`]) -- this function only ever sees text.
+/// (see [`read_plist_facts`]) -- this function only ever sees text.
 pub fn parse_workspace_path_from_plist_xml(xml: &str) -> Option<String> {
     let key_pos = xml.find("<key>WorkspacePath</key>")?;
     let after_key = &xml[key_pos..];
@@ -46,13 +46,35 @@ fn html_unescape(s: &str) -> String {
         .replace("&apos;", "'")
 }
 
+/// What one DerivedData `info.plist` records: the workspace that built
+/// the folder, and the last time Xcode opened it. Both come from the one
+/// `plutil` conversion; either may be absent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlistFacts {
+    pub workspace_path: Option<String>,
+    /// `LastAccessedDate`, seconds since the epoch.
+    pub last_accessed: Option<u64>,
+}
+
+/// Extracts `LastAccessedDate` from an XML-plist rendering: the `<date>`
+/// that directly follows the key, in RFC 3339 UTC. Text that is not that
+/// shape (a different element, a malformed date, the key absent) is
+/// `None`, which the caller reports as no record, never as a date.
+pub fn parse_last_accessed_from_plist_xml(xml: &str) -> Option<u64> {
+    const KEY: &str = "<key>LastAccessedDate</key>";
+    let after_key = xml[xml.find(KEY)? + KEY.len()..].trim_start();
+    let date = after_key.strip_prefix("<date>")?;
+    let end = date.find("</date>")?;
+    crate::activity::parse_rfc3339_secs(&date[..end])
+}
+
 /// Real read: converts `info_plist_path` to XML via `plutil` (a fixed,
 /// read-only, output-only system utility -- it never rewrites the
-/// source file with `-o -`) and extracts `WorkspacePath`. Any failure
-/// (missing file, plutil unavailable, unexpected format) is a named
-/// `Err`, never a silent `None` indistinguishable from "no workspace
-/// recorded".
-pub fn read_workspace_path(info_plist_path: &Path) -> Result<Option<String>, String> {
+/// source file with `-o -`) and extracts the facts above. Any failure
+/// (missing file, plutil unavailable, a file plutil cannot parse) is a
+/// named `Err`, never a silent empty answer indistinguishable from "no
+/// workspace recorded".
+pub fn read_plist_facts(info_plist_path: &Path) -> Result<PlistFacts, String> {
     let output = crate::fs_gate::spawn::run(
         crate::fs_gate::spawn::Program::Plutil,
         [
@@ -73,14 +95,17 @@ pub fn read_workspace_path(info_plist_path: &Path) -> Result<Option<String>, Str
         ));
     }
     let xml = output.stdout_lossy();
-    Ok(parse_workspace_path_from_plist_xml(&xml))
+    Ok(PlistFacts {
+        workspace_path: parse_workspace_path_from_plist_xml(&xml),
+        last_accessed: parse_last_accessed_from_plist_xml(&xml),
+    })
 }
 
 /// One level of `DerivedData`'s own subdirectories (each named
 /// `<ProjectName>-<hash>`, one per built workspace/project): a single
 /// bounded `read_dir`, never a recursive walk into any one project's
 /// build output. Used to find each subfolder's own `info.plist` for
-/// [`read_workspace_path`]/[`xcode_derived_data_association`].
+/// [`read_plist_facts`]/[`xcode_derived_data_association`].
 pub fn list_derived_data_subfolders(derived_data: &Path) -> Vec<std::path::PathBuf> {
     // One bounded, single-level listing through the shared helper: this
     // enumerates DerivedData's immediate children, never descends, and
@@ -106,7 +131,7 @@ pub fn xcode_derived_data_association(
     let Some(workspace_path) = workspace_path else {
         return Evidence::unknown(
             FactKind::Consumer,
-            FactSubtype::DeclaredConsumer,
+            FactSubtype::RecordedLink,
             source,
             now(),
             crate::reason!("info.plist has no WorkspacePath recorded"),
@@ -121,7 +146,7 @@ pub fn xcode_derived_data_association(
     match matches.len() {
         0 => Evidence::unknown(
             FactKind::Consumer,
-            FactSubtype::DeclaredConsumer,
+            FactSubtype::RecordedLink,
             source,
             now(),
             crate::reason!(
@@ -130,14 +155,14 @@ pub fn xcode_derived_data_association(
         ),
         1 => Evidence::known(
             FactKind::Consumer,
-            FactSubtype::DeclaredConsumer,
+            FactSubtype::RecordedLink,
             FactValue::Text(matches[0].clone()),
             source,
             now(),
         ),
         _ => Evidence::conflicting(
             FactKind::Consumer,
-            FactSubtype::DeclaredConsumer,
+            FactSubtype::RecordedLink,
             matches.into_iter().map(FactValue::Text).collect(),
             source,
             now(),
@@ -578,6 +603,47 @@ mod tests {
             parse_workspace_path_from_plist_xml(SAMPLE_INFO_PLIST_XML),
             Some("/Users/dev/src/MyApp/MyApp.xcworkspace".to_string())
         );
+    }
+
+    fn plist_with(body: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n{body}\n</dict>\n</plist>\n"
+        )
+    }
+
+    #[test]
+    fn extracts_last_accessed_date_from_plist_xml() {
+        let xml = plist_with(
+            "\t<key>LastAccessedDate</key>\n\t<date>2026-09-06T15:39:21Z</date>\n\t<key>WorkspacePath</key>\n\t<string>/x/y.xcworkspace</string>",
+        );
+        assert_eq!(
+            parse_last_accessed_from_plist_xml(&xml),
+            Some(1_788_709_161)
+        );
+        assert_eq!(
+            parse_workspace_path_from_plist_xml(&xml),
+            Some("/x/y.xcworkspace".to_string()),
+            "both facts come from the one document"
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_missing_last_accessed_date_is_none_never_a_date() {
+        // The tempting wrong patches: the first <date> anywhere in the
+        // document (another key's), or a partial parse of a bad date.
+        for xml in [
+            plist_with("\t<key>WorkspacePath</key><string>/x</string>"),
+            plist_with("\t<key>LastAccessedDate</key>\n\t<string>2026-09-06T15:39:21Z</string>"),
+            plist_with("\t<key>LastAccessedDate</key>\n\t<date>yesterday</date>"),
+            plist_with("\t<key>LastAccessedDate</key>\n\t<date>2026-09-06</date>"),
+            plist_with(
+                "\t<key>Other</key>\n\t<date>2026-09-06T15:39:21Z</date>\n\t<key>LastAccessedDate</key>\n\t<string>x</string>",
+            ),
+            String::new(),
+            "\u{0}\u{1}garbage".to_string(),
+        ] {
+            assert_eq!(parse_last_accessed_from_plist_xml(&xml), None, "{xml}");
+        }
     }
 
     #[test]

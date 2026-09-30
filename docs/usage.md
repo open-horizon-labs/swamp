@@ -102,7 +102,9 @@ observation produced: the project, worktree and artifact rows
 `artifact_shape.parquet` + `artifact_shape_lists.parquet`, and the
 per-volume current-artifact table); external and agent-tool storage
 units (`external_units.parquet`/`agent_units.parquet` +
-`unit_consumers.parquet`/`agent_unit_members.parquet`); a volume's
+`unit_consumers.parquet`/`agent_unit_members.parquet`, and the sibling
+tables `unit_meta.parquet` for an external unit's last-used and overlap and
+`unit_children.parquet` for its depth-2 rows); a volume's
 unowned rows (`unowned.parquet` + lists/evidence, and
 `docker_unowned.parquet` for the Docker objects no project claims);
 nested build-artifact units (`nested_artifacts.parquet` + lists/
@@ -544,6 +546,151 @@ The TUI has a dedicated, read-only External view (`v`/`9`): the same
 one-row-per-unit facts as `--view external`, never markable -- act on
 what it shows with the manager's own tools, not swamp.
 
+### Last run or opened
+
+Every external unit shows one fact about use, with where it came from:
+
+```text
+Last run or opened: Jul 8 (file access time)
+Last run or opened: Sep 6 (Xcode DerivedData record)
+Last run or opened: no record
+```
+
+In JSON it is `last_used`: `at` (epoch seconds, `null` for no record),
+`source` (`tool_native:<name>`, `file_atime` or `none`) and, beside a
+tool-native value, `atime` -- the key files' access time, kept so the two
+can be compared. The label is a fact about one file or one record. It is
+never "unused" and never "since": a unit whose row says Jul 8 was last
+opened that day as far as the record shows, which is not a statement that
+nothing needs it. Dates are UTC.
+
+**Precedence, highest first.**
+
+1. A **tool-native record**: the tool's own database or metadata, written
+   for this purpose. A backup, an antivirus scan or an indexer cannot move
+   it.
+2. The **file access time of the unit's key files** -- the regular files
+   directly inside a `bin` directory of the unit. Never a directory's own
+   access time (a listing moves it), never a symlink's, never a file swamp
+   opened.
+3. **No record.** Never a date derived from a modification time.
+
+When both exist and disagree the tool-native value is shown and the access
+time stays in the JSON. A unit that declares no source shows no record.
+
+| Unit kind | Source | Read from | Checked on a real machine |
+|---|---|---|---|
+| rustup toolchains | file access time | `toolchains/<toolchain>/bin/*` | yes: a toolchain's `rustc` access time moved when it ran, its `bin` directory's did not |
+| mise installs | file access time | `installs/<tool>/<version>/bin/*` | yes |
+| pyenv versions | file access time | `versions/<version>/bin/*` | yes |
+| Homebrew Cellar | file access time | `Cellar/<formula>/<version>/bin/*` | layout yes; the detector is off by default, so the default report does not exercise it |
+| Android SDK packages | file access time | `<package>/<version>/bin/*` (`cmdline-tools`, `cmake`); a package with no `bin` (system images, platforms, emulator, platform-tools, build-tools) shows no record | yes |
+| ESP-IDF tools | file access time | `tools/<tool>/<version>/<tool>/bin/*` | yes |
+| Cargo registry cache and sources, git databases and checkouts | tool-native: `~/.cargo/.global-cache`, shown as "last used by cargo" | the newest `timestamp` in the table for that subtree (`registry_crate`, `registry_src`, `git_db`, `git_checkout`), opened with SQLite's immutable read-only mode: no file created beside cargo's database (no `-shm`/`-wal`), no lock taken; a read torn by a checkpoint is "unavailable", and a change still in a WAL is not seen | yes: the database and its values were read on this machine (SQLite `user_version` 7) |
+| Xcode DerivedData | tool-native: each project folder's `info.plist` `LastAccessedDate` | the existing bounded `plutil` read; a project shows its own, the unit the newest | yes |
+| CoreSimulator devices | not implemented | `device.plist` has no last-booted key on this machine (keys seen: `deviceType`, `isDeleted`, `isEphemeral`, `name`, `runtime`, `runtimePolicy`, `state`, `UDID`; no device was booted) | unverified |
+| Docker and OrbStack | build-cache entries keep the daemon's own `last_used` (an existing fact); images and volumes report none | the daemon | existing |
+| npm `_cacache`, Gradle | not implemented | | unverified |
+| everything else | no record | | |
+
+Access time is a weak signal and the docs say so where it is used:
+
+- **Backup tools, antivirus and indexers touch it.** A unit can show a
+  recent date because something scanned it: a later access date may be an
+  indexer or a backup reading the file, not you. It is therefore an upper
+  bound on how recently the unit was used, never proof of use.
+- **`--version` counts.** So does any read; a shell completion that runs a
+  tool counts as a run.
+- **Mounts.** On a `noatime` mount nothing updates it; on `relatime` (Linux
+  default) it updates when the previous value is older than the file's
+  modification or a day. APFS behaves the same way for this purpose.
+- **Aliases are not double counted.** Symlinks (mise's `latest`, Homebrew's
+  `bin` links) are skipped, so an alias never lends its target's time to
+  another unit.
+- **A date in the future is not shown.** A tool-native record dated after now
+  (a tracker written in milliseconds reads as the year 58,000, a copied plist
+  as 2099) is set aside as `no record (ignored: date in the future)`. A scan
+  that hits its listing limit says `no record (probe limit reached)`, not a
+  bare `no record`.
+- **It is read on every observation, not replayed.** Reading a file raises
+  no filesystem event, so an unchanged unit that is replayed without a walk
+  would report an access time that is only as new as its last walk. Swamp
+  lists the declared `bin` directories and takes one `lstat` per key file
+  each observation instead: bounded (a unit that would need more than 4,096
+  listings shows no record), counted in the observation's work counters,
+  and it opens nothing (justification: `docs/architecture.md`). `swamp report` never does this: it reads the stored
+  value.
+
+### What is inside a big root
+
+A large `unclassified` root (`~/Library/Caches` was one 36.8 GB row) and
+every unit that declares a last-use source list their immediate child
+folders, largest first, with size, modification time and last-used:
+
+```text
+36.9GB  unclassified  /Users/me/Library/Caches
+    inside, largest first (rows add up to the total the walk measured):
+           19.5GB  hiphi-endpoints  modified 1d ago  Last run or opened: no record
+           ...
+          281.7MB  remainder: 145 other entries (the other folders, and files directly inside); 9 folders not measured
+           -3.7MB  adjustment: hardlinked files are counted once in this unit's total
+```
+
+- **Bounded.** The top 15 rows (`DRILLDOWN_TOP_N`) and one remainder row; an
+  unclassified root is listed only at or above 1 GiB
+  (`DRILLDOWN_MIN_BYTES`). Both are constants in `drilldown.rs`.
+- **Exact.** The rows sum to the total the same walk measured, in `--json`
+  too (`children`). The remainder is the walk's total minus the listed
+  rows, so it holds the other folders and the files directly inside. A
+  hardlinked file the walk counted once but two parent folders counted
+  under each appears as the signed `adjustment` row, never as missing bytes.
+- **Not measured is not zero.** A folder the process could not list is
+  shown as `not measured` (`bytes: null`); one with an unreadable folder
+  below it is `partial` and its size is a lower bound. Unlisted unreadable
+  folders are counted in the remainder row.
+- **Names, sizes and dates only.** Folder names are shown as they are on
+  disk; no file content and no `Info.plist` is read for them.
+- **From the one walk.** The rows come from the per-directory rows the
+  folded walk already produces, are stored in `unit_children.parquet`, and
+  are replayed with the unit when it is unchanged. In the TUI the External
+  view's row opens (`Enter`) onto them; the selected row's detail line
+  carries the last-used fact.
+
+### Standalone Cargo target directories
+
+A directory `CARGO_TARGET_DIR` builds into, inside a root you declared,
+is recognized by Cargo's own signature: a regular `CACHEDIR.TAG` whose
+first line is `Signature: 8a477f597d28d172789f06886806bc55` **and** a
+regular `.rustc_info.json` beside it. It shows in the unowned view as
+`standalone-cargo-target` with its allocated size, its modification time,
+and the consequence "rebuild with `cargo build`".
+
+- A directory with only the tag (pytest, uv and others write the same
+  signature) is not called Cargo's, and neither is a `target/` sitting next
+  to a `Cargo.toml` (a Cargo project that is not a git checkout keeps its
+  build directory there).
+- Swamp does not link it to a project and guesses none. Whether the
+  directory itself records one varies, and was checked here: a target built
+  from a git worktree records absolute workspace source paths in
+  `<profile>/deps/*.d` (`/private/tmp/swamp-cli-brokenpipe-target-145` records
+  `/private/tmp/swamp-fix-cli-defects/crates/...`), while targets built in
+  place record relative ones and `.fingerprint/*` records only hashes. When
+  absolute paths are there the row shows their common directory as a
+  **recorded link** (second tier, labelled "recorded in dep-info, not checked
+  to exist"); it is never used to select, order or authorize anything.
+- It has its own section in `swamp report --view external` (and
+  `standalone_cargo_targets` in `--json`, and rows in the TUI's External view),
+  counted under unowned and not in the external total.
+- A project's own `target/` is a build artifact of that project and is
+  counted once there, never also as a standalone target.
+- It is plannable through the same reviewed Trash flow as any build output:
+  mark it in the TUI's unowned view (the plan is `actions::propose`'s, the
+  same call every other plan unit goes through). The confirm line says what
+  it is, what a rebuild costs, and shows the in-use reading taken when it
+  was planned. Nothing is removed without the human's Enter.
+- Only roots you declare are scanned; `/private/tmp` is not in the default
+  scope.
+
 ## Agent-tool storage
 
 Coding-agent tools (Claude Code, Codex, its desktop app, Oh My Pi,
@@ -953,8 +1100,8 @@ What each domain actually establishes:
 
 | Domain | What it can show | What it cannot |
 |---|---|---|
-| Activity | Newest recorded modification among a unit's measured children (never "last used"); a tool's own reported use timestamp (Docker's `last_used`, a Cargo fingerprint), kept distinct from filesystem age | Whether a human intentionally used the content; access time when the mount suppresses `atime` (`noatime`/`relatime`, detected and reported `unavailable`) |
-| Consumer | A declared reference: a version-manager pin, a dependency lockfile entry, an Xcode `WorkspacePath`, a Docker join -- who *asks for* something | Whether that reference was ever actually exercised at runtime |
+| Activity | Newest recorded modification among a unit's measured children (never "last used"); a tool's own reported use timestamp (Docker's `last_used`, a Cargo fingerprint), kept distinct from filesystem age; and, for external units, the separate **last-used** fact above | Whether a human intentionally used the content; access time when the mount suppresses `atime` (`noatime`/`relatime`, detected and reported `unavailable`) |
+| Consumer | A declared reference: a version-manager pin, a dependency lockfile entry, a Docker join -- who *asks for* something; and, one tier down, a **recorded link** a tool wrote about its own output (an Xcode `WorkspacePath`), worded as such | Whether that reference was ever actually exercised at runtime |
 | Current-use | A live, bounded, read-only check: an open file handle (`lsof`), a running Docker container, a simulator's booted state, a manager lock file's holder | Whether something not currently open/running/locked has no consumer at all -- absence here is not proof of no use |
 | Recovery | A sourced restoration path (rebuild from present source, network-fetch from a named lockfile, local reinstall from a known version, or "potentially unique local state" for mutable environments) with named prerequisites and a concrete smallest useful follow-up check | Whether the network/registry/credentials needed at restore time are actually available -- always stated as a material unknown, never assumed |
 | Reclaimability | Allocated bytes (always known), an estimated-reclaimable figure that is bounded rather than exact when hardlinks/APFS clones/snapshots are in play, and an observed post-action free-space change (`statvfs` before/after) | An exact reclaimed-byte guarantee from a scan alone; Trash, snapshots, open files and concurrent writers can all suppress the expected change |
@@ -974,7 +1121,7 @@ the table.
 | Docker images/volumes | unknown: the daemon reports creation time and container references, not a last-used timestamp |
 | Cargo nested build artifacts | fingerprint file mtime (tool-reported build time), where a .fingerprint entry exists |
 | agent-tool session/category units | modification age of the session/category's own recorded mtime_max; no tool reports a distinct use timestamp |
-| external location detectors (version managers, package caches, SDKs) | modification age of the measured directory only; no per-tool invocation history is read |
+| external location detectors (version managers, package caches, SDKs) | modification age of the measured directory; plus a separate last-used fact where a source is declared (tool record, else key-file access time, else none) |
 <!-- END ACTIVITY_EVIDENCE_INVENTORY -->
 
 `swamp protect add/remove` changes the keep-list; `protect list` reads it.

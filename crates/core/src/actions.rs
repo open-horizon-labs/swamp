@@ -299,6 +299,16 @@ pub fn propose(
         if units.iter().any(|u| &u.path == p) || refused.iter().any(|r| &r.path == p) {
             continue;
         }
+        // A standalone Cargo target directory (#171): outside every
+        // checkout, recognized by Cargo's own signature, and plannable
+        // through the same reviewed Trash flow as any build output.
+        if let Some(row) = report.unowned.iter().find(|u| {
+            u.reason == crate::report::UnownedReason::StandaloneCargoTarget
+                && Path::new(&u.path_or_object) == p.as_path()
+        }) {
+            units.push(unit_from_standalone_target(row, report.observed_at));
+            continue;
+        }
         if let Some(nested) = report.nested_artifacts.iter().find(|u| &u.path == p) {
             if nested.action == crate::artifact::NestedActionCapability::TrashPath {
                 let owner = report
@@ -835,6 +845,44 @@ pub fn unit_from_external(unit: &crate::external::ExternalUnit) -> PlanUnit {
              own tools, not swamp"
         )],
         evidence,
+        agent_meta: None,
+    }
+}
+
+/// One plan unit for a standalone Cargo target directory. There is no
+/// project to name, so none is: the unit says so, states what a rebuild
+/// is, and carries the row's own facts plus a fresh open-file reading
+/// (`plan_unit_evidence`), the same current-use check every other unit
+/// gets before the human confirms.
+fn unit_from_standalone_target(row: &crate::report::UnownedRow, observed_at: u64) -> PlanUnit {
+    let path = PathBuf::from(&row.path_or_object);
+    PlanUnit {
+        cargo_group: None,
+        path: path.clone(),
+        rel_path: ".".into(),
+        project: "(standalone Cargo target: no project recorded)".into(),
+        project_id: "standalone-cargo-target".into(),
+        worktree_id: "standalone-cargo-target".into(),
+        worktree_path: path.clone(),
+        kind: ArtifactKind::BuildOutput,
+        bytes: row.bytes,
+        dedup_stale: false,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at,
+        recovery: recovery_for(&ArtifactKind::BuildOutput).to_string(),
+        idle_secs: None,
+        merge_complete: false,
+        signals: Vec::new(),
+        verb: "delete".into(),
+        track: None,
+        warnings: vec![
+            crate::attribution::STANDALONE_CARGO_TARGET_NOTE.to_string(),
+            "moves this whole directory to Trash; stop any `cargo build` writing into it first; \
+             allocation is not guaranteed freed space"
+                .to_string(),
+        ],
+        evidence: plan_unit_evidence(&row.evidence, &path),
         agent_meta: None,
     }
 }

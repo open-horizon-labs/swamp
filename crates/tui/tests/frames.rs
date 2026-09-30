@@ -415,6 +415,29 @@ fn capture(app: &App, w: u16, h: u16) -> String {
     terminal.backend().to_string()
 }
 
+/// A store written by an older swamp cannot be read, so the list is empty
+/// until the background rebuild lands. It says why, instead of claiming
+/// nothing was ever scanned.
+#[test]
+fn an_older_generation_store_says_it_is_being_rebuilt_not_that_nothing_was_scanned() {
+    let mut app = App::new(
+        swamp_core::report::Report::empty("/Users/dev/src".into()),
+        "/Users/dev/src".into(),
+    );
+    app.has_index = false;
+    app.filter_text = "0".into();
+    let plain = capture(&app, 120, 24);
+    assert!(plain.contains("Nothing has been scanned yet"), "{plain}");
+    app.store_rebuild = true;
+    let rebuild = capture(&app, 120, 24);
+    assert!(rebuild.contains("older"), "{rebuild}");
+    assert!(rebuild.contains("rebuilt in the background"), "{rebuild}");
+    assert!(
+        !rebuild.contains("Nothing has been scanned yet"),
+        "{rebuild}"
+    );
+}
+
 #[test]
 fn scope_unique_estimate_is_labeled_even_in_a_narrow_header() {
     let mut report = fixture_report();
@@ -791,6 +814,10 @@ fn external_view() {
             consumers: Vec::new(),
             note: None,
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         }]);
         app.set_view(ViewKind::External);
         check(&format!("external_{w}x{h}"), &capture(&app, w, h));
@@ -1232,6 +1259,8 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         allocated: false,
         project: None,
         evidence: Vec::new(),
+        last_used: None,
+        size_text: None,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [
@@ -2445,5 +2474,92 @@ fn long_rows_keep_their_rail_and_long_popup_lines_wrap() {
     assert!(
         f.contains("ENDMARK"),
         "the tail of a long line is wrapped in, not cut:\n{f}"
+    );
+}
+
+/// Adversarial audit (v0.8.0 G2): a drilldown row for a folder that could
+/// not be read must not show a size of zero as a fact, and a negative
+/// adjustment row must not be drawn as `0B` (the rows would then not add
+/// up to the unit on screen). Wrong patch: `Row.bytes` is unsigned, so the
+/// builder writes `bytes.unwrap_or(0).max(0)` and the Size column renders
+/// that number like any other.
+#[test]
+fn adv_a_not_measured_or_negative_drilldown_row_never_draws_a_zero_size() {
+    use swamp_core::drilldown::{ChildKind, ChildMeasure, UnitChild};
+    let child = |kind, name: &str, bytes: Option<i64>, measure| UnitChild {
+        kind,
+        name: name.into(),
+        bytes,
+        measure,
+        mtime_max: 0,
+        entries: 2,
+        not_measured: 0,
+        last_used: Default::default(),
+    };
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.filter_text.clear();
+    app.set_external_units(vec![swamp_core::external::ExternalUnit {
+        detector_id: "rustup".into(),
+        detector_name: "rustup".into(),
+        category: swamp_core::locations::StorageCategory::Installation,
+        provenance: swamp_core::locations::Provenance::BuiltinConvention,
+        path: PathBuf::from("/Users/dev/.rustup/toolchains"),
+        bytes: 2_950_000_000,
+        mtime_max: 0,
+        hardlinked: true,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at: 1_700_000_000,
+        consumers: Vec::new(),
+        note: None,
+        evidence: Vec::new(),
+        bytes_counted_elsewhere: 0,
+        overlap_count: 0,
+        last_used: Default::default(),
+        children: vec![
+            child(
+                ChildKind::Entry,
+                "stable",
+                Some(2_000_000_000),
+                ChildMeasure::Complete,
+            ),
+            child(
+                ChildKind::Entry,
+                "lockedtc",
+                None,
+                ChildMeasure::NotMeasured,
+            ),
+            child(
+                ChildKind::Remainder,
+                "",
+                Some(1_000_000_000),
+                ChildMeasure::Complete,
+            ),
+            child(
+                ChildKind::Adjustment,
+                "",
+                Some(-50_000_000),
+                ChildMeasure::Complete,
+            ),
+        ],
+    }]);
+    app.set_view(ViewKind::External);
+    app.selected = 0;
+    app.enter_row();
+    let frame = capture(&app, 200, 60);
+    let line_of = |needle: &str| {
+        frame
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle}:\n{frame}"))
+            .to_string()
+    };
+    // The Size column: `0B`, with or without the allocated-basis `*`.
+    let zero = |l: &str| l.contains(" 0B*") || l.contains(" 0B ") || l.contains(" 0.0B");
+    let locked = line_of("lockedtc");
+    let adjustment = line_of("adjustment");
+    assert!(
+        !zero(&locked) && !zero(&adjustment),
+        "a zero size drawn as a fact:\n{locked}\n{adjustment}"
     );
 }

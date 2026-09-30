@@ -370,6 +370,7 @@ pub fn run(root: &Path) -> Result<()> {
                 root.clone(),
             );
             a.observed_label = "no observation yet".into();
+            a.store_rebuild = swamp_core::report::store_is_older_generation(&store);
             a
         }
     };
@@ -453,6 +454,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
             app.scope = Some(scope.clone());
             app.observed_label = "no observation yet".into();
             app.has_index = false;
+            app.store_rebuild = swamp_core::report::store_is_older_generation(&store);
             app.set_declared_roots(&swamp_core::roots::declared_roots(scope, &[]));
             finish_startup(&mut app, &store, None);
             app

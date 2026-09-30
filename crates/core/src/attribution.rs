@@ -220,6 +220,91 @@ pub(crate) fn self_declared_cache(dir: &Path) -> Option<ArtifactKind> {
     (head.bytes == SIGNATURE).then_some(ArtifactKind::Cache)
 }
 
+/// What a standalone Cargo target directory costs to lose, in Cargo's
+/// own terms. Said on the row and on the confirm line. It claims only what
+/// swamp does: no project is linked. Any source path the directory itself
+/// recorded is shown separately, as a recorded link.
+pub(crate) const STANDALONE_CARGO_TARGET_NOTE: &str =
+    "standalone Cargo target: rebuild with `cargo build`; swamp does not link it to a project";
+
+/// A directory `CARGO_TARGET_DIR` built into: Cargo's own signature, both
+/// halves. The Cache Directory Tagging signature at byte 0 of a regular
+/// `CACHEDIR.TAG` ([`self_declared_cache`]) is shared with pytest, uv and
+/// others, so it is not enough alone; `.rustc_info.json`, a regular file
+/// Cargo writes into every target directory, is what says Cargo. A
+/// directory with only the tag is a cache of some other tool's, and is
+/// not called Cargo's.
+pub(crate) fn is_standalone_cargo_target(dir: &Path) -> bool {
+    self_declared_cache(dir).is_some()
+        && crate::fs_gate::symlink_metadata(dir.join(".rustc_info.json"))
+            .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+        // A `target/` beside a `Cargo.toml` is that package's own build
+        // directory (a Cargo project that is not a git checkout), not a
+        // `CARGO_TARGET_DIR` somewhere else.
+        && !dir
+            .parent()
+            .is_some_and(|p| crate::fs_gate::is_real_file(p.join("Cargo.toml")))
+}
+
+/// The directory a standalone target's own dep-info records its source
+/// files under, if it records any outside Cargo's registry and toolchain:
+/// the common ancestor of the absolute source paths in a bounded sample of
+/// `<profile>/deps/*.d`. Verified on this machine's targets: a target
+/// built from a git worktree records absolute workspace paths, others
+/// record only relative ones (then this is `None`). Only ever shown as a
+/// recorded link, never used to select, authorize or order anything.
+pub(crate) fn recorded_source_root(target: &Path) -> Option<std::path::PathBuf> {
+    const PROFILES_SAMPLED: usize = 2;
+    const FILES_PER_PROFILE: usize = 32;
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for profile in crate::locations::shallow_list(target)
+        .entries
+        .iter()
+        .filter(|e| e.is_dir)
+        .take(PROFILES_SAMPLED * 4)
+    {
+        let deps = target.join(&profile.name).join("deps");
+        for f in crate::locations::shallow_list(&deps)
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir && e.name.ends_with(".d"))
+            .take(FILES_PER_PROFILE)
+        {
+            let Ok(bytes) = crate::fs_gate::read::bounded_read(
+                deps.join(&f.name),
+                crate::fs_gate::read::BoundedCap::POINTER,
+            ) else {
+                continue;
+            };
+            let text = bytes.lossy();
+            let Some((_, sources)) = text.lines().next().and_then(|l| l.split_once(": ")) else {
+                continue;
+            };
+            for src in sources.split(' ') {
+                let p = Path::new(src);
+                let tools = ["/.cargo/", "/.rustup/", "/rustc/"];
+                if p.is_absolute()
+                    && !p.starts_with(target)
+                    && !tools.iter().any(|t| src.contains(t))
+                    && let Some(dir) = p.parent()
+                {
+                    roots.push(dir.to_path_buf());
+                }
+            }
+        }
+    }
+    let mut it = roots.into_iter();
+    let mut common = it.next()?;
+    for r in it {
+        while !r.starts_with(&common) {
+            if !common.pop() {
+                return None;
+            }
+        }
+    }
+    (common.components().count() > 2).then_some(common)
+}
+
 /// Basenames that, when found *outside* every checkout/worktree, are a
 /// shared cache rather than an ordinary unowned path.
 const SHARED_CACHE_NAMES: &[&str] = &[

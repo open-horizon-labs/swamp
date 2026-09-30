@@ -1048,6 +1048,10 @@ fn empty_state(app: &App) -> String {
         );
     }
     match app.view {
+        V::Projects if !app.has_index && app.store_rebuild => "This store was written by an older \
+             swamp, so its index is being rebuilt in the background. Your settings, protections \
+             and notes are kept; growth history starts again. R rescans."
+            .to_string(),
         V::Projects if !app.has_index => {
             "Nothing has been scanned yet. Press R to scan; it runs in the background.".to_string()
         }
@@ -1200,11 +1204,14 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         );
         let bytes = format!(
             "{:>10}",
-            format!(
-                "{}{}",
-                human_bytes(row.bytes),
-                if row.allocated { "*" } else { "" }
-            )
+            match &row.size_text {
+                Some(text) => text.clone(),
+                None => format!(
+                    "{}{}",
+                    human_bytes(row.bytes),
+                    if row.allocated { "*" } else { "" }
+                ),
+            }
         );
         let growth = format!(
             "{:>10}",
