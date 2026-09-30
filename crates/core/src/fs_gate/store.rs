@@ -802,6 +802,11 @@ pub enum TextFile<'a> {
     /// The scheduled refresh's LaunchAgent plist, where
     /// [`launch_agent_plist`] resolves it.
     LaunchAgent,
+    /// `<store>/first-run-asked`: the record that the first-run question
+    /// was asked or that the store already held an observation. Not a
+    /// derived table, so a store reset leaves it alone (like
+    /// `ui_state.json`).
+    Onboarded { store: &'a StoreDir },
 }
 
 impl TextFile<'_> {
@@ -809,6 +814,7 @@ impl TextFile<'_> {
         match *self {
             TextFile::Config { store } => Ok(store.0.join("config.toml")),
             TextFile::LaunchAgent => launch_agent_plist(),
+            TextFile::Onboarded { store } => Ok(store.0.join("first-run-asked")),
         }
     }
 }
@@ -828,6 +834,29 @@ pub fn launch_agent_plist() -> io::Result<PathBuf> {
 /// Writes `text` into `file`, atomically.
 pub fn write_text(file: TextFile<'_>, text: &str) -> io::Result<()> {
     write_atomic(&file.path()?, text.as_bytes())
+}
+
+/// Whether the `Onboarded` record exists.
+pub fn onboarded_recorded(store: &StoreDir) -> bool {
+    TextFile::Onboarded { store }
+        .path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Rewrites the user's `config.toml` in place: a symlinked config is
+/// followed and its target replaced (the link stays), the file's mode is
+/// kept, and the temporary file is created next to the target, so the
+/// rename never crosses a filesystem. Fails, leaving the old file, when
+/// that temporary file cannot be created.
+pub fn write_config_in_place(store: &StoreDir, text: &str) -> io::Result<()> {
+    let path = TextFile::Config { store }.path()?;
+    let target = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(&path)?,
+        _ => path,
+    };
+    let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    write_atomic_with(&target, text.as_bytes(), perms)
 }
 
 /// Removes a file swamp wrote (the LaunchAgent plist on `schedule
@@ -935,6 +964,14 @@ impl ObserveLock<'_> {
 /// Best-effort: a filesystem that refuses to sync a directory handle
 /// must not fail the write that already succeeded.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with(path, bytes, None)
+}
+
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    perms: Option<std::fs::Permissions>,
+) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
@@ -946,6 +983,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         crate::entities::new_id()
     ));
     std::fs::write(&tmp, bytes)?;
+    if let Some(perms) = perms
+        && let Err(e) = std::fs::set_permissions(&tmp, perms)
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Ok(f) = std::fs::File::open(&tmp) {
         let _ = f.sync_all();
     }

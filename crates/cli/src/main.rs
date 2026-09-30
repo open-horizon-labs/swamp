@@ -130,7 +130,7 @@ enum ConfigAction {
     /// Declare a directory that holds your source code (writes `[scan]
     /// include`; comments and other keys in config.toml are kept). A root
     /// inside one already declared is refused, one already declared is a
-    /// no-op, and one that contains declared roots replaces them.
+    /// no-op, and one that contains declared roots keeps them (shown as covered).
     AddRoot {
         path: String,
         /// Record a root that does not exist yet (an unmounted volume);
@@ -1389,7 +1389,9 @@ fn main() -> Result<()> {
                         Ok(swamp_core::roots::AddOutcome::Added { stored, absorbed }) => {
                             safe_println!("declared {stored} in {}", path.display());
                             for a in absorbed {
-                                safe_println!("  {a} is inside it and was removed as redundant");
+                                safe_println!(
+                                    "  {a} is inside it and stays declared; it shows as covered"
+                                );
                             }
                         }
                         Ok(swamp_core::roots::AddOutcome::AlreadyDeclared { entry }) => {

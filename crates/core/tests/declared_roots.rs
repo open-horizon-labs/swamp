@@ -198,9 +198,10 @@ fn a_root_inside_a_declared_one_is_refused_and_names_the_declared_one() {
 }
 
 #[test]
-fn a_parent_of_declared_roots_absorbs_them_and_says_so() {
-    // Tempting wrong patch: append the parent and leave the children,
-    // which stores nested-redundant roots.
+fn a_parent_of_declared_roots_keeps_them_and_says_so() {
+    // Tempting wrong patch: delete the declared children when a parent is
+    // added, so `add-root ~/work` then `remove-root ~/work` loses the
+    // user's original entries.
     let f = fx();
     f.dir("work/a");
     f.dir("work/b");
@@ -215,7 +216,16 @@ fn a_parent_of_declared_roots_absorbs_them_and_says_so() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(declared_entries(&f.store).unwrap(), ["~/other", "~/work"]);
+    assert_eq!(
+        declared_entries(&f.store).unwrap(),
+        ["~/work/a", "~/other", "~/work/b", "~/work"]
+    );
+    remove_root(&f.store, &f.reach(), "~/work").unwrap();
+    assert_eq!(
+        declared_entries(&f.store).unwrap(),
+        ["~/work/a", "~/other", "~/work/b"],
+        "back to the prior state"
+    );
 }
 
 #[test]
@@ -603,4 +613,41 @@ fn removing_the_first_entry_of_a_one_line_array_leaves_no_stray_space() {
     fs::write(&f.config, "[scan]\ninclude = [\"~/a\", \"~/b\"]\n").unwrap();
     remove_root(&f.store, &f.reach(), "~/a").unwrap();
     assert_eq!(f.text(), "[scan]\ninclude = [\"~/b\"]\n");
+}
+
+#[test]
+fn broad_system_areas_and_the_home_directory_are_refused() {
+    // Tempting wrong patch: only refuse `/`, so `/Users` or `~` puts a
+    // whole machine area in scope.
+    let f = fx();
+    for typed in [
+        "/", "/Users", "/Volumes", "/private", "/System", "/opt", "/usr", "~", "~/",
+    ] {
+        let r = f.add(typed);
+        assert!(matches!(r, Err(RootError::TooBroad(_))), "{typed}: {r:?}");
+    }
+    assert!(!f.config.exists());
+}
+
+#[test]
+fn the_first_run_record_survives_a_store_reset_and_an_index_counts_as_onboarded() {
+    // Tempting wrong patch: gate the question on the store-format marker,
+    // so a later reset re-asks everyone who has no config.toml.
+    let f = fx();
+    f.store.mark_current_format().unwrap();
+    let (r, _) = run_first_run(&f, true, "");
+    assert_eq!(r, FirstRun::NotNeeded);
+    // A reset removes the marker; the record that this store was past its
+    // first run remains.
+    assert!(f.store.reset_incompatible_format().is_ok());
+    fs::remove_file(f.store.path().join("housekeeping.version")).ok();
+    let (r, out) = run_first_run(&f, true, "");
+    assert_eq!(r, FirstRun::NotNeeded, "{out}");
+}
+
+#[test]
+fn a_config_edit_never_echoes_terminal_escapes() {
+    let f = fx();
+    let err = f.add("~/\u{1b}[2Jx").unwrap_err().to_string();
+    assert!(!err.contains('\u{1b}'), "{err:?}");
 }

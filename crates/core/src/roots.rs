@@ -19,7 +19,7 @@
 use crate::coverage::{RegionStatus, RootCoverage};
 use crate::fs_gate::StoreDir;
 use crate::fs_gate::store::TextFile;
-use crate::scope::{EffectiveScope, RootReason, RootStatus, comparable, configured_path};
+use crate::scope::{EffectiveScope, RootReason, RootStatus, comparable, configured_path, lexical};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item, Value};
@@ -51,8 +51,13 @@ pub enum RootError {
         typed: String,
         declared: String,
     },
-    /// `/` would put the whole machine in scope.
+    /// A directory that holds far more than one person's projects (`/`,
+    /// `/Users`, the home directory itself, ...).
     TooBroad(PathBuf),
+    /// `~user/...`: swamp cannot resolve another account's home.
+    UnsupportedTilde(String),
+    /// `~` was typed but there is no usable home directory.
+    NoHome,
     NotDeclared(String),
     /// The path cannot be written to a TOML file as text.
     NotUtf8(PathBuf),
@@ -62,6 +67,18 @@ pub enum RootError {
     Io(String),
 }
 
+/// Text safe to echo to a terminal: control characters, escape sequences
+/// included, become `?`.
+pub fn sanitized(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn shown(p: &Path) -> String {
+    sanitized(&p.display().to_string())
+}
+
 impl std::fmt::Display for RootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -69,42 +86,57 @@ impl std::fmt::Display for RootError {
                 f,
                 "{} does not exist. Check the spelling, or pass --allow-missing to record a \
                  root that is not mounted yet (it is then reported as missing, never as an error).",
-                p.display()
+                shown(p)
             ),
             RootError::NotADirectory(p) => write!(
                 f,
                 "{} is not a directory; a source root is a directory that holds projects.",
-                p.display()
+                shown(p)
             ),
             RootError::Unreadable { path, reason } => write!(
                 f,
                 "{} exists but this user cannot read it ({reason}); swamp only declares roots \
                  within your reach.",
-                path.display()
+                shown(path)
             ),
             RootError::NestedUnder { typed, declared } => write!(
                 f,
-                "{typed} is inside {declared}, which is already declared; the declared root \
-                 already covers it. Nothing was changed."
+                "{} is inside {}, which is already declared; the declared root \
+                 already covers it. Nothing was changed.",
+                sanitized(typed),
+                sanitized(declared)
             ),
             RootError::TooBroad(p) => write!(
                 f,
-                "{} would put the whole machine in scope; declare the directories that hold \
-                 your projects instead.",
-                p.display()
+                "{} holds far more than your projects, so declaring it would put a whole \
+                 machine area in scope; declare a narrower directory that holds your \
+                 projects instead.",
+                shown(p)
+            ),
+            RootError::UnsupportedTilde(t) => write!(
+                f,
+                "{} uses another account's home (`~name`), which is not supported; type the \
+                 full path instead.",
+                sanitized(t)
+            ),
+            RootError::NoHome => write!(
+                f,
+                "`~` needs a home directory and none is set (HOME is empty); type the full \
+                 path instead."
             ),
             RootError::NotDeclared(t) => write!(
                 f,
-                "{t} is not a declared root; nothing was changed. `swamp config show` lists \
-                 the declared roots."
+                "{} is not a declared root; nothing was changed. `swamp config show` lists \
+                 the declared roots.",
+                sanitized(t)
             ),
             RootError::NotUtf8(p) => write!(
                 f,
                 "{} is not valid UTF-8 and cannot be written to config.toml.",
-                p.display()
+                shown(p)
             ),
-            RootError::Config(m) => write!(f, "{m}"),
-            RootError::Io(m) => write!(f, "{m}"),
+            RootError::Config(m) => write!(f, "{}", sanitized(m)),
+            RootError::Io(m) => write!(f, "{}", sanitized(m)),
         }
     }
 }
@@ -203,36 +235,45 @@ pub fn declared_entries(store: &StoreDir) -> Result<Vec<String>, RootError> {
     }
 }
 
-/// What gets written: `~/...` when typed with a tilde, else the absolute
-/// path. `.`, `..` and trailing slashes are gone; symlinks are not
-/// resolved, so the entry reads the way the user wrote it.
-fn stored_form(typed: &str, reach: &Reach) -> Result<String, RootError> {
+/// A typed path as an absolute path and the text that gets written:
+/// `~/...` when typed with a tilde, else the absolute path. `.`, `..`,
+/// repeated and trailing slashes are gone; symlinks are not resolved, so
+/// the entry reads the way the user wrote it. `~user` forms, `~` without a
+/// home directory and a relative path under a non-UTF-8 working directory
+/// are refused, never guessed.
+fn stored_form(typed: &str, reach: &Reach) -> Result<(String, PathBuf), RootError> {
     let typed = typed.trim();
-    let absolute = if typed == "~" || typed.starts_with("~/") {
-        configured_path(&reach.home, typed)
-    } else {
-        let p = Path::new(typed);
-        if p.is_absolute() {
-            configured_path(&reach.home, typed)
-        } else {
-            configured_path(&reach.home, &reach.cwd.join(p).to_string_lossy())
-        }
-    };
     let text = |p: &Path| {
         p.to_str()
             .map(str::to_string)
             .ok_or_else(|| RootError::NotUtf8(p.to_path_buf()))
     };
-    if (typed == "~" || typed.starts_with("~/"))
-        && let Ok(rest) = absolute.strip_prefix(&reach.home)
-    {
-        return Ok(if rest.as_os_str().is_empty() {
-            "~".to_string()
-        } else {
-            format!("~/{}", text(rest)?)
-        });
+    if let Some(rest) = typed.strip_prefix('~') {
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            return Err(RootError::UnsupportedTilde(typed.to_string()));
+        }
+        if !reach.home.is_absolute() {
+            return Err(RootError::NoHome);
+        }
+        let below = rest.trim_start_matches('/');
+        let absolute = lexical(&reach.home.join(below));
+        if let Ok(inside) = absolute.strip_prefix(&reach.home) {
+            let stored = if inside.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", text(inside)?)
+            };
+            return Ok((stored, absolute));
+        }
+        return Ok((text(&absolute)?, absolute));
     }
-    text(&absolute)
+    let p = Path::new(typed);
+    let absolute = if p.is_absolute() {
+        lexical(p)
+    } else {
+        lexical(&reach.cwd.join(p))
+    };
+    Ok((text(&absolute)?, absolute))
 }
 
 /// The spelling two entries are compared in: symlinks resolved where the
@@ -290,26 +331,45 @@ fn push_entry(array: &mut Array, entry: &str) {
     array.set_trailing_comma(true);
 }
 
-fn write(store: &StoreDir, doc: &DocumentMut) -> Result<(), RootError> {
-    crate::fs_gate::store::write_text(TextFile::Config { store }, &doc.to_string())
-        .map_err(|e| RootError::Io(format!("writing config.toml: {e}")))
+/// Writes the edited document. A file that used CRLF stays CRLF.
+fn write(store: &StoreDir, doc: &DocumentMut, crlf: bool) -> Result<(), RootError> {
+    let mut text = doc.to_string();
+    if crlf {
+        text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
+    crate::fs_gate::store::write_config_in_place(store, &text).map_err(|e| {
+        RootError::Io(format!(
+            "config.toml was not changed: a temporary file could not be written next to it ({e})"
+        ))
+    })
+}
+
+/// Whether the config file text uses CRLF line endings.
+fn uses_crlf(text: &str) -> bool {
+    text.contains("\r\n")
 }
 
 /// Declares `typed` as a source root.
 ///
 /// Refused, with the file untouched: a path that does not exist (unless
-/// `allow_missing`), is not a directory, cannot be read, is `/`, or is
+/// `allow_missing`), is not a directory, cannot be read, is too broad (`/`, the home
+/// directory, ...), or is
 /// inside a root already declared. A path that is already declared,
 /// however spelled (trailing slash, `..`, a symlink, `~`), is a no-op. A
-/// path that contains declared roots replaces them.
+/// path that contains declared roots leaves them declared (they show as
+/// covered) and says so.
 pub fn add_root(
     store: &StoreDir,
     reach: &Reach,
     typed: &str,
     allow_missing: bool,
 ) -> Result<AddOutcome, RootError> {
-    let stored = stored_form(typed, reach)?;
-    let expanded = configured_path(&reach.home, &stored);
+    let (stored, expanded) = stored_form(typed, reach)?;
+    // Everything below, the checks included, happens under the lock, so
+    // what was validated is what is recorded.
+    let _lock = store
+        .lock_config_edits()
+        .map_err(|e| RootError::Io(format!("locking config.toml: {e}")))?;
     match crate::fs_gate::metadata_following(&expanded) {
         Ok(m) if !m.is_dir() => return Err(RootError::NotADirectory(expanded)),
         Ok(_) => {
@@ -333,19 +393,16 @@ pub fn add_root(
         }
     }
     let key = comparable(&expanded);
-    if key == Path::new("/") {
+    if too_broad(&key, reach) {
         return Err(RootError::TooBroad(key));
     }
-
-    let _lock = store
-        .lock_config_edits()
-        .map_err(|e| RootError::Io(format!("locking config.toml: {e}")))?;
-    let mut doc = parse(&config_text(store)?)?;
+    let original = config_text(store)?;
+    let mut doc = parse(&original)?;
     let existing = match include_array(&mut doc, false)? {
         Some(a) => entries(a)?,
         None => Vec::new(),
     };
-    let mut absorbed = Vec::new();
+    let mut covered = Vec::new();
     for entry in &existing {
         let other = compare_key(entry, reach);
         if other == key {
@@ -360,62 +417,103 @@ pub fn add_root(
             });
         }
         if other.starts_with(&key) {
-            absorbed.push(entry.clone());
+            covered.push(entry.clone());
         }
     }
     let array = include_array(&mut doc, true)?.expect("created");
-    array.retain(|v| v.as_str().is_none_or(|s| !absorbed.iter().any(|a| a == s)));
     push_entry(array, &stored);
-    write(store, &doc)?;
-    Ok(AddOutcome::Added { stored, absorbed })
+    write(store, &doc, uses_crlf(&original))?;
+    Ok(AddOutcome::Added {
+        stored,
+        absorbed: covered,
+    })
+}
+
+/// Directories that hold far more than one person's projects: the
+/// filesystem root, the system and user areas, and the home directory
+/// itself.
+fn too_broad(key: &Path, reach: &Reach) -> bool {
+    const AREAS: &[&str] = &[
+        "/",
+        "/Users",
+        "/Volumes",
+        "/private",
+        "/System",
+        "/opt",
+        "/usr",
+        "/home",
+        "/var",
+        "/Library",
+        "/Applications",
+    ];
+    AREAS.iter().any(|a| key == comparable(Path::new(a))) || key == comparable(&reach.home)
 }
 
 /// Stops declaring `typed`, matched however it is spelled. Returns the
 /// entry that was removed. An undeclared root is an error, not a no-op, so
 /// a typo does not look like success.
 pub fn remove_root(store: &StoreDir, reach: &Reach, typed: &str) -> Result<String, RootError> {
-    let stored = stored_form(typed, reach)?;
+    let (stored, _) = stored_form(typed, reach)?;
     let key = compare_key(&stored, reach);
     let _lock = store
         .lock_config_edits()
         .map_err(|e| RootError::Io(format!("locking config.toml: {e}")))?;
-    let mut doc = parse(&config_text(store)?)?;
+    let original = config_text(store)?;
+    let mut doc = parse(&original)?;
     let Some(array) = include_array(&mut doc, false)? else {
         return Err(RootError::NotDeclared(typed.to_string()));
     };
-    let existing = entries(array)?;
-    let Some(found) = existing
-        .iter()
-        .find(|e| **e == stored || compare_key(e, reach) == key)
-        .cloned()
-    else {
+    // Every entry that spells this root, however it is spelled.
+    let found: Vec<String> = entries(array)?
+        .into_iter()
+        .filter(|e| *e == stored || compare_key(e, reach) == key)
+        .collect();
+    if found.is_empty() {
         return Err(RootError::NotDeclared(typed.to_string()));
-    };
-    array.retain(|v| v.as_str() != Some(found.as_str()));
+    }
+    array.retain(|v| v.as_str().is_none_or(|s| !found.iter().any(|f| f == s)));
     // A one-line array whose first entry was removed would start `[ "x"`.
     if let Some(first) = array.get_mut(0)
         && !raw(first.decor().prefix()).contains('\n')
     {
         first.decor_mut().set_prefix("");
     }
-    write(store, &doc)?;
-    Ok(found)
+    write(store, &doc, uses_crlf(&original))?;
+    Ok(found.join(", "))
 }
 
 // --- first run ---------------------------------------------------------
 
-/// Whether swamp should ask where the source code is: nothing has ever
-/// been observed in this store and the config has no `[scan]` section. A
-/// config that cannot be read or parsed never asks (the command's own
-/// config error says so).
+/// Whether swamp should ask where the source code is: the store holds no
+/// observation, the config has no `[scan]` section, and the question has
+/// not been asked before. Deliberately not tied to the store-format
+/// marker: a later store reset must not re-ask anyone. A store that
+/// already holds an index, or a config that cannot be read or parsed
+/// (the command's own error says so), never asks. When an existing index
+/// is what settles it, that is recorded, so a reset later cannot make it
+/// look like a first run.
 pub fn first_run_needed(store: &StoreDir) -> bool {
-    if store.has_current_format().unwrap_or(true) {
+    if crate::fs_gate::store::onboarded_recorded(store) {
         return false;
     }
-    match config_text(store).and_then(|t| parse(&t)) {
-        Ok(doc) => doc.get("scan").is_none(),
-        Err(_) => false,
+    let has_index = store.has_current_format().unwrap_or(true)
+        || store.has_incompatible_marker().unwrap_or(true);
+    let scan = match config_text(store).and_then(|t| parse(&t)) {
+        Ok(doc) => doc.get("scan").is_some(),
+        Err(_) => return false,
+    };
+    if has_index || scan {
+        if has_index {
+            record_onboarded(store);
+        }
+        return false;
     }
+    true
+}
+
+/// Best effort: remember that this store is past its first run.
+fn record_onboarded(store: &StoreDir) {
+    let _ = crate::fs_gate::store::write_text(TextFile::Onboarded { store }, "asked\n");
 }
 
 /// What [`first_run`] did.
@@ -467,7 +565,8 @@ pub fn first_run(
         let prompt = if !recorded.is_empty() {
             "Another source directory? Press Enter when done: "
         } else if offer {
-            "Where is your source code? Press Enter for ~/src, or type a directory: "
+            "Where is your source code? Press Enter for ~/src, or type a directory \
+             (~/src stays a built-in default either way): "
         } else {
             "Where is your source code? Type a directory, or press Enter to use the \
              built-in defaults: "
@@ -486,11 +585,11 @@ pub fn first_run(
         };
         match add_root(store, reach, answer, false) {
             Ok(AddOutcome::Added { stored, .. }) => {
-                writeln!(out, "  recorded {stored}").map_err(io)?;
+                writeln!(out, "  recorded {}", sanitized(&stored)).map_err(io)?;
                 recorded.push(stored);
             }
             Ok(AddOutcome::AlreadyDeclared { entry }) => {
-                writeln!(out, "  already declared: {entry}").map_err(io)?;
+                writeln!(out, "  already declared: {}", sanitized(&entry)).map_err(io)?;
             }
             Err(e) => {
                 writeln!(out, "  {e}").map_err(io)?;
@@ -501,14 +600,16 @@ pub fn first_run(
             }
         }
     }
+    record_onboarded(store);
     if recorded.is_empty() {
         // Remember that the question was asked.
         let _lock = store
             .lock_config_edits()
             .map_err(|e| RootError::Io(e.to_string()))?;
-        let mut doc = parse(&config_text(store)?)?;
+        let original = config_text(store)?;
+        let mut doc = parse(&original)?;
         include_array(&mut doc, true)?;
-        write(store, &doc)?;
+        write(store, &doc, uses_crlf(&original))?;
         writeln!(
             out,
             "No roots recorded; using the built-in defaults. Add one any time with: \
@@ -555,8 +656,17 @@ pub fn declared_roots(scope: &EffectiveScope, coverage: &[RootCoverage]) -> Vec<
         .map(|r| DeclaredRoot {
             path: r.path.clone(),
             state: match &r.status {
+                // Present by `stat`, but a directory this user cannot open
+                // is unreadable, however it got declared. The probe opens
+                // the directory and reads no entry.
                 RootStatus::Present => {
                     let row = coverage.iter().find(|c| c.path == r.path);
+                    if let Err(e) = crate::fs_gate::probe_listable(&r.path) {
+                        return DeclaredRoot {
+                            path: r.path.clone(),
+                            state: DeclaredState::Unreadable(e.to_string()),
+                        };
+                    }
                     match row.map(|c| &c.status) {
                         Some(RegionStatus::Complete) => DeclaredState::Present {
                             bytes: row.map(|c| c.walked_total),

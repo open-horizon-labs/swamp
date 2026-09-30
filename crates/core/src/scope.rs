@@ -794,7 +794,9 @@ fn expand_tilde(home: &Path, raw: &str) -> PathBuf {
         return home.to_path_buf();
     }
     if let Some(rest) = raw.strip_prefix("~/") {
-        return home.join(rest);
+        // `~//x` is `<home>/x`: joining an absolute `/x` would replace
+        // home with the filesystem root.
+        return home.join(rest.trim_start_matches('/'));
     }
     PathBuf::from(raw)
 }
@@ -870,6 +872,28 @@ fn stat_root(path: &Path) -> RootStatus {
 /// written in either spelling covers both families (the 2026-09-22
 /// re-review's P2).
 pub fn comparable(path: &Path) -> PathBuf {
+    unify_firmlinks(comparable_resolved(path))
+}
+
+/// macOS mounts the data volume at `/System/Volumes/Data` and firmlinks
+/// each of its top-level directories into `/`; `canonicalize` keeps
+/// whichever spelling it was given, so `/Users/x/src` and
+/// `/System/Volumes/Data/Users/x/src` would be two roots over the same
+/// bytes. Both compare as the `/` spelling.
+fn unify_firmlinks(path: PathBuf) -> PathBuf {
+    match path.strip_prefix("/System/Volumes/Data") {
+        Ok(rest) if !rest.as_os_str().is_empty() => Path::new("/").join(rest),
+        _ => path,
+    }
+}
+
+/// A [`lexical`] spelling of `path`, for callers that must not touch the
+/// filesystem.
+pub fn lexical(path: &Path) -> PathBuf {
+    lexically_normalize(path)
+}
+
+fn comparable_resolved(path: &Path) -> PathBuf {
     let normalized = lexically_normalize(path);
     if let Ok(c) = crate::fs_gate::canonicalize(&normalized) {
         return c;
