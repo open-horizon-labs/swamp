@@ -147,11 +147,6 @@ fn rustup_default(name: &str) -> ManagerFacts {
     ])
 }
 
-/// The tempting wrong patch: the toolchains unit is one regenerable row,
-/// so the default toolchain's bytes are counted as reclaimable, or the
-/// default is matched only by exact directory name (`stable` never equals
-/// `stable-aarch64-apple-darwin`).
-
 fn aged(mut mf: ManagerFacts, secs: i64) -> ManagerFacts {
     for f in &mut mf.facts {
         f.observed_at = (NOW as i64 - secs) as u64;
