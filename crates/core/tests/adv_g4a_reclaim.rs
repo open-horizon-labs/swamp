@@ -1,5 +1,6 @@
 //! Adversarial tests for v0.8.0 G4a (#175), written by the auditor.
 //! Fixture-only: nothing reads the real store or runs a real manager.
+#![allow(dead_code, unused_imports, unused_variables)]
 
 use std::collections::HashMap;
 use std::io;
