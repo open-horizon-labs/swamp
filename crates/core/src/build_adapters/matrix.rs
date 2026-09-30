@@ -205,7 +205,7 @@ pub const MATRIX: &[MatrixEntry] = &[
              entries plus outputs/{apk/<flavor>/<buildType>,bundle/<variant>,mapping/<variant>,aar,logs}, \
              intermediates/<task>/<variant>, test-results/<task>, reports",
             ".cxx/<Variant>/<hash>/<abi>, .cxx/cmake/<variant>/<abi>, .externalNativeBuild/cmake/<variant>/<abi>",
-            "<sdk>/{platforms,build-tools,system-images/<api>/<tag>/<abi>,emulator} with source.properties",
+            "<sdk>/{platforms,build-tools,system-images/<api>/<tag>/<abi>,emulator,ndk,cmdline-tools,platform-tools,cmake} with source.properties, and an NDK that ANDROID_NDK_HOME or ANDROID_NDK_ROOT names outside the SDK root",
             "~/.android/avd/<name>.avd with config.ini and emulator lock files",
         ],
         attribution_limits: &[

@@ -17,7 +17,7 @@ detector-resolved location becomes a first-class external unit
 `swamp scope --json` lists every detector's `id`, resolved locations,
 `category`, `provenance`, and `status` for the machine actually running
 it; the table below is the human-readable index, current as of catalog
-version `2026-09-21.4`.
+version `2026-09-29.1`.
 
 ## Categories
 
@@ -65,7 +65,7 @@ further, e.g. Maven's local repository).
 |---|---|---|---|
 | `xcode` | `DerivedData` (`build-output`), `Archives` (`build-output`, a developer may keep these deliberately, unlike DerivedData), `iOS DeviceSupport`/`watchOS DeviceSupport` (`cache`, shared per-device/OS-version symbol files -- not owned by any one project), `UserData` (`local-state`) | Custom `DerivedData` location via the bounded, allow-listed `defaults read com.apple.dt.Xcode IDECustomDerivedDataLocation` query (a failed/absent query still leaves the conventional path proposed) | Xcode component documentation; macOS only |
 | `core-simulator` | `Devices/` (`environments`, mutable per-simulator instance data), `Caches/` (`cache`), `Profiles/Runtimes` (`installation`, per-user) | -- | `/Library/Developer/CoreSimulator/Volumes` (`installation`, system-wide, may be permission-gated -- reported as `RootStatus::Unreadable`, never silently absent); macOS only |
-| `android` | `platforms/`, `system-images/`, `build-tools/`, `emulator/` (all `installation`); AVDs (`environments`, mutable emulator instance data) | `ANDROID_HOME`, else `ANDROID_SDK_ROOT` (deprecated, still honored), else `~/Library/Android/sdk`; AVDs: `ANDROID_AVD_HOME`, else `~/.android/avd` | https://developer.android.com/tools/variables -- Gradle's own caches (including Android Gradle Plugin downloads) are the `gradle` detector's job |
+| `android` | `platforms/`, `system-images/`, `build-tools/`, `emulator/`, `ndk/`, `cmdline-tools/`, `platform-tools/`, `cmake/` (all `installation`, #165); AVDs (`environments`, mutable emulator instance data) | `ANDROID_HOME`, else `ANDROID_SDK_ROOT` (deprecated, still honored), else `~/Library/Android/sdk`; an NDK that `ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT` names outside the SDK root is a further `installation` (one inside it is already `ndk/`'s child and is not proposed again); AVDs: `ANDROID_AVD_HOME`, else `~/.android/avd` | https://developer.android.com/tools/variables -- Gradle's own caches (including Android Gradle Plugin downloads) are the `gradle` detector's job. `licenses/` (the record of accepted licences) and the loose files beside the folders (`ndk-install.log`, `.knownPackages`, `.temp`) are not measured, so a `du` of the SDK root exceeds the sum of its units by exactly those. A package folder that is a symlink into another SDK (Homebrew's `android-commandlinetools`) is measured at the path it resolves to, once. A missing folder (no NDK installed) is reported missing, not an error. Removing a package: reinstall with `sdkmanager`. |
 
 ## Homebrew, model stores, and VM backing storage (#49)
 

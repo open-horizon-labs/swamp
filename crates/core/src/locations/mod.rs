@@ -204,7 +204,7 @@ pub fn shallow_dir_names(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-pub const CATALOG_VERSION: &str = "2026-09-21.4";
+pub const CATALOG_VERSION: &str = "2026-09-29.1";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any
 /// value so a Linux-configured `Environment` can be asserted to produce

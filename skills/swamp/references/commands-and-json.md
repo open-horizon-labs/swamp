@@ -77,7 +77,7 @@ turns it back on:
 
 ```json
 {
-  "catalog_version": "2026-09-21.4",
+  "catalog_version": "2026-09-29.1",
   "generated_at": 1758470400,
   "defaults_enabled": true,
   "disabled_detectors": ["homebrew"],

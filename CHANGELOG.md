@@ -3,6 +3,14 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.8.0
+
+- **The Android SDK's big folders are reported.** Only `platforms/`, `system-images/`,
+  `build-tools/` and `emulator/` were measured, and on this machine they held almost
+  nothing while `ndk/` held 5.9 GB. `ndk/`, `cmdline-tools/`, `platform-tools/` and
+  `cmake/` now appear, each package with its `sdkmanager` reinstall command. An NDK
+  that `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` names outside the SDK is measured too.
+  `licenses/` stays out. An SDK with no NDK shows no NDK row and no error.
 ## v0.7.5
 
 - **`swamp ui` opens immediately and no longer scans on its own.** v0.7.4 said `swamp ui`
