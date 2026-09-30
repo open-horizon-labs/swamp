@@ -4659,6 +4659,53 @@ table! {
 }
 
 table! {
+    /// `<store>/volume_ledger.parquet` (#169, #170): one row per location
+    /// the volume pass accounts for -- a catalog or declared location's
+    /// total taken from the observation, a coarse "everything else"
+    /// folder, a system volume, a snapshot or purgeable line, a directory
+    /// that could not be read. `allocated_bytes` is null exactly when the
+    /// row is `not_measured`: not measured, never zero. `overlap_bytes`
+    /// is the part of `allocated_bytes` an enclosing row already counts
+    /// (the rows add up with it subtracted). Each row carries its own
+    /// `measured_at`, so a pass that ran out of time still leaves a
+    /// ledger whose ages are honest.
+    StoredVolumeLedgerRow, write_volume_ledger_rows, read_volume_ledger_rows {
+        path: String,
+        category: String,
+        allocated_bytes: Option<u64>,
+        overlap_bytes: u64,
+        entry_count: Option<u64>,
+        unreadable_count: u64,
+        measured_at: u64,
+        method: String,
+        exactness: String,
+        note: Option<String>,
+    }
+}
+
+table! {
+    /// `<store>/volume_ledger_meta.parquet` (#169): one row -- when the
+    /// last run finished, the cursor (`cycle_started_at`: a location is
+    /// pending in the running cycle until its row is at least this new;
+    /// `complete` says the cycle finished), the time budget and how much
+    /// of it the last run used, and the statfs / diskutil snapshot the
+    /// accounting identity is checked against.
+    StoredVolumeMetaRow, write_volume_meta_rows, read_volume_meta_rows {
+        measured_at: u64,
+        cycle_started_at: u64,
+        cycle_complete_at: u64,
+        complete: bool,
+        budget_secs: u64,
+        budget_used_ms: u64,
+        statfs_at: u64,
+        container_total: Option<u64>,
+        container_used: Option<u64>,
+        container_free: Option<u64>,
+        data_volume_used: Option<u64>,
+    }
+}
+
+table! {
     /// `<store>/scope.parquet`: the last resolved effective scope's
     /// scalars (coverage bookkeeping only, never byte history --
     /// `coverage_changes` compares root sets). Replaces `scope.json`.

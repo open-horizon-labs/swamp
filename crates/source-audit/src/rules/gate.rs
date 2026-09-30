@@ -122,6 +122,9 @@ const WALKERS: &[(Krate, &[&str])] = &[
     (Krate::Core, &["growth"]),
     (Krate::Core, &["locations"]),
     (Krate::Core, &["live_watch"]),
+    // The volume pass lists one folder level at a time under a time
+    // budget, never from `report` or the TUI.
+    (Krate::Core, &["volume_ledger"]),
 ];
 
 const STORE_MODULES: &[(Krate, &[&str])] = &[
@@ -201,6 +204,7 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["cargo_cleanup"]),
             (Krate::Core, &["occupancy"]),
             (Krate::Core, &["live_watch"]),
+            (Krate::Core, &["volume_ledger"]),
         ],
         why: "statfs/flock/O_NOFOLLOW are for the modules that need them",
     },
@@ -215,6 +219,7 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["github"]),
             (Krate::Core, &["actions"]),
             (Krate::Core, &["schedule"]),
+            (Krate::Core, &["volume_ledger"]),
         ],
         why: "every module that starts a process is one of these",
     },
@@ -308,6 +313,16 @@ const GROUPS: &[Group] = &[
         path: "@core::fs_gate::spawn::Program::Loginctl",
         allowed: &[(Krate::Core, &["systemd_user"])],
         why: "session state (Linger) belongs to the systemd scheduling module",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Diskutil",
+        allowed: &[(Krate::Core, &["volume_ledger"])],
+        why: "diskutil's two read-only APFS queries belong to the volume ledger's system-volume probe",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Tmutil",
+        allowed: &[(Krate::Core, &["volume_ledger"])],
+        why: "tmutil's read-only snapshot listing belongs to the volume ledger's system-volume probe",
     },
     Group {
         path: "@core::occupancy::OccupancyState",

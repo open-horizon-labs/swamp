@@ -22,8 +22,8 @@
 //!   configuration up the tree (mise) answers the same wherever swamp was
 //!   started.
 //!
-//! A program with no candidate list keeps its old behavior (a `PATH`
-//! lookup, the inherited environment) until it is migrated.
+//! A program with no candidate list keeps its old behavior (its
+//! `Program::executable`, the inherited environment) until it is migrated.
 //!
 //! **Tests.** With swamp-core's `testing` feature (never in a shipped
 //! build graph) `SWAMP_TEST_PROGRAM_DIR` names a directory holding fakes:
@@ -37,8 +37,10 @@ use std::path::{Path, PathBuf};
 /// How a program is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// The program is not migrated: `PATH` lookup, inherited environment.
-    Inherit,
+    /// The program is not migrated to the scrubbed environment: it runs
+    /// as `Program::executable` says (an absolute path where one is
+    /// fixed, else a `PATH` lookup) with the inherited environment.
+    Inherit(&'static str),
     /// Absolute executable, a from-scratch environment and a fixed
     /// working directory.
     Scrubbed(Scrubbed),
@@ -130,7 +132,7 @@ fn scrubbed_env(program: Program, exe: &Path, home: &str) -> Vec<(String, String
 /// candidate exists.
 pub fn plan(program: Program) -> io::Result<Plan> {
     if !migrated(program) {
-        return Ok(Plan::Inherit);
+        return Ok(Plan::Inherit(program.executable()));
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let exe = match test_override(program) {
@@ -158,8 +160,12 @@ mod tests {
 
     #[test]
     fn a_program_that_is_not_migrated_keeps_its_old_behavior() {
-        assert_eq!(plan(Program::Git).unwrap(), Plan::Inherit);
-        assert_eq!(plan(Program::Lsof).unwrap(), Plan::Inherit);
+        assert_eq!(plan(Program::Git).unwrap(), Plan::Inherit("git"));
+        assert_eq!(plan(Program::Lsof).unwrap(), Plan::Inherit("lsof"));
+        assert_eq!(
+            plan(Program::Tmutil).unwrap(),
+            Plan::Inherit("/usr/bin/tmutil")
+        );
     }
 
     #[test]
