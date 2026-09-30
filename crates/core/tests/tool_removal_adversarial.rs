@@ -334,13 +334,6 @@ fn global_config_version_refused_even_though_mise_dry_run_exits_0() {
     assert!(r.reason.contains("global config"), "{}", r.reason);
     assert!(r.next.contains("mise unuse -g node"), "{}", r.next);
     assert_refusal_plain(&r);
-    // And the prune set that contains it refuses as a whole.
-    let r = refused(tool_removal::review_target(
-        &sb.host(),
-        &Target::MisePrune,
-        &[],
-    ));
-    assert!(r.reason.contains("node@24.14.1"), "{}", r.reason);
     assert_eq!(sb.ran("-C / uninstall node@24.14.1"), 0);
     assert_eq!(sb.ran("-C / prune --tools"), 0);
 }
@@ -367,28 +360,31 @@ fn source_null_from_cwd_is_not_no_consumer() {
     assert_refusal_plain(&r);
 }
 
-/// Tempting wrong patch: bare `mise prune` ("--tools is the default
-/// anyway"). Bare prune also prunes tracked config links: the removal
-/// shape without `--tools` does not exist, and what runs carries it.
+/// Tempting wrong patch: a bulk `mise prune` removal ("--tools is the
+/// default anyway", or "per-version rows are tedious"). Bare prune also
+/// prunes tracked config links, and the set form decides what goes at
+/// exec time: no prune removal shape exists at all (owner decision 7);
+/// only the dry run is a read.
 #[test]
-fn prune_runs_only_as_prune_tools() {
+fn no_prune_removal_shape_exists() {
     let words = |s: &str| -> Vec<OsString> { s.split(' ').map(OsString::from).collect() };
-    assert!(!is_tool_exec(Program::Mise, &words("-C / prune")));
-    assert!(!is_tool_exec(Program::Mise, &words("prune --tools")));
-    assert!(!is_tool_exec(
-        Program::Mise,
-        &words("-C / prune --tools --yes")
-    ));
-    assert!(is_tool_exec(Program::Mise, &words("-C / prune --tools")));
-
+    for bulk in [
+        "-C / prune",
+        "prune --tools",
+        "-C / prune --tools",
+        "-C / prune --tools --yes",
+        "-C / uninstall --all",
+    ] {
+        assert!(!is_tool_exec(Program::Mise, &words(bulk)), "{bulk}");
+    }
+    assert!(is_tool_read(Program::Mise, &words("-C / prune --tools --dry-run")));
     let sb = Sandbox::new();
     sb.standard_mise();
-    sb.on_run("-C / prune --tools", "exit 0\n");
-    let p = tool_removal::review_target(&sb.host(), &Target::MisePrune, &[]).unwrap();
-    assert_eq!(p.command_line(), "mise -C / prune --tools");
+    sb.go_uninstall_removes(0);
+    let p = tool_removal::review_target(&sb.host(), &go(), &[]).unwrap();
     tool_removal::execute(&sb.host(), &p, &[], &sb.ledger());
-    assert_eq!(sb.ran("-C / prune --tools"), 1);
     assert_eq!(sb.ran("-C / prune"), 0, "bare prune never runs");
+    assert_eq!(sb.ran("-C / prune --tools"), 0, "prune never runs as a removal");
 }
 
 /// Tempting wrong patch: "one shape with an optional `--dry-run`". Each
@@ -402,7 +398,6 @@ fn a_dry_run_without_its_flag_is_not_a_read() {
             Program::Mise,
             "-C / uninstall --dry-run go@1.23.5".to_string(),
         ),
-        (Program::Mise, "-C / prune --tools --dry-run".to_string()),
         (
             Program::Xcrun,
             format!("simctl runtime delete {UUID} --dry-run"),
@@ -604,22 +599,23 @@ fn a_preview_gone_out_of_date_refuses_at_enter() {
     assert_plain(&out.line);
 }
 
-/// Tempting wrong patch: "exec after one dry run". The prune set grew
-/// between review and Enter: refused, nothing runs.
+/// Tempting wrong patch: "exec after one dry run". mise's prune stopped
+/// listing go between review and Enter (a project started asking for it):
+/// refused, nothing runs.
 #[test]
 fn a_prune_set_that_changed_since_review_refuses() {
     let sb = Sandbox::new();
     sb.standard_mise();
-    let p = tool_removal::review_target(&sb.host(), &Target::MisePrune, &[]).unwrap();
+    let p = tool_removal::review_target(&sb.host(), &go(), &[]).unwrap();
     sb.answer(
         "-C / prune --tools --dry-run",
         "",
-        &sb.prune_text(&["go@1.23.5"]),
+        &sb.prune_text(&["java@temurin-17.0.20+101"]),
         0,
     );
     let out = tool_removal::execute(&sb.host(), &p, &[], &sb.ledger());
     assert!(matches!(out.status, Status::Refused(_)), "{}", out.line);
-    assert_eq!(sb.ran("-C / prune --tools"), 0);
+    assert_eq!(sb.ran("-C / uninstall go@1.23.5"), 0);
 }
 
 /// Tempting wrong patch: "`.ok()` means nothing is open". An open-file
@@ -935,7 +931,6 @@ fn the_docs_say_what_the_code_runs() {
     let sb = Sandbox::new();
     sb.standard_mise();
     let one = tool_removal::review_target(&sb.host(), &go(), &[]).unwrap();
-    let all = tool_removal::review_target(&sb.host(), &Target::MisePrune, &[]).unwrap();
     let sim = Sandbox::new();
     sim.standard_simctl("Shutdown");
     let rt =
@@ -943,7 +938,6 @@ fn the_docs_say_what_the_code_runs() {
             .unwrap();
     for (p, doc_form) in [
         (&one, "mise -C / uninstall <tool>@<version>"),
-        (&all, "mise -C / prune --tools"),
         (&rt, "xcrun simctl runtime delete <UUID>"),
     ] {
         let line = p.command_line();
@@ -968,6 +962,10 @@ fn the_docs_say_what_the_code_runs() {
         );
         assert!(usage.contains(&v), "usage.md does not name {v}");
     }
+    assert!(
+        !usage.contains("mise -C / prune --tools`,"),
+        "usage.md still offers the bulk prune removal"
+    );
     for var in swamp_core::fs_gate::program_paths::MISE_PASSTHROUGH
         .iter()
         .chain(&["DEVELOPER_DIR"])

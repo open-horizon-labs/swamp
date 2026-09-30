@@ -18,12 +18,16 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+/// Always on a mise confirm: a `MISE_<TOOL>_VERSION` in the user's shell
+/// never reaches swamp's child, so mise's prune under swamp cannot see it.
+pub(super) const PINNED_BY_ENV: &str =
+    "Versions pinned by environment variables in your shell are not visible to swamp.";
+
 /// The mise version the dry-run formats below were read from.
 pub(super) const VERIFIED_VERSION: &str = "2026.9.15";
 
 const LS: &[&str] = &["-C", "/", "ls", "--json", "--installed"];
 const PRUNE_DRY: &[&str] = &["-C", "/", "prune", "--tools", "--dry-run"];
-const PRUNE_EXEC: &[&str] = &["-C", "/", "prune", "--tools"];
 
 /// One installed version, as `mise ls --json --installed` lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,24 +96,37 @@ fn parse_ls(text: &str) -> Result<Vec<Install>, String> {
                 .get("install_path")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("{tool}@{version} has no install_path"))?;
+            let tv = format!("{tool}@{version}");
+            // A field swamp cannot read is not "absent": an unreadable
+            // `source` must never pass the consumer guard.
+            let source = match e.get("source") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Object(o)) => match o.get("path") {
+                    Some(serde_json::Value::String(p)) => Some(PathBuf::from(p)),
+                    _ => return Err(format!("{tv} has a source without a readable path")),
+                },
+                Some(_) => return Err(format!("{tv} has a source swamp cannot read")),
+            };
+            let opt_str = |k: &str| -> Result<Option<String>, String> {
+                match e.get(k) {
+                    None | Some(serde_json::Value::Null) => Ok(None),
+                    Some(serde_json::Value::String(v)) => Ok(Some(v.clone())),
+                    Some(_) => Err(format!("{tv} has a {k} swamp cannot read")),
+                }
+            };
+            let active = match e.get("active") {
+                None => false,
+                Some(serde_json::Value::Bool(b)) => *b,
+                Some(_) => return Err(format!("{tv} has an active flag swamp cannot read")),
+            };
             out.push(Install {
                 tool: tool.clone(),
                 version: version.to_string(),
                 install_path: PathBuf::from(install_path),
-                source: e
-                    .get("source")
-                    .and_then(|s| s.get("path"))
-                    .and_then(|p| p.as_str())
-                    .map(PathBuf::from),
-                requested: e
-                    .get("requested_version")
-                    .and_then(|r| r.as_str())
-                    .map(str::to_string),
-                symlinked_to: e
-                    .get("symlinked_to")
-                    .and_then(|p| p.as_str())
-                    .map(PathBuf::from),
-                active: e.get("active").and_then(|a| a.as_bool()) == Some(true),
+                source,
+                requested: opt_str("requested_version")?,
+                symlinked_to: opt_str("symlinked_to")?.map(PathBuf::from),
+                active,
             });
         }
     }
@@ -235,27 +252,74 @@ fn parse_dry(text: &str, form: Form, home: &Path) -> Result<Dry, String> {
     Ok(dry)
 }
 
-/// mise's own directories under `home`: a dry run naming anything else
-/// refuses.
-fn mise_dirs(home: &Path) -> [PathBuf; 3] {
-    [
-        home.join(".local/share/mise"),
-        home.join("Library/Caches/mise"),
-        home.join(".cache/mise"),
-    ]
+/// mise's directories as the child sees them: its own variables, then
+/// XDG, then the defaults under `home` (the same order mise uses).
+struct Dirs {
+    data: PathBuf,
+    caches: Vec<PathBuf>,
+    config: PathBuf,
 }
 
-fn check_removes(inst: &Install, removes: &[PathBuf], home: &Path) -> Result<(), String> {
+fn dirs(bin: &ToolBin, home: &Path) -> Dirs {
+    let var = |k: &str| bin.env_value(k).filter(|v| v.starts_with('/')).map(PathBuf::from);
+    let data = var("MISE_DATA_DIR")
+        .or_else(|| var("XDG_DATA_HOME").map(|d| d.join("mise")))
+        .unwrap_or_else(|| home.join(".local/share/mise"));
+    let caches = match var("MISE_CACHE_DIR")
+        .or_else(|| var("XDG_CACHE_HOME").map(|d| d.join("mise")))
+    {
+        Some(c) => vec![c],
+        None => vec![home.join("Library/Caches/mise"), home.join(".cache/mise")],
+    };
+    let config = var("MISE_CONFIG_DIR")
+        .or_else(|| var("XDG_CONFIG_HOME").map(|d| d.join("mise")))
+        .unwrap_or_else(|| home.join(".config/mise"));
+    Dirs {
+        data,
+        caches,
+        config,
+    }
+}
+
+/// A path read from manager output, lexically: absolute, and no `.` or
+/// `..` component (so `starts_with` means what it says).
+fn plain_abs(p: &Path) -> bool {
+    use std::path::Component;
+    p.is_absolute()
+        && p.components()
+            .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+}
+
+/// Exactly `<base>/<folder>/<version>`, component by component.
+fn is_exactly(p: &Path, base: &Path, folder: &str, version: &str) -> bool {
+    p.strip_prefix(base).is_ok_and(|rest| {
+        let parts: Vec<_> = rest.components().map(|c| c.as_os_str()).collect();
+        parts.len() == 2 && parts[0] == folder && parts[1] == version
+    })
+}
+
+/// The install dir mise uses for `inst`: `<data>/installs/<folder>/<version>`.
+fn expected_install(inst: &Install, d: &Dirs) -> PathBuf {
+    d.data
+        .join("installs")
+        .join(crate::manager_facts::mise_folder_name(&inst.tool))
+        .join(&inst.version)
+}
+
+fn check_removes(inst: &Install, removes: &[PathBuf], d: &Dirs) -> Result<(), String> {
     if removes.is_empty() {
         return Err(format!(
             "mise's dry run names nothing to remove for {}",
             inst.tv()
         ));
     }
+    let folder = crate::manager_facts::mise_folder_name(&inst.tool);
     for p in removes {
-        let own = *p == inst.install_path
-            || (mise_dirs(home).iter().any(|d| p.starts_with(d))
-                && p.file_name().and_then(|n| n.to_str()) == Some(inst.version.as_str()));
+        let own = plain_abs(p)
+            && (is_exactly(p, &d.data.join("installs"), &folder, &inst.version)
+                || d.caches
+                    .iter()
+                    .any(|c| is_exactly(p, c, &folder, &inst.version)));
         if !own {
             return Err(format!(
                 "mise's dry run names {}, which is not {}'s install or cache directory",
@@ -267,21 +331,40 @@ fn check_removes(inst: &Install, removes: &[PathBuf], home: &Path) -> Result<(),
     Ok(())
 }
 
-/// The global config, in every spelling swamp knows: mise's config dir
-/// under `home`, or the file `MISE_GLOBAL_CONFIG_FILE` names.
-fn is_global_config(p: &Path, home: &Path, bin: &ToolBin) -> bool {
-    p.starts_with(home.join(".config/mise"))
+/// The global config, in every spelling swamp knows: mise's config dir,
+/// or the file `MISE_GLOBAL_CONFIG_FILE` names.
+fn is_global_config(p: &Path, d: &Dirs, bin: &ToolBin) -> bool {
+    p.starts_with(&d.config)
         || bin
             .env_value("MISE_GLOBAL_CONFIG_FILE")
             .is_some_and(|g| Path::new(g) == p)
+}
+
+/// Every directory from `<data>/installs` down to the install dir itself,
+/// by `lstat`: a link anywhere on it points the removal somewhere
+/// nobody reviewed.
+fn linked_component(install: &Path, d: &Dirs) -> Option<PathBuf> {
+    let base = d.data.join("installs");
+    let rest = install.strip_prefix(&base).ok()?;
+    let mut at = base.clone();
+    for p in std::iter::once(base.clone()).chain(rest.components().map(|c| {
+        at.push(c);
+        at.clone()
+    })) {
+        if crate::fs_gate::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// swamp's own refusals for one installed version (mise checks none of
 /// them).
 fn guard(inst: &Install, home: &Path, bin: &ToolBin) -> Result<(), Refusal> {
     let tv = inst.tv();
+    let d = dirs(bin, home);
     if let Some(src) = &inst.source {
-        return Err(if is_global_config(src, home, bin) {
+        return Err(if is_global_config(src, &d, bin) {
             Refusal::new(
                 format!(
                     "{tv} is requested by {} (mise's global config). mise's own dry run does not \
@@ -315,17 +398,23 @@ fn guard(inst: &Install, home: &Path, bin: &ToolBin) -> Result<(), Refusal> {
             "Remove it with mise yourself if you mean to.",
         ));
     }
-    if !inst
-        .install_path
-        .starts_with(home.join(".local/share/mise/installs"))
-    {
+    if !plain_abs(&inst.install_path) || inst.install_path != expected_install(inst, &d) {
         return Err(Refusal::new(
             format!(
-                "{tv} is installed at {}, outside mise's default data directory; swamp does not \
-                 pass MISE_DATA_DIR to mise.",
-                inst.install_path.display()
+                "{tv} is installed at {}, not where mise keeps it ({}).",
+                inst.install_path.display(),
+                expected_install(inst, &d).display()
             ),
             "Remove it with mise yourself.",
+        ));
+    }
+    if let Some(link) = linked_component(&inst.install_path, &d) {
+        return Err(Refusal::new(
+            format!(
+                "{} is a symlink; removing {tv} would go through it.",
+                link.display()
+            ),
+            "Remove it with mise yourself if you mean to.",
         ));
     }
     Ok(())
@@ -367,14 +456,6 @@ pub(super) fn candidates(host: &Host, bin: &ToolBin) -> Result<Vec<Candidate>, R
         .map(|(d, _)| d.versions.keys().cloned().collect())
         .unwrap_or_default();
     let mut out = Vec::new();
-    if !prunable.is_empty() {
-        out.push(Candidate {
-            target: Target::MisePrune,
-            label: format!("every version mise reports prunable ({})", prunable.len()),
-            facts: prunable.join(", "),
-            path: None,
-        });
-    }
     for inst in installs {
         let tv = inst.tv();
         let mut facts = Vec::new();
@@ -459,7 +540,12 @@ pub(super) fn review(
                     "Press R to refresh, then review again.",
                 ));
             };
-            guard(inst, &home, bin)?;
+            // Every entry mise lists for this version: a duplicate that is
+            // requested, active or unreadable refuses, whatever the first
+            // one says.
+            for dup in installs.iter().filter(|i| i.tv() == tv) {
+                guard(dup, &home, bin)?;
+            }
             if !prune.versions.contains_key(&tv) {
                 return Err(Refusal::new(
                     format!(
@@ -508,7 +594,7 @@ pub(super) fn review(
                 .with_output(shown));
             }
             let removes = parsed.versions[&tv].removes.clone();
-            check_removes(inst, &removes, &home).map_err(|why| {
+            check_removes(inst, &removes, &dirs(bin, &home)).map_err(|why| {
                 Refusal::new(
                     format!("{why}."),
                     "Remove it with mise yourself if you mean to.",
@@ -537,74 +623,10 @@ pub(super) fn review(
                 size: size_of(&[inst.install_path.as_path()], sizes),
                 regen: regen(inst),
                 evidence,
-                warnings: Vec::new(),
+                warnings: vec![PINNED_BY_ENV.to_string()],
                 open_files,
                 manager_version: String::new(),
                 title: tv,
-            })
-        }
-        Target::MisePrune => {
-            if prune.versions.is_empty() {
-                return Err(
-                    Refusal::new("mise reports nothing to prune.", "Nothing to do.")
-                        .with_output(prune_shown),
-                );
-            }
-            let mut removes: Vec<PathBuf> = Vec::new();
-            let mut paths: Vec<&Path> = Vec::new();
-            for (tv, dv) in &prune.versions {
-                let Some(inst) = find(tv) else {
-                    return Err(Refusal::new(
-                        format!("mise's prune names {tv}, which its own list does not show."),
-                        "Press R to refresh, then review again.",
-                    )
-                    .with_output(prune_shown));
-                };
-                guard(inst, &home, bin).map_err(|r| r.with_output(prune_shown.clone()))?;
-                check_removes(inst, &dv.removes, &home).map_err(|why| {
-                    Refusal::new(
-                        format!("{why}."),
-                        "Run `mise prune --tools` yourself if you mean to.",
-                    )
-                    .with_output(prune_shown.clone())
-                })?;
-                state.push((format!("mise's entry for {tv}"), inst.fact(&home)));
-                removes.extend(dv.removes.iter().cloned());
-                paths.push(inst.install_path.as_path());
-            }
-            let open_files = super::open_files_fact(host, &removes, &[], Manager::Mise)?;
-            let exec: Vec<OsString> = PRUNE_EXEC.iter().map(OsString::from).collect();
-            let dry: Vec<OsString> = PRUNE_DRY.iter().map(OsString::from).collect();
-            let mut evidence: Vec<String> = prune
-                .reasons
-                .iter()
-                .map(|r| format!("mise says: \"{}\"", r.trim_start_matches("mise ")))
-                .collect();
-            evidence.push(checked);
-            let n = prune.versions.len();
-            Ok(Preview {
-                manager: Manager::Mise,
-                target: target.clone(),
-                bin: bin.clone(),
-                dry_output_digest: digest(&prune_shown),
-                dry_output: prune_shown,
-                exec_argv: exec,
-                dry_argv: dry,
-                removes: removes.iter().map(|p| p.display().to_string()).collect(),
-                listed_as: prune_set.clone(),
-                state,
-                size: size_of(&paths, sizes),
-                regen: "Reinstall is a download per version (`mise install <tool>@<version>`); \
-                        its size is not measured."
-                    .to_string(),
-                evidence,
-                warnings: Vec::new(),
-                open_files,
-                manager_version: String::new(),
-                title: format!(
-                    "{n} version{} mise reports prunable",
-                    if n == 1 { "" } else { "s" }
-                ),
             })
         }
         Target::SimRuntime { .. } => Err(Refusal::new(

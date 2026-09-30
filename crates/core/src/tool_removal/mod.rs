@@ -84,8 +84,6 @@ impl Manager {
 pub enum Target {
     /// One installed mise tool version.
     MiseVersion { tool: String, version: String },
-    /// Every version `mise prune --tools` reports prunable.
-    MisePrune,
     /// One simulator runtime image, by the UUID `simctl runtime list -j`
     /// keys it by.
     SimRuntime { uuid: String },
@@ -419,7 +417,7 @@ pub fn review_target(
     sizes: &[(PathBuf, u64)],
 ) -> Result<Preview, Refusal> {
     let manager = match target {
-        Target::MiseVersion { .. } | Target::MisePrune => Manager::Mise,
+        Target::MiseVersion { .. } => Manager::Mise,
         Target::SimRuntime { .. } => Manager::Simulator,
     };
     let bin = host.resolve(manager)?;
@@ -442,6 +440,7 @@ pub fn review_target(
             manager.verified_version()
         )),
     }
+    preview.warnings.extend(bin.notes().iter().cloned());
     preview.manager_version = version.unwrap_or_else(|| "not read".to_string());
     Ok(preview)
 }
