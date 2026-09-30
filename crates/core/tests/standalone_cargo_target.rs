@@ -268,3 +268,109 @@ fn an_open_handle_inside_the_target_is_reported_not_hidden() {
     }
     drop(held);
 }
+
+#[test]
+fn a_target_beside_a_cargo_toml_is_that_projects_own_not_standalone() {
+    // Tempting wrong patch: any directory with both halves of the signature.
+    // A Cargo project that is not a git checkout keeps its `target/` next to
+    // its manifest; calling that "standalone, no project" is wrong.
+    let fx = fixture();
+    let proj = fx.root.join("plain-cargo-project");
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(
+        proj.join("Cargo.toml"),
+        b"[package]\nname=\"p\"\nversion=\"0.1.0\"\n",
+    )
+    .unwrap();
+    cargo_target(&proj.join("target"));
+    let elsewhere = fx.root.join("shared-target");
+    cargo_target(&elsewhere);
+    let r = report(&fx.root, fx.store.path());
+    let own = row_for(&r, &proj.join("target")).expect("still one unit");
+    assert_ne!(own.reason, UnownedReason::StandaloneCargoTarget);
+    assert_eq!(
+        row_for(&r, &elsewhere).unwrap().reason,
+        UnownedReason::StandaloneCargoTarget
+    );
+}
+
+#[test]
+fn dep_info_that_records_absolute_source_paths_is_a_labelled_recorded_link_only() {
+    // Verified on this machine: a target built from a git worktree records
+    // absolute workspace paths in deps/*.d; one built in place records
+    // relative ones. Registry and toolchain paths are never the project.
+    let fx = fixture();
+    let with_paths = fx.root.join("with-paths-target");
+    cargo_target(&with_paths);
+    fs::write(
+        with_paths.join("debug/deps/core-1.d"),
+        format!(
+            "{}/debug/deps/core-1.rmeta: /work/proj/crates/core/src/lib.rs /work/proj/crates/core/src/x.rs /home/u/.cargo/registry/src/idx/serde/src/lib.rs\n",
+            with_paths.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        with_paths.join("debug/deps/cli-1.d"),
+        format!(
+            "{}/debug/deps/cli-1.rmeta: /work/proj/crates/cli/src/main.rs\n",
+            with_paths.display()
+        ),
+    )
+    .unwrap();
+    let relative = fx.root.join("relative-target");
+    cargo_target(&relative);
+    fs::write(
+        relative.join("debug/deps/core-1.d"),
+        format!(
+            "{}/debug/deps/core-1.rmeta: crates/core/src/lib.rs\n",
+            relative.display()
+        ),
+    )
+    .unwrap();
+    let r = report(&fx.root, fx.store.path());
+    let link = |p: &Path| {
+        row_for(&r, p)
+            .unwrap()
+            .evidence
+            .iter()
+            .find(|e| e.subtype == swamp_core::evidence::FactSubtype::RecordedLink)
+            .cloned()
+    };
+    let got = link(&with_paths).expect("a recorded link");
+    assert_eq!(
+        got.status,
+        FactStatus::Known(FactValue::Text("/work/proj/crates".to_string()))
+    );
+    assert!(
+        got.note
+            .as_deref()
+            .unwrap()
+            .contains("never used to select")
+    );
+    assert!(link(&relative).is_none(), "relative paths link nothing");
+    // The row's note claims only what swamp does.
+    let note = row_for(&r, &with_paths).unwrap().note.clone().unwrap();
+    assert!(!note.contains("nothing in it records"), "{note}");
+    // And the link is not a selector: planning is the same with or without.
+    let plan =
+        swamp_core::actions::propose(&r, None, std::slice::from_ref(&with_paths), "test").unwrap();
+    assert_eq!(plan.len(), 1);
+}
+
+#[test]
+fn standalone_targets_are_their_own_section_of_the_external_view_not_its_total() {
+    let fx = fixture();
+    let target = fx.root.join("own-kind-target");
+    cargo_target(&target);
+    let r = report(&fx.root, fx.store.path());
+    let text = swamp_core::render::render_standalone_targets(&r.unowned);
+    assert!(text.contains("standalone-cargo-target"), "{text}");
+    assert!(text.contains(&target.display().to_string()), "{text}");
+    assert!(text.contains("not in the external total"), "{text}");
+    assert_eq!(
+        swamp_core::render::standalone_cargo_targets(&r.unowned).len(),
+        1
+    );
+    assert!(swamp_core::render::render_standalone_targets(&[]).is_empty());
+}

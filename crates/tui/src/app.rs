@@ -1020,12 +1020,17 @@ impl App {
             ViewKind::Docker => model::docker_rows_with(&self.report, &self.collapsed),
             ViewKind::Unowned => model::unowned_rows(&self.report),
             ViewKind::Types => model::types_rows(&self.report, &self.filter),
-            ViewKind::External => model::external_rows_with(
-                &self.external_units,
-                &self.store_interiors,
-                &self.collapsed,
-                self.report.observed_at,
-            ),
+            ViewKind::External => {
+                let mut rows = model::external_rows_with(
+                    &self.external_units,
+                    &self.store_interiors,
+                    &self.collapsed,
+                    self.report.observed_at,
+                );
+                // Standalone Cargo targets are their own kind here too.
+                rows.extend(model::standalone_target_rows(&self.report));
+                rows
+            }
             ViewKind::Agents => model::agent_rows(&self.agent_units),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
@@ -4322,6 +4327,97 @@ mod tests {
             lines.iter().any(|l| l.starts_with("Last run or opened:")),
             "{lines:?}"
         );
+    }
+
+    /// Reviewer M2: the same bytes never appear twice under one row. The
+    /// interior of a unit that sits under another (go-build under
+    /// Library/Caches) belongs to that unit, and a unit's own interior is
+    /// held under one closed header beside its folder rows.
+    #[test]
+    fn a_folder_or_interior_is_listed_once_and_the_visible_rows_add_up_once() {
+        use swamp_core::artifact::{AccountingBasis, ArtifactRole};
+        use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
+        use swamp_core::drilldown::{ChildKind, ChildMeasure, UnitChild};
+        let entry = |name: &str, bytes: i64| UnitChild {
+            kind: ChildKind::Entry,
+            name: name.into(),
+            bytes: Some(bytes),
+            measure: ChildMeasure::Complete,
+            mtime_max: 5,
+            entries: 0,
+            not_measured: 0,
+            last_used: Default::default(),
+        };
+        let mut caches = drilled_unit("/fixture/Caches", vec![entry("a", 600), entry("b", 400)]);
+        caches.category = swamp_core::locations::StorageCategory::Unclassified;
+        let mut gobuild = drilled_unit("/fixture/Caches/go-build", Vec::new());
+        gobuild.detector_id = "go".into();
+        gobuild.bytes = 300;
+        let make = |root: &str, unit: &str| {
+            let c = BuildContainer::shared_store_of(
+                "go",
+                root.into(),
+                swamp_core::locations::BuildStoreKind::GoBuildCache,
+            );
+            NestedUnitBuilder::new(&c, ArtifactRole::Intermediate, unit.into())
+                .is_dir(true)
+                .bytes_on_basis(300, AccountingBasis::Allocated)
+                .supported_with_reason("fixture")
+                .consequence("recompiled")
+                .no_action_because("shared")
+                .build()
+        };
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        app.set_external_units(vec![caches, gobuild]);
+        app.set_store_interiors(vec![
+            make("/fixture/Caches/go-build", "/fixture/Caches/go-build"),
+            make("/fixture/Caches/go-build", "/fixture/Caches/go-build/x"),
+        ]);
+        app.set_view(ViewKind::External);
+        app.selected = 0;
+        app.enter_row();
+        let open = app.rows();
+        let labels: Vec<String> = open.iter().map(|r| r.label.clone()).collect();
+        // Caches: its two folders, once. go-build's interior families are
+        // not among them.
+        // Caches, its two folders, then go-build as its own top-level unit.
+        assert_eq!(open.len(), 4, "{labels:?}");
+        assert!(labels[3].contains("go-build"), "{labels:?}");
+        let shown: u64 = open[1..3].iter().map(|r| r.bytes).sum();
+        assert_eq!(
+            shown, 1_000,
+            "the rows under Caches add up once: {labels:?}"
+        );
+        assert!(!labels.iter().any(|l| l.contains("Caches & intermediates")));
+    }
+
+    /// #171 in the External view: its own kind, markable.
+    #[test]
+    fn a_standalone_cargo_target_is_a_row_of_the_external_view_too() {
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        report.unowned.push(swamp_core::report::UnownedRow {
+            measurement: None,
+            path_or_object: "/fixture/scratch-target".into(),
+            bytes: 4096,
+            reason: swamp_core::report::UnownedReason::StandaloneCargoTarget,
+            shared_bytes: None,
+            note: Some("standalone Cargo target: rebuild with `cargo build`; swamp does not link it to a project".into()),
+            docker_kind: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
+            evidence: Vec::new(),
+        });
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        app.set_view(ViewKind::External);
+        let rows = app.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].label.starts_with("standalone Cargo target"));
+        assert!(rows[0].unit.is_some(), "plannable from this view");
     }
 
     /// #171: a standalone Cargo target directory marks like any unowned

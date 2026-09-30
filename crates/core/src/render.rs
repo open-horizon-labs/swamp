@@ -1828,6 +1828,54 @@ pub fn render_view_external_with(
     out
 }
 
+/// The standalone Cargo target directories the walk found, as their own
+/// kind (#171): rows of the unowned list that carry Cargo's own signature.
+/// Their bytes are counted under `unowned`, never in the external total.
+pub fn standalone_cargo_targets(
+    unowned: &[crate::report::UnownedRow],
+) -> Vec<&crate::report::UnownedRow> {
+    let mut rows: Vec<&crate::report::UnownedRow> = unowned
+        .iter()
+        .filter(|u| u.reason == UnownedReason::StandaloneCargoTarget)
+        .collect();
+    rows.sort_by_key(|u| std::cmp::Reverse(u.bytes));
+    rows
+}
+
+/// `--view external`'s section for [`standalone_cargo_targets`]: empty
+/// when there are none.
+pub fn render_standalone_targets(unowned: &[crate::report::UnownedRow]) -> String {
+    let rows = standalone_cargo_targets(unowned);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nstandalone Cargo targets (their own kind; counted under unowned, not in the external total above):"
+    );
+    for row in &rows {
+        let _ = writeln!(
+            out,
+            "{:<10}  standalone-cargo-target  {}  [{}]",
+            human_bytes(row.bytes),
+            row.path_or_object,
+            row.note.as_deref().unwrap_or("")
+        );
+        for line in render_evidence_lines(&row.evidence) {
+            let _ = writeln!(out, "    {line}");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "standalone Cargo targets: {} in {} director{}",
+        human_bytes(rows.iter().map(|r| r.bytes).sum()),
+        rows.len(),
+        if rows.len() == 1 { "y" } else { "ies" }
+    );
+    out
+}
+
 /// The text of one drilldown row after its byte figure: the folder's
 /// name exactly as on disk with its facts, or what a remainder or
 /// adjustment row stands for. Shared with the TUI so the two say the same

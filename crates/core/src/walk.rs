@@ -1263,6 +1263,24 @@ fn mark_standalone_cargo_target(
             mtime_max,
             observed_at,
         ));
+        if let Some(root) = crate::attribution::recorded_source_root(dir_path) {
+            row.evidence.push(
+                crate::evidence::Evidence::known(
+                    crate::evidence::FactKind::Consumer,
+                    crate::evidence::FactSubtype::RecordedLink,
+                    crate::evidence::FactValue::Text(root.display().to_string()),
+                    crate::evidence::EvidenceSource::BuildMetadata {
+                        path: "deps/*.d".to_string(),
+                    },
+                    observed_at,
+                )
+                .with_note(
+                    "source files recorded in this directory's dep-info; a recorded path, \
+                     not checked to exist or to be the project, and never used to select \
+                     or authorize anything",
+                ),
+            );
+        }
     }
 }
 

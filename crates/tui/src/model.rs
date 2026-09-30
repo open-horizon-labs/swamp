@@ -2109,42 +2109,53 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
         .unowned
         .iter()
         .filter(|u| u.reason != UnownedReason::DockerNoJoin)
-        .map(|u| {
-            let standalone = u.reason == UnownedReason::StandaloneCargoTarget;
-            let mut row = Row::leaf(
-                0,
-                if standalone {
-                    // What it is and what losing it costs, in the row
-                    // itself: a Cargo target directory with no project
-                    // recorded, rebuilt by `cargo build`.
-                    format!(
-                        "standalone Cargo target · {} · rebuild with `cargo build`",
-                        u.path_or_object
-                    )
-                } else {
-                    format!("{:?} · {}", u.reason, u.path_or_object)
-                },
-                u.bytes,
-                None,
-            );
-            // Bytes nothing claims are still bytes, and the path is real:
-            // it can be marked like any other unit and goes to Trash.
-            // Except one the walk could not even read — there is nothing
-            // to stand behind.
-            if u.reason != UnownedReason::PermissionDenied {
-                row.kind = Some(if standalone {
-                    ArtifactKind::BuildOutput
-                } else {
-                    ArtifactKind::Loose
-                });
-                row.unit = Some(UnitId::for_artifact(std::path::Path::new(
-                    &u.path_or_object,
-                )));
-            }
-            row.evidence = u.evidence.clone();
-            row
-        })
+        .map(unowned_row)
         .collect()
+}
+
+/// The External view's rows for standalone Cargo targets: their own kind,
+/// markable through the reviewed Trash flow like the same rows in the
+/// unowned view (they are the same rows).
+pub fn standalone_target_rows(report: &Report) -> Vec<Row> {
+    swamp_core::render::standalone_cargo_targets(&report.unowned)
+        .into_iter()
+        .map(unowned_row)
+        .collect()
+}
+
+fn unowned_row(u: &swamp_core::report::UnownedRow) -> Row {
+    let standalone = u.reason == UnownedReason::StandaloneCargoTarget;
+    let mut row = Row::leaf(
+        0,
+        if standalone {
+            // What it is and what losing it costs, in the row itself: a
+            // Cargo target directory swamp does not link to a project,
+            // rebuilt by `cargo build`.
+            format!(
+                "standalone Cargo target · {} · rebuild with `cargo build`",
+                u.path_or_object
+            )
+        } else {
+            format!("{:?} · {}", u.reason, u.path_or_object)
+        },
+        u.bytes,
+        None,
+    );
+    // Bytes nothing claims are still bytes, and the path is real: it can be
+    // marked like any other unit and goes to Trash. Except one the walk
+    // could not even read: there is nothing to stand behind.
+    if u.reason != UnownedReason::PermissionDenied {
+        row.kind = Some(if standalone {
+            ArtifactKind::BuildOutput
+        } else {
+            ArtifactKind::Loose
+        });
+        row.unit = Some(UnitId::for_artifact(std::path::Path::new(
+            &u.path_or_object,
+        )));
+    }
+    row.evidence = u.evidence.clone();
+    row
 }
 
 /// External/shared storage view (#43/#51/#60): the same flat shape
