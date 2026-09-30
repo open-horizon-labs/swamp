@@ -909,12 +909,21 @@ impl Headline {
                 group_digits(self.developer_bytes)
             );
         }
-        for m in &self.mixed_owners {
+        if let Some(m) = self.mixed_owners.iter().max_by_key(|m| m.bytes) {
+            let rest = self.mixed_owners.len() - 1;
             let _ = writeln!(
                 out,
-                "  other developer units include {} in {}: other, mixed owners (not only developer tools)",
+                "  other developer units include {} in {}: other, mixed owners (not only developer tools){}",
                 human(m.bytes),
-                m.path
+                m.path,
+                if rest > 0 {
+                    format!(
+                        "; and {rest} smaller mixed {}",
+                        plural(rest, "folder", "folders")
+                    )
+                } else {
+                    String::new()
+                }
             );
         }
         if self.lower_bound_units > 0 {
