@@ -255,11 +255,15 @@ enum OpenFiles {
 impl Host {
     /// Managers from the fixed candidate list, open files from `lsof`.
     pub fn system() -> Self {
+        let resolver = ToolResolver::system();
+        // Only a test build's SWAMP_TEST_TOOL_SANDBOX makes this a
+        // sandbox; its ledger is then the sandbox's own.
+        let sandbox_store = resolver.sandbox().map(|s| s.join("store"));
         Host {
-            resolver: ToolResolver::system(),
+            resolver,
             open_files: OpenFiles::System,
             exec_timeout: EXEC_TIMEOUT,
-            sandbox_store: None,
+            sandbox_store,
         }
     }
 
@@ -315,10 +319,17 @@ impl Host {
     /// The ledger a removal is recorded in: `store`'s, or a test
     /// sandbox's own (`dir/store`), so a test never writes the real one.
     pub fn ledger_in(&self, store: &crate::fs_gate::StoreDir) -> Ledger {
-        if let Some(dir) = &self.sandbox_store
-            && let Ok(ledger) = Ledger::open(dir.join("ledger.parquet"))
-        {
-            return ledger;
+        if let Some(dir) = &self.sandbox_store {
+            // A test build must never write the real ledger.
+            return Ledger::open(dir.join("ledger.parquet")).unwrap_or_else(|e| {
+                panic!(
+                    "test build: the sandbox ledger under {} did not open: {e}",
+                    dir.display()
+                )
+            });
+        }
+        if self.resolver.sandbox().is_some() {
+            panic!("test build: a sandboxed resolver never records in the real ledger");
         }
         Ledger::resolved(store)
     }
@@ -613,6 +624,26 @@ fn changed_since(preview: &Preview, now: &Preview) -> Option<Refusal> {
                 preview.manager.name(),
                 now.removes.len(),
                 preview.removes.len()
+            ),
+            again,
+        ));
+    }
+    // The manager's whole dry-run text and its own reason lines, not only
+    // what swamp parsed out of them: any change is a different preview.
+    if now.dry_output_digest != preview.dry_output_digest {
+        return Some(Refusal::new(
+            format!(
+                "{}'s dry run printed something different since review.",
+                preview.manager.name()
+            ),
+            again,
+        ));
+    }
+    if now.evidence != preview.evidence {
+        return Some(Refusal::new(
+            format!(
+                "{}'s own reasons changed since review.",
+                preview.manager.name()
             ),
             again,
         ));

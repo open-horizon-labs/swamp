@@ -350,15 +350,14 @@ fn linked_component(install: &Path, d: &Dirs) -> Option<PathBuf> {
     let base = d.data.join("installs");
     let rest = install.strip_prefix(&base).ok()?;
     let mut at = base.clone();
-    for p in std::iter::once(base.clone()).chain(rest.components().map(|c| {
+    let mut chain = vec![base.clone()];
+    for c in rest.components() {
         at.push(c);
-        at.clone()
-    })) {
-        if crate::fs_gate::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Some(p);
-        }
+        chain.push(at.clone());
     }
-    None
+    chain
+        .into_iter()
+        .find(|p| crate::fs_gate::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
 }
 
 /// swamp's own refusals for one installed version (mise checks none of

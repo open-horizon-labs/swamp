@@ -1014,3 +1014,65 @@ fn no_verdict_words_or_em_dashes_in_this_action_class() {
         }
     }
 }
+
+/// Tempting wrong patch: "compare only the parsed targets at Enter". The
+/// dry run's text or mise's own reason changed (same targets): refused.
+#[test]
+fn a_changed_dry_run_text_or_reason_refuses_at_enter() {
+    for change in ["text", "reason"] {
+        let sb = Sandbox::new();
+        sb.standard_mise();
+        sb.go_uninstall_removes(0);
+        let p = tool_removal::review_target(&sb.host(), &go(), &[]).unwrap();
+        if change == "text" {
+            sb.answer(
+                "-C / uninstall --dry-run go@1.23.5",
+                "",
+                &format!(
+                    "mise WARN  something new\n{}",
+                    Sandbox::uninstall_dry("go@1.23.5")
+                ),
+                0,
+            );
+        } else {
+            sb.answer(
+                "-C / prune --tools --dry-run",
+                "",
+                &sb.prune_text(&["go@1.23.5", "java@temurin-17.0.20+101"])
+                    .replace("required at other", "required at something else"),
+                0,
+            );
+        }
+        let out = tool_removal::execute(&sb.host(), &p, &[], &sb.ledger());
+        assert!(
+            matches!(out.status, Status::Refused(_)),
+            "{change}: {}",
+            out.line
+        );
+        assert_eq!(sb.ran("-C / uninstall go@1.23.5"), 0, "{change}");
+    }
+}
+
+/// Owner decision 6: a backend tool name (uppercase, `:`, `/`, npm scope)
+/// is readable, so one such tool never makes the whole prune dry run
+/// unreadable.
+#[test]
+fn backend_tool_names_mise_prints_are_operands() {
+    for ok in [
+        "aqua:BurntSushi/ripgrep@14.1.1",
+        "cargo:ripgrep@14.1.1",
+        "github:cli/cli@2.60.0",
+        "go:github.com/x/y@1.0.0",
+        "npm:@antfu/ni@0.21.0",
+        "ubi:BurntSushi/ripgrep@14.1.1",
+        "pipx:black@24.1.0",
+    ] {
+        assert!(swamp_core::fs_gate::spawn::is_mise_tool_version(ok), "{ok}");
+    }
+    for bad in ["-a@1", "x@-1", "../x@1", "a b@1", "x@1;rm", "x@", "@1"] {
+        assert!(
+            !swamp_core::fs_gate::spawn::is_mise_tool_version(bad),
+            "{bad}"
+        );
+    }
+}

@@ -981,7 +981,7 @@ impl ToolResolver {
     }
 
     /// The test sandbox, when this resolver is one.
-    pub fn sandbox(&self) -> Option<&Path> {
+    pub(crate) fn sandbox(&self) -> Option<&Path> {
         self.sandbox.as_deref()
     }
 

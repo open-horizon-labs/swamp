@@ -298,11 +298,6 @@ const GROUPS: &[Group] = &[
         why: "liveness of the observation lock holder",
     },
     Group {
-        path: "@core::fs_gate::spawn::Program::Mise",
-        allowed: &[(Krate::Core, &["tool_removal"])],
-        why: "mise runs only as a resolved ToolBin for tool-managed removal",
-    },
-    Group {
         path: "@core::fs_gate::spawn::Program::Xcrun",
         allowed: &[(Krate::Core, &["tool_removal"])],
         why: "xcrun runs only as an allow-listed detector command (`Program::named` in \
@@ -317,9 +312,10 @@ const GROUPS: &[Group] = &[
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Mise",
-        allowed: &[],
+        allowed: &[(Krate::Core, &["tool_removal"])],
         why: "mise runs only through `spawn::ManagerCommand` in a scheduled observe \
-              (`manager_facts`), which cannot name a non-dry-run",
+              (`manager_facts`), which cannot name a non-dry-run, or as tool-managed \
+              removal's resolved ToolBin",
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Defaults",

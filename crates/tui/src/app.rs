@@ -3146,8 +3146,11 @@ impl App {
         let Some(sheet) = self.tool_sheet.as_mut() else {
             return;
         };
-        match &sheet.stage {
-            Stage::Choose => {
+        // Enter never runs a removal: a held, queued or pasted Enter that
+        // opened the review must not also confirm it. Only `Y` on the
+        // confirm does ([`App::tool_remove_key`]).
+        if matches!(sheet.stage, Stage::Choose) {
+            {
                 let Some(c) = sheet
                     .listing
                     .as_ref()
@@ -3165,10 +3168,6 @@ impl App {
                     let _ = tx.send(ToolEvent::Reviewed(r));
                 });
             }
-            // Enter never runs a removal: a held, queued or pasted Enter
-            // that opened the review must not also confirm it. Only `Y`
-            // on the confirm does ([`App::tool_remove_key`]).
-            _ => {}
         }
     }
 

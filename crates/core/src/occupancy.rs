@@ -30,9 +30,10 @@ const OCCUPANCY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The answer to "does anything outside this process hold this path (or
 /// anything under it) open right now". Deliberately three-valued: a
 /// failed, timed-out or permission-denied probe is **not** "nothing is
-/// open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`). Every
-/// destructive sink matches on this and refuses on `Unknown`; nothing
-/// that moves user data may consume the boolean [`occupied`] instead.
+/// open" (`.oh/guardrails/occupancy-gaps-are-unknown-never-free.md`).
+/// A Trash move shows it as a fact and is never gated on it (2026-09-23);
+/// tool-managed removal, which has no Trash, refuses on `Occupied` and
+/// `Unknown` (`.oh/guardrails/tool-removal-refuses-on-manager-facts.md`).
 #[must_use = "an occupancy answer that is not matched on is a recheck that did not happen"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OccupancyState {
@@ -44,24 +45,6 @@ pub enum OccupancyState {
     /// The probe could not answer (binary missing, timed out, permission
     /// denied, unreadable directory). Treated as a refusal at every sink.
     Unknown(String),
-}
-
-impl OccupancyState {
-    /// A one-line refusal cause for a sink's outcome/ledger record.
-    pub fn refusal(&self) -> Option<String> {
-        match self {
-            Self::Free => None,
-            Self::Occupied(p) => Some(format!(
-                "refused: an open file handle was found on {} just now, so an active process is \
-                 using it — propose again once it is closed (for a directory this answer covers \
-                 everything under it)",
-                p.display()
-            )),
-            Self::Unknown(why) => Some(format!(
-                "refused: occupancy could not be determined ({why}); refusing rather than guessing that nothing is open"
-            )),
-        }
-    }
 }
 
 /// The one bounded `lsof` probe every occupancy question in this crate
@@ -840,7 +823,6 @@ mod tests {
         let state = probe(Some(1), "", "lsof: WARNING: Permission denied");
         assert!(matches!(state, OccupancyState::Unknown(_)), "{state:?}");
         assert!(!matches!(state, OccupancyState::Free));
-        assert!(state.refusal().is_some());
     }
 
     #[test]
@@ -852,7 +834,6 @@ mod tests {
     #[test]
     fn a_free_probe_is_the_only_state_that_permits_an_action() {
         assert!(matches!(OccupancyState::Free, OccupancyState::Free));
-        assert!(OccupancyState::Free.refusal().is_none());
         assert!(!matches!(
             OccupancyState::Occupied(PathBuf::from("/x")),
             OccupancyState::Free

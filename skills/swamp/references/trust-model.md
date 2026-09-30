@@ -33,7 +33,7 @@ commands. Filesystem selections use the Trash flow:
   (`~/.Trash` on macOS, the freedesktop home trash on Linux) and appends
   one ledger line per unit: path, recovery location, bytes, time.
 
-Docker image/volume removal uses Docker and has no Trash recovery.
+Docker image/volume removal uses Docker and has no Trash recovery. A mise tool version or a simulator runtime is removed by mise or simctl itself, permanently, from the TUI only (Backspace on its row, then `Y` on a confirm that shows the manager's own dry run); swamp refuses it when a config requests the version, a simulator is not shut down, files are held open or cannot be checked, or anything changed since the confirm (`.oh/guardrails/tool-removal-refuses-on-manager-facts.md`). No CLI, JSON or agent path runs it.
 Moving filesystem data to Trash does not itself free disk space.
 
 There is no re-derivation between marking

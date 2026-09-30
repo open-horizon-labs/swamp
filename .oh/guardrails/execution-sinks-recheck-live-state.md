@@ -5,6 +5,9 @@ statement: "Retired 2026-09-23 by product decision: swamp reports, the human rem
 outcome: decision-relevant-storage-evidence
 ---
 
+
+**Exception (2026-09-30, #177):** tool-managed removal (a mise version, a simulator runtime), which has no Trash, keeps automated refusals, a review-to-confirm recheck and a TUI-only, human-only confirm: `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`.
+
 ## Why this was retired
 
 This guardrail described `crate::recheck`: a live re-derivation
