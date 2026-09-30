@@ -206,7 +206,7 @@ const GROUPS: &[Group] = &[
     Group {
         path: "@core::tool_removal::execute",
         allowed: &[(Krate::Tui, &["actions"]), (Krate::Core, &["tool_removal"])],
-        why: "a tool-managed removal has no Trash: only the human's Enter on the TUI confirm \
+        why: "a tool-managed removal has no Trash: only the human's `Y` on the TUI confirm \
               runs one, never a CLI, JSON or agent path (tool-removal-refuses-on-manager-facts)",
     },
     Group {
