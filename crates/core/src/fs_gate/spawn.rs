@@ -16,8 +16,11 @@
 //!   option smuggled in as an operand, a different verb or an extra flag
 //!   is refused before anything starts. `docker … rm` and `git worktree
 //!   prune` are not shapes at all: they are reachable only through
-//!   [`super::destroy`], which takes a [`crate::recheck::RecheckProof`]
-//!   and an [`crate::authority::Authorized`].
+//!   [`super::destroy`], which builds their arguments itself.
+//! * **A manager that removes things runs as a [`ToolBin`]** (#177): an
+//!   absolute binary from a fixed list of directories with an environment
+//!   built from nothing, through [`run_tool_read`] (listings and dry runs)
+//!   or `destroy::tool_remove` (the removal), never by name on `PATH`.
 
 // killpg/signal/atexit for the child-lifetime guard (#156).
 #![allow(unsafe_code)]
@@ -195,7 +198,7 @@ enum Slot {
 /// different verb, an option smuggled in where an operand belongs
 /// (`git -c core.pager=…`, `docker --host …`) -- is refused before
 /// anything starts. Programs with no shape here (`git`) run only through
-/// [`super::destroy`], behind a recheck proof.
+/// [`super::destroy`].
 fn shapes(program: Program) -> &'static [&'static [Slot]] {
     use Slot::*;
     match program {
@@ -488,9 +491,8 @@ where
     run_unchecked(program, &args, timeout)
 }
 
-/// [`run`] without the argument allow-list: only [`super::destroy`],
-/// behind a recheck proof and an authorization, calls this, with
-/// arguments it builds itself from the proof.
+/// [`run`] without the argument allow-list: only [`super::destroy`]
+/// calls this, with arguments it builds itself.
 pub(super) fn run_unchecked(
     program: Program,
     args: &[OsString],
