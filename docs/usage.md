@@ -542,7 +542,7 @@ flushed; such files are counted as reported and listed as
 right after a big write is explained rather than surprising. A file that
 cannot be read mid-walk is not measured; the rest of its directory still is.
 
-The TUI has a dedicated, read-only External view (`v`/`9`): the same
+The TUI has a dedicated, read-only External view (Tools section: `2`, then `v`): the same
 one-row-per-unit facts as `--view external`, never markable -- act on
 what it shows with the manager's own tools, not swamp.
 
@@ -763,9 +763,9 @@ rows[]       { path, kind, detector, bytes, growth_bytes?,
 
 `bytes == regenerable_bytes + held_bytes + not_regenerable_bytes +
 not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
-is not measured). `totals` is the object the storage headline reuses.
+is not measured). `totals` is the object the storage headline reuses (`remainder_bytes` is the part of it that is not developer storage; see "Developer storage: the headline").
 
-In the TUI, `v` reaches the Reclaim view (after External). It is built from the
+In the TUI, Reclaim is the first view of the Tools section (`2`, or `Tab` from Projects). It is built from the
 stored facts, scans nothing on open, and keeps the same layout as every view:
 the scope statement sits under the heading, the cost, last-used fact and removal
 path are the signals (and the detail pane's first lines at any width), `→` or
@@ -883,8 +883,7 @@ today vs. named-and-planned). In short:
   contributing tool in the text tree, and an `agent_storage: {units,
   total_bytes}` object in JSON.
 
-The TUI has a dedicated Agents view (`v`, no digit -- `0` is "clear
-filter"): the same per-unit facts as `--view agents`. `Space`/
+The TUI has a dedicated Agents view (Tools section: `2`, then `v` to Agents): the same per-unit facts as `--view agents`. `Space`/
 `Backspace` mark the selected unit and open the confirm banner showing
 its real consequences (session-removal loss warnings, the linked
 project); `Enter` moves it to the Trash through the same
@@ -897,6 +896,137 @@ same way, skipping protected/unmarkable ones and naming the skip in the
 status rows. The project tree's own Tree view also shows the collapsed
 "Agent storage (linked)" summary row (informational; marking a specific
 unit still happens in the Agents view).
+
+## The TUI's sections and views
+
+The TUI has three sections, each holding a few views. `Tab` and `Shift-Tab` move
+between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the
+current section (wrapping). Nothing else opens a view.
+
+| Section | Views (first is the default) |
+|---|---|
+| 1 Projects | Projects, Tree, Builds, Deps, Types, Kinds, Unowned |
+| 2 Tools | Reclaim, Docker, External, Agents |
+| 3 Disk | Summary (the stored volume ledger's parts), Not measured (unreadable and not-yet-measured folders, the largest measured folders outside developer storage) |
+
+A row under the headline names the three sections with the current one in reverse
+video; the line below it names the view (`view: Tools › Reclaim (1 of 4 · v next)`).
+`?` help lists every section and view with a line on each. **Changed in 0.8.0:** in
+0.7.x the digits `1`-`9` selected views; now `1`-`3` select sections and the old
+digits are unbound.
+
+## Developer storage: the headline
+
+The first thing `swamp report` prints, the top of the TUI and the top of
+`swamp report --view reclaim` is one line:
+
+```text
+Developer storage: 224.1GB across 40 projects and 77 tool locations (57.4% of used)
+```
+
+It reads stored facts only: no listing, no `stat`, no program (a test counts
+work and asserts zero). Sizes use the one byte formatter (decimal, `GB`).
+
+**What it counts.** Allocated bytes of:
+
+- **projects**: everything under the declared (or built-in default) source
+  roots, less the standalone Cargo target directories found there (they have
+  their own row), **plus git worktrees outside those roots that a checkout's
+  worktree registry names** (on the reporting machine 23.9 GB of a 42.0 GB
+  projects row: mostly agent worktrees under `/private/tmp`, and
+  `~/.codex/mcp/...`). The unit that holds such a folder already leaves the
+  worktree out (`bytes_counted_elsewhere`), so nothing is counted twice in the
+  headline;
+- **toolchains and SDKs** (installations and environments), **caches**
+  (downloads, caches, build output), **agent storage** (an AI tool's home,
+  from the detector's own declaration), **containers and VMs** (Docker,
+  OrbStack), **other developer units** (local state, models, and anything a
+  build of swamp does not place: a unit is never left out for want of a row).
+  A folder the catalog cannot attribute to one tool (category `unclassified`:
+  `~/Library/Caches`, 36.5 GB on the reporting machine) is counted here and named
+  on its own line as "other, mixed owners (not only developer tools)";
+- **standalone Cargo targets**.
+
+**What it never counts:** system volumes; the measured "Everything else"
+bucket; the *remainder* of a location after its developer tooling (Homebrew's
+"other", selected by the detector's `remainder_of` capability, never by name);
+mounted disk images (a view of image files: the disk cost is the image files
+themselves, which the disk view lists under **Everything else**, not in
+developer storage; the mounted size is taken out only when the disk ledger knows
+the mounts); the unattributed residual; and
+protected or not-yet-measured estimates. A location is counted when it holds
+bytes; the count is the number of rows added.
+
+**The percent** is developer storage divided by the container's used bytes from
+the disk ledger, the number `df` calls used, never the Data volume's. It is
+rounded **down** to one decimal, in integer arithmetic, so it is never larger
+than the truth (99.96% reads 99.9%). It is absent, and the line says why, when
+there is no ledger yet (`disk ledger: not measured yet; run swamp observe
+--volume`), when the ledger is unreadable, written by a newer swamp or dated in
+the future, when the container's used bytes are missing or zero, when the report
+covers only a root named on the command line, and when developer storage is
+larger than used (a `FLAG` line instead: a measurement is wrong or counts shared
+bytes twice; never a percent above 100).
+
+Below the line, in order:
+
+- the ages: `observed 4 min ago; disk ledger measured 3 h ago`, and, when the
+  ledger is more than a day older than the observation, that the percent divides
+  newer developer storage by an older disk reading;
+- when the numbers cover a previous scope (roots changed since), or one root
+  named on the command line, the sentence that says so;
+- one row per breakdown category with its bytes and count. The rows add up to the
+  headline **exactly** (in bytes; the exact figure is printed once, after the
+  rows, because each row is rounded on its own);
+- what was left out on purpose, with bytes (the remainder unit, mounted images);
+- from the ledger: **Everything else** with its five largest measured folders,
+  **System volumes** (named, one sentence on sharing the free space),
+  **Not measured: N directories** with the first names, and, when something is
+  unreadable, "protected folders ... the unexplained part of the Data volume, up
+  to X, may be inside them (an estimate, not part of any check)";
+- the walk's spot audit: `FLAG: walk spot audit disagrees: see swamp report
+  --view disk` when it disagrees (the only check that can catch a walk that
+  undercounts), otherwise how many folders were audited.
+
+**How the numbers relate.** On one store, with `walked` the source roots'
+walked total and `standalone` the standalone Cargo targets:
+
+```text
+developer storage = (walked - standalone)                        projects
+                  + Reclaim totals (regenerable + held out
+                    + not regenerable + cost not established)   units and targets
+                  - Reclaim remainder units
+                  - mounted disk images
+disk view "accounted" = developer storage + remainder units
+```
+
+`swamp report --view reclaim` prints the first line after its headline, and its
+JSON carries `headline_relation` (`holds`); `headline.disk.accounted_check`
+carries the second. They differ when the ledger's accounted rows came from a
+different observation than the units read here, or when a unit's row was lost.
+Whenever they differ the report prints a plain line (`disk view check: the
+ledger's accounted bytes (X) differ from developer storage plus the remainder units
+(Y) by Z`) and the Disk view repeats it on its Accounted row. (A same-path
+collision that used to lose ~/.codex's 6.8 GB is fixed: an agent tool's home at a
+catalog unit's path folds into that unit's row as a note.)
+
+A report that covers a previous scope shows no percent (it would divide one scope's
+storage by today's disk). When the observation is more than a day older than the
+ledger, or the ledger more than a day older than the observation, the ages line says
+which way the percent mixes them.
+
+`swamp report --json` carries the same numbers as a `headline` object
+(`developer_bytes`, `locations`, `categories`, `not_counted`, `percent_of_used`,
+`disk` with its `state`, `ages`, `flags`, and `line`, the text's first line).
+
+In the TUI the same block is four rows under the header on every view and in
+every state (headline, breakdown, disk state and ages, then the pointers to
+Reclaim and Disk), two rows on a terminal under 22 rows tall (the headline and
+the pointers), one under 16, none under 12. Nothing changes its height, so no
+row moves when a warning appears. Until you have opened Tools or Disk once, the
+pointer row says `New: Tab opens Tools (Reclaim) and Disk. Hides after you open
+either.`; that is remembered in `ui_state.json` (`views_seen`; an older swamp
+ignores the key).
 
 ## Where the whole disk went (the volume ledger)
 
@@ -1072,7 +1202,9 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | `/` | Open the filter form |
 | `:` | Edit the filter expression; Tab completes terms |
 | `0` | Clear the filter |
-| `v`, `1`–`9` | Cycle/select projects, tree, builds, deps, Docker, kinds, unowned, types, external; `v` also reaches agents (no digit -- `0` is clear filter) |
+| `Tab` / `Shift-Tab` | Next / previous section: Projects, Tools, Disk. While you type a filter, Tab completes it as before |
+| `v` | Next view inside the current section, wrapping around |
+| `1`, `2`, `3` | Jump to a section: 1 Projects, 2 Tools, 3 Disk (help lists them; the legend does not) |
 | `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age |
 | `r` | Reverse the sort |
 | `?` | Show help |

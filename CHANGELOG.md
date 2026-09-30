@@ -29,6 +29,37 @@ observations, not general performance guarantees. See the README for current use
   the full 30-minute `observe_timeout_sec`. That path is skipped as
   `not measured (stalled on <date>)` for 24 hours, so one blocking path cannot
   fail every scheduled pass.
+- **The first line of `swamp report`, the TUI and the Reclaim view is now "Developer
+  storage: X across N projects and M tool locations (P% of used)".** It replaces headlining ~/src alone
+  (16 GB on the reporting machine, while developer storage was about 224 GB). It
+  counts the source roots (less standalone Cargo targets, which get their own row), every catalog unit
+  (toolchains and SDKs, caches, agent storage, containers and VMs, other), and never
+  system volumes, the measured "everything else", Homebrew's remainder unit or
+  mounted disk images. The percent is of the container's used bytes from the disk
+  ledger (never the Data volume), rounded down to one decimal, and is absent, with the
+  reason, when there is no ledger, when it is unreadable, from a newer swamp or dated
+  in the future, when used is zero or missing, or when developer storage exceeds
+  used (a FLAG instead of a percent above 100). The breakdown rows add up to the
+  headline exactly; below them: everything else (five largest), system volumes, not
+  measured with its count, the walk's spot-audit warning when it disagrees, and the ages of
+  the observation and the ledger. `report --json` has the same numbers as a `headline`
+  object, and the Reclaim JSON adds `headline_relation`. This also puts the "System
+  volumes" line (#170) in the TUI. Reading it starts nothing and lists nothing.
+  It also fixes the volume ledger losing a folder's bytes when an agent tool's home and a
+  catalog unit share a path (~/.codex, 6.8 GB on the reporting machine, was counted in no row).
+- **BREAKING (TUI keys): views are nested in three sections.** In 0.7.x the digits `1`-`9`
+  selected views; now `1` Projects, `2` Tools, `3` Disk select *sections*, `Tab` /
+  `Shift-Tab` move between them, and `v` cycles the views inside the current one
+  (Projects: Projects, Tree, Builds, Deps, Types, Kinds, Unowned; Tools: Reclaim, Docker,
+  External, Agents; Disk: Summary, Not measured). Digits 4-9 are unbound. A row under the
+  headline names the sections (current one in reverse video) and the view line reads
+  `view: Tools › Reclaim (1 of 4 · v next)`. Disk is new: Summary is the stored volume
+  ledger as rows, Not measured lists the unreadable and not-yet-measured folders. The
+  legend is `Tab section  v view  / filter  R refresh  ⌫ delete ...`; `?` help lists every
+  section and view. The headline block points at Reclaim and Disk (`2 for Tools`, `3`),
+  and a store that has never opened Tools or Disk shows one line saying so until it does
+  (`ui_state.json` `views_seen`). The block is four rows plus the strip, so on a 24-row
+  screen the table area (its heading included) is 14 rows where it was 19.
 - **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
   unit of developer storage, largest first, with what getting it back costs in the
   tool's own words, when it was last used and from what record, who is known to

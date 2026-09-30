@@ -62,6 +62,87 @@ pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
 /// not an error): the schedule is meant to keep it younger.
 pub const STALE_AFTER_SECS: u64 = 15 * 60;
 
+/// The three sections the views are nested in. `Tab` / `Shift-Tab` move
+/// between them, `1` / `2` / `3` jump to one, and `v` cycles the views
+/// inside the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Section {
+    Projects,
+    Tools,
+    Disk,
+}
+
+impl Section {
+    pub const ALL: [Section; 3] = [Section::Projects, Section::Tools, Section::Disk];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Section::Projects => "Projects",
+            Section::Tools => "Tools",
+            Section::Disk => "Disk",
+        }
+    }
+
+    /// The digit that jumps here.
+    pub fn key(self) -> char {
+        match self {
+            Section::Projects => '1',
+            Section::Tools => '2',
+            Section::Disk => '3',
+        }
+    }
+
+    pub fn from_key(k: char) -> Option<Section> {
+        Self::ALL.iter().copied().find(|s| s.key() == k)
+    }
+
+    /// The views inside, in the order `v` walks them; the first is the
+    /// one a jump lands on.
+    pub fn views(self) -> &'static [ViewKind] {
+        match self {
+            Section::Projects => &[
+                ViewKind::Projects,
+                ViewKind::Tree,
+                ViewKind::Builds,
+                ViewKind::Deps,
+                ViewKind::Types,
+                ViewKind::Kinds,
+                ViewKind::Unowned,
+            ],
+            Section::Tools => &[
+                ViewKind::Reclaim,
+                ViewKind::Docker,
+                ViewKind::External,
+                ViewKind::Agents,
+            ],
+            Section::Disk => &[ViewKind::Disk, ViewKind::DiskGaps],
+        }
+    }
+
+    pub fn default_view(self) -> ViewKind {
+        self.views()[0]
+    }
+
+    pub fn next(self) -> Section {
+        let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(at + 1) % 3]
+    }
+
+    pub fn prev(self) -> Section {
+        let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(at + 2) % 3]
+    }
+
+    /// One line on what the section is for, for `?` help.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Section::Projects => "your projects and what they hold",
+            Section::Tools => "storage outside any project: toolchains, caches, AI tools",
+            Section::Disk => "where the whole disk went, from the stored volume ledger",
+        }
+    }
+}
+
 /// Same view set the CLI's `--view` exposes at root (`worktrees` there
 /// is `Projects` here: one row per project, same aggregation), plus
 /// `Tree`, the per-project drill-down `--project` renders (#33). `v`
@@ -85,6 +166,15 @@ pub enum ViewKind {
     /// used, who is known to need it and which removal path exists.
     /// Read-only and built from stored facts: opening it scans nothing.
     Reclaim,
+    /// Where the whole disk went (#169, #170): the stored volume ledger's
+    /// parts (accounted, everything else, system volumes, what could not
+    /// be read). Read-only and built from the stored ledger: opening it
+    /// scans nothing.
+    Disk,
+    /// The Disk section's second view: what was not measured (unreadable
+    /// and not-yet-measured folders) and the largest measured folders
+    /// outside developer storage. Read-only, from the stored ledger.
+    DiskGaps,
     /// Agent-tool storage (#91/#92/#100): read-only, one row per
     /// `AgentUnit`. See `model::agent_rows`'s doc comment for why
     /// marking is not wired up in this chunk.
@@ -92,59 +182,100 @@ pub enum ViewKind {
 }
 
 impl ViewKind {
-    /// `'0'` is not a view digit here: it is already the global "clear
-    /// filter" key (see `crate::handle_key_mod`), so `ViewKind::Reclaim`
-    /// and `ViewKind::Agents` have no dedicated digit and are reached
-    /// only by cycling with `v`
-    /// (`ViewKind::next`) -- documented, not a silent omission.
-    pub fn from_digit(d: char) -> Option<Self> {
-        Some(match d {
-            '1' => ViewKind::Projects,
-            '2' => ViewKind::Tree,
-            '3' => ViewKind::Builds,
-            '4' => ViewKind::Deps,
-            '5' => ViewKind::Docker,
-            '6' => ViewKind::Kinds,
-            '7' => ViewKind::Unowned,
-            '8' => ViewKind::Types,
-            '9' => ViewKind::External,
-            _ => return None,
-        })
+    /// The section this view lives in.
+    pub fn section(self) -> Section {
+        match self {
+            ViewKind::Projects
+            | ViewKind::Tree
+            | ViewKind::Builds
+            | ViewKind::Deps
+            | ViewKind::Types
+            | ViewKind::Kinds
+            | ViewKind::Unowned => Section::Projects,
+            ViewKind::Reclaim | ViewKind::Docker | ViewKind::External | ViewKind::Agents => {
+                Section::Tools
+            }
+            ViewKind::Disk | ViewKind::DiskGaps => Section::Disk,
+        }
     }
-    /// Every view, in the order `v` walks them.
-    pub const ALL: [ViewKind; 11] = [
+
+    /// The name on the view strip and in `?` help.
+    pub fn title(self) -> &'static str {
+        match self {
+            ViewKind::Projects => "Projects",
+            ViewKind::Tree => "Tree",
+            ViewKind::Builds => "Builds",
+            ViewKind::Deps => "Deps",
+            ViewKind::Docker => "Docker",
+            ViewKind::Kinds => "Kinds",
+            ViewKind::Unowned => "Unowned",
+            ViewKind::Types => "Types",
+            ViewKind::External => "External",
+            ViewKind::Reclaim => "Reclaim",
+            ViewKind::Disk => "Summary",
+            ViewKind::DiskGaps => "Not measured",
+            ViewKind::Agents => "Agents",
+        }
+    }
+
+    /// One line on what the view shows, for `?` help.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ViewKind::Projects => "one row per project: size, growth, what can be rebuilt",
+            ViewKind::Tree => "a project's worktrees and their folders",
+            ViewKind::Builds => "build output across projects, by kind",
+            ViewKind::Deps => "dependency folders across projects",
+            ViewKind::Docker => "Docker images, volumes and build cache",
+            ViewKind::Kinds => "storage grouped by kind of folder",
+            ViewKind::Unowned => "storage that belongs to no project",
+            ViewKind::Types => "storage grouped by ecosystem",
+            ViewKind::External => "toolchains, caches and stores outside any project",
+            ViewKind::Reclaim => {
+                "regenerable developer storage by unit: what getting it back costs, last used"
+            }
+            ViewKind::Disk => {
+                "where the whole disk went: accounted, everything else, system volumes, not measured"
+            }
+            ViewKind::Agents => "AI coding tools' sessions, caches and logs",
+            ViewKind::DiskGaps => {
+                "what could not be read or is not measured yet, and the largest measured folders outside developer storage"
+            }
+        }
+    }
+
+    /// Every view, section by section, in the order `v` walks them within
+    /// each.
+    pub const ALL: [ViewKind; 13] = [
         ViewKind::Projects,
         ViewKind::Tree,
         ViewKind::Builds,
         ViewKind::Deps,
-        ViewKind::Docker,
+        ViewKind::Types,
         ViewKind::Kinds,
         ViewKind::Unowned,
-        ViewKind::Types,
-        ViewKind::External,
         ViewKind::Reclaim,
+        ViewKind::Docker,
+        ViewKind::External,
         ViewKind::Agents,
+        ViewKind::Disk,
+        ViewKind::DiskGaps,
     ];
 
-    /// 1-based place in [`ViewKind::ALL`], for "3 of 11".
+    /// 1-based place within the view's own section, for "2 of 3".
     pub fn position(self) -> usize {
-        Self::ALL.iter().position(|v| *v == self).unwrap_or(0) + 1
+        self.section()
+            .views()
+            .iter()
+            .position(|v| *v == self)
+            .unwrap_or(0)
+            + 1
     }
 
+    /// The next view within the same section, wrapping around (`v`).
     pub fn next(self) -> Self {
-        match self {
-            ViewKind::Projects => ViewKind::Tree,
-            ViewKind::Tree => ViewKind::Builds,
-            ViewKind::Builds => ViewKind::Deps,
-            ViewKind::Deps => ViewKind::Docker,
-            ViewKind::Docker => ViewKind::Kinds,
-            ViewKind::Kinds => ViewKind::Unowned,
-            ViewKind::Unowned => ViewKind::Types,
-            ViewKind::Types => ViewKind::External,
-            ViewKind::External => ViewKind::Reclaim,
-            ViewKind::Reclaim => ViewKind::Agents,
-            ViewKind::Agents => ViewKind::Projects,
-        }
+        let views = self.section().views();
+        let at = views.iter().position(|v| *v == self).unwrap_or(0);
+        views[(at + 1) % views.len()]
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -158,6 +289,8 @@ impl ViewKind {
             ViewKind::Types => "types",
             ViewKind::External => "external",
             ViewKind::Reclaim => "reclaim",
+            ViewKind::Disk => "disk",
+            ViewKind::DiskGaps => "not-measured",
             ViewKind::Agents => "agents",
         }
     }
@@ -195,19 +328,25 @@ enum LockPollMsg {
     Holder(Option<swamp_core::schedule::LockHolder>),
     /// The holder finished: the store's newest observation, read off the
     /// event thread.
-    Reloaded(Box<swamp_core::report::ReportSnapshot>),
+    Reloaded(
+        Box<swamp_core::report::ReportSnapshot>,
+        Box<swamp_core::volume_ledger::LedgerReading>,
+    ),
 }
 
 /// A reload waiting for the confirm or check to end.
 enum HeldReload {
     Fresh(Box<RefreshedObservation>),
-    Snapshot(Box<swamp_core::report::ReportSnapshot>),
+    Snapshot(
+        Box<swamp_core::report::ReportSnapshot>,
+        Box<swamp_core::volume_ledger::LedgerReading>,
+    ),
 }
 
 const REFRESH_WAITS: &str = "A check is running; press R after it finishes";
 
 /// The smallest terminal that shows the permanent-removal line of a plan.
-pub const CONFIRM_MIN_ROWS: u16 = 8;
+pub const CONFIRM_MIN_ROWS: u16 = 9;
 pub const CONFIRM_MIN_COLS: u16 = 40;
 
 type PendingObservation = anyhow::Result<RefreshedObservation>;
@@ -250,6 +389,11 @@ impl RefreshedObservation {
         }
     }
 }
+
+/// What the cached headline was built from: the report's time, the scope
+/// it covers, and the clock minute (a ledger dated ahead of now is judged
+/// against it).
+type HeadlineKey = (u64, Option<usize>, bool, u64);
 
 pub struct App {
     /// Ephemeral on-demand details; never persisted in the observation store.
@@ -457,9 +601,23 @@ pub struct App {
     /// (`swamp_core::manager_facts`), read from the store with the rest of
     /// the snapshot. The TUI never asks a manager anything itself.
     pub manager_facts: swamp_core::manager_facts::ManagerFacts,
+    /// What the stored disk ledger says (`swamp observe --volume` writes
+    /// it), read with the stored snapshot: two small Parquet reads, never
+    /// a directory read. The headline's percent and its "everything
+    /// else", "system volumes" and "not measured" lines come from it.
+    pub ledger: swamp_core::volume_ledger::LedgerReading,
+    /// The person has already opened Reclaim or Disk (stored in
+    /// `ui_state.json`), so the first-run pointer to them is not shown.
+    /// `true` for a fixture app; `finish_startup` sets it from the store.
+    pub views_seen: bool,
     /// The Reclaim view built from the stored facts above, kept until one
     /// of them changes: building it joins every unit to its interior.
     reclaim_cache: std::cell::RefCell<Option<std::sync::Arc<swamp_core::reclaim::ReclaimView>>>,
+    /// The headline built from the facts above, kept until one of them
+    /// (or the clock minute) changes: drawing reuses it instead of
+    /// rebuilding it every frame.
+    headline_cache:
+        std::cell::RefCell<Option<(HeadlineKey, std::sync::Arc<swamp_core::headline::Headline>)>>,
     /// The authorized scope this TUI is showing. Every refresh --
     /// background, post-action re-observe -- goes through it,
     /// so exclusions and external pruning survive an update rather than
@@ -573,6 +731,11 @@ pub struct UiState {
     pub reverse: bool,
     #[serde(default)]
     pub keep_executables: bool,
+    /// The person has opened Tools or Disk once: the "New: Tab opens Tools
+    /// and Disk" line is not shown again. Additive: an older swamp ignores
+    /// the key and keeps its own.
+    #[serde(default)]
+    pub views_seen: bool,
 }
 
 pub fn load_ui_state(store: &std::path::Path) -> UiState {
@@ -700,7 +863,10 @@ impl App {
             declared_lines: Vec::new(),
             declared_roots: Vec::new(),
             manager_facts: swamp_core::manager_facts::ManagerFacts::default(),
+            ledger: swamp_core::volume_ledger::LedgerReading::NotMeasured,
+            views_seen: true,
             reclaim_cache: std::cell::RefCell::new(None),
+            headline_cache: std::cell::RefCell::new(None),
             scope: None,
         }
     }
@@ -723,6 +889,47 @@ impl App {
     pub fn set_manager_facts(&mut self, facts: swamp_core::manager_facts::ManagerFacts) {
         self.manager_facts = facts;
         self.reclaim_cache.borrow_mut().take();
+    }
+
+    /// Sets what the stored disk ledger says.
+    pub fn set_ledger(&mut self, ledger: swamp_core::volume_ledger::LedgerReading) {
+        self.ledger = ledger;
+        self.headline_cache.borrow_mut().take();
+    }
+
+    /// The developer-storage headline over the stored facts this app
+    /// holds: a pure function of them (`swamp_core::headline::build`),
+    /// so drawing it lists nothing, stats nothing and starts no process.
+    pub fn headline(&self) -> std::sync::Arc<swamp_core::headline::Headline> {
+        use swamp_core::headline::ScopeKind;
+        let explicit = self.scope.as_ref().is_some_and(|s| s.explicit);
+        let now = swamp_core::entities::now();
+        let key: HeadlineKey = (
+            self.report.observed_at,
+            self.previous_scope_roots,
+            explicit,
+            now / 60,
+        );
+        if let Some((k, h)) = self.headline_cache.borrow().as_ref()
+            && *k == key
+        {
+            return h.clone();
+        }
+        let built =
+            std::sync::Arc::new(swamp_core::headline::build(&swamp_core::headline::Input {
+                units: &self.external_units,
+                report: &self.report,
+                ledger: &self.ledger,
+                scope: match (explicit, self.previous_scope_roots) {
+                    (true, _) => ScopeKind::ExplicitRoot,
+                    (false, Some(roots)) => ScopeKind::Previous { roots },
+                    (false, None) => ScopeKind::Current,
+                },
+                observed_at: self.report.observed_at,
+                now,
+            }));
+        *self.headline_cache.borrow_mut() = Some((key, built.clone()));
+        built
     }
 
     /// The Reclaim view over the stored facts this app holds. A pure
@@ -757,6 +964,7 @@ impl App {
     pub fn set_external_units(&mut self, units: Vec<swamp_core::external::ExternalUnit>) {
         self.external_units = units;
         self.reclaim_cache.borrow_mut().take();
+        self.headline_cache.borrow_mut().take();
     }
 
     /// Sets the store interiors shown under `ViewKind::External`. Same
@@ -874,6 +1082,7 @@ impl App {
         // the new report sorts it.
         let anchor = self.selected_row_key();
         self.report = report;
+        self.headline_cache.borrow_mut().take();
         self.restore_selection(anchor);
     }
 
@@ -937,8 +1146,13 @@ impl App {
         self.drop_marks_missing_from_report();
     }
 
-    fn install_snapshot(&mut self, snap: swamp_core::report::ReportSnapshot) {
+    fn install_snapshot(
+        &mut self,
+        snap: swamp_core::report::ReportSnapshot,
+        ledger: swamp_core::volume_ledger::LedgerReading,
+    ) {
         self.has_index = true;
+        self.set_ledger(ledger);
         self.replace_report(snap.report);
         self.set_external_units(snap.external_units);
         self.set_store_interiors(snap.store_interiors);
@@ -962,8 +1176,8 @@ impl App {
                 self.drop_marks_missing_from_report();
                 true
             }
-            Some(HeldReload::Snapshot(snap)) => {
-                self.install_snapshot(*snap);
+            Some(HeldReload::Snapshot(snap, ledger)) => {
+                self.install_snapshot(*snap, *ledger);
                 true
             }
             None => false,
@@ -1098,6 +1312,12 @@ impl App {
                 return model::reclaim_rows(&self.reclaim_view(), &self.collapsed);
             }
             ViewKind::Agents => model::agent_rows(&self.agent_units),
+            // Parts of one disk, largest meaning first as the ledger
+            // orders them: sort never reorders them.
+            ViewKind::Disk => {
+                return model::disk_rows(&self.ledger, self.headline().accounted_sentence());
+            }
+            ViewKind::DiskGaps => return model::disk_gaps_rows(&self.ledger),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
         rows
@@ -1137,6 +1357,12 @@ impl App {
         }
         self.view_cursor.insert(self.view, self.selected);
         self.view = v;
+        // Opening either of the two views the first-run hint points at
+        // ends the hint, for good.
+        if v.section() != Section::Projects && !self.views_seen {
+            self.views_seen = true;
+            self.persist_ui_state();
+        }
         let len = self.rows().len();
         self.selected = self
             .view_cursor
@@ -1144,6 +1370,13 @@ impl App {
             .copied()
             .unwrap_or(0)
             .min(len.saturating_sub(1));
+    }
+
+    /// `Tab`, `Shift-Tab` and `1`-`3`: open a section on its first view.
+    pub fn set_section(&mut self, s: Section) {
+        if s != self.view.section() {
+            self.set_view(s.default_view());
+        }
     }
 
     pub fn move_selection(&mut self, delta: i32) {
@@ -1293,6 +1526,7 @@ impl App {
             sort: sort_to_str(self.sort).to_string(),
             reverse: self.reverse,
             keep_executables: self.keep_executables,
+            views_seen: self.views_seen,
         };
         if self.ui_state_tx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel::<UiStateMsg>();
@@ -3017,7 +3251,12 @@ impl App {
                 if prev.is_some()
                     && now_holder.is_none()
                     && let Ok(snap) = swamp_core::report::report_scope_from_store(&scope, &store)
-                    && tx.send(LockPollMsg::Reloaded(Box::new(snap))).is_err()
+                    && tx
+                        .send(LockPollMsg::Reloaded(
+                            Box::new(snap),
+                            Box::new(swamp_core::volume_ledger::read_reading(&store)),
+                        ))
+                        .is_err()
                 {
                     return;
                 }
@@ -3040,17 +3279,17 @@ impl App {
         for m in msgs {
             match m {
                 LockPollMsg::Holder(h) => self.external_observer = h,
-                LockPollMsg::Reloaded(snap) => {
+                LockPollMsg::Reloaded(snap, ledger) => {
                     // Our own observation in flight will replace this
                     // report anyway.
                     if self.pending.is_some() {
                         continue;
                     }
                     if self.reload_must_wait() {
-                        self.held_reload = Some(HeldReload::Snapshot(snap));
+                        self.held_reload = Some(HeldReload::Snapshot(snap, ledger));
                         continue;
                     }
-                    self.install_snapshot(*snap);
+                    self.install_snapshot(*snap, *ledger);
                 }
             }
         }
@@ -4028,36 +4267,37 @@ mod tests {
     }
 
     #[test]
-    fn view_cycles_and_digit_keys() {
+    fn view_cycles_within_a_section_and_keys_jump_to_sections() {
         assert_eq!(ViewKind::Projects.next(), ViewKind::Tree);
-        assert_eq!(ViewKind::from_digit('3'), Some(ViewKind::Builds));
-        assert_eq!(ViewKind::from_digit('6'), Some(ViewKind::Kinds));
-        assert_eq!(ViewKind::from_digit('8'), Some(ViewKind::Types));
-        assert_eq!(ViewKind::from_digit('9'), Some(ViewKind::External));
-        // '0' is reserved for "clear filter" (crate::handle_key_mod);
-        // Reclaim and Agents have no dedicated digit and must not silently
-        // claim '0'.
-        assert_eq!(ViewKind::from_digit('0'), None);
-        // Full cycle returns to Projects, matching the CLI's view order:
-        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/
-        // types/external/reclaim/agents.
-        let mut v = ViewKind::Projects;
-        for _ in 0..ViewKind::ALL.len() {
-            v = v.next();
+        assert_eq!(Section::from_key('1'), Some(Section::Projects));
+        assert_eq!(Section::from_key('2'), Some(Section::Tools));
+        assert_eq!(Section::from_key('3'), Some(Section::Disk));
+        // '0' is reserved for "clear filter" (crate::handle_key_mod), and
+        // 4-9 are no longer keys at all.
+        for k in ['0', '4', '9', 'c', 'D', 'I'] {
+            assert_eq!(Section::from_key(k), None, "{k}");
         }
-        assert_eq!(v, ViewKind::Projects);
-        // Reclaim and Agents are reachable by cycling even without their
-        // own digit, and Reclaim sits right after External.
-        let mut seen = std::collections::HashSet::new();
-        let mut v = ViewKind::Projects;
-        for _ in 0..ViewKind::ALL.len() {
-            seen.insert(v);
-            v = v.next();
+        // `v` wraps inside the section it is in.
+        for s in Section::ALL {
+            let mut v = s.default_view();
+            for _ in 0..s.views().len() {
+                assert_eq!(v.section(), s);
+                v = v.next();
+            }
+            assert_eq!(v, s.default_view());
         }
-        assert!(seen.contains(&ViewKind::Agents));
-        assert!(seen.contains(&ViewKind::Reclaim));
-        assert_eq!(ViewKind::External.next(), ViewKind::Reclaim);
-        assert_eq!(ViewKind::ALL.len(), seen.len());
+        assert_eq!(ViewKind::Kinds.next(), ViewKind::Unowned);
+        assert_eq!(ViewKind::Unowned.next(), ViewKind::Projects);
+        assert_eq!(ViewKind::Reclaim.next(), ViewKind::Docker);
+        assert_eq!(ViewKind::Agents.next(), ViewKind::Reclaim);
+        assert_eq!(Section::Disk.next(), Section::Projects);
+        assert_eq!(Section::Projects.prev(), Section::Disk);
+        // Every view is in exactly one section.
+        let total: usize = Section::ALL.iter().map(|s| s.views().len()).sum();
+        assert_eq!(total, ViewKind::ALL.len());
+        for v in ViewKind::ALL {
+            assert!(v.section().views().contains(&v), "{v:?}");
+        }
     }
 
     // -----------------------------------------------------------------
@@ -4662,7 +4902,7 @@ mod tests {
             state: swamp_core::roots::DeclaredState::Missing,
         }]);
         helped.toggle_help();
-        assert!(paint(&helped, 100, 60).contains("Declared source roots"));
+        assert!(paint(&helped, 100, 100).contains("Declared source roots"));
     }
 
     // ---- v0.7.5 adversarial fixes ----

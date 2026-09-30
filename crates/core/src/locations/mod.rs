@@ -1033,6 +1033,16 @@ pub struct Remainder {
     pub include_all: &'static str,
 }
 
+/// A group of the developer-storage headline that a detector can claim
+/// for its units (see [`Detector::headline_group`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadlineGroup {
+    /// An AI coding tool's own storage (sessions, caches, logs, state).
+    AgentStorage,
+    /// A container or VM runtime's data.
+    Containers,
+}
+
 /// Whether units of detector `detector_id` are a remainder (see
 /// [`Detector::remainder_of`]).
 pub fn remainder_of(detector_id: &str) -> Option<Remainder> {
@@ -1297,6 +1307,17 @@ pub trait Detector: Send + Sync {
     /// counted in the sibling's unit, once). A headline that wants the
     /// remainder selects units by this capability, never by id.
     fn remainder_of(&self) -> Option<Remainder> {
+        None
+    }
+    /// The developer-storage headline group this detector's units belong
+    /// to when the storage category alone would put them elsewhere: an AI
+    /// tool's home is agent storage, not "other local state", and a
+    /// container runtime's data is containers, not "other local state".
+    /// `None` (the default) means the unit's storage category decides
+    /// (`crate::headline::category_of_unit`). Declared here, on the
+    /// detector, so a new tool is grouped where it is registered
+    /// (`.oh/guardrails/detector-ids-only-in-registry.md`).
+    fn headline_group(&self) -> Option<HeadlineGroup> {
         None
     }
     /// For a location this detector proposes as a *container* rather than

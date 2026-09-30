@@ -44,6 +44,10 @@ impl Detector for CodexDetector {
         "Codex"
     }
 
+    fn headline_group(&self) -> Option<super::HeadlineGroup> {
+        Some(super::HeadlineGroup::AgentStorage)
+    }
+
     fn platforms(&self) -> &'static [Platform] {
         &[Platform::MacOS, Platform::Linux]
     }

@@ -85,6 +85,10 @@ impl Detector for OpenCodeDetector {
         "OpenCode"
     }
 
+    fn headline_group(&self) -> Option<super::HeadlineGroup> {
+        Some(super::HeadlineGroup::AgentStorage)
+    }
+
     fn platforms(&self) -> &'static [Platform] {
         &[Platform::MacOS, Platform::Linux]
     }

@@ -904,7 +904,7 @@ tools this chunk added.
 |---|---|
 | CLI text | `swamp report --view agents [--project NAME] [--all]` |
 | CLI JSON | `swamp report --view agents --json` (`{units, total_bytes}`) |
-| TUI (read) | `v` (cycle) reaches the Agents view; no dedicated digit (`0` is "clear filter") |
+| TUI (read) | `2` opens the Tools section, `v` cycles to the Agents view |
 | TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every markable row in the Agents view the same way, skipping protected/unmarkable ones and naming the skip in the footer; `Enter` moves it to the Trash through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected row, or one whose category has no Trash move, cannot be marked; the footer names `propose_agents`'s own refusal reason. |
 | Protect | `swamp protect add\|remove\|list [--json] <path>` |
 | Removal | TUI only (2026-09-23: there is no `propose`/`propose-agents`/`approve`/`execute` command any more). |

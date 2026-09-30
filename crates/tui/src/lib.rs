@@ -21,7 +21,7 @@ pub mod units;
 pub mod worker;
 
 use anyhow::Result;
-use app::{App, ViewKind};
+use app::App;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use model::Sort;
 use ratatui::Terminal;
@@ -161,6 +161,30 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         return;
     }
+    // An open confirm is its own small mode: the plan on screen is what
+    // Enter would run, so nothing may change what is under it. Keys that
+    // move the cursor, switch views or sections, open the filter, or mark
+    // and unmark are swallowed; the ones it uses (Enter, Esc, d, b, k, ?,
+    // R, q) fall through to the arms below.
+    if app.confirm_open
+        && matches!(
+            code,
+            KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Backspace
+                | KeyCode::Char('v' | '0'..='3' | '/' | ':' | ' ' | 'A')
+        )
+    {
+        return;
+    }
     match code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('b') => app.open_blocked(),
@@ -192,10 +216,15 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('/') => app.open_picker(),
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
+        // Three sections, and the views inside them: Tab and Shift-Tab move
+        // between sections, `1` `2` `3` jump to one, `v` cycles the views of
+        // the current section. Nothing else opens a view.
+        KeyCode::Tab => app.set_section(app.view.section().next()),
+        KeyCode::BackTab => app.set_section(app.view.section().prev()),
         KeyCode::Char('v') => app.set_view(app.view.next()),
-        KeyCode::Char(d @ '1'..='9') => {
-            if let Some(v) = ViewKind::from_digit(d) {
-                app.set_view(v);
+        KeyCode::Char(k @ '1'..='3') => {
+            if let Some(sec) = app::Section::from_key(k) {
+                app.set_section(sec);
             }
         }
         KeyCode::Char('g') => app.set_sort(Sort::Growth),
@@ -294,6 +323,7 @@ fn stored_multi_root_app(
     app.set_store_interiors(snapshot.store_interiors);
     app.set_agent_units(snapshot.agent_units);
     app.set_manager_facts(snapshot.manager_facts);
+    app.set_ledger(swamp_core::volume_ledger::read_reading(store));
     app.scope = Some(scope.clone());
     app.observed_label = "from last observation".into();
     app.disk_banner = banner;
@@ -355,6 +385,7 @@ pub fn run(root: &Path) -> Result<()> {
             a.set_store_interiors(snapshot.store_interiors);
             a.set_agent_units(snapshot.agent_units);
             a.set_manager_facts(snapshot.manager_facts);
+            a.set_ledger(swamp_core::volume_ledger::read_reading(&store));
             a.disk_banner = banner.clone();
             a
         }
@@ -552,6 +583,9 @@ fn finish_startup(
     }
     app.reverse = saved.reverse;
     app.keep_executables = saved.keep_executables;
+    // A store that has never shown the new views shows the pointer to them
+    // once; the flag is written when either is opened.
+    app.views_seen = saved.views_seen;
 }
 
 fn run_terminal_loop(mut guard: term::TerminalGuard, app: &mut App) -> Result<()> {
@@ -1408,7 +1442,7 @@ mod tests {
             },
         ];
         app.confirm_open = true;
-        let s = buffer_text(&app, 60, 10);
+        let s = buffer_text(&app, 60, 11);
         let blank_inside = s
             .lines()
             .filter(|r| {

@@ -847,6 +847,7 @@ fn report_json_envelope(
     agent_units: &[swamp_core::agents::AgentUnit],
     store_interiors: &[swamp_core::artifact::NestedArtifact],
     reclaim: Option<&swamp_core::reclaim::ReclaimView>,
+    headline: &swamp_core::headline::Headline,
 ) -> Result<serde_json::Value> {
     let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
@@ -855,6 +856,7 @@ fn report_json_envelope(
         swamp_core::agent_json::apply_filter_to_report(&mut rr, f);
     }
     let observed_at = rr.observed_at;
+    let headline_json = headline.to_json();
 
     if let Some(v) = view {
         let name = v.name();
@@ -933,6 +935,15 @@ fn report_json_envelope(
         if !scope_coverage.is_empty() {
             envelope["scope_coverage"] = serde_json::json!(scope_coverage);
         }
+        if v == View::Reclaim {
+            // The same numbers the text prints above the view, and how
+            // the view's totals add up to them.
+            envelope["headline"] = headline_json.clone();
+            if let Some(view) = reclaim {
+                envelope["headline_relation"] =
+                    serde_json::to_value(swamp_core::headline::relation(headline, &view.totals))?;
+            }
+        }
         if v == View::Docker && project.is_none() {
             envelope["buildkit"] = swamp_core::agent_json::buildkit_payload(&rr);
         }
@@ -960,6 +971,9 @@ fn report_json_envelope(
     value["index_refreshed"] = serde_json::json!(index_refreshed);
     // The whole-disk ledger, read from the store (never a walk).
     value["disk"] = disk_json_now(&store_dir, all_rows);
+    // The developer-storage headline: the numbers `swamp report` prints
+    // first, from the same stored facts.
+    value["headline"] = headline_json;
     if !scope_coverage.is_empty() {
         value["scope_coverage"] = serde_json::json!(scope_coverage);
     }
@@ -1016,6 +1030,32 @@ fn disk_text_now(store_dir: &Path) -> String {
         ),
         Err(e) => format!("Disk ledger: could not be read ({e}); run `swamp observe --volume`\n"),
     }
+}
+
+/// The developer-storage headline for a stored observation: a pure
+/// function of the stored units, the stored report and the stored disk
+/// ledger (two small Parquet reads). Nothing is walked or spawned.
+fn headline_now(
+    store_dir: &Path,
+    r: &Report,
+    units: &[swamp_core::external::ExternalUnit],
+    previous_roots: Option<usize>,
+    explicit: bool,
+) -> swamp_core::headline::Headline {
+    use swamp_core::headline::ScopeKind;
+    let ledger = swamp_core::volume_ledger::read_reading(store_dir);
+    swamp_core::headline::build(&swamp_core::headline::Input {
+        units,
+        report: r,
+        ledger: &ledger,
+        scope: match (explicit, previous_roots) {
+            (true, _) => ScopeKind::ExplicitRoot,
+            (false, Some(roots)) => ScopeKind::Previous { roots },
+            (false, None) => ScopeKind::Current,
+        },
+        observed_at: r.observed_at,
+        now: swamp_core::entities::now(),
+    })
 }
 
 const PREVIOUS_SCOPE_NOTE: &str = "the scope's roots changed since this observation; nothing was walked and no growth is computed across the two scopes";
@@ -1287,6 +1327,13 @@ fn main() -> Result<()> {
                     observed_at: r.observed_at,
                 })
             });
+            let headline = headline_now(
+                &store_dir,
+                &r,
+                &external_units,
+                previous_scope.as_ref().map(|p| p.roots),
+                scope.explicit,
+            );
             let root = r.root.clone();
             if !coverage.is_empty() {
                 print_scope_coverage_note(&coverage);
@@ -1328,6 +1375,7 @@ fn main() -> Result<()> {
                     &agent_units,
                     &store_interiors,
                     reclaim_view.as_ref(),
+                    &headline,
                 )?;
                 bound_interior_units(&mut value, unit_limit, unit_offset);
                 if let Some(obj) = value.as_object_mut() {
@@ -1412,7 +1460,15 @@ fn main() -> Result<()> {
                     }
                     Some(View::Reclaim) => {
                         if let Some(v) = &reclaim_view {
-                            safe_print!("{}", swamp_core::reclaim::render_text(v));
+                            safe_print!(
+                                "{}{}",
+                                swamp_core::headline::render_reclaim_header(
+                                    &headline,
+                                    &v.totals,
+                                    swamp_core::entities::now()
+                                ),
+                                swamp_core::reclaim::render_text(v)
+                            );
                         }
                     }
                     Some(View::Agents) => {
@@ -1468,7 +1524,15 @@ fn main() -> Result<()> {
                     }
                     Some(View::Reclaim) => {
                         if let Some(v) = &reclaim_view {
-                            safe_print!("{}", swamp_core::reclaim::render_text(v));
+                            safe_print!(
+                                "{}{}",
+                                swamp_core::headline::render_reclaim_header(
+                                    &headline,
+                                    &v.totals,
+                                    swamp_core::entities::now()
+                                ),
+                                swamp_core::reclaim::render_text(v)
+                            );
                         }
                     }
                     Some(View::Agents) => {
@@ -1488,6 +1552,7 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                     None => {
+                        safe_print!("{}", headline.render_text(swamp_core::entities::now()));
                         safe_print!("{declared_block}");
                         safe_print!(
                             "{}",

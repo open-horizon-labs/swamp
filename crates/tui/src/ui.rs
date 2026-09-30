@@ -274,11 +274,22 @@ fn age_label(app: &App) -> String {
 /// When this changes the screen is repainted even though nobody touched
 /// anything.
 pub fn clock_signature(app: &App) -> String {
+    // The headline block's ages read in minutes and hours; they change on
+    // the clock, like the header's own age.
+    let now = swamp_core::entities::now();
+    let ledger_age = match &app.ledger {
+        swamp_core::volume_ledger::LedgerReading::Measured(a) => {
+            swamp_core::volume_ledger::age_text(a.measured_at, now)
+        }
+        _ => String::new(),
+    };
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         age_label(app),
         stale_warning(app).is_some(),
-        app.refusal_active().is_some()
+        app.refusal_active().is_some(),
+        swamp_core::volume_ledger::age_text(app.report.observed_at, now),
+        ledger_age
     )
 }
 
@@ -333,9 +344,10 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
 fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
-    const BASE: [&str; 11] = [
-        "/ filter",
+    const BASE: [&str; 12] = [
+        "Tab section",
         "v view",
+        "/ filter",
         "R refresh",
         "⌫ delete",
         "Space mark",
@@ -731,12 +743,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else {
         Vec::new()
     };
-    // Chrome is the same five rows in every state: header, filter line,
-    // two status rows, keys. Sheets overlay the body; nothing resizes it.
+    // Chrome is the same rows in every state and every view: header, the
+    // developer-storage headline block (a fixed number of rows for this
+    // terminal height), filter line, two status rows, keys. Sheets
+    // overlay the body; nothing resizes it.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
+            Constraint::Length(headline_rows(size.height)),
+            Constraint::Length(1), // view strip
             Constraint::Length(1), // filter line
             Constraint::Min(1),    // body
             Constraint::Length(STATUS_ROWS),
@@ -745,16 +761,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .split(size);
 
     draw_header(frame, app, chunks[0]);
-    draw_filter_line(frame, app, chunks[1]);
-    draw_body(frame, app, chunks[2]);
+    draw_headline(frame, app, chunks[1]);
+    draw_view_strip(frame, app, chunks[2]);
+    draw_filter_line(frame, app, chunks[3]);
+    draw_body(frame, app, chunks[4]);
     if app.operation.is_none() {
         if app.blocked_open {
             // Two rows per item.
             app.page
-                .set((usize::from(SHEET_ROWS.min(chunks[2].height)).saturating_sub(2) / 2).max(1));
+                .set((usize::from(SHEET_ROWS.min(chunks[4].height)).saturating_sub(2) / 2).max(1));
             draw_sheet(
                 frame,
-                chunks[2],
+                chunks[4],
                 &if app.blocked_scroll > 0 {
                     format!(
                         "Blocked: {} · from item {}",
@@ -770,14 +788,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
         } else if app.confirm_open {
             draw_sheet(
                 frame,
-                chunks[2],
+                chunks[4],
                 "Plan · nothing has changed yet",
                 &plan_sheet(app, &summary),
                 &|n| format!("+{n} more lines"),
             );
         }
     }
-    draw_status(frame, app, &summary, chunks[3]);
+    draw_status(frame, app, &summary, chunks[5]);
 
     // The keys row is the legend for the state you are actually in, and
     // nothing else ever replaces it.
@@ -837,10 +855,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         footer_legend(
             size.width as usize,
             !app.blocked.is_empty(),
-            app.view != crate::app::ViewKind::Reclaim,
+            !matches!(
+                app.view,
+                crate::app::ViewKind::Reclaim
+                    | crate::app::ViewKind::Disk
+                    | crate::app::ViewKind::DiskGaps
+            ),
         )
     };
-    frame.render_widget(Paragraph::new(footer_text), chunks[4]);
+    frame.render_widget(Paragraph::new(footer_text), chunks[6]);
 
     if app.help_open {
         draw_help(frame, app, size);
@@ -877,6 +900,315 @@ pub fn draw(frame: &mut Frame, app: &App) {
             popup,
         );
     }
+}
+
+/// Rows the developer-storage headline block takes on a terminal `height`
+/// rows tall: four when there is room for a useful table under them (the
+/// headline, the breakdown, the disk state, and the pointers to Reclaim and
+/// Disk), two on a shorter terminal (the headline and the pointers), one
+/// under 16 rows (the headline itself), none under 12. Fixed for a given
+/// height: no view and no state changes it, so no row moves.
+pub fn headline_rows(height: u16) -> u16 {
+    if height >= 22 {
+        4
+    } else if height >= 16 {
+        2
+    } else if height >= 12 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Clauses that each come in shorter forms (longest first), in priority
+/// order. Every clause steps to the same form at once (longest, then the
+/// next, and so on); at each form as many leading clauses as fit are kept.
+/// The form that keeps the most clauses wins, and among equals the one
+/// with the fullest wording. So trailing clauses give way before leading
+/// clauses lose words. When not even the first clause fits, its shortest
+/// form is cut to the width.
+fn fit_tiered(clauses: &[Vec<String>], width: usize) -> String {
+    let clauses: Vec<&Vec<String>> = clauses.iter().filter(|c| !c.is_empty()).collect();
+    let levels = clauses.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut best: Option<(usize, usize, String)> = None;
+    for level in 0..levels {
+        let picked: Vec<String> = clauses
+            .iter()
+            .map(|c| c[level.min(c.len() - 1)].clone())
+            .collect();
+        let mut kept = 0;
+        let mut line = String::new();
+        for k in 1..=picked.len() {
+            let candidate = picked[..k].join(" · ");
+            if crate::model::display_width(&candidate) > width {
+                break;
+            }
+            kept = k;
+            line = candidate;
+        }
+        if kept > best.as_ref().map_or(0, |b| b.0) {
+            best = Some((kept, level, line));
+        }
+    }
+    match best {
+        Some((_, _, line)) => line,
+        None => {
+            let shortest: Vec<String> = clauses.iter().map(|c| c[c.len() - 1].clone()).collect();
+            fit_clauses(&shortest, width)
+        }
+    }
+}
+
+/// The four lines of the headline block, each already fitted to `width`.
+/// Only as many as `headline_rows` gives are drawn: all four, the first and
+/// the fourth, or the first.
+pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
+    use swamp_core::headline::Disk;
+    if !app.has_index {
+        return [
+            fit_tiered(
+                &[vec![
+                    "Developer storage: not measured yet · press R to scan".to_string(),
+                    "Developer storage: not measured yet".to_string(),
+                    "Dev storage: not measured yet".to_string(),
+                ]],
+                width,
+            ),
+            String::new(),
+            String::new(),
+            pointer_line(app, None, width, now),
+        ];
+    }
+    let h = app.headline();
+    // Line 1: the headline, with the figures unchanged at every width.
+    let first = fit_tiered(&[h.line_tiers()], width);
+    // Line 2: the breakdown rows. They add up to the headline exactly;
+    // a narrow screen shows the largest and counts the rest.
+    let rows: Vec<&swamp_core::headline::CategoryRow> =
+        h.categories.iter().filter(|c| c.bytes > 0).collect();
+    let second = if rows.is_empty() {
+        "no developer storage found in the stored observation".to_string()
+    } else {
+        let mut sorted = rows.clone();
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.bytes));
+        let long: Vec<String> = sorted
+            .iter()
+            .map(|c| format!("{} {}", c.label, human_bytes(c.bytes)))
+            .collect();
+        let short: Vec<String> = sorted
+            .iter()
+            .map(|c| format!("{} {}", c.category.short(), human_bytes(c.bytes)))
+            .collect();
+        let fits = |v: &[String]| crate::model::display_width(&v.join(" · ")) <= width;
+        if fits(&long) {
+            long.join(" · ")
+        } else if fits(&short) {
+            short.join(" · ")
+        } else {
+            let mut n = short.len();
+            loop {
+                n -= 1;
+                let mut v: Vec<String> = short[..n].to_vec();
+                v.push(format!("+{} more", short.len() - n));
+                if n == 0 || fits(&v) {
+                    break clip_end(&v.join(" · "), width);
+                }
+            }
+        }
+    };
+    // Line 3: what covers or limits the numbers, then the ages, then the
+    // disk ledger's own parts. The first clauses are the ones that must
+    // survive a narrow screen.
+    let mut third: Vec<Vec<String>> = Vec::new();
+    if let Some(n) = h.previous_scope_roots {
+        third.push(vec![
+            format!("covers the previous scope ({n} roots)"),
+            format!("previous scope ({n} roots)"),
+            "previous scope".to_string(),
+        ]);
+    }
+    if h.scope == "explicit_root" {
+        third.push(vec![
+            "only the root named on the command line".to_string(),
+            "one root only".to_string(),
+        ]);
+    }
+    // The spot audit is the one check that can catch an undercounting
+    // walk: when it disagrees, that is the first thing the block says.
+    if h.audit_sentence().is_some() {
+        // One form per width: the wording is never traded for the clauses
+        // after it, which give way instead.
+        third.push(if width >= 64 {
+            vec!["FLAG: walk spot audit disagrees: see swamp report --view disk".to_string()]
+        } else {
+            vec!["FLAG: spot audit disagrees (3)".to_string()]
+        });
+    }
+    match &h.disk {
+        Disk::Measured(m) if m.percent_of_used_tenths.is_none() && m.exceeds_used => {
+            third.push(vec![
+                "FLAG: more than the disk's used bytes; no percent".to_string(),
+                "FLAG: over used; no percent".to_string(),
+            ])
+        }
+        Disk::Measured(m) if m.percent_of_used_tenths.is_none() && h.scope == "current" => third
+            .push(vec![
+                "disk ledger: no used figure; no percent".to_string(),
+                "ledger: no percent".to_string(),
+            ]),
+        Disk::Measured(_) => {}
+        Disk::NotMeasured => third.push(vec![
+            "disk ledger: not measured yet; run swamp observe --volume".to_string(),
+            "disk ledger: not measured yet".to_string(),
+            "no disk ledger".to_string(),
+        ]),
+        Disk::Unreadable { .. } => third.push(vec![
+            "disk ledger: could not be read; run swamp observe --volume".to_string(),
+            "disk ledger: unreadable".to_string(),
+        ]),
+        Disk::Newer { .. } => third.push(vec![
+            "disk ledger: written by a newer swamp; not used".to_string(),
+            "disk ledger: newer swamp".to_string(),
+        ]),
+        Disk::FutureDated { .. } => third.push(vec![
+            "disk ledger: dated in the future; not used".to_string(),
+            "ledger: future date".to_string(),
+        ]),
+    }
+    let observed = if h.observed_at > 0 {
+        swamp_core::volume_ledger::age_text(h.observed_at, now)
+    } else {
+        "at an unknown time".to_string()
+    };
+    match &h.disk {
+        Disk::Measured(m) => {
+            let ledger = swamp_core::volume_ledger::age_text(m.measured_at, now);
+            let mut long = format!("observed {observed}; disk ledger measured {ledger}");
+            if m.older_than_observation_secs.is_some() {
+                long.push_str(" (older than the observation)");
+            }
+            third.push(vec![long, format!("observed {observed} · ledger {ledger}")]);
+            third.push(vec![
+                format!("System volumes {}", human_bytes(m.system_volumes.bytes)),
+                format!("system {}", human_bytes(m.system_volumes.bytes)),
+            ]);
+            third.push(vec![
+                format!("Everything else {}", human_bytes(m.everything_else.bytes)),
+                format!("else {}", human_bytes(m.everything_else.bytes)),
+            ]);
+            third.push(vec![
+                format!(
+                    "Not measured: {} {}",
+                    m.not_measured.directories,
+                    if m.not_measured.directories == 1 {
+                        "directory"
+                    } else {
+                        "directories"
+                    }
+                ),
+                format!("not measured {}", m.not_measured.directories),
+            ]);
+        }
+        _ => third.push(vec![format!("observed {observed}")]),
+    }
+    [
+        first,
+        second,
+        fit_tiered(&third, width),
+        pointer_line(app, Some(&h), width, now),
+    ]
+}
+
+/// The fourth line: where Reclaim and Disk are and the key for each, or,
+/// until the person has opened either once, the one-time line saying so.
+/// The line is the same length class either way: no row moves when it goes.
+fn pointer_line(
+    app: &App,
+    h: Option<&swamp_core::headline::Headline>,
+    width: usize,
+    now: u64,
+) -> String {
+    use swamp_core::headline::Disk;
+    use swamp_core::volume_ledger::age_text;
+    if !app.views_seen {
+        return fit_tiered(
+            &[vec![
+                "New: Tab opens Tools (Reclaim) and Disk. Hides after you open either.".to_string(),
+                "New: Tab opens Tools and Disk (hides after use)".to_string(),
+                "New: Tab opens Tools and Disk".to_string(),
+            ]],
+            width,
+        );
+    }
+    let reclaim: Vec<String> = match h {
+        Some(_) => {
+            let view = app.reclaim_view();
+            let n = view.totals.count;
+            let regen = human_bytes(view.totals.regenerable_bytes);
+            vec![
+                format!(
+                    "Reclaim: {regen} regenerable across {n} unit{} (2 for Tools)",
+                    if n == 1 { "" } else { "s" }
+                ),
+                format!(
+                    "Reclaim: {regen} regenerable, {n} unit{} (2)",
+                    if n == 1 { "" } else { "s" }
+                ),
+                "Reclaim (2)".to_string(),
+            ]
+        }
+        None => vec!["Reclaim (2)".to_string()],
+    };
+    let disk: Vec<String> = match h.map(|h| &h.disk) {
+        Some(Disk::Measured(m)) => {
+            let a = age_text(m.measured_at, now);
+            vec![
+                format!("Disk: ledger measured {a} (3)"),
+                format!("Disk: ledger {a} (3)"),
+                "Disk (3)".to_string(),
+            ]
+        }
+        Some(Disk::NotMeasured) | None => vec![
+            "Disk: not measured; run swamp observe --volume (3)".to_string(),
+            "Disk: not measured (3)".to_string(),
+            "Disk (3)".to_string(),
+        ],
+        Some(_) => vec![
+            "Disk: ledger not usable; run swamp observe --volume (3)".to_string(),
+            "Disk: ledger not usable (3)".to_string(),
+            "Disk (3)".to_string(),
+        ],
+    };
+    fit_tiered(&[reclaim, disk], width)
+}
+
+fn draw_headline(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let all = headline_lines(app, area.width as usize, swamp_core::entities::now());
+    // Four rows: all. Two rows: the headline and the pointers. One: the
+    // headline.
+    let lines: Vec<&String> = match area.height {
+        1 => vec![&all[0]],
+        2 | 3 => vec![&all[0], &all[3]],
+        _ => all.iter().collect(),
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let rows: Vec<Line> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            // The headline is the one bold line; the rest stays quiet.
+            let style = if i == 0 {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            };
+            Line::from(Span::styled((*l).clone(), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
@@ -976,51 +1308,127 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// The section strip: one row naming the three sections, the current one
+/// in reverse video (an attribute, not a color: it survives `NO_COLOR` and
+/// any theme). `1 Projects  2 Tools  3 Disk` while the digits fit, then the
+/// bare names; `· Tab section` follows when there is room. The sub-view is
+/// named on the line below (`view: Tools › Reclaim (1 of 3 · v next)`).
+pub fn view_strip_spans(app: &App, width: usize) -> Vec<Span<'static>> {
+    use crate::app::Section;
+    let dw = crate::model::display_width;
+    let cur = app.view.section();
+    let build = |digits: bool| -> Vec<String> {
+        Section::ALL
+            .iter()
+            .map(|s| {
+                if digits {
+                    format!("{} {}", s.key(), s.title())
+                } else {
+                    s.title().to_string()
+                }
+            })
+            .collect()
+    };
+    let total = |l: &[String]| l.iter().map(|x| dw(x)).sum::<usize>() + 2 * (l.len() - 1);
+    let labels = if total(&build(true)) <= width {
+        build(true)
+    } else if total(&build(false)) <= width {
+        build(false)
+    } else {
+        // Too narrow for all three: the current section alone, cut to fit.
+        let name = cur.title().to_string();
+        vec![clip_end(&name, width.max(1))]
+    };
+    let hint = " · Tab section";
+    let quiet = Style::default().add_modifier(Modifier::DIM);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let l = clip_end(label, width.max(1));
+        spans.push(if labels.len() == 1 || Section::ALL[i] == cur {
+            Span::styled(l, selected_style())
+        } else {
+            Span::raw(l)
+        });
+    }
+    if total(&labels) + dw(hint) <= width {
+        spans.push(Span::styled(hint.to_string(), quiet));
+    }
+    spans
+}
+
+fn draw_view_strip(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(
+        Paragraph::new(Line::from(view_strip_spans(app, area.width as usize))),
+        area,
+    );
+}
+
+/// `filter: growth > 100MB in 7d · sort: size ↑`: what narrows and orders
+/// the rows.
+fn filter_clause(app: &App, width: usize) -> String {
+    let sort_name = match app.sort {
+        crate::model::Sort::Growth => Some("growth"),
+        crate::model::Sort::Size => Some("size"),
+        crate::model::Sort::Name => Some("name"),
+        crate::model::Sort::Type => Some("type"),
+        crate::model::Sort::Age => Some("age"),
+        crate::model::Sort::None => None,
+    };
+    let sort = match sort_name {
+        Some(n) if app.reverse => format!(" · sort: {n} ↑"),
+        Some(n) => format!(" · sort: {n}"),
+        None => String::new(),
+    };
+    let filter = if app.filter_text == "0" {
+        "none".to_string()
+    } else {
+        app.filter_text.clone()
+    };
+    let of = match (app.view, app.selected_project.as_deref()) {
+        (crate::app::ViewKind::Projects, _) | (_, None) => String::new(),
+        (_, Some(p)) => format!(" of {p}"),
+    };
+    let esc = if app.view == crate::app::ViewKind::Projects {
+        ""
+    } else {
+        " · Esc: projects"
+    };
+    let filt = format!("filter: {filter}{sort}");
+    let (sec, view) = (app.view.section().title(), app.view.title());
+    let (pos, n) = (app.view.position(), app.view.section().views().len());
+    // The filter hides rows, so it is never the part that is cut: the view
+    // part shortens first (the counts, then the section), and only a filter
+    // wider than the line itself is clipped.
+    let tiers = [
+        format!("view: {sec} › {view}{of} ({pos} of {n} · v next{esc})"),
+        format!("view: {sec} › {view}{of} ({pos} of {n})"),
+        format!("{sec} › {view}{of}"),
+        format!("{view}{of}"),
+    ];
+    let dw = crate::model::display_width;
+    for t in &tiers {
+        if dw(t) + 3 + dw(&filt) <= width {
+            return format!("{t} · {filt}");
+        }
+    }
+    clip_end(&filt, width)
+}
+
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.editing_filter {
+    let line = if app.editing_filter {
         let hint = if app.completions.is_empty() {
             "(Tab complete · Enter apply · Esc cancel)".to_string()
         } else {
             format!("(Tab: {})", app.completions.join("  "))
         };
-        format!("filter › {}▏  {hint}", app.filter_text)
+        Line::from(format!("filter › {}▏  {hint}", app.filter_text))
     } else {
-        // Which view this is, where it sits among the ten, and how to move:
-        // `v` walks the list in order, Esc goes to the projects list.
-        let place = format!(
-            "{} of {}",
-            app.view.position(),
-            crate::app::ViewKind::ALL.len()
-        );
-        let scope = match (app.view, app.selected_project.as_deref()) {
-            (crate::app::ViewKind::Projects, _) => format!("projects ({place} · v next)"),
-            (crate::app::ViewKind::Tree, Some(p)) => {
-                format!("tree of {p} ({place} · Esc: projects)")
-            }
-            (v, Some(p)) => format!("{} of {p} ({place} · v next · Esc: projects)", v.label()),
-            (v, None) => format!("{} ({place} · v next · Esc: projects)", v.label()),
-        };
-        let sort_name = match app.sort {
-            crate::model::Sort::Growth => Some("growth"),
-            crate::model::Sort::Size => Some("size"),
-            crate::model::Sort::Name => Some("name"),
-            crate::model::Sort::Type => Some("type"),
-            crate::model::Sort::Age => Some("age"),
-            crate::model::Sort::None => None,
-        };
-        let sort = match sort_name {
-            Some(n) if app.reverse => format!(" · sort: {n} ↑"),
-            Some(n) => format!(" · sort: {n}"),
-            None => String::new(),
-        };
-        let filter = if app.filter_text == "0" {
-            "none".to_string()
-        } else {
-            app.filter_text.clone()
-        };
-        format!("view: {scope} · filter: {filter}{sort}")
+        Line::from(filter_clause(app, area.width as usize))
     };
-    frame.render_widget(Paragraph::new(text), area);
+    frame.render_widget(Paragraph::new(line), area);
     if let Some(err) = &app.filter_error {
         // Parse errors show inline in red under the line; with only one
         // row budgeted here we overlay on the same line's tail instead
@@ -1087,6 +1495,15 @@ fn empty_state(app: &App) -> String {
             "No storage units in the stored observation. {}. Press v for another view, or R to scan again.",
             app.reclaim_view().scope.statement
         ),
+        V::Disk | V::DiskGaps => {
+            let h = app.headline();
+            let why = h
+                .disk_state_sentence()
+                .unwrap_or_else(|| "disk ledger: nothing recorded in it".to_string());
+            format!(
+                "{why}. The ledger is written by `swamp observe --volume` (a scheduled observe does it once a day); opening the UI never scans. Press v for another view."
+            )
+        }
         _ => "Nothing here yet. Press v for another view, or R to scan again.".to_string(),
     }
 }
@@ -1638,8 +2055,18 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     );
     entry(
         &mut out,
-        "v  1-9",
-        "next view, or pick one: 1 projects 2 tree 3 builds 4 deps 5 docker 6 kinds 7 unowned 8 types 9 external. v also reaches reclaim (what each unit costs to get back) and agents. Esc returns to projects.",
+        "Tab",
+        "next section (Projects, Tools, Disk); Shift-Tab goes back. In the : filter editor Tab completes as before; the / picker ignores it",
+    );
+    entry(
+        &mut out,
+        "v",
+        "next view inside the current section, wrapping around; Esc returns to projects",
+    );
+    entry(
+        &mut out,
+        "1 2 3",
+        "jump to a section: 1 Projects, 2 Tools, 3 Disk",
     );
     entry(
         &mut out,
@@ -1670,6 +2097,25 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "q",
         "quit. While a check or a move runs, q and Esc stop it after the current item",
     );
+    blank(&mut out);
+    heading(
+        &mut out,
+        "Sections and views (Tab, v and 1 2 3 reach every one)",
+    );
+    for sec in crate::app::Section::ALL {
+        entry(
+            &mut out,
+            &format!("{} {}", sec.key(), sec.title()),
+            sec.describe(),
+        );
+        for (i, v) in sec.views().iter().enumerate() {
+            entry(
+                &mut out,
+                "",
+                &format!("{}. {}: {}", i + 1, v.title(), v.describe()),
+            );
+        }
+    }
     blank(&mut out);
     heading(&mut out, "Columns");
     plain(

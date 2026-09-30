@@ -41,6 +41,10 @@ impl Detector for ClaudeCodeDetector {
         "Claude Code"
     }
 
+    fn headline_group(&self) -> Option<super::HeadlineGroup> {
+        Some(super::HeadlineGroup::AgentStorage)
+    }
+
     fn platforms(&self) -> &'static [Platform] {
         &[Platform::MacOS, Platform::Linux]
     }
@@ -97,6 +101,10 @@ impl Detector for ClaudeCodeScratchDetector {
 
     fn name(&self) -> &'static str {
         "Claude Code session scratch"
+    }
+
+    fn headline_group(&self) -> Option<super::HeadlineGroup> {
+        Some(super::HeadlineGroup::AgentStorage)
     }
 
     fn platforms(&self) -> &'static [Platform] {

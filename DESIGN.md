@@ -78,13 +78,46 @@ The renderer uses the terminal's own colors and attributes. Committed frames exe
 
 `→` opens or expands; `←` collapses or returns to projects. Enter opens a project or confirms an action. Esc cancels the active interaction or returns to projects. `/` opens the filter form; `:` edits the expression; `0` clears it. Parse errors retain the previous valid filter.
 
-The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take precedence on later runs. Ten views are available through `v` and `1`–`9` (External is `9`; Agents has no dedicated digit -- `0` is "clear filter" -- and is reached only by cycling with `v`). The [usage guide](docs/usage.md#terminal-controls) holds the full key table.
+The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take precedence on later runs. The views are nested in three sections (Projects, Tools, Disk): `Tab`/`Shift-Tab` move between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the current section. The [usage guide](docs/usage.md#terminal-controls) holds the full key table.
 
 ## Header, progress, and history
 
 The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals, but the activity chip (`⠋ observing 12s`, or `⠋ another observation running (pid N, 1m 12s)`) owns the left edge at every width. The UI opens on the stored report at any age and never scans when one exists; with none, the first scan runs in the background and its progress shows in the header. `R` refreshes on demand, and says so, rather than starting a second walk, when another process already holds the observation lock. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
 
 Observation progress shows the elapsed time and the bytes seen; there is no percentage, because the total is not known. The TUI opens no filesystem watch: nothing scans on a file event, so a stored report is exactly as old as the header says. A lock poll only notices when another process observes, shows it, and reloads the stored report when that run ends. The right side of the header is the history sparkline with the net change it covers and the window it is over (`-41.4GB in 1w`); body rows use change bars.
+
+### The developer-storage headline block and the view strip
+
+Under the header, on every view and in every state, sits a headline block of a
+fixed number of rows chosen by the terminal's height alone: four at 22 rows and
+up (the headline with its percent; the breakdown rows, largest first, with
+`+N more` when a narrow screen cannot name them all; the disk state with the
+ages and the ledger's parts; the pointers to Reclaim and Disk with their keys),
+two from 16 rows (headline and pointers), one from 12, none below. Nothing
+changes that height: a warning, a missing ledger, a running scan, a previous
+scope, the first-run line and every view draw into the same rows, so no row of
+the table moves. Lines that come in shorter forms step together to the form
+that keeps the most leading clauses; the wording of the spot-audit warning is
+never traded away, so the clauses after it give way instead. The first-run line
+("New: Tab opens Tools (Reclaim) and Disk. Hides after you open either.") takes the
+pointer row until Tools or Disk is opened once, and is remembered in
+`ui_state.json`.
+
+Under the block is the section strip: one row naming the three sections (`1
+Projects  2 Tools  3 Disk`), the current one in reverse video (an attribute,
+never a color, so `NO_COLOR` and light themes keep it). The line below it names
+the view: `view: Tools › Reclaim (1 of 4 · v next)`, then the filter and sort.
+The only keys that move between views are `Tab`/`Shift-Tab` (sections), `v` (views
+inside a section, wrapping) and `1` `2` `3` (a section); the legend shows `Tab
+section  v view` and never a key per view. Every modal keeps its own keys first,
+so Tab completes in the filter and none of these switch anything while you type;
+a test reads the keymap and fails when a key is bound twice or a view is
+unreachable by those keys.
+
+The Disk section's Summary view is the stored volume ledger as rows: accounted, everything else
+with its folders, system volumes, not measured (never a size), the protected
+folders estimate, the bookkeeping line and the walk's spot audit. It is read
+only and built from the stored ledger, so opening it lists nothing.
 
 ### External and Agents rows, and a scope-coverage header clause
 
@@ -117,8 +150,8 @@ chunk; all three now ship:
   column, so no width rule moves. An unowned row for a standalone Cargo
   target directory is markable like any unowned row and its confirm line
   says what it is and that `cargo build` remakes it.
-- **Agents rows.** `ViewKind::Agents` (no dedicated digit -- `0` is
-  "clear filter"; reached by cycling with `v`) lists `AgentUnit`s the
+- **Agents rows.** `ViewKind::Agents` (Tools section, third view; `v` from
+  Reclaim or External) lists `AgentUnit`s the
   same way: tool/category/relative-path/project-link facts. Every row
   carries `Row.unit: Some(...)` (protected/unmarkable ones included):
   `Space`/`Backspace` mark the selected unit through

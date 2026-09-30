@@ -226,7 +226,9 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
         assert!(!rendered.contains("No selectable groups"));
     }
     app.selected = incremental;
-    for (width, height) in [(80, 24), (120, 30), (200, 60)] {
+    // 30 rows at the narrow size: the headline block and the view strip
+    // are more rows of chrome than this screen had.
+    for (width, height) in [(80, 30), (120, 30), (200, 60)] {
         let rendered = capture(&app, width, height);
         assert!(
             rendered.contains("Start here: compiler cache"),
@@ -1175,22 +1177,24 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     app.width = 200;
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
+    assert!(before.contains("1 Projects"), "{before}");
     assert!(
-        before.contains("view: projects (1 of 11 · v next) · filter: none"),
+        before.contains("view: Projects › Projects (1 of 7 · v next)"),
         "{before}"
     );
+    assert!(before.contains("filter: none"), "{before}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
     let tree = capture(&app, 200, 60);
     assert!(
-        tree.contains("view: tree of "),
-        "second line must name the scope:\n{tree}"
+        tree.contains("view: Projects › Tree of "),
+        "the view line must name the scope:\n{tree}"
     );
-    assert!(tree.contains("2 of 11 · Esc: projects"), "{tree}");
+    assert!(tree.contains("Esc: projects"), "{tree}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
-    assert!(back.contains("view: projects"), "{back}");
+    assert!(back.contains("view: Projects › Projects"), "{back}");
 }
 
 #[test]
@@ -1947,8 +1951,10 @@ fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
             .lines()
             .position(|l| l.trim_start_matches('"').starts_with("Name"))
             .unwrap();
-        assert_eq!(header, 2, "w={w}\n{idle}");
-        let table = |f: &str| (1..=4).map(|i| line_of(f, i)).collect::<Vec<_>>();
+        // Header, four headline rows, the view strip, the filter line,
+        // then the table.
+        assert_eq!(header, 7, "w={w}\n{idle}");
+        let table = |f: &str| (6..=9).map(|i| line_of(f, i)).collect::<Vec<_>>();
         let want = table(&idle);
 
         let mut states: Vec<(&str, String)> = Vec::new();
@@ -2038,7 +2044,10 @@ fn one_down_moves_the_selection_one_row_at_80x24() {
         let mut t = Terminal::new(backend).unwrap();
         t.draw(|f| ui::draw(f, app)).unwrap();
         let buf = t.backend().buffer().clone();
+        // The section strip's current section is reversed too.
+        let strip_y = 1 + ui::headline_rows(24);
         (0..24u16)
+            .filter(|y| *y != strip_y)
             .find(|y| buf[(0, *y)].modifier.contains(Modifier::REVERSED))
             .expect("a selected row is drawn") as usize
     };
@@ -2145,7 +2154,11 @@ fn the_selected_row_is_reverse_video_and_sets_no_background_color() {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| ui::draw(f, &app)).unwrap();
         let buf = t.backend().buffer().clone();
+        // The view strip's current tab is reversed too (no color either);
+        // the selected ROW is the one reversed line that is not the strip.
+        let strip_y = 1 + ui::headline_rows(h);
         let reversed_rows: Vec<u16> = (0..h)
+            .filter(|y| *y != strip_y)
             .filter(|y| buf[(0, *y)].modifier.contains(Modifier::REVERSED))
             .collect();
         assert_eq!(reversed_rows.len(), 1, "{w}x{h}: exactly one selected row");
@@ -2198,7 +2211,7 @@ fn page_and_home_end_keys_move_the_list() {
     let total = app.rows().len();
     let _ = capture(&app, 80, 24); // the draw tells the app its page size
     let page = app.page.get();
-    assert!((10..24).contains(&page), "one screenful, got {page}");
+    assert!((8..24).contains(&page), "one screenful, got {page}");
     swamp_tui::handle_key(&mut app, KeyCode::PageDown);
     assert_eq!(app.selected, page);
     swamp_tui::handle_key(&mut app, KeyCode::PageDown);
@@ -2301,12 +2314,12 @@ fn k_says_what_it_changed_and_the_legend_keeps_the_common_keys() {
     swamp_tui::handle_key(&mut app, KeyCode::Down);
     let f = capture(&app, 80, 24);
     assert!(
-        f.contains("/ filter  v view  R refresh  ⌫ delete"),
+        f.contains("Tab section  v view  / filter  R refresh  ⌫ delete"),
         "the four keys people reach for stay at 80 columns:\n{f}"
     );
     assert!(f.contains("? help  q quit"), "{f}");
     let f50 = capture(&app, 50, 24);
-    assert!(f50.contains("/ filter  v view  R refresh"), "{f50}");
+    assert!(f50.contains("Tab section  v view  / filter"), "{f50}");
     assert!(f50.contains("? help  q quit"), "{f50}");
 }
 
@@ -2322,9 +2335,8 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
     assert_eq!(app.view, ViewKind::Builds);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("builds of mole (3 of 11 · v next"), "{f}");
-    swamp_tui::handle_key(&mut app, KeyCode::Char('2'));
-    assert_eq!(app.view, ViewKind::Tree);
+    assert!(f.contains("view: Projects › Builds of mole (3 of 7"), "{f}");
+    app.set_view(ViewKind::Tree);
     assert_eq!(app.selected, at, "the tree cursor came back");
     // Esc to projects and back to the same project row.
     swamp_tui::handle_key(&mut app, KeyCode::Esc);
@@ -2460,7 +2472,11 @@ fn long_rows_keep_their_rail_and_long_popup_lines_wrap() {
     app.clear_filter();
     app.drill_into_selected();
     let f = capture(&app, 50, 24);
-    let cut: Vec<&str> = f.lines().filter(|l| l.contains('…')).collect();
+    // The view strip also uses `…` where it is cut; the rail is about rows.
+    let cut: Vec<&str> = f
+        .lines()
+        .filter(|l| l.contains('…') && (l.contains("├─") || l.contains("└─")))
+        .collect();
     assert!(!cut.is_empty(), "the long name is shortened:\n{f}");
     for l in cut {
         let ell = l.find('…').unwrap();
@@ -2820,7 +2836,8 @@ fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
             footer_of(&app)
         };
         for v in ViewKind::ALL {
-            if v == ViewKind::Reclaim {
+            // Reclaim and the two Disk views mark nothing: no delete keys.
+            if matches!(v, ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps) {
                 continue;
             }
             app.set_view(v);
