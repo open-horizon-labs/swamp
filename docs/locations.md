@@ -67,6 +67,12 @@ further, e.g. Maven's local repository).
 | `core-simulator` | `Devices/` (`environments`, mutable per-simulator instance data), `Caches/` (`cache`), `Profiles/Runtimes` (`installation`, per-user) | -- | `/Library/Developer/CoreSimulator/Volumes` (`installation`, system-wide, may be permission-gated -- reported as `RootStatus::Unreadable`, never silently absent); macOS only |
 | `android` | `platforms/`, `system-images/`, `build-tools/`, `emulator/`, `ndk/`, `cmdline-tools/`, `platform-tools/`, `cmake/` (all `installation`, #165); AVDs (`environments`, mutable emulator instance data) | `ANDROID_HOME`, else `ANDROID_SDK_ROOT` (deprecated, still honored), else `~/Library/Android/sdk`; an NDK that `ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT` names outside the SDK root is a further `installation` (one inside it is already `ndk/`'s child and is not proposed again); AVDs: `ANDROID_AVD_HOME`, else `~/.android/avd` | https://developer.android.com/tools/variables -- Gradle's own caches (including Android Gradle Plugin downloads) are the `gradle` detector's job. `licenses/` (the record of accepted licences) and the loose files beside the folders (`ndk-install.log`, `.knownPackages`, `.temp`) are not measured, so a `du` of the SDK root exceeds the sum of its units by exactly those. A package folder that is a symlink into another SDK (Homebrew's `android-commandlinetools`) is measured at the path it resolves to, once. A missing folder (no NDK installed) is reported missing, not an error. Removing a package: reinstall with `sdkmanager`. |
 
+## Vendor tool directories (#164)
+
+| Detector id | Locations | Overrides | Notes / source |
+|---|---|---|---|
+| `espressif` | `dist/` (`cache`, downloaded tool archives), `tools/` (`installation`, installed toolchains), `python_env/` (`environments`, one Python virtual environment per ESP-IDF version), each its own unit | `IDF_TOOLS_PATH`, else `~/.espressif` | ESP-IDF's `idf_tools.py`. Removing: reinstall with ESP-IDF's `install.sh` (or `idf_tools.py install` / `install-python-env`). `idf-env.json` and `espidf.constraints.*.txt` (a few KB) are not measured. The `~/esp` checkout (ESP-IDF source) is an ordinary project root the user declares, never proposed here. |
+
 ## Homebrew, model stores, and VM backing storage (#49)
 
 | Detector id | Locations | Overrides | Notes / source |

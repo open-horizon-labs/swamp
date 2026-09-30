@@ -5,6 +5,11 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.8.0
 
+- **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
+  8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
+  `dist/` (downloaded archives) and `python_env/` as separate rows, each with what
+  reinstalling costs in Espressif's own words (`install.sh`). A machine without it
+  lists the location as missing.
 - **The Android SDK's big folders are reported.** Only `platforms/`, `system-images/`,
   `build-tools/` and `emulator/` were measured, and on this machine they held almost
   nothing while `ndk/` held 5.9 GB. `ndk/`, `cmdline-tools/`, `platform-tools/` and

@@ -37,6 +37,7 @@ pub mod copilot_cli;
 pub mod core_simulator;
 pub mod cursor;
 pub mod docker_desktop;
+pub mod espressif;
 pub mod gemini_cli;
 pub mod go;
 pub mod gradle;
@@ -763,6 +764,12 @@ pub enum BuildStoreKind {
     AndroidSdkPackages,
     /// Android Virtual Device data (`~/.android/avd`).
     AndroidVirtualDevices,
+    /// ESP-IDF's `dist/` (downloaded tool archives).
+    EspressifDist,
+    /// ESP-IDF's `tools/` (installed toolchains and tools).
+    EspressifTools,
+    /// ESP-IDF's `python_env/` (per-version Python virtual environments).
+    EspressifPythonEnv,
     /// A BuildKit build cache, answered by the Docker daemon rather than
     /// measured on disk.
     BuildKitCache,
@@ -793,6 +800,9 @@ impl BuildStoreKind {
             Self::SimulatorCaches => "simulator-caches",
             Self::AndroidSdkPackages => "android-sdk-packages",
             Self::AndroidVirtualDevices => "android-virtual-devices",
+            Self::EspressifDist => "espressif-dist",
+            Self::EspressifTools => "espressif-tools",
+            Self::EspressifPythonEnv => "espressif-python-env",
             Self::BuildKitCache => "buildkit-cache",
         }
     }
@@ -827,6 +837,9 @@ impl BuildStoreKind {
         Self::SimulatorCaches,
         Self::AndroidSdkPackages,
         Self::AndroidVirtualDevices,
+        Self::EspressifDist,
+        Self::EspressifTools,
+        Self::EspressifPythonEnv,
         Self::BuildKitCache,
     ];
 }
@@ -1065,6 +1078,7 @@ impl Registry {
                 Box::new(xcode::XcodeDetector),
                 Box::new(core_simulator::CoreSimulatorDetector),
                 Box::new(android::AndroidDetector),
+                Box::new(espressif::EspressifDetector),
                 Box::new(huggingface::HuggingFaceDetector),
                 Box::new(ollama::OllamaDetector),
                 Box::new(docker_desktop::DockerDesktopDetector),

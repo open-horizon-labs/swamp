@@ -11,7 +11,9 @@
 //! is the whole repair.
 
 use super::BuildAdapter;
-use super::{android, cargo, docker_buildkit, go, gradle, maven, node, python, xcode_swift};
+use super::{
+    android, cargo, docker_buildkit, go, gradle, maven, node, python, tool_stores, xcode_swift,
+};
 
 pub struct Registry {
     adapters: Vec<Box<dyn BuildAdapter>>,
@@ -38,6 +40,7 @@ impl Registry {
                 Box::new(go::Adapter),
                 Box::new(xcode_swift::Adapter),
                 Box::new(docker_buildkit::Adapter),
+                Box::new(tool_stores::Adapter),
             ],
         }
     }

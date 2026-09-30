@@ -57,6 +57,7 @@ pub mod maven;
 pub mod node;
 pub mod python;
 pub mod registry;
+pub mod tool_stores;
 pub mod xcode_swift;
 
 use crate::artifact::{

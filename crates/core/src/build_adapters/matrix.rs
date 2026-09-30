@@ -362,6 +362,21 @@ pub const MATRIX: &[MatrixEntry] = &[
                                 removes every record not in use that matches its filters",
         actions: INSPECTION_ONLY,
     },
+    MatrixEntry {
+        id: "tool-stores",
+        name: "Tool stores (ESP-IDF)",
+        status: Status::Implemented,
+        families: &[RoleFamily::Intermediates, RoleFamily::Installations],
+        known_layouts: &[
+            "ESP-IDF dist/, tools/ and python_env/ under IDF_TOOLS_PATH or ~/.espressif, one unit each",
+        ],
+        attribution_limits: &[
+            "each store is one unit: nothing inside is identified or attributed to a project",
+            "the consequence text is the tool's own reinstall command; how long a removed store takes to come back is not measured",
+        ],
+        operation_granularity: "one whole store directory",
+        actions: INSPECTION_ONLY,
+    },
 ];
 
 /// The ids of families with a registered adapter.
