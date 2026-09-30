@@ -29,14 +29,43 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use swamp_core::report::ArtifactKind;
 
-/// Flushes dirty data so `st_blocks` is the final allocation (#197): on
+/// Asks the kernel to flush every regular file under `root` (#197): on
 /// ext4, XFS and overlayfs over them a freshly written file reports a
-/// token block count until writeback, so any test that compares the
-/// walker with `st_blocks` or `du` must settle the fixture first, and
-/// never compare an unflushed measurement with a later one.
-fn settle() {
-    let status = std::process::Command::new("sync").status();
-    assert!(status.is_ok_and(|s| s.success()), "sync must run");
+/// token `st_blocks` until writeback. A per-file `fsync` rather than a
+/// global `sync`: on the shared fleet host `sync` took minutes. Some
+/// filesystems (the fleet's overlay) still report the token count for
+/// minutes afterwards, which is why `alloc` below models the walker's
+/// documented policy instead of trusting `st_blocks` for recent files.
+fn settle(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            let m = fs::symlink_metadata(e.path()).unwrap();
+            if m.is_dir() {
+                stack.push(e.path());
+            } else if m.is_file() {
+                let _ = fs::File::open(e.path()).and_then(|f| f.sync_all());
+            }
+        }
+    }
+}
+
+/// The allocation the walker is documented to report for one file
+/// (docs/architecture.md, "Recently written files"): `st_blocks * 512`,
+/// except a regular file modified in the last 120 s that reports some
+/// blocks but under 4 KiB is counted at its length rounded up to 4 KiB.
+/// An independent statement of the policy, checked against the
+/// filesystem's own numbers; never a re-use of the walker's code.
+fn alloc(m: &fs::Metadata) -> u64 {
+    let reported = m.blocks() * 512;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    if m.is_file() && m.len() > 0 && m.blocks() > 0 && reported < 4096 && now - m.mtime() <= 120 {
+        return (m.len().div_ceil(4096) * 4096).max(reported);
+    }
+    reported
 }
 
 /// Fills a fixture with every case that has ever made a size wrong.
@@ -87,7 +116,7 @@ fn build(root: &Path) -> Fixture {
 
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut expected = 0u64;
-    settle();
+    settle(root);
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for e in fs::read_dir(&dir).unwrap().flatten() {
@@ -98,7 +127,7 @@ fn build(root: &Path) -> Fixture {
             if m.is_dir() {
                 stack.push(e.path());
             } else if m.is_file() && seen.insert((m.dev(), m.ino())) {
-                expected += m.blocks() * 512;
+                expected += alloc(&m);
             }
         }
     }
@@ -225,11 +254,8 @@ fn a_hardlinked_file_is_counted_once_not_once_per_name() {
     let root = tmp.path().join("hardlinks");
     fs::create_dir_all(root.join("b")).unwrap();
     fs::write(root.join("original.bin"), vec![3u8; 1_048_576]).unwrap();
-    settle();
-    let one = fs::symlink_metadata(root.join("original.bin"))
-        .unwrap()
-        .blocks()
-        * 512;
+    settle(&root);
+    let one = alloc(&fs::symlink_metadata(root.join("original.bin")).unwrap());
     for i in 0..8 {
         fs::hard_link(
             root.join("original.bin"),
@@ -254,11 +280,8 @@ fn a_symlink_loop_terminates_and_contributes_nothing() {
     let root = tmp.path().join("loops");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("real.bin"), vec![5u8; 4_096]).unwrap();
-    settle();
-    let real = fs::symlink_metadata(root.join("real.bin"))
-        .unwrap()
-        .blocks()
-        * 512;
+    settle(&root);
+    let real = alloc(&fs::symlink_metadata(root.join("real.bin")).unwrap());
 
     std::os::unix::fs::symlink(root.join("l2"), root.join("l1")).unwrap();
     std::os::unix::fs::symlink(root.join("l1"), root.join("l2")).unwrap();
@@ -282,11 +305,8 @@ fn a_symlink_to_a_directory_does_not_double_count_it() {
     let root = tmp.path().join("aliased");
     fs::create_dir_all(root.join("data")).unwrap();
     fs::write(root.join("data/x.bin"), vec![9u8; 2_097_152]).unwrap();
-    settle();
-    let once = fs::symlink_metadata(root.join("data/x.bin"))
-        .unwrap()
-        .blocks()
-        * 512;
+    settle(&root);
+    let once = alloc(&fs::symlink_metadata(root.join("data/x.bin")).unwrap());
     std::os::unix::fs::symlink(root.join("data"), root.join("data-link")).unwrap();
 
     let row = swamp_core::walk::resize_artifact(&root, ArtifactKind::Cache, 1_000);
@@ -305,7 +325,7 @@ fn a_file_that_vanishes_mid_walk_does_not_fail_the_measurement() {
     for i in 0..64 {
         fs::write(root.join(format!("{i}.bin")), vec![1u8; 4_096]).unwrap();
     }
-    settle();
+    settle(&root);
     let doomed = root.join("32.bin");
 
     let handle = std::thread::spawn({
