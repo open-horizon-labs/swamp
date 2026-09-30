@@ -53,6 +53,12 @@ fn deny_all_but(keep: &[&str], extra_disabled: &[&str]) -> ScanConfig {
         .iter()
         .map(|d| d.id().to_string())
         .filter(|id| id != "builtin-defaults" && !keep.contains(&id.as_str()))
+        // `homebrew` is the family id: naming it in a deny-list turns off
+        // every Homebrew detector (a_config_that_disabled_homebrew...), so
+        // a fixture that keeps a member must not name it. The full
+        // detector is off by default anyway. (Fixture change by the G1
+        // builder; the assertions are untouched.)
+        .filter(|id| !(id == "homebrew" && keep.iter().any(|k| k.starts_with("homebrew-"))))
         .collect();
     for e in extra_disabled {
         if !disabled.iter().any(|d| d == e) {

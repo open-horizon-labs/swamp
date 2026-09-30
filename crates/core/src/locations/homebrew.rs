@@ -42,6 +42,14 @@ pub const HOMEBREW_OTHER_DETECTOR_ID: &str = "homebrew-other";
 /// deliberately absent: they land in `Homebrew (other)`.
 pub const DEV_FORMULAE: &[&str] = &[
     "llvm",
+    "gcc",
+    "swift",
+    "bun",
+    "deno",
+    "bazel",
+    "bazelisk",
+    "uv",
+    "kotlin",
     "openjdk",
     "dotnet",
     "zig",
@@ -141,6 +149,10 @@ impl Detector for HomebrewDevToolsDetector {
         Some(REINSTALL)
     }
 
+    fn group(&self) -> Option<&'static str> {
+        Some(HOMEBREW_DETECTOR_ID)
+    }
+
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let mut out = Vec::new();
         for (prefix, provenance) in prefixes(env) {
@@ -211,28 +223,54 @@ impl Detector for HomebrewOtherDetector {
         "Homebrew prefix conventions; the remainder after the dev tooling units"
     }
 
-    fn recovery_hint(&self) -> Option<super::RecoveryHint> {
-        Some(REINSTALL)
+    // No recovery hint: the remainder is the prefix minus the dev tooling
+    // (Homebrew itself, `bin`, `lib`, GUI casks); no one command
+    // re-obtains it as a unit.
+    fn group(&self) -> Option<&'static str> {
+        Some(HOMEBREW_DETECTOR_ID)
+    }
+
+    fn remainder_of(&self) -> Option<super::Remainder> {
+        Some(super::Remainder {
+            of: HOMEBREW_DEVTOOLS_DETECTOR_ID,
+            include_all: "[scan] enabled_detectors = [\"homebrew\"]",
+        })
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
-        prefixes(env)
-            .into_iter()
-            .filter(|(prefix, provenance)| is_homebrew_prefix(prefix, provenance))
-            .map(|(prefix, provenance)| ProposedLocation {
-                detector_id: HOMEBREW_OTHER_DETECTOR_ID.to_string(),
-                path: Some(prefix),
-                category: StorageCategory::Installation,
-                provenance,
-                status: LocationStatus::Resolved,
-                note: Some(
-                    "everything under the prefix not classified as dev tooling (other \
-                     formulae, casks, libraries); `[scan] enabled_detectors = \
-                     [\"homebrew\"]` reports Cellar and Caskroom whole instead"
-                        .to_string(),
-                ),
-            })
-            .collect()
+        let mut out = Vec::new();
+        for (prefix, provenance) in prefixes(env) {
+            if !is_homebrew_prefix(&prefix, &provenance) {
+                continue;
+            }
+            // `/usr/local` is the system's; on an Intel Mac Homebrew owns
+            // only Cellar, Caskroom and Homebrew inside it, so only those
+            // are measured, never the directory whole.
+            let paths: Vec<std::path::PathBuf> = if prefix == std::path::Path::new("/usr/local") {
+                ["Cellar", "Caskroom", "Homebrew"]
+                    .iter()
+                    .map(|d| prefix.join(d))
+                    .collect()
+            } else {
+                vec![prefix]
+            };
+            for path in paths {
+                out.push(ProposedLocation {
+                    detector_id: HOMEBREW_OTHER_DETECTOR_ID.to_string(),
+                    path: Some(path),
+                    category: StorageCategory::Installation,
+                    provenance: provenance.clone(),
+                    status: LocationStatus::Resolved,
+                    note: Some(
+                        "everything Homebrew owns here that is not dev tooling (other \
+                         formulae, casks, libraries); `[scan] enabled_detectors = \
+                         [\"homebrew\"]` reports Cellar and Caskroom whole instead"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+        out
     }
 }
 

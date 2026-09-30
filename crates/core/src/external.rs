@@ -524,7 +524,29 @@ pub fn observe_external(
         })
         .collect();
 
-    for (idx, (candidate, canonical)) in canon_candidates.iter().enumerate() {
+    // A remainder unit (`Detector::remainder_of`) is measured whole and
+    // then has its sibling's measured units subtracted, so it goes after
+    // every sibling. Units whose measurement did not complete this pass
+    // are remembered: a remainder over one of them cannot be derived.
+    let remainder_roles: HashMap<usize, crate::locations::Remainder> = canon_candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (c, _))| {
+            detectors
+                .detectors()
+                .iter()
+                .find(|d| d.id() == c.detector_id)
+                .and_then(|d| d.remainder_of())
+                .map(|r| (i, r))
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..canon_candidates.len()).collect();
+    order.sort_by_key(|i| remainder_roles.contains_key(i));
+    let mut unmeasured: Vec<PathBuf> = Vec::new();
+
+    for idx in order {
+        let (candidate, canonical) = &canon_candidates[idx];
+        let role = remainder_roles.get(&idx).copied();
         let Candidate {
             detector_id,
             detector_name,
@@ -552,10 +574,13 @@ pub fn observe_external(
         let mut nested_exclusions: Vec<PathBuf> = canon_candidates
             .iter()
             .enumerate()
-            .filter(|(j, (_, other_canonical))| {
+            .filter(|(j, (other, other_canonical))| {
                 *j != idx
                     && other_canonical != &canonical
                     && other_canonical.starts_with(&canonical)
+                    // A remainder keeps its sibling's bytes in the whole
+                    // measurement and subtracts them afterwards.
+                    && role.is_none_or(|r| other.detector_id != r.of)
             })
             .map(|(_, (_, other_canonical))| other_canonical.clone())
             .collect();
@@ -653,6 +678,7 @@ pub fn observe_external(
             // tombstoning, and skip measuring rather than guessing.
             // Coverage is incomplete, which is not a storage change.
             crate::folded_measurement::UnitObservation::Unreadable(_) => {
+                unmeasured.push(canonical.clone());
                 protected_keys.insert(key);
                 continue;
             }
@@ -674,6 +700,7 @@ pub fn observe_external(
                     reused_unit_paths.push(canonical.display().to_string());
                 }
                 lower_bounds.insert(key.clone(), row);
+                unmeasured.push(canonical.clone());
                 protected_keys.insert(key);
                 continue;
             }
@@ -681,6 +708,24 @@ pub fn observe_external(
         };
         if row.reused {
             reused_unit_paths.push(canonical.display().to_string());
+        }
+        let mut row = row;
+        if let Some(role) = role {
+            // The whole, minus the sibling's units: the parts add up to
+            // the whole, and a file hardlinked between a sibling unit and
+            // the rest is counted in the sibling's unit, once. If a
+            // sibling unit could not be measured, the remainder cannot be
+            // derived this pass.
+            if unmeasured.iter().any(|p| p.starts_with(&canonical)) {
+                protected_keys.insert(key);
+                continue;
+            }
+            let taken: u64 = meta_by_key
+                .values()
+                .filter(|m| m.detector_id == role.of && m.path.starts_with(&canonical))
+                .map(|m| m.bytes)
+                .sum();
+            row.bytes = row.bytes.saturating_sub(taken);
         }
         observed.push(crate::growth::ObservedExternal {
             key: key.clone(),

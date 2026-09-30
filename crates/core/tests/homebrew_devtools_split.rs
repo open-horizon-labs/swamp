@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use swamp_core::external::ExternalUnit;
-use swamp_core::locations::{Environment, Platform, Registry};
+use swamp_core::locations::{Detector, Environment, Platform, Registry};
 use swamp_core::scope::{ScanConfig, resolve_effective_scope};
 use swamp_core::walk::resize_artifact;
 
@@ -286,7 +286,17 @@ fn enabling_the_full_detector_still_counts_every_byte_once() {
         .map(|u| u.bytes)
         .sum();
     assert_eq!(brew_sum, total(&f.prefix), "{units:#?}");
-    assert!(units.iter().any(|u| u.detector_id == "homebrew"));
+    // Cellar is reported whole (the full detector), not split by the
+    // allowlist: a `homebrew` unit's path is Cellar itself.
+    assert!(
+        units
+            .iter()
+            .any(|u| u.detector_id == "homebrew" && u.path == f.prefix.join("Cellar")),
+        "{units:#?}"
+    );
+    assert!(units.iter().all(|u| {
+        u.detector_id != "homebrew-devtools" || u.path.ends_with("share/android-commandlinetools")
+    }));
     assert!(units.iter().all(|u| u.detector_id != "homebrew-other"));
 }
 
@@ -316,10 +326,14 @@ fn the_remainder_and_the_dev_units_can_each_be_disabled() {
 }
 
 /// Tempting wrong patch: an `exclude` of a dev formula is ignored by the
-/// expansion, so it is still measured (or its bytes vanish from the
-/// remainder). The excluded formula stays inside the remainder.
+/// expansion, so it is still measured, or is subtracted from nothing and
+/// is counted in the remainder. Chosen semantics: an excluded formula is
+/// out of scope entirely, so its bytes are in NO unit, and the parent
+/// subtracts it (an exclusion is never read as the parent shrinking or
+/// growing). The exclusion itself is the named residual: `swamp scope`
+/// lists it as excluded by the pattern that names it.
 #[test]
-fn an_excluded_dev_formula_is_not_a_unit_and_stays_in_the_prefix_total() {
+fn an_excluded_dev_formula_is_in_no_unit_and_is_subtracted_from_the_remainder() {
     let f = fixture();
     let registry = Registry::with_builtins();
     let mut cfg = config_running(&["homebrew-devtools", "homebrew-other"], &registry);
@@ -327,11 +341,80 @@ fn an_excluded_dev_formula_is_not_a_unit_and_stays_in_the_prefix_total() {
     let units = measure(&env(&f, false), &cfg);
     assert!(units.iter().all(|u| !u.path.ends_with("Cellar/llvm@21")));
     let sum: u64 = units.iter().map(|u| u.bytes).sum();
-    // The excluded formula is out of scope: excluded from the parent as
-    // well, so it is in neither.
     assert_eq!(
         sum + total(&f.prefix.join("Cellar/llvm@21")),
         total(&f.prefix),
         "{units:#?}"
     );
+}
+
+/// The remainder has no recovery hint (it is Homebrew itself, bin, lib and
+/// GUI casks: no command re-obtains that as a unit); the dev units do.
+#[test]
+fn the_remainder_has_no_recovery_hint_and_is_marked_by_capability() {
+    let registry = Registry::with_builtins();
+    let by_id = |id: &str| registry.detectors().iter().find(|d| d.id() == id).unwrap();
+    assert!(by_id("homebrew-other").recovery_hint().is_none());
+    assert!(by_id("homebrew-devtools").recovery_hint().is_some());
+    let r = swamp_core::locations::remainder_of("homebrew-other").expect("a remainder");
+    assert!(r.include_all.contains("enabled_detectors"));
+    assert!(swamp_core::locations::remainder_of("homebrew-devtools").is_none());
+}
+
+/// Tempting wrong patch: measure `/usr/local` whole as the Intel prefix, so
+/// every other installer's files there are reported as Homebrew's.
+#[test]
+fn on_the_shared_usr_local_prefix_only_homebrews_own_directories_are_proposed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("HOMEBREW_PREFIX".to_string(), "/usr/local".to_string());
+    let env = Environment::fixture(tmp.path().to_path_buf(), vars, Platform::MacOS);
+    let other = swamp_core::locations::homebrew::HomebrewOtherDetector.detect(&env);
+    let paths: Vec<_> = other.iter().filter_map(|l| l.path.clone()).collect();
+    assert!(!paths.contains(&PathBuf::from("/usr/local")), "{paths:?}");
+    assert!(paths.contains(&PathBuf::from("/usr/local/Homebrew")));
+}
+
+/// Tempting wrong patch: a config that disabled Homebrew before the split
+/// keeps its meaning: the family id turns off every member, and a member
+/// id turns off just that member.
+#[test]
+fn the_family_id_disables_every_member_and_a_member_id_only_itself() {
+    let f = fixture();
+    let registry = Registry::with_builtins();
+    let mut cfg = ScanConfig::default();
+    cfg.disabled_detectors = registry
+        .detectors()
+        .iter()
+        .map(|d| d.id().to_string())
+        .filter(|id| id != "builtin-defaults" && !id.starts_with("homebrew"))
+        .collect();
+    let mut family = cfg.clone();
+    family.disabled_detectors.push("homebrew".into());
+    assert!(measure(&env(&f, false), &family).is_empty());
+    let mut one = cfg;
+    one.disabled_detectors.push("homebrew-other".into());
+    let units = measure(&env(&f, false), &one);
+    assert!(units.iter().all(|u| u.detector_id == "homebrew-devtools"));
+    assert!(!units.is_empty());
+}
+
+/// Tempting wrong patch: print only the detector id for the remainder and
+/// leave the setting that includes it in the scope note, where nobody
+/// reading the external view finds it.
+#[test]
+fn the_external_view_names_the_remainder_and_carries_the_setting_on_its_row() {
+    let f = fixture();
+    let units = defaults_only(&env(&f, false));
+    let text = swamp_core::render::render_view_external(&units);
+    assert!(text.contains("Homebrew (other) (homebrew-other)"), "{text}");
+    assert!(
+        text.contains("[scan] enabled_detectors = [\"homebrew\"]"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Homebrew (dev tooling) (homebrew-devtools)"),
+        "{text}"
+    );
+    assert_eq!(text.matches("to report it whole").count(), 1, "{text}");
 }

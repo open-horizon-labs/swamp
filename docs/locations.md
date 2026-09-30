@@ -92,7 +92,8 @@ A formula or cask is dev tooling only if its whole name, with any `@version`
 suffix removed (`llvm@20` is `llvm`), is on this list. Substrings never
 match: `gopls`, `zigbee2mqtt` and `nodejs-foo` are not `go`, `zig` or `node`.
 
-Formulae (`Cellar`): `llvm`, `openjdk`, `dotnet`, `zig`, `go`, `rust`,
+Formulae (`Cellar`): `llvm`, `gcc`, `swift`, `bun`, `deno`, `bazel`,
+`bazelisk`, `uv`, `kotlin`, `openjdk`, `dotnet`, `zig`, `go`, `rust`,
 `rustup`, `node`, `python`, `ruby`, `cmake`, `gradle`, `maven`, `ninja`,
 `mise`, `terraform`.
 
@@ -104,6 +105,34 @@ as an office or chat app) are not on the list and are reported in
 tooling for essentially everyone; a project's `Brewfile` naming it would be
 such evidence, but reading `Brewfile`s is not implemented yet, so today
 nothing is promoted by declaration.
+
+**Who maintains the list, and how to add a name.** The list is
+`DEV_FORMULAE` / `DEV_CASKS` in `crates/core/src/locations/homebrew.rs`;
+the maintainers of the catalog own it. To add a name, open a pull request
+that adds it there and its row here (the docs-matches-code test fails
+until both exist), with the evidence that it is developer tooling for
+essentially everyone who has it installed (a language toolchain or build
+tool, not an application that also happens to be useful to developers).
+
+**The remainder and hardlinks.** `Homebrew (other)` is measured as the
+prefix whole minus the dev tooling units, so a file hardlinked between a
+dev keg and the rest of the prefix is counted in the dev unit, once, and
+dev + other + android = the prefix. `swamp report --view external` says so
+on the remainder row, together with the exact setting that reports Cellar
+and Caskroom whole (`[scan] enabled_detectors = ["homebrew"]`). Units are
+marked as a remainder by the detector capability `Detector::remainder_of`,
+so a headline that groups "everything else" selects them without matching
+an id. It has no recovery hint: it is Homebrew itself, `bin`, `lib` and the
+GUI casks, and no single command re-obtains that as a unit.
+
+**Intel.** On the `/usr/local` prefix only the directories Homebrew owns
+(`Cellar`, `Caskroom`, `Homebrew`) are ever measured, never `/usr/local`
+whole, and only when a `Cellar` or `Homebrew` directory exists there.
+There the dev units are reported and the non-dev part of `Cellar` and
+`Caskroom` only under the full `homebrew` detector.
+
+**Disabling.** `disabled_detectors = ["homebrew"]` turns off all three
+Homebrew detectors, as it did before they existed; their own ids work too.
 
 The Android command-line tools that Homebrew installs
 (`share/android-commandlinetools`) are dev tooling. The `android` detector
