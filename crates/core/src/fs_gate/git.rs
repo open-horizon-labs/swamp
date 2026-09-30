@@ -112,7 +112,6 @@ fn sweep(top: &Path, dir: &Path, seen: &mut usize) -> Sweep {
     let Ok(entries) = super::read_dir(dir) else {
         return Sweep::Clean;
     };
-    crate::work_counters::record_dir_listed();
     for entry in entries.flatten() {
         *seen += 1;
         if *seen > SWEEP_CAP {
@@ -127,10 +126,10 @@ fn sweep(top: &Path, dir: &Path, seen: &mut usize) -> Sweep {
                 continue;
             }
         }
+        crate::work_counters::record_git_dir_entries(1);
         let Ok(ft) = entry.file_type() else {
             continue;
         };
-        crate::work_counters::record_files_statted(1);
         if ft.is_dir() {
             match sweep(top, &path, seen) {
                 Sweep::Clean => {}

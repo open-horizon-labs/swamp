@@ -53,6 +53,7 @@ pub struct Counters {
     containers_reused: AtomicU64,
     containers_identified: AtomicU64,
     spawns: AtomicU64,
+    git_dir_entries: AtomicU64,
 }
 
 impl Counters {
@@ -66,6 +67,7 @@ impl Counters {
             containers_reused: self.containers_reused.load(Ordering::Relaxed),
             containers_identified: self.containers_identified.load(Ordering::Relaxed),
             subprocess_spawns: self.spawns.load(Ordering::Relaxed),
+            git_dir_entries_checked: self.git_dir_entries.load(Ordering::Relaxed),
         }
     }
 }
@@ -79,6 +81,7 @@ static GLOBAL: Counters = Counters {
     containers_reused: AtomicU64::new(0),
     containers_identified: AtomicU64::new(0),
     spawns: AtomicU64::new(0),
+    git_dir_entries: AtomicU64::new(0),
 };
 
 thread_local! {
@@ -136,6 +139,11 @@ pub struct WorkCounters {
     /// happens makes the same assertion, through the scoped sink
     /// [`measured`] installs, with no process-wide state at all.
     pub subprocess_spawns: u64,
+    /// Entries of a repository's git dir `lstat`ed before gix may open it
+    /// (#190). Counted apart from `dirs_listed`/`files_statted`, which
+    /// measure the user's tree: this is a fixed per-repository check
+    /// (loose objects and packs are skipped), not a traversal.
+    pub git_dir_entries_checked: u64,
 }
 
 pub fn record_dir_listed() {
@@ -174,6 +182,11 @@ pub fn record_spawn() {
     add(|c| &c.spawns, 1);
 }
 
+/// `n` git-dir entries checked before a gix open (#190).
+pub fn record_git_dir_entries(n: u64) {
+    add(|c| &c.git_dir_entries, n);
+}
+
 /// The process-global counters. Sees every thread; a caller that wants
 /// an exact number either serializes itself or uses [`measured`].
 pub fn snapshot() -> WorkCounters {
@@ -205,6 +218,7 @@ pub fn reset() {
         &GLOBAL.containers_reused,
         &GLOBAL.containers_identified,
         &GLOBAL.spawns,
+        &GLOBAL.git_dir_entries,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -234,6 +248,9 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         subprocess_spawns: now
             .subprocess_spawns
             .saturating_sub(before.subprocess_spawns),
+        git_dir_entries_checked: now
+            .git_dir_entries_checked
+            .saturating_sub(before.git_dir_entries_checked),
     }
 }
 
