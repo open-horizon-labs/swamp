@@ -1454,3 +1454,34 @@ mod adv_g5_tests {
         assert!(matches!(s, OccupancyState::Occupied(_)), "{s:?}");
     }
 }
+
+/// Independent verification of #177 round 2: the exemption is the exact
+/// name AND a verified executable; a prefix match is wrong even when the
+/// look-alike's executable sits under a trusted root.
+#[cfg(test)]
+mod adv_g5b_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Tempting wrong patch: "`starts_with` is fine now that the
+    /// executable is verified". `SimLaunchHostX` living under
+    /// CoreSimulator's tree is still not `SimLaunchHost.arm64`.
+    #[test]
+    fn g5b_verified_lookalike_name_still_blocks() {
+        let listing = "p1\ncSimLaunchHost.arm64X\nn/Library/Developer/CoreSimulator/x/SimLaunchHost.arm64X\nn/vol/iOS/lib.dylib\n";
+        let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
+        let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
+        assert!(matches!(s, OccupancyState::Occupied(_)), "{s:?}");
+    }
+
+    /// Tempting wrong patch: "any path of the process named like the
+    /// command counts as its executable". A `..` escape out of the trusted
+    /// root does not verify.
+    #[test]
+    fn g5b_dotdot_out_of_trusted_root_does_not_verify() {
+        let listing = "p1\ncSimLaunchHost.arm64\nn/Library/Developer/CoreSimulator/../../../tmp/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\n";
+        let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
+        let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
+        assert!(matches!(s, OccupancyState::Occupied(_)), "{s:?}");
+    }
+}
