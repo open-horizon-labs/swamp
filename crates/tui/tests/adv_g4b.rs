@@ -308,3 +308,57 @@ fn adv_strip_row_has_no_color_cells() {
         }
     }
 }
+
+/// Tempting wrong patch: the Disk view's "Not measured" row hard-codes
+/// the plural, so one unreadable directory reads "1 directories".
+#[test]
+fn adv_disk_view_not_measured_row_is_singular_for_one() {
+    // The fixture ledger has exactly one unreadable directory.
+    let rows = swamp_tui::model::disk_rows(&measured(now() - 60));
+    let nm: Vec<&String> = rows
+        .iter()
+        .map(|r| &r.label)
+        .filter(|n| n.starts_with("Not measured"))
+        .collect();
+    assert_eq!(nm.len(), 1);
+    assert!(!nm[0].contains("1 directories"), "{}", nm[0]);
+}
+
+/// Tempting wrong patch: a zero-used or over-used ledger adds a row or
+/// the TUI says "no used figure" for a container that reported 0 bytes.
+#[test]
+fn adv_zero_and_over_used_ledgers_keep_rows_and_say_why() {
+    let meta = |used: u64| VolumeMetaRow {
+        measured_at: now() - 60,
+        cycle_started_at: 1,
+        cycle_complete_at: now() - 60,
+        complete: true,
+        budget_secs: 120,
+        budget_used_ms: 1,
+        statfs_at: now() - 60,
+        container_total: Some(500 * GB),
+        container_used: Some(used),
+        container_free: Some(1),
+        data_volume_used: Some(used),
+    };
+    for w in [40u16, 50, 80, 120] {
+        let base = frame(&app(), w, 24);
+        for used in [0u64, GB] {
+            let mut a = app();
+            a.set_ledger(LedgerReading::Measured(Box::new(account(&[], &meta(used)))));
+            let f = frame(&a, w, 24);
+            assert_eq!(
+                f[ui::headline_rows(24) as usize + 1].is_empty(),
+                base[ui::headline_rows(24) as usize + 1].is_empty()
+            );
+            assert!(!f[1].contains('%'), "used={used} w={w}: {}", f[1]);
+            if used == 0 && w >= 80 {
+                assert!(
+                    !f.join("\n").contains("no used figure"),
+                    "0 bytes used is reported as missing:\n{}",
+                    f.join("\n")
+                );
+            }
+        }
+    }
+}
