@@ -2601,9 +2601,19 @@ pub fn observe_scope(
     let pass = pass::DiscoveryPass::begin();
     let mut external_ok = true;
     let (mut external_units, store_interiors) = if want.external {
+        let nested_worktrees: Vec<crate::external::NestedWorktree> = merged
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .map(|wt| crate::external::NestedWorktree {
+                path: wt.path.clone(),
+                reported_bytes: wt.artifacts.iter().map(|a| a.bytes).sum(),
+            })
+            .collect();
         let measured = crate::external::observe_external(
             &pass,
             scope,
+            &nested_worktrees,
             store_dir,
             observe,
             observed_at,

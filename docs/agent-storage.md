@@ -370,6 +370,45 @@ treats anything else as an unknown, never a parse panic or a guess.
   during ordinary identification, which would mean hundreds of process
   spawns on an otherwise-cheap `report`.
 
+### Session scratch outside the home: `/private/tmp/claude-<uid>` (#172)
+
+Claude Code also writes per-project session scratch (task output,
+scratchpad directories, `cache-break-state-*.json`) to
+`/private/tmp/claude-<uid>`, outside `~/.claude`. The `claude-code-scratch`
+detector proposes that one exact path (macOS only) as a `cache` unit with
+the consequence *session scratch; removing it during a session breaks that
+session*. That sentence is swamp's own statement, not something Claude Code
+documents. It is inspection only: no action is offered, so the open-file
+occupancy check the agent units use is never run for it, and **no
+active-session evidence is shown for this unit**. #172's acceptance line about
+active-session evidence is therefore still open.
+
+- **Why a separate detector.** The agent layer identifies a tool's units
+  inside the *first* location its detector resolves. Scratch is not a
+  session store, so it is not given to that layer.
+- **No discovery.** `/private/tmp` also holds other tools' files and this
+  user's own; nothing there is scanned. Only the named path is measured.
+- **Lifetime: what was observed, not a mechanism.** On the machine this was
+  built on, every entry under `/private/tmp` was newer than the last boot
+  (`sysctl kern.boottime`), and `/etc/periodic` does not exist there, so no
+  clearing mechanism was found. Swamp does not assume the directory is
+  cleared. Measured there: about 6.6 GB (`du`), of which the largest
+  per-project directories were 4.5 GB and 1.8 GB.
+- **Worktrees inside it are counted once.** A git worktree that lives under
+  the scratch directory is a project worktree with its own row. Its bytes are
+  subtracted from this unit and the row says so (`N GB inside is counted under
+  projects`), so the two never add up to more than `du`.
+- **Codex: no scratch location is added.** Looked for on that machine:
+  `~/.codex/tmp` (an `arg0` directory, 0 bytes on disk) is inside
+  `CODEX_HOME`, so the `codex` home unit already covers it;
+  `/private/tmp/codex-browser-use` holds only sockets (0 bytes) and is
+  created by a bundled browser plugin; `/private/tmp/codex-remote-attachments`
+  (2.3 MB) and `/private/tmp/codex-assembler-*.tar.gz` have no source in
+  Codex's own code or docs that this work could point to. None was added:
+  the rule is one exact, evidenced path per location, never a name guess.
+- **Linux is not covered.** The equivalent was not observed, so none is
+  guessed; the platform table reports the detector as not applicable.
+
 ## Codex (#93)
 
 Session linkage is sourced from the versioned Codex state DB, not from

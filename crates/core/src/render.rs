@@ -1023,11 +1023,18 @@ fn render_container_section(
     let mut section = String::new();
     let _ = writeln!(
         section,
-        "\n{indent}{} ({}, {} {})",
+        "\n{indent}{} ({}, {} {}{})",
         root.path.display(),
         root.adapter.clone().unwrap_or_else(|| "unknown".into()),
         human_bytes(root.bytes),
-        root.basis.label()
+        root.basis.label(),
+        // Two numbers describe one directory: the row above counts a
+        // hardlinked file once, this one counts every link. Say which.
+        if root.basis == crate::artifact::AccountingBasis::Allocated {
+            "; each hardlink counted, the row above counts a shared file once"
+        } else {
+            ""
+        }
     );
     for limit in &root.coverage.limits {
         let _ = writeln!(section, "{indent}  limit: {limit}");

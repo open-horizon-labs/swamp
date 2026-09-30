@@ -205,7 +205,7 @@ pub const MATRIX: &[MatrixEntry] = &[
              entries plus outputs/{apk/<flavor>/<buildType>,bundle/<variant>,mapping/<variant>,aar,logs}, \
              intermediates/<task>/<variant>, test-results/<task>, reports",
             ".cxx/<Variant>/<hash>/<abi>, .cxx/cmake/<variant>/<abi>, .externalNativeBuild/cmake/<variant>/<abi>",
-            "<sdk>/{platforms,build-tools,system-images/<api>/<tag>/<abi>,emulator} with source.properties",
+            "<sdk>/{platforms,build-tools,system-images/<api>/<tag>/<abi>,emulator,ndk,cmdline-tools,platform-tools,cmake} with source.properties, and an NDK that ANDROID_NDK_HOME or ANDROID_NDK_ROOT names outside the SDK root",
             "~/.android/avd/<name>.avd with config.ini and emulator lock files",
         ],
         attribution_limits: &[
@@ -317,7 +317,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "a project-local DerivedData or -derivedDataPath folder",
             "SwiftPM .build/{<triple>/<debug or release>,checkouts,repositories,artifacts,.lock}",
             "Archives/<date>/*.xcarchive with Info.plist; iOS/watchOS DeviceSupport/<version (build)>",
-            "CoreSimulator Devices/<UDID>/device.plist, Profiles/Runtimes/*.simruntime, Caches",
+            "CoreSimulator Devices/<UDID>/device.plist, Profiles/Runtimes/*.simruntime, Caches; system-wide /Library/Developer/{CommandLineTools,DeveloperDiskImages} and CoreSimulator/{Images,Cryptex,Profiles} as one unit each",
         ],
         attribution_limits: &[
             "the source project is read from info.plist's WorkspacePath; a folder without one \
@@ -360,6 +360,23 @@ pub const MATRIX: &[MatrixEntry] = &[
         operation_granularity: "daemon-side only: `docker buildx prune --filter id=<id>` \
                                 removes a record with its dependents; `docker builder prune` \
                                 removes every record not in use that matches its filters",
+        actions: INSPECTION_ONLY,
+    },
+    MatrixEntry {
+        id: "tool-stores",
+        name: "Tool stores (ESP-IDF, agent scratch)",
+        status: Status::Implemented,
+        families: &[RoleFamily::Intermediates, RoleFamily::Installations],
+        known_layouts: &[
+            "ESP-IDF dist/, tools/ and python_env/ under IDF_TOOLS_PATH or ~/.espressif, one unit each",
+            "Claude Code's per-user session scratch directory /private/tmp/claude-<uid> (macOS), one unit",
+        ],
+        attribution_limits: &[
+            "each store is one unit: nothing inside is identified or attributed to a project",
+            "the consequence text is the tool's own reinstall command where one exists (ESP-IDF's install.sh, xcode-select --install); otherwise it is swamp's own statement, labelled as such (session scratch, the simulator support directories, developer disk images); how long a removed store takes to come back is not measured",
+            "scratch is measured while a session may be writing to it; an open-file check is evidence, never proof",
+        ],
+        operation_granularity: "one whole store directory",
         actions: INSPECTION_ONLY,
     },
 ];

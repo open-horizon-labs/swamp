@@ -49,7 +49,7 @@ pub fn remove_unit(path: &Path) -> io::Result<()> {
 /// This process's real uid, for a `loginctl show-user <uid>` argument
 /// (`systemd_user::linger`).
 pub fn current_uid() -> u32 {
-    super::sys::current_uid()
+    super::current_uid()
 }
 
 /// Runs `systemctl --user`/`loginctl` (`program`/`args` -- the shape

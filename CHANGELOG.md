@@ -3,6 +3,33 @@
 Release notes describe behavior at the named version. Older timings are individual
 observations, not general performance guarantees. See the README for current use.
 
+## v0.8.0
+
+- **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
+  8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
+  `dist/` (downloaded archives) and `python_env/` as separate rows, each with what
+  reinstalling costs in Espressif's own words (`install.sh`). A machine without it
+  lists the location as missing.
+- **The Android SDK's big folders are reported.** Only `platforms/`, `system-images/`,
+  `build-tools/` and `emulator/` were measured, and on this machine they held almost
+  nothing while `ndk/` held 5.9 GB. `ndk/`, `cmdline-tools/`, `platform-tools/` and
+  `cmake/` now appear, each package with its `sdkmanager` reinstall command. An NDK
+  that `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` names outside the SDK is measured too.
+  `licenses/` stays out. An SDK with no NDK shows no NDK row and no error.
+- **The rest of `/Library/Developer` is reported.** Besides the simulator runtime
+  volumes (still counted once, through `CoreSimulator/Volumes`, never also through
+  the `AssetsV2` disk images behind them): `CoreSimulator/Caches`, `Images`,
+  `Cryptex` and `Profiles`, `CommandLineTools` (reinstall with
+  `xcode-select --install`), `DeveloperDiskImages`, `CoreDevice` and `DeviceKit`.
+- **Claude Code's session scratch is reported.** `/private/tmp/claude-<uid>` was
+  several GB here and unmeasured. It shows as a cache (rows per project directory
+  under "Caches & intermediates"), with swamp's own note that removing it during a session
+  breaks that session. It is one exact path; nothing else in `/private/tmp` is scanned.
+  Git worktrees that live inside it are counted under their projects, and the row says how
+  much. On this machine every entry there was newer than the last boot; swamp does not
+  assume it is cleared. The simulator runtime row is labelled as mounted size: runtimes
+  that are not mounted are not measured.
+
 ## v0.7.5
 
 - **`swamp ui` opens immediately and no longer scans on its own.** v0.7.4 said `swamp ui`

@@ -23,10 +23,12 @@
 //! a model that does not fit it.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 
 pub const CLAUDE_CODE_DETECTOR_ID: &str = "claude-code";
+pub const CLAUDE_CODE_SCRATCH_DETECTOR_ID: &str = "claude-code-scratch";
 
 pub struct ClaudeCodeDetector;
 
@@ -65,6 +67,71 @@ impl Detector for ClaudeCodeDetector {
             note: Some(
                 "Claude Code home: sessions, caches, logs, checkpoints and protected config; \
                  see crate::agents::claude_code for the interior identification"
+                    .to_string(),
+            ),
+        }]
+    }
+}
+
+/// Claude Code's per-user session scratch directory,
+/// `/private/tmp/claude-<uid>` on macOS: one exact, known path per user,
+/// measured as its own external unit.
+///
+/// It is a **separate detector from [`ClaudeCodeDetector`]** on purpose.
+/// The agent layer takes a tool's *first* authorized location as that
+/// tool's home and identifies sessions inside it; a second location on
+/// the `claude-code` detector would become the home whenever `~/.claude`
+/// is excluded or absent, and its scratch files would be read as a
+/// session store. Nothing else under `/private/tmp` is looked at: there
+/// is no discovery of temp directories, only this one named path.
+///
+/// macOS only. The Linux equivalent was not observed on any machine
+/// this was built on, so it is not guessed; the platform table reports
+/// the detector as not applicable there.
+pub struct ClaudeCodeScratchDetector;
+
+impl Detector for ClaudeCodeScratchDetector {
+    fn id(&self) -> &'static str {
+        CLAUDE_CODE_SCRATCH_DETECTOR_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Claude Code session scratch"
+    }
+
+    fn platforms(&self) -> &'static [Platform] {
+        &[Platform::MacOS]
+    }
+
+    fn version_note(&self) -> &'static str {
+        "observed layout: /private/tmp/claude-<uid> holds per-project session scratch directories \
+         (macOS); not documented upstream"
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::AgentScratch,
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Cache,
+                suffix: &[],
+            },
+        }]
+    }
+
+    fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
+        vec![ProposedLocation {
+            detector_id: CLAUDE_CODE_SCRATCH_DETECTOR_ID.to_string(),
+            path: Some(std::path::PathBuf::from(format!(
+                "/private/tmp/claude-{}",
+                env.uid
+            ))),
+            category: StorageCategory::Cache,
+            provenance: Provenance::BuiltinConvention,
+            status: LocationStatus::Resolved,
+            note: Some(
+                "Claude Code's per-user session scratch; on the machine this was built on, every entry \
+                 under /private/tmp was newer than the last boot (swamp does not assume it is \
+                 cleared)"
                     .to_string(),
             ),
         }]
@@ -121,5 +188,40 @@ mod tests {
         let env = Environment::fixture(PathBuf::from("/home/dev"), HashMap::new(), Platform::Linux);
         let got = ClaudeCodeDetector.detect(&env);
         assert_eq!(got[0].path, Some(PathBuf::from("/home/dev/.claude")));
+    }
+
+    #[test]
+    fn scratch_is_the_one_exact_per_user_directory() {
+        let mut env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        env.uid = 777;
+        let got = ClaudeCodeScratchDetector.detect(&env);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, Some(PathBuf::from("/private/tmp/claude-777")));
+        assert_eq!(got[0].category, StorageCategory::Cache);
+        assert_eq!(got[0].status, LocationStatus::Resolved);
+    }
+
+    #[test]
+    fn scratch_ignores_home_and_claude_config_dir() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/opt/claude-home".to_string(),
+        );
+        let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
+        let got = ClaudeCodeScratchDetector.detect(&env);
+        assert_eq!(got[0].path, Some(PathBuf::from("/private/tmp/claude-501")));
+    }
+
+    #[test]
+    fn scratch_is_macos_only_and_never_a_claude_code_home() {
+        assert_eq!(ClaudeCodeScratchDetector.platforms(), &[Platform::MacOS]);
+        // The home detector's own locations stay exactly one, so the
+        // agent layer's first-location contract is untouched.
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        assert_eq!(ClaudeCodeDetector.detect(&env).len(), 1);
+        assert_ne!(ClaudeCodeScratchDetector.id(), ClaudeCodeDetector.id());
     }
 }

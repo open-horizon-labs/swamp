@@ -79,6 +79,9 @@ impl BuildAdapter for Adapter {
             BuildStoreKind::SimulatorDevices,
             BuildStoreKind::SimulatorRuntimes,
             BuildStoreKind::SimulatorCaches,
+            BuildStoreKind::SimulatorSystemSupport,
+            BuildStoreKind::XcodeCommandLineTools,
+            BuildStoreKind::XcodeDeveloperDiskImages,
         ]
     }
 
@@ -127,6 +130,29 @@ impl BuildAdapter for Adapter {
             Some(BuildStoreKind::SimulatorRuntimes) => return identify_runtimes(container, ctx),
             Some(BuildStoreKind::SimulatorCaches) => {
                 return identify_simulator_caches(container, ctx);
+            }
+            Some(BuildStoreKind::SimulatorSystemSupport) => {
+                return identify_simulator_system_support(container, ctx);
+            }
+            Some(BuildStoreKind::XcodeCommandLineTools) => {
+                return identify_system_directory(
+                    container,
+                    ctx,
+                    "the Command Line Tools for Xcode, system-wide",
+                    "reinstall with `xcode-select --install`",
+                    "the Command Line Tools are shared by every build on this machine",
+                );
+            }
+            Some(BuildStoreKind::XcodeDeveloperDiskImages) => {
+                return identify_system_directory(
+                    container,
+                    ctx,
+                    "developer disk images Xcode uses to develop on connected devices",
+                    "Xcode is the tool that installs these; a device's disk image is downloaded \
+                     through Xcode again when that device is next prepared for development \
+                     (swamp has not verified this on every Xcode version)",
+                    "disk images are shared by every project and device",
+                );
             }
             Some(BuildStoreKind::XcodeDerivedData) => return identify_derived_data(container, ctx),
             _ => {}
@@ -860,33 +886,52 @@ fn identify_devices(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArt
 
 /// Simulator runtimes: installations, by name.
 fn identify_runtimes(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
-    let mut units = vec![store_root(
+    let mut root = store_root(
         container,
         ctx,
         ArtifactRole::Installation,
         "simulator runtimes: installed simulator OS versions",
-        "a removed runtime is downloaded again from Xcode's platform settings -- a multi-gigabyte \
-         download; simulators on it stop booting until then",
+        "a removed runtime is downloaded again from Xcode's platform settings: a multi-gigabyte \
+         download, and simulators on it stop booting until then",
         "simulator devices boot from these runtimes",
-    )];
+    );
+    // `Volumes/` holds the *mounted* runtime images. What is printed is
+    // the size of the files inside them, which is not the space their
+    // backing images take on the data volume, and a runtime that is
+    // installed but not mounted is not here at all.
+    let mounted_volumes = name_of(&container.path) == "Volumes";
+    if mounted_volumes {
+        root = NestedUnitBuilder::amend(root)
+            .limit(
+                "mounted size: the files inside the mounted runtime images, not the space their \
+                 disk images take (those live under /System/Library/AssetsV2, which swamp does \
+                 not read); a runtime installed but not mounted is not measured",
+            )
+            .build();
+    }
+    let mut units = vec![root];
     for r in ctx.folded().children(&container.path) {
         let name = name_of(&r.path).to_string();
         let label = name.trim_end_matches(".simruntime").to_string();
-        units.push(
-            NestedUnitBuilder::known_dir(
-                container,
-                ArtifactRole::Installation,
-                r,
-                format!("`{name}` is an installed simulator runtime"),
-                format!("{label} is downloaded again when a simulator needs it"),
-            )
-            .variant(ArtifactVariant {
-                toolchain: Some(label),
-                ..Default::default()
-            })
-            .no_action_because("simulator devices boot from this runtime")
-            .build(),
-        );
+        let mut b = NestedUnitBuilder::known_dir(
+            container,
+            ArtifactRole::Installation,
+            r,
+            format!("`{name}` is an installed simulator runtime"),
+            format!("{label} is downloaded again when a simulator needs it"),
+        )
+        .variant(ArtifactVariant {
+            toolchain: Some(label),
+            ..Default::default()
+        })
+        .no_action_because("simulator devices boot from this runtime");
+        if mounted_volumes && r.allocated_total == 0 {
+            b = b.limit(
+                "nothing is mounted here, so this runtime is not measured: its disk image is \
+                 under /System/Library/AssetsV2, which swamp does not read",
+            );
+        }
+        units.push(b.build());
     }
     units
 }
@@ -909,6 +954,62 @@ fn identify_simulator_caches(container: &BuildContainer, ctx: &BuildCtx) -> Vec<
                 format!("`{name}` is part of CoreSimulator's cache"),
                 "the next simulator boot rebuilds it",
             )
+            .build(),
+        );
+    }
+    units
+}
+
+/// The system-wide CoreSimulator support directories, named by what
+/// each holds. The runtime bytes are `Volumes/`'s, not these.
+fn identify_simulator_system_support(
+    container: &BuildContainer,
+    ctx: &BuildCtx,
+) -> Vec<NestedArtifact> {
+    let what = match name_of(&container.path) {
+        "Images" => "the system-wide simulator runtime disk-image bookkeeping",
+        "Cryptex" => "the system-wide simulator runtime cryptex images and caches",
+        "Profiles" => "the system-wide simulator device-type profiles",
+        _ => "a system-wide CoreSimulator support directory",
+    };
+    identify_system_directory(
+        container,
+        ctx,
+        what,
+        "simulators that depend on it may not start until their runtimes are reinstalled \
+         (Xcode > Settings > Components); swamp has not verified what else recreates it",
+        "simulator runtimes and devices depend on this directory",
+    )
+}
+
+/// A system-wide directory that is one installation: its own row, and
+/// one unit per directory directly inside it, each with the same
+/// consequence (the rows a report prints).
+fn identify_system_directory(
+    container: &BuildContainer,
+    ctx: &BuildCtx,
+    what: &str,
+    consequence: &str,
+    no_action: &str,
+) -> Vec<NestedArtifact> {
+    let mut units = vec![
+        NestedUnitBuilder::container_root(container, ctx, ArtifactRole::Installation)
+            .supported_with_reason(what)
+            .membership(Membership::Unknown)
+            .consequence(consequence)
+            .no_action_because(no_action)
+            .build(),
+    ];
+    for child in ctx.folded().children(&container.path) {
+        units.push(
+            NestedUnitBuilder::known_dir(
+                container,
+                ArtifactRole::Installation,
+                child,
+                format!("`{}` is part of {what}", name_of(&child.path)),
+                consequence,
+            )
+            .no_action_because(no_action)
             .build(),
         );
     }
@@ -1246,5 +1347,111 @@ mod tests {
             f.coverage.supported,
             "partial metadata: still a DerivedData folder, still inspectable"
         );
+    }
+
+    #[test]
+    fn system_wide_directories_are_installations_with_their_own_consequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (kind, folder, child, needle) in [
+            (
+                BuildStoreKind::XcodeCommandLineTools,
+                "CommandLineTools",
+                "SDKs",
+                "xcode-select --install",
+            ),
+            (
+                BuildStoreKind::XcodeDeveloperDiskImages,
+                "DeveloperDiskImages",
+                "iOS_DDI",
+                "through Xcode",
+            ),
+            (
+                BuildStoreKind::SimulatorSystemSupport,
+                "Cryptex",
+                "Images",
+                "Components",
+            ),
+        ] {
+            let root = tmp.path().join(folder);
+            fs::create_dir_all(root.join(child)).unwrap();
+            let units = run(
+                &BuildContainer::shared_store_of("xcode-swift", root.clone(), kind),
+                &index_of(&root, 5),
+            );
+            assert_eq!(units.len(), 2, "{kind:?}: the root and its one child");
+            for u in &units {
+                assert_eq!(u.role, ArtifactRole::Installation);
+                assert!(
+                    u.consequence.clone().unwrap().contains(needle),
+                    "{kind:?}: {:?}",
+                    u.consequence
+                );
+                assert!(matches!(
+                    u.action,
+                    crate::artifact::NestedActionCapability::Unsupported { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn the_mounted_volumes_row_is_labelled_mounted_size_and_an_empty_mount_is_not_measured() {
+        // Tempting wrong patch: printing the mounted content size as the
+        // runtime's disk footprint, and an empty mount point as a small
+        // exact number.
+        let tmp = tempfile::tempdir().unwrap();
+        let vols = tmp.path().join("Volumes");
+        put(&vols.join("iOS_23F77/System/x"), "0123456789");
+        fs::create_dir_all(vols.join("watchOS_unmounted")).unwrap();
+        let mut idx: Vec<FoldedDir> = Vec::new();
+        for (p, n) in [
+            (vols.clone(), 8192u64),
+            (vols.join("iOS_23F77"), 8192),
+            (vols.join("watchOS_unmounted"), 0),
+        ] {
+            idx.push(FoldedDir {
+                path: p,
+                allocated_total: n,
+                mtime_max: 5,
+                complete: true,
+            });
+        }
+        let units = run(
+            &BuildContainer::shared_store_of(
+                "xcode-swift",
+                vols.clone(),
+                BuildStoreKind::SimulatorRuntimes,
+            ),
+            &FoldedIndex::from_dirs(idx),
+        );
+        let root = units.iter().find(|u| u.path == vols).unwrap();
+        assert!(
+            root.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("mounted size"))
+        );
+        assert!(
+            root.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("not mounted is not measured"))
+        );
+        let empty = units
+            .iter()
+            .find(|u| u.path == vols.join("watchOS_unmounted"))
+            .unwrap();
+        assert!(
+            empty
+                .coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("not measured"))
+        );
+        let mounted = units
+            .iter()
+            .find(|u| u.path == vols.join("iOS_23F77"))
+            .unwrap();
+        assert!(mounted.coverage.limits.is_empty());
     }
 }

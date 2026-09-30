@@ -33,6 +33,18 @@ use std::path::{Path, PathBuf};
 
 pub struct Adapter;
 
+/// The SDK root's package folders whose children are one package each.
+const SDK_PACKAGE_FOLDERS: &[&str] = &[
+    "platforms",
+    "system-images",
+    "build-tools",
+    "emulator",
+    "ndk",
+    "cmdline-tools",
+    "platform-tools",
+    "cmake",
+];
+
 /// Build types the Android Gradle plugin defines by default. A variant
 /// name ending in one of these is `<flavor><BuildType>`; anything else is
 /// kept whole with the split unknown, never guessed.
@@ -497,12 +509,28 @@ fn identify_native(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArti
 /// package with its revision from its own `source.properties`.
 fn identify_sdk_packages(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
     let category = name_of(&container.path).to_string();
+    // A folder that is not one of the SDK's package folders is an NDK
+    // that `ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT` names outside the SDK
+    // root: one package, named by its version directory, not a list.
+    // Decided by what the directory is, not by its name: an SDK package
+    // folder holds packages, each with its own `source.properties`,
+    // while an NDK named by the environment is itself one package and
+    // has `source.properties` at its root -- even when it is called
+    // `ndk`.
+    let is_package_folder = SDK_PACKAGE_FOLDERS.contains(&category.as_str())
+        && ctx
+            .manifest(&container.path.join("source.properties"))
+            .is_none();
     let mut units = vec![
         NestedUnitBuilder::container_root(container, ctx, ArtifactRole::Installation)
-            .supported_with_reason(format!("the Android SDK's `{category}` packages"))
+            .supported_with_reason(if is_package_folder {
+                format!("the Android SDK's `{category}` packages")
+            } else {
+                format!("`{category}`, an NDK outside the SDK root")
+            })
             .membership(Membership::Unknown)
             .consequence(
-                "reinstall with `sdkmanager` (or Android Studio's SDK Manager) -- a download",
+                "reinstall with `sdkmanager` (or Android Studio's SDK Manager): a download",
             )
             .no_action_because("SDK packages are shared by every Android project on this machine")
             .build(),
@@ -519,7 +547,7 @@ fn identify_sdk_packages(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nest
             dir,
             format!("`{category}/{label}` is an installed SDK package"),
             format!(
-                "reinstall `{category};{}` with sdkmanager -- a download",
+                "reinstall `{category};{}` with sdkmanager: a download",
                 label.replace('/', ";")
             ),
         )
@@ -541,7 +569,7 @@ fn identify_sdk_packages(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nest
     };
     // These package directories are one package each, not a list of
     // versions: the root row is the unit.
-    if matches!(category.as_str(), "emulator" | "platform-tools") {
+    if !is_package_folder || matches!(category.as_str(), "emulator" | "platform-tools") {
         return units;
     }
     for child in ctx.folded().children(&container.path) {
@@ -912,6 +940,97 @@ mod tests {
             split_variant("rerelease"),
             (None, None, None),
             "no capital boundary, no split"
+        );
+    }
+
+    #[test]
+    fn ndk_cmdline_tools_platform_tools_and_cmake_are_installations_with_sdkmanager_words() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (folder, child) in [
+            ("ndk", "26.1.10909125"),
+            ("cmdline-tools", "latest"),
+            ("cmake", "3.22.1"),
+        ] {
+            let dir = tmp.path().join("sdk").join(folder);
+            put(
+                &dir.join(child).join("source.properties"),
+                "Pkg.Revision=1.2.3\n",
+            );
+            let c = BuildContainer::shared_store_of(
+                "android",
+                dir.clone(),
+                BuildStoreKind::AndroidSdkPackages,
+            );
+            let units = run(&c, &index_of(&dir, 5));
+            assert!(units.iter().all(|u| u.role == ArtifactRole::Installation));
+            let pkg = units.iter().find(|u| u.path == dir.join(child)).unwrap();
+            let consequence = pkg.consequence.clone().unwrap();
+            assert!(
+                consequence.contains(&format!("{folder};{child}"))
+                    && consequence.contains("sdkmanager"),
+                "{consequence}"
+            );
+        }
+        // platform-tools is one package, like emulator: the root row is the unit.
+        let pt = tmp.path().join("sdk/platform-tools");
+        put(&pt.join("adb"), "x");
+        let c = BuildContainer::shared_store_of(
+            "android",
+            pt.clone(),
+            BuildStoreKind::AndroidSdkPackages,
+        );
+        let units = run(&c, &index_of(&pt, 5));
+        assert_eq!(units.len(), 1);
+        assert!(units[0].consequence.clone().unwrap().contains("sdkmanager"));
+    }
+
+    #[test]
+    fn an_ndk_outside_the_sdk_is_one_package_not_a_list_of_fake_packages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ndk = tmp.path().join("26.1.10909125");
+        put(&ndk.join("toolchains/llvm/x"), "x");
+        let c = BuildContainer::shared_store_of(
+            "android",
+            ndk.clone(),
+            BuildStoreKind::AndroidSdkPackages,
+        );
+        let units = run(&c, &index_of(&ndk, 5));
+        assert_eq!(units.len(), 1, "toolchains/ is not an SDK package");
+        assert_eq!(units[0].path, ndk);
+    }
+    /// Adversarial (audit/v080-g0). Tempting wrong patch: decide "SDK
+    /// package folder vs outside NDK" by the container's *name*. An NDK
+    /// that `ANDROID_NDK_HOME=/opt/ndk` names (one NDK, with its own
+    /// `source.properties` at the top) is called `ndk`, so it is read as
+    /// the SDK's `ndk/` list and its `toolchains/`, `prebuilt/` folders
+    /// are reported as fake `ndk;toolchains` packages.
+    #[test]
+    fn audit_an_outside_ndk_named_ndk_is_one_package_not_a_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ndk = tmp.path().join("opt/ndk");
+        put(
+            &ndk.join("source.properties"),
+            "Pkg.Revision=26.1.10909125\n",
+        );
+        put(&ndk.join("toolchains/llvm/x"), "x");
+        put(&ndk.join("prebuilt/y"), "y");
+        let c = BuildContainer::shared_store_of(
+            "android",
+            ndk.clone(),
+            BuildStoreKind::AndroidSdkPackages,
+        );
+        let units = run(&c, &index_of(&ndk, 5));
+        let fake: Vec<String> = units
+            .iter()
+            .filter_map(|u| u.consequence.clone())
+            .filter(|t| t.contains("ndk;toolchains") || t.contains("ndk;prebuilt"))
+            .collect();
+        assert!(fake.is_empty(), "fake NDK packages: {fake:?}");
+        assert_eq!(
+            units.len(),
+            1,
+            "{:?}",
+            units.iter().map(|u| &u.path).collect::<Vec<_>>()
         );
     }
 }

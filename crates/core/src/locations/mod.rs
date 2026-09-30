@@ -37,6 +37,7 @@ pub mod copilot_cli;
 pub mod core_simulator;
 pub mod cursor;
 pub mod docker_desktop;
+pub mod espressif;
 pub mod gemini_cli;
 pub mod go;
 pub mod gradle;
@@ -204,7 +205,7 @@ pub fn shallow_dir_names(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-pub const CATALOG_VERSION: &str = "2026-09-21.4";
+pub const CATALOG_VERSION: &str = "2026-09-29.1";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any
 /// value so a Linux-configured `Environment` can be asserted to produce
@@ -511,6 +512,10 @@ impl CommandRunner for FakeCommandRunner {
 /// the developer's real home (#44's fixture-injection requirement).
 pub struct Environment {
     pub home: PathBuf,
+    /// The real uid, for the per-user directory names a tool derives
+    /// from it (`/private/tmp/claude-<uid>`). Injected so a fixture
+    /// names a uid of its own rather than the machine's.
+    pub uid: u32,
     pub env: HashMap<String, String>,
     pub platform: Platform,
     pub runner: Arc<dyn CommandRunner>,
@@ -528,6 +533,7 @@ impl Environment {
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
             home,
+            uid: crate::fs_gate::current_uid(),
             env: std::env::vars().collect(),
             platform: Platform::current(),
             runner: Arc::new(SystemCommandRunner),
@@ -541,6 +547,7 @@ impl Environment {
     pub fn fixture(home: PathBuf, env: HashMap<String, String>, platform: Platform) -> Self {
         Self {
             home,
+            uid: 501,
             env,
             platform,
             runner: Arc::new(NullCommandRunner),
@@ -763,6 +770,22 @@ pub enum BuildStoreKind {
     AndroidSdkPackages,
     /// Android Virtual Device data (`~/.android/avd`).
     AndroidVirtualDevices,
+    /// ESP-IDF's `dist/` (downloaded tool archives).
+    EspressifDist,
+    /// ESP-IDF's `tools/` (installed toolchains and tools).
+    EspressifTools,
+    /// ESP-IDF's `python_env/` (per-version Python virtual environments).
+    EspressifPythonEnv,
+    /// Claude Code's per-user session scratch directory
+    /// (`/private/tmp/claude-<uid>`).
+    AgentScratch,
+    /// `/Library/Developer/CommandLineTools`.
+    XcodeCommandLineTools,
+    /// `/Library/Developer/DeveloperDiskImages`.
+    XcodeDeveloperDiskImages,
+    /// The system-wide CoreSimulator support directories
+    /// (`Images`, `Cryptex`, `Profiles`).
+    SimulatorSystemSupport,
     /// A BuildKit build cache, answered by the Docker daemon rather than
     /// measured on disk.
     BuildKitCache,
@@ -793,6 +816,13 @@ impl BuildStoreKind {
             Self::SimulatorCaches => "simulator-caches",
             Self::AndroidSdkPackages => "android-sdk-packages",
             Self::AndroidVirtualDevices => "android-virtual-devices",
+            Self::EspressifDist => "espressif-dist",
+            Self::EspressifTools => "espressif-tools",
+            Self::EspressifPythonEnv => "espressif-python-env",
+            Self::AgentScratch => "agent-scratch",
+            Self::XcodeCommandLineTools => "xcode-command-line-tools",
+            Self::XcodeDeveloperDiskImages => "xcode-developer-disk-images",
+            Self::SimulatorSystemSupport => "simulator-system-support",
             Self::BuildKitCache => "buildkit-cache",
         }
     }
@@ -827,6 +857,13 @@ impl BuildStoreKind {
         Self::SimulatorCaches,
         Self::AndroidSdkPackages,
         Self::AndroidVirtualDevices,
+        Self::EspressifDist,
+        Self::EspressifTools,
+        Self::EspressifPythonEnv,
+        Self::AgentScratch,
+        Self::XcodeCommandLineTools,
+        Self::XcodeDeveloperDiskImages,
+        Self::SimulatorSystemSupport,
         Self::BuildKitCache,
     ];
 }
@@ -1034,6 +1071,7 @@ impl Registry {
                 Box::new(rustup::RustupDetector),
                 Box::new(homebrew::HomebrewDetector),
                 Box::new(claude_code::ClaudeCodeDetector),
+                Box::new(claude_code::ClaudeCodeScratchDetector),
                 Box::new(codex::CodexDetector),
                 Box::new(codex_desktop::CodexDesktopDetector),
                 Box::new(oh_my_pi::OhMyPiDetector),
@@ -1063,8 +1101,10 @@ impl Registry {
                 Box::new(go::GoDetector),
                 Box::new(pip::PipDetector),
                 Box::new(xcode::XcodeDetector),
+                Box::new(xcode::XcodeSystemDetector),
                 Box::new(core_simulator::CoreSimulatorDetector),
                 Box::new(android::AndroidDetector),
+                Box::new(espressif::EspressifDetector),
                 Box::new(huggingface::HuggingFaceDetector),
                 Box::new(ollama::OllamaDetector),
                 Box::new(docker_desktop::DockerDesktopDetector),
@@ -1123,6 +1163,63 @@ impl Default for Registry {
 
 #[cfg(test)]
 mod tests {
+    /// The simulator runtimes are reachable by two paths: the mounted
+    /// volumes under `/Library/Developer/CoreSimulator/Volumes` and the
+    /// disk images under `/System/Library/AssetsV2` that back them
+    /// (`/System` is firmlinked onto the data volume). `Volumes/` owns
+    /// them (see `core_simulator`'s module docs); this fails the moment
+    /// any detector, on any platform, proposes an `AssetsV2` path -- or
+    /// proposes `Volumes/` twice -- because the same runtime would then
+    /// be measured, and summed, twice.
+    #[test]
+    fn the_simulator_runtimes_are_counted_through_one_path() {
+        use super::*;
+        let assets = [
+            "/System/Library/AssetsV2",
+            "/System/Volumes/Data/System/Library/AssetsV2",
+            "/private/var/db/AssetsV2",
+        ];
+        let volumes = std::path::Path::new("/Library/Developer/CoreSimulator/Volumes");
+        let registry = Registry::with_builtins();
+        for platform in [Platform::MacOS, Platform::Linux] {
+            let env = Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), platform);
+            let permitted = permitted::PermittedDetectors::from_config(
+                &crate::scope::ScanConfig::default(),
+                &registry,
+            );
+            let proposed: Vec<(String, PathBuf)> = registry
+                .resolve(&env, &permitted)
+                .into_iter()
+                .flat_map(|(id, locs)| {
+                    locs.into_iter()
+                        .filter_map(move |l| l.path.map(|p| (id.clone(), p)))
+                })
+                .collect();
+            for (id, path) in &proposed {
+                for asset in assets {
+                    assert!(
+                        !path.starts_with(asset) && !std::path::Path::new(asset).starts_with(path),
+                        "{id} proposes {} which overlaps {asset}: the runtime images would be \
+                         counted there and again through Volumes/",
+                        path.display()
+                    );
+                }
+            }
+            let volumes_owners: Vec<&String> = proposed
+                .iter()
+                .filter(|(_, p)| p.starts_with(volumes) || volumes.starts_with(p))
+                .map(|(id, _)| id)
+                .collect();
+            assert!(
+                volumes_owners.len() <= 1,
+                "Volumes/ (or an ancestor/descendant) is proposed more than once: {volumes_owners:?}"
+            );
+            if platform == Platform::MacOS {
+                assert_eq!(volumes_owners, vec![&"core-simulator".to_string()]);
+            }
+        }
+    }
+
     #[test]
     fn a_listing_past_its_cap_says_it_was_truncated() {
         let dir = tempfile::tempdir().unwrap();
