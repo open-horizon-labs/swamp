@@ -51,7 +51,23 @@ observations, not general performance guarantees. See the README for current use
   the prefix is one `Homebrew (other)` unit, so the parts add up to the prefix. The Android
   bytes are counted once. `[scan] enabled_detectors = ["homebrew"]` still reports Cellar
   and Caskroom whole. Ambiguous tools (qemu, ansible, pandoc, duckdb, mlx) stay in
-  `Homebrew (other)`. Removal, if you decide to, is `brew reinstall <formula>`.
+  `Homebrew (other)`, shown with the setting that reports it whole and no recovery
+  hint (it is Homebrew itself, `bin`, `lib` and the GUI casks). A file hardlinked between a
+  dev keg and the rest of the prefix is counted once, in the dev unit. Removal of a dev
+  unit, if you decide to, is `brew reinstall <formula>`.
+  **Upgrade note:** `disabled_detectors = ["homebrew"]` still turns off all Homebrew
+  reporting (it now names the family of three); `enabled_detectors = ["homebrew"]` still
+  means the full detector.
+- **Changing your roots no longer hides your last observation.** The stored observation is
+  now keyed by your project roots, not by every detector location, so an upgrade that adds
+  a detector, or `swamp config add-root`, no longer makes `swamp report` say "no observation
+  yet" or `swamp ui` start a scan. When the roots did change, the most recent observation
+  that overlaps the new scope is shown, labelled `showing the previous scope (N roots); new
+  roots not yet observed; press R`, from stored tables with nothing walked and no growth
+  computed across the two scopes. The first run after this upgrade shows your v0.7.5
+  observation that way; `R` or the next scheduled `observe` builds the new one. `swamp ui`
+  scans on its own only when the store holds no observation at all.
+- **Declared roots are in the TUI header and help and in `report --json`** (`declared_roots`).
 
 ## v0.7.5
 

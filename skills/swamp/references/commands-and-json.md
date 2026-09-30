@@ -82,7 +82,7 @@ present (with stored bytes), missing or unreadable:
 
 ```json
 {
-  "catalog_version": "2026-09-29.1",
+  "catalog_version": "2026-09-30.1",
   "generated_at": 1758470400,
   "defaults_enabled": true,
   "disabled_detectors": ["homebrew"],

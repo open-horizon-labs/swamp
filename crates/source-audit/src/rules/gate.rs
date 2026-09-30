@@ -384,6 +384,9 @@ const TUI_REPORT_API: &[&str] = &[
     // `EffectiveScope` the caller already resolved -- no bare root, no
     // walk.
     "@core::report::report_scope_from_store",
+    // Whether the store holds an observation of any scope (two small
+    // tables): the "is there an index" question before deciding to scan.
+    "@core::report::store_has_observation",
 ];
 
 fn allowed(m: &Module, list: &[(Krate, &[&str])]) -> bool {

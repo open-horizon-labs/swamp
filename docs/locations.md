@@ -17,7 +17,7 @@ detector-resolved location becomes a first-class external unit
 `swamp scope --json` lists every detector's `id`, resolved locations,
 `category`, `provenance`, and `status` for the machine actually running
 it; the table below is the human-readable index, current as of catalog
-version `2026-09-29.1`.
+version `2026-09-30.1`.
 
 ## Categories
 

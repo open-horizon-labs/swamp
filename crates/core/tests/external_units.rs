@@ -320,7 +320,6 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
         ("xcode-system", "/Library/Developer/DeveloperDiskImages"),
         ("xcode-system", "/Library/Developer/CoreDevice"),
         ("xcode-system", "/Library/Developer/DeviceKit"),
-        ("claude-code-scratch", "/private/tmp/claude-501"),
         ("homebrew", "/opt/homebrew"),
         ("homebrew", "/usr/local"),
         ("homebrew", "/opt/homebrew/Cellar"),
@@ -345,9 +344,15 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
         ("homebrew-other", "/usr/local"),
         ("ruby-install", "/opt/rubies"),
     ];
+    // Claude Code's scratch is per user: the path comes from the uid the
+    // environment carries (injected, not the machine's), never a literal.
+    let scratch = format!("/private/tmp/claude-{}", env.uid);
     let unexpected: Vec<&(String, String)> = escaping
         .iter()
-        .filter(|(id, path)| !known.iter().any(|(k, p)| k == id && p == path))
+        .filter(|(id, path)| {
+            !(id == "claude-code-scratch" && *path == scratch)
+                && !known.iter().any(|(k, p)| k == id && p == path)
+        })
         .collect();
     assert!(
         unexpected.is_empty(),
@@ -400,4 +405,27 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
             .map(|r| r.detector_id.clone())
             .collect::<Vec<_>>()
     );
+}
+
+/// Claude Code's scratch path follows the uid the environment carries: a
+/// fixture at uid 502 (the maintainer's) resolves `claude-502`, one at 501
+/// resolves `claude-501`, and neither resolves the other's. Tempting wrong
+/// patch: a literal `claude-501` in the detector's proof, which passes only
+/// on a machine whose uid is 501.
+#[test]
+fn claude_code_scratch_follows_the_injected_uid() {
+    let home = tempfile::tempdir().unwrap();
+    for uid in [501u32, 502] {
+        let mut env = fixture_env(home.path(), &[]);
+        env.uid = uid;
+        let paths: Vec<String> = Registry::with_builtins()
+            .detectors()
+            .iter()
+            .filter(|d| d.id() == "claude-code-scratch")
+            .flat_map(|d| d.detect(&env))
+            .filter_map(|l| l.path)
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(paths, vec![format!("/private/tmp/claude-{uid}")]);
+    }
 }

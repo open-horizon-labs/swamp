@@ -404,6 +404,10 @@ pub struct ExternalObservation {
     /// store; a unit's store is the external unit whose `path` its own
     /// path lies under.
     pub interiors: Vec<crate::artifact::NestedArtifact>,
+    /// Coverage facts of this pass, for the report's notes: a container
+    /// that could not be listed completely, so what it holds was not
+    /// measured (not measured, never zero).
+    pub notes: Vec<String>,
 }
 
 /// [`discover_and_measure`], plus the store interiors. Takes the
@@ -757,6 +761,15 @@ pub fn observe_external(
     // that was excluded, whose detector was disabled, or that could not
     // be read contributes nothing here, so nothing under it is
     // tombstoned (`.oh/guardrails/history-sweeps-are-owned.md`).
+    let notes: Vec<String> = partial_containers
+        .iter()
+        .map(|p| {
+            format!(
+                "{} could not be listed completely: the units inside it were not measured this pass",
+                p.display()
+            )
+        })
+        .collect();
     let ownership = crate::growth::ObservationOwnership::new(
         crate::growth::KeyFamily::External,
         meta_by_key.values().map(|m| m.path.clone()).collect(),
@@ -1007,7 +1020,11 @@ pub fn observe_external(
                 .build();
         }
     }
-    Ok(ExternalObservation { units, interiors })
+    Ok(ExternalObservation {
+        units,
+        interiors,
+        notes,
+    })
 }
 
 pub(crate) fn category_from_str(s: &str) -> Option<StorageCategory> {

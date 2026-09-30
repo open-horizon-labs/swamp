@@ -398,6 +398,9 @@ pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
 /// path, a file name, a config key or a program name spelled anywhere,
 /// including through `format!`/`concat!` arguments, is caught.
 const INFERENCE_SOURCES: &[(&str, &str)] = &[
+    ("histfile", "shell history"),
+    (".python_history", "a REPL's history"),
+    (".node_repl_history", "a REPL's history"),
     ("zsh_history", "shell history"),
     ("bash_history", "shell history"),
     ("fish_history", "shell history"),
@@ -417,9 +420,24 @@ const INFERENCE_SOURCES: &[(&str, &str)] = &[
     ("recentworkspaces", "an editor's recent projects"),
     ("recently-used", "a desktop's recent files"),
     ("recentitems", "a desktop's recent files"),
+    (".config/git/config", "git configuration"),
+    ("state.vscdb", "an editor's recent projects"),
+    ("globalstorage/storage.json", "an editor's recent projects"),
+    (".sfl2", "a desktop's recent files"),
+    (".sfl3", "a desktop's recent files"),
+    ("mdutil", "Spotlight"),
+    ("fasd", "a directory jumper's database"),
     ("zoxide", "a directory jumper's database"),
     ("autojump", "a directory jumper's database"),
 ];
+
+/// Needles that name a file an AI-tool adapter legitimately measures as
+/// that tool's own storage (never as a source of roots), with the modules
+/// that may say so. A reviewed exception, added here in the open.
+const REVIEWED_ADAPTER_FILES: &[(&str, &[&[&str]])] = &[(
+    "state.vscdb",
+    &[&["agents", "vscode_family"], &["agents", "matrix"]],
+)];
 
 pub fn no_root_inference_sources(ws: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();
@@ -429,8 +447,20 @@ pub fn no_root_inference_sources(ws: &Workspace) -> Vec<String> {
                 continue;
             }
             let lower = l.value.to_lowercase();
+            // rupa/z's data file is too short to match as a substring.
+            if lower == ".z" || lower.ends_with("/.z") {
+                problems.push(format!(
+                    "{}: \"{}\" names a directory jumper's database: source roots are declared \
+                     with `swamp config add-root`, never inferred from it \
+                     (roots-are-declared-never-inferred)",
+                    l.site, l.value
+                ));
+            }
             for (needle, what) in INFERENCE_SOURCES {
-                if lower.contains(needle) {
+                let reviewed = REVIEWED_ADAPTER_FILES.iter().any(|(n, mods)| {
+                    n == needle && mods.iter().any(|p| m.is_within(Krate::Core, p))
+                });
+                if lower.contains(needle) && !reviewed {
                     problems.push(format!(
                         "{}: \"{}\" names {what}: source roots are declared with `swamp \
                          config add-root`, never inferred from {what} \

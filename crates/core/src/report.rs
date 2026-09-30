@@ -2623,6 +2623,7 @@ pub fn observe_scope(
         );
         external_ok = measured.is_ok();
         let observation = measured.unwrap_or_default();
+        merged.notes.extend(observation.notes);
         let mut units = observation.units;
         crate::consumer_wiring::attach_associations(&mut merged, &mut units, store_dir);
         (units, observation.interiors)

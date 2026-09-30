@@ -239,6 +239,14 @@ scanned for projects)` for the second class.
    that contains declared roots replaces them and says so. What is stored
    is what you typed (with `~` kept), not the resolved path.
 
+   When your roots change (`add-root`, `remove-root`, or an upgrade that adds a
+   detector), `swamp report` and `swamp ui` keep showing the most recent
+   observation whose roots overlap, labelled `showing the previous scope`, until
+   `R` or the next `swamp observe` builds the new one: nothing is walked to show
+   it and no growth is computed across the two scopes. The TUI header carries a
+   `N declared roots` clause and the help screen lists them, and
+   `swamp report --json` has a `declared_roots` array.
+
    `swamp scope`, `swamp config show` and `swamp report` print each
    declared root as `present` (with the bytes from the last stored
    observation, or `not measured yet`), `missing`, or `unreadable`, and
@@ -247,8 +255,8 @@ scanned for projects)` for the second class.
    **First run.** When nothing has been observed yet and `config.toml` has
    no `[scan]` section, an interactive `swamp ui` or `swamp observe` asks
    `Where is your source code? Press Enter for ~/src` (offering `~/src`
-   only if it exists; otherwise just asking for a directory), records the
-   answer and carries on. It looks at nothing else on disk to propose a
+   only if it exists; otherwise just asking for a directory; `~/src` stays a
+   built-in default either way), records the answer and carries on. It looks at nothing else on disk to propose a
    candidate. Without a terminal it never waits: it prints
    `swamp config add-root <path>` as the way to declare a root and uses the
    built-in defaults. A skipped answer is remembered, so it is asked once.
@@ -329,6 +337,10 @@ detector, which `swamp scope` reports `disabled (default off)`):
 [scan]
 enabled_detectors = ["homebrew"]  # everything else keeps its own default
 ```
+
+`disabled_detectors = ["homebrew"]` turns off **all** Homebrew reporting, as it did
+before the split (the id names the family of three); the member ids
+`homebrew-devtools` and `homebrew-other` work on their own.
 
 To drop the remainder line, or Homebrew entirely:
 

@@ -418,3 +418,40 @@ fn the_external_view_names_the_remainder_and_carries_the_setting_on_its_row() {
     );
     assert_eq!(text.matches("to report it whole").count(), 1, "{text}");
 }
+
+/// Tempting wrong patch: a Cellar this user cannot list yields no dev units
+/// and no word about it, which reads as "nothing installed". It is a
+/// coverage note: named, not measured, never zero.
+#[test]
+fn an_unlistable_cellar_is_a_coverage_note_not_silence() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture();
+    let cellar = f.prefix.join("Cellar");
+    fs::set_permissions(&cellar, fs::Permissions::from_mode(0o000)).unwrap();
+    let registry = Registry::with_builtins();
+    let cfg = config_running(&["homebrew-devtools"], &registry);
+    let scope = resolve_effective_scope(&env(&f, false), &cfg, &[], &registry, 1_000);
+    let got = swamp_core::external::observe_external(
+        &swamp_core::report::DiscoveryPass::for_tests(),
+        &scope,
+        &[],
+        None,
+        false,
+        1_000,
+        30,
+        3600,
+        &swamp_core::fs_events::EventCoverage::untrusted(),
+    );
+    let bypassed = fs::read_dir(&cellar).is_ok();
+    fs::set_permissions(&cellar, fs::Permissions::from_mode(0o755)).unwrap();
+    let got = got.unwrap();
+    if !bypassed {
+        assert!(
+            got.notes
+                .iter()
+                .any(|n| n.contains("Cellar") && n.contains("not measured")),
+            "{:?}",
+            got.notes
+        );
+    }
+}
