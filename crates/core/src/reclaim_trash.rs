@@ -17,19 +17,18 @@
 //!
 //! **The two-row ledger write** is the tool-removal rule: a `started`
 //! row first, the move second, the final row third. A ledger that cannot
-//! take the first row means nothing moves.
+//! take the first row means nothing moves. The move itself is
+//! `actions::trash_reclaim`, an execution sink.
 //!
 //! Trash is the way back: the move is one rename (`fs_gate::destroy`),
 //! and the final ledger row names where it went. Space is freed only
 //! when the Trash is emptied.
 
 use crate::drilldown::ChildKind;
-use crate::entities::{id_for, new_id, now};
 use crate::evidence::{FactKind, FactStatus, FactValue};
-use crate::ledger::{ActionRecord, Ledger, LedgerFact, NO_GRANT, Verb};
+use crate::fs_gate::MetadataExt;
 use crate::locations::RegenClass;
 use crate::reclaim::{ReclaimView, hold_line};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// What a Reclaim row stands for, from the stored view.
@@ -455,94 +454,6 @@ pub fn recheck(r: &Reviewed, store: Option<&Path>) -> Result<(), String> {
     }
     check_protect(&r.path, store)?;
     check_protect(&canonical, store)
-}
-
-/// The facts of one marked row the ledger keeps beside the move.
-#[derive(Debug, Clone)]
-pub struct MoveFacts {
-    pub label: String,
-    pub bytes: u64,
-    pub observed_at: u64,
-    pub warnings: Vec<String>,
-    pub category: String,
-}
-
-fn record(
-    id: &str,
-    r: &Reviewed,
-    facts: &MoveFacts,
-    outcome: &str,
-    recovery: Option<PathBuf>,
-    state: &str,
-) -> ActionRecord {
-    ActionRecord {
-        id: id.to_string(),
-        verb: Verb::Delete,
-        entity_id: id_for(&r.path.display().to_string()),
-        evidence: vec![
-            LedgerFact::new("label", &facts.label),
-            LedgerFact::new("bytes", facts.bytes),
-            LedgerFact::new("observed_at", facts.observed_at),
-            LedgerFact::new("warnings_shown", facts.warnings.join("; ")),
-            LedgerFact::new("reclaim_category", &facts.category),
-            LedgerFact::new("canonical", r.canonical.display()),
-        ],
-        grant_id: NO_GRANT.to_string(),
-        actor: "human:tui".to_string(),
-        outcome: outcome.to_string(),
-        recovery_location: recovery,
-        measured_free_space_delta: None,
-        observed_path_state: Some(state.to_string()),
-        recorded_at: now(),
-    }
-}
-
-/// Moves one reviewed Reclaim row to the Trash: recheck, a `started`
-/// ledger row, the move, the final row. Returns where it went. A started
-/// row that cannot be written means nothing moved.
-pub fn trash(
-    r: &Reviewed,
-    facts: &MoveFacts,
-    store: Option<&Path>,
-    ledger: &Ledger,
-    trash_root: &Path,
-) -> Result<PathBuf, String> {
-    recheck(r, store)?;
-    let id = new_id();
-    if let Err(e) = ledger.append(&record(&id, r, facts, "started", None, "moving to Trash")) {
-        // Only an append that did write the row (into a new ledger, the
-        // unreadable one kept aside) lets the move go on.
-        if !e.to_string().starts_with(crate::ledger::KEPT_ASIDE) {
-            return Err(format!(
-                "swamp could not write its ledger ({e}), so nothing moved"
-            ));
-        }
-    }
-    let name = r
-        .path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("item");
-    let moved =
-        crate::fs_gate::destroy::trash_move(&r.path, trash_root, &format!("{name}-{}", now()))
-            .map_err(|e| format!("the move to Trash failed: {e}"))?;
-    let dest = moved.path().to_path_buf();
-    ledger
-        .replace(&record(
-            &id,
-            r,
-            facts,
-            "completed",
-            Some(dest.clone()),
-            "trashed",
-        ))
-        .map_err(|e| {
-            format!(
-                "moved to Trash at {}, but the final ledger row could not be written ({e}); the started row stays",
-                dest.display()
-            )
-        })?;
-    Ok(dest)
 }
 
 #[cfg(test)]

@@ -221,14 +221,14 @@ fn trash_reclaim(
     ledger: &Ledger,
     trash_root: &Path,
 ) -> Result<Outcome> {
-    let facts = swamp_core::reclaim_trash::MoveFacts {
+    let facts = swamp_core::actions::ReclaimMoveFacts {
         label: unit.label.clone(),
         bytes: unit.bytes,
         observed_at: unit.observed_at,
         warnings: unit.warnings.clone(),
         category: mark.category.clone(),
     };
-    swamp_core::reclaim_trash::trash(
+    swamp_core::actions::trash_reclaim(
         &mark.reviewed,
         &facts,
         mark.store.as_deref(),

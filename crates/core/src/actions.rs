@@ -1413,6 +1413,100 @@ pub fn trash_cargo_group(
     crate::cargo_cleanup::move_group(group, trash)
 }
 
+/// The facts of one marked row the ledger keeps beside the move.
+#[derive(Debug, Clone)]
+pub struct ReclaimMoveFacts {
+    pub label: String,
+    pub bytes: u64,
+    pub observed_at: u64,
+    pub warnings: Vec<String>,
+    pub category: String,
+}
+
+fn reclaim_record(
+    id: &str,
+    r: &crate::reclaim_trash::Reviewed,
+    facts: &ReclaimMoveFacts,
+    outcome: &str,
+    recovery: Option<PathBuf>,
+    state: &str,
+) -> crate::ledger::ActionRecord {
+    crate::ledger::ActionRecord {
+        id: id.to_string(),
+        verb: crate::ledger::Verb::Delete,
+        entity_id: crate::entities::id_for(&r.path.display().to_string()),
+        evidence: vec![
+            crate::ledger::LedgerFact::new("label", &facts.label),
+            crate::ledger::LedgerFact::new("bytes", facts.bytes),
+            crate::ledger::LedgerFact::new("observed_at", facts.observed_at),
+            crate::ledger::LedgerFact::new("warnings_shown", facts.warnings.join("; ")),
+            crate::ledger::LedgerFact::new("reclaim_category", &facts.category),
+            crate::ledger::LedgerFact::new("canonical", r.canonical.display()),
+        ],
+        grant_id: crate::ledger::NO_GRANT.to_string(),
+        actor: "human:tui".to_string(),
+        outcome: outcome.to_string(),
+        recovery_location: recovery,
+        measured_free_space_delta: None,
+        observed_path_state: Some(state.to_string()),
+        recorded_at: now(),
+    }
+}
+
+/// Moves one reviewed Reclaim/External row to the Trash: recheck, a `started`
+/// ledger row, the move, the final row. Returns where it went. A started
+/// row that cannot be written means nothing moved.
+pub fn trash_reclaim(
+    r: &crate::reclaim_trash::Reviewed,
+    facts: &ReclaimMoveFacts,
+    store: Option<&Path>,
+    ledger: &crate::ledger::Ledger,
+    trash_root: &Path,
+) -> Result<PathBuf, String> {
+    crate::reclaim_trash::recheck(r, store)?;
+    let id = crate::entities::new_id();
+    if let Err(e) = ledger.append(&reclaim_record(
+        &id,
+        r,
+        facts,
+        "started",
+        None,
+        "moving to Trash",
+    )) {
+        // Only an append that did write the row (into a new ledger, the
+        // unreadable one kept aside) lets the move go on.
+        if !crate::ledger::wrote_into_new_ledger(&e) {
+            return Err(format!(
+                "swamp could not write its ledger ({e}), so nothing moved"
+            ));
+        }
+    }
+    let name = r
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("item");
+    let moved = fs_gate::destroy::trash_move(&r.path, trash_root, &format!("{name}-{}", now()))
+        .map_err(|e| format!("the move to Trash failed: {e}"))?;
+    let dest = moved.path().to_path_buf();
+    ledger
+        .replace(&reclaim_record(
+            &id,
+            r,
+            facts,
+            "completed",
+            Some(dest.clone()),
+            "trashed",
+        ))
+        .map_err(|e| {
+            format!(
+                "moved to Trash at {}, but the final ledger row could not be written ({e}); the started row stays",
+                dest.display()
+            )
+        })?;
+    Ok(dest)
+}
+
 /// The Trash root `fs_gate::destroy::trash_move`/`Envelope::open` write
 /// into: `~/.Trash` on macOS (a rename target directly); on Linux, the
 /// freedesktop home trash (`$XDG_DATA_HOME/Trash`, defaulting to
