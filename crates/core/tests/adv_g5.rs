@@ -688,3 +688,30 @@ fn adv_write_tool_remove_row_into_store_copy() {
     assert!(out.recorded.is_ok());
     assert_eq!(ledger.all().unwrap().len(), before + 1);
 }
+
+/// Attack 6: DEVELOPER_DIR is passed through to `xcrun` (TOOL_ENV_PASSTHROUGH).
+/// xcrun runs `$DEVELOPER_DIR/usr/bin/simctl`, so the binary that actually
+/// deletes the runtime is chosen by the environment and never passes
+/// swamp's owner/permission check (the ledger records /usr/bin/xcrun).
+/// Tempting wrong patch: "the user set it, so keep it". A DEVELOPER_DIR
+/// that is world-writable (or not an Xcode developer dir) must be dropped
+/// or refuse.
+#[test]
+fn adv_untrusted_developer_dir_never_reaches_xcrun() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    let evil = sb.root.join("evil");
+    fs::create_dir_all(evil.join("usr/bin")).unwrap();
+    fs::set_permissions(&evil, fs::Permissions::from_mode(0o777)).unwrap();
+    let host = sb.host().with_parent_env(&[("DEVELOPER_DIR", evil.to_str().unwrap())]);
+    let bin = ToolResolver::sandboxed(&sb.root)
+        .with_parent_env(vec![("DEVELOPER_DIR".into(), evil.clone().into())])
+        .resolve(Program::Xcrun)
+        .unwrap();
+    let _ = host;
+    assert!(
+        bin.env_value("DEVELOPER_DIR").is_none(),
+        "a world-writable DEVELOPER_DIR ({}) is handed to xcrun",
+        evil.display()
+    );
+}
