@@ -255,61 +255,52 @@ pub(super) fn review(host: &Host, bin: &ToolBin, target: &Target) -> Result<Prev
             "Manage it in Xcode > Settings > Components.",
         ));
     }
+    let mut warnings: Vec<String> = Vec::new();
     if !matches!(rt.state.as_str(), "Ready" | "Unusable") {
-        return Err(Refusal::new(
-            format!(
-                "simctl reports {label} as {}; swamp removes only a Ready or Unusable runtime.",
-                rt.state
-            ),
-            "Wait for simctl to finish with it, then review again.",
+        warnings.push(format!(
+            "simctl reports {label} as {}, not Ready or Unusable: simctl may still be working with it.",
+            rt.state
         ));
     }
+    // Which simulators use this runtime: read from simctl, and said when
+    // it cannot be.
+    let mut devices: Vec<Device> = Vec::new();
     if rt.runtime_id.is_empty() {
-        return Err(Refusal::new(
-            format!(
-                "simctl lists {label} without a runtime identifier, so swamp cannot tell which \
-                 simulators use it."
-            ),
-            "Manage it in Xcode > Settings > Components.",
+        warnings.push(format!(
+            "simctl lists {label} without a runtime identifier, so swamp cannot tell which simulators use it."
         ));
-    }
-    let mut devices = list_devices(bin, &rt.runtime_id)?;
-    let mut warnings = Vec::new();
-    match previews_devices(bin, &rt.runtime_id) {
-        Some(p) => devices.extend(p),
-        None => warnings.push(
-            "Xcode Previews and other device sets are not visible to swamp; simctl may shut \
-             down a simulator there."
-                .to_string(),
-        ),
+    } else {
+        match list_devices(bin, &rt.runtime_id) {
+            Ok(list) => devices = list,
+            Err(why) => warnings.push(format!(
+                "simctl's device list could not be read ({}): any simulator that uses this runtime stops working without it.",
+                why.reason.trim_end_matches('.')
+            )),
+        }
+        match previews_devices(bin, &rt.runtime_id) {
+            Some(p) => devices.extend(p),
+            None => warnings.push(
+                "Xcode Previews and other device sets are not visible to swamp; simctl may shut down a simulator there."
+                    .to_string(),
+            ),
+        }
     }
     // Only a device simctl reports exactly `Shutdown` is known not to be
-    // running: Booted, Booting, Shutting Down, a missing or unknown state
-    // all refuse (simctl would shut it down and delete anyway).
+    // running; anything else (Booted, Booting, Shutting Down, a missing or
+    // unknown state) is said, because simctl shuts it down and deletes
+    // anyway.
     let running: Vec<String> = devices
         .iter()
         .filter(|d| d.state != "Shutdown")
         .map(|d| format!("{} ({})", d.name, d.state))
         .collect();
     if !running.is_empty() {
-        return Err(Refusal::new(
-            format!(
-                "Simulator {} is not shut down on this runtime; simctl would shut it down and \
-                 delete anyway.",
-                running.join(", ")
-            ),
-            "Shut it down in Simulator, then review again.",
+        warnings.push(format!(
+            "Simulator {} is not shut down on this runtime: simctl shuts it down and deletes anyway.",
+            running.join(", ")
         ));
     }
-    let Some(mount) = rt.mount_path.clone() else {
-        return Err(Refusal::new(
-            format!(
-                "simctl reports no mount path for {label}, so open files cannot be checked. \
-                 Swamp does not remove without that check."
-            ),
-            "Manage it in Xcode > Settings > Components.",
-        ));
-    };
+    let mount = rt.mount_path.clone();
     let exec: Vec<OsString> = ["simctl", "runtime", "delete", uuid.as_str()]
         .iter()
         .map(OsString::from)
@@ -354,7 +345,16 @@ pub(super) fn review(host: &Host, bin: &ToolBin, target: &Target) -> Result<Prev
         )
         .with_output(shown));
     }
-    let open_files = super::open_files_fact(host, &[mount], MANAGER_OWN, Manager::Simulator)?;
+    let (open_files, open_warning) = match mount {
+        Some(mount) => super::open_files_fact(host, &[mount], MANAGER_OWN, Manager::Simulator),
+        None => (
+            "not checked (simctl reports no mount path)".to_string(),
+            Some(format!(
+                "simctl reports no mount path for {label}, so open files could not be checked."
+            )),
+        ),
+    };
+    warnings.extend(open_warning);
     if !devices.is_empty() {
         let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
         let shown_names = if names.len() > 6 {
@@ -381,6 +381,7 @@ pub(super) fn review(host: &Host, bin: &ToolBin, target: &Target) -> Result<Prev
     let state = vec![
         (format!("simctl's entry for {uuid}"), rt.fact()),
         (format!("devices on {}", rt.runtime_id), devices_fact),
+        ("open files".to_string(), open_files.clone()),
     ];
     let platform = label.split(' ').next().unwrap_or("iOS").to_string();
     Ok(Preview {

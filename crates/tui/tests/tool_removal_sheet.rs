@@ -125,6 +125,15 @@ if [ -f "$S/state/$key.code" ]; then exit "$(cat "$S/state/$key.code")"; fi
                  mise go@1.23.5     ✓ uninstalled (dry-run)\n"
             ),
         );
+        // The global config's node: mise's own dry run names it too.
+        fs::create_dir_all(self.install("node", "24.14.1")).unwrap();
+        self.answer(
+            "-C / uninstall --dry-run node@24.14.1",
+            "",
+            "mise node@24.14.1       uninstall\n\
+             mise node@24.14.1       remove ~/.local/share/mise/installs/node/24.14.1\n\
+             mise node@24.14.1     ✓ uninstalled (dry-run)\n",
+        );
         let after = self.ls(false);
         fs::write(self.root.join("state/ls_after.json"), after).unwrap();
         fs::write(
@@ -267,24 +276,32 @@ fn choose(app: &mut App, label: &str) {
     }
 }
 
-/// Tempting wrong patch: "treat a mise install like any other directory
-/// and mark it for Trash". Space refuses with the reason; Backspace opens
-/// the manager's own list and marks nothing.
+/// Tempting wrong patch: Space on a manager-removed row still answers
+/// "never moved to Trash" (the person cannot move what they see), or
+/// Backspace stops opening the manager's own list. Space marks the folder
+/// for the plain Trash move; Backspace on an unmarked row opens the list.
 #[test]
-fn the_mise_row_opens_the_managers_list_and_never_marks_for_trash() {
+fn the_mise_row_marks_for_trash_and_backspace_still_opens_the_managers_list() {
     let f = Fakes::new();
     f.mise(0);
     let mut app = f.app();
     handle_key(&mut app, KeyCode::Char(' '));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.operation.is_some() {
+        assert!(Instant::now() < deadline);
+        app.poll_operation();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(app.marked.len(), 1, "{:?}", app.refusal_active());
+    assert!(f.calls().is_empty(), "Space starts no manager command");
+    // Space again takes the mark back; Backspace then opens the list.
+    handle_key(&mut app, KeyCode::Char(' '));
+    while app.operation.is_some() {
+        assert!(Instant::now() < deadline);
+        app.poll_operation();
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert!(app.marked.is_empty());
-    assert!(
-        app.refusal_active()
-            .unwrap_or("")
-            .contains("never moved to Trash"),
-        "{:?}",
-        app.refusal_active()
-    );
-    assert!(f.calls().is_empty(), "Space starts nothing");
     handle_key(&mut app, KeyCode::Backspace);
     wait(&mut app);
     assert!(app.marked.is_empty());
@@ -350,11 +367,12 @@ fn the_confirm_rows_never_move_and_the_keys_stay_visible() {
     }
 }
 
-/// Tempting wrong patch: "the dry run exited 0, so show the confirm".
-/// The global node is refused with the reason and the next step, and Esc
-/// goes back to the list with nothing run.
+/// Tempting wrong patch: a version a config requests is refused (the
+/// person cannot decide), or it gets the confirm with no word about the
+/// request. The global node shows the confirm with the request as a
+/// warning; nothing ran at review, and Esc goes back with nothing run.
 #[test]
-fn a_refusal_shows_reason_and_next_step_and_runs_nothing() {
+fn a_config_request_is_a_warning_on_the_confirm_and_runs_nothing() {
     let f = Fakes::new();
     f.mise(0);
     let mut app = f.app();
@@ -363,20 +381,12 @@ fn a_refusal_shows_reason_and_next_step_and_runs_nothing() {
     wait(&mut app);
     for (w, h) in [(80u16, 24u16), (120, 30)] {
         let r = rows(&mut app, w, h);
-        row_of(
-            &r,
-            "Swamp will not run this removal (node@24.14.1). Nothing ran.",
-        );
-        row_of(&r, "Reason: node@24.14.1 is requested by");
-        row_of(&r, "Next: Edit that file or run");
-        assert!(r[h as usize - 3].contains("Esc back"));
+        row_of(&r, "Remove node@24.14.1 with mise, permanently.");
+        row_of(&r, "Warning: node@24.14.1 is requested by");
+        assert!(r[h as usize - 3].contains("Y remove (cannot be undone) · Esc cancel"));
         assert_plain(&r);
     }
     handle_key(&mut app, KeyCode::Esc);
-    assert!(matches!(
-        app.tool_sheet.as_ref().unwrap().stage,
-        Stage::Choose
-    ));
     assert!(
         f.calls()
             .iter()
@@ -513,7 +523,7 @@ fn simulator_app(f: &Fakes, state: &str) -> App {
 /// Owner decision 5 on screen: unbooted devices are counted and named on
 /// the confirm (the confirm is still required); a booted one refuses.
 #[test]
-fn simulator_runtime_confirm_names_devices_and_a_booted_one_refuses() {
+fn simulator_runtime_confirm_names_devices_and_a_booted_one_is_a_warning() {
     let f = Fakes::new();
     let mut app = simulator_app(&f, "Shutdown");
     choose(&mut app, "iOS 26.2 (23C54)");
@@ -536,11 +546,14 @@ fn simulator_runtime_confirm_names_devices_and_a_booted_one_refuses() {
     for (w, h) in [(80u16, 24u16), (120, 30)] {
         let r = rows(&mut app, w, h);
         row_of(&r, "iPhone 17 Pro (Booted) is not shut down");
-        row_of(&r, "Next: Shut it down in Simulator");
+        assert!(r[h as usize - 3].contains("Y remove (cannot be undone)"));
         assert_plain(&r);
     }
+    // Review ran the dry run; nothing deleted anything.
     assert!(
-        f.calls().iter().all(|c| !c.iter().any(|w| w == "delete")),
+        f.calls()
+            .iter()
+            .all(|c| !c.iter().any(|w| w == "delete") || c.iter().any(|w| w == "--dry-run")),
         "{:?}",
         f.calls()
     );

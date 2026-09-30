@@ -564,6 +564,44 @@ pub struct NestedArtifact {
 }
 
 impl NestedArtifact {
+    /// What the adapter that identified this unit says about removing it,
+    /// as plain facts for a confirm: the reason it offers no cleanup rule,
+    /// what it could not read, who may be writing, what hardlinks share.
+    /// Not a gate: the person may move any real path to Trash, and what
+    /// is listed here is what swamp does not establish about it.
+    pub fn advisories(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let by = self
+            .adapter
+            .as_deref()
+            .map(|a| format!(" (the {a} adapter)"))
+            .unwrap_or_default();
+        match &self.action {
+            NestedActionCapability::TrashPath => {}
+            NestedActionCapability::InspectionOnly => out.push(format!(
+                "swamp identifies this{by} but has no cleanup rule for it: what else uses it is not established"
+            )),
+            NestedActionCapability::Unsupported { reason } => {
+                out.push(format!("swamp's cleanup rule{by} does not cover it: {reason}"))
+            }
+        }
+        if !self.coverage.supported && !self.coverage.limits.is_empty() {
+            out.push("its layout is not one swamp identifies".to_string());
+        }
+        out.extend(self.coverage.limits.iter().cloned());
+        if !self.coverage.complete {
+            out.push("its measurement is incomplete: the bytes are a lower bound".to_string());
+        }
+        if self.writer_lock.is_some() {
+            out.push("a lock file is present: the tool may be writing here now".to_string());
+        }
+        if self.membership == Membership::SharedHardlink {
+            out.push("it has hardlinks: space is freed only when every link is gone".to_string());
+        }
+        out.dedup();
+        out
+    }
+
     pub fn storage_id(root: &Path, relative: &str) -> String {
         use std::os::unix::ffi::OsStrExt;
         let root = crate::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());

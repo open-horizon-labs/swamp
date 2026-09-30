@@ -1077,7 +1077,7 @@ fn render_container_section(
         );
         let _ = writeln!(
             section,
-            "{indent}  {:<24} {} item(s), {size}, {oldest}{unknowns}{}; inspection only",
+            "{indent}  {:<24} {} item(s), {size}, {oldest}{unknowns}{}; no cleanup rule",
             "",
             f.count,
             if f.complete {
@@ -1142,7 +1142,7 @@ fn render_buildkit_records(report: &Report) -> String {
     let _ = writeln!(
         out,
         "\nBuildKit build cache, as the daemon reports it (logical sizes, each record's own; \
-         inspection only):"
+         no cleanup rule):"
     );
     for units in builders.values() {
         if let Some((_, section)) = render_container_section(units, report.observed_at, "") {

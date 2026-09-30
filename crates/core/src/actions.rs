@@ -310,34 +310,48 @@ pub fn propose(
             continue;
         }
         if let Some(nested) = report.nested_artifacts.iter().find(|u| &u.path == p) {
-            if nested.action == crate::artifact::NestedActionCapability::TrashPath {
+            // One selected path to Trash, under the checkout that owns it.
+            // What the adapter could not establish about it is a warning
+            // on the confirm (`advisories`), never a reason it cannot be
+            // marked: the human decides, swamp says what it does not know.
+            let single = |extra: Vec<String>, must_exist: bool| -> Result<PlanUnit, String> {
+                if must_exist && fs_gate::symlink_metadata(p).is_err() {
+                    return Err("the path is gone or cannot be read".into());
+                }
                 let owner = report
                     .projects
                     .iter()
                     .flat_map(|project| project.worktrees.iter().map(move |wt| (project, wt)))
                     .filter(|(_, wt)| p != &wt.path && crate::scope::under(p, &wt.path))
                     .max_by_key(|(_, wt)| wt.path.components().count());
-                if let Some((project, wt)) = owner {
-                    let mut unit = unit_from_worktree(project, wt);
-                    unit.path = p.clone();
-                    unit.rel_path = crate::artifact::relative_path(&wt.path, p);
-                    unit.kind = ArtifactKind::BuildOutput;
-                    unit.verb = "delete".into();
-                    unit.bytes = nested.bytes;
-                    unit.growth_bytes = nested.growth_bytes;
-                    unit.recovery = nested
-                        .consequence
-                        .clone()
-                        .unwrap_or_else(|| "restore from Trash".into());
-                    unit.warnings = vec![unit.recovery.clone(),
-                        "moves only this selected path to Trash; stop its build before removing it; allocation is not guaranteed freed space".into()];
-                    unit.evidence = nested.decision_evidence.clone();
-                    units.push(unit);
-                } else {
-                    refused.push(Refused {
+                let Some((project, wt)) = owner else {
+                    return Err("no owning checkout for this project-local action".into());
+                };
+                let mut unit = unit_from_worktree(project, wt);
+                unit.path = p.clone();
+                unit.rel_path = crate::artifact::relative_path(&wt.path, p);
+                unit.kind = ArtifactKind::BuildOutput;
+                unit.verb = "delete".into();
+                unit.bytes = nested.bytes;
+                unit.growth_bytes = nested.growth_bytes;
+                unit.recovery = nested
+                    .consequence
+                    .clone()
+                    .unwrap_or_else(|| "restore from Trash".into());
+                unit.warnings = vec![unit.recovery.clone(),
+                    "moves only this selected path to Trash; stop its build before removing it; allocation is not guaranteed freed space".into()];
+                unit.warnings.extend(nested.advisories());
+                unit.warnings.extend(extra);
+                unit.evidence = nested.decision_evidence.clone();
+                Ok(unit)
+            };
+            if nested.action == crate::artifact::NestedActionCapability::TrashPath {
+                match single(Vec::new(), false) {
+                    Ok(unit) => units.push(unit),
+                    Err(cause) => refused.push(Refused {
                         path: p.clone(),
-                        cause: "no owning checkout for this project-local action".into(),
-                    });
+                        cause,
+                    }),
                 }
                 continue;
             }
@@ -352,49 +366,66 @@ pub fn propose(
                 .find(|(_, wt)| {
                     container.is_some_and(|c| wt.artifacts.iter().any(|a| a.path == c.path))
                 });
-            if let (Some(container), Some((project, wt))) = (container, owner) {
-                match crate::cargo_cleanup::propose(&report.nested_artifacts, p, &container.path) {
-                    Ok(group) => {
-                        let row = wt
-                            .artifacts
-                            .iter()
-                            .find(|a| a.path == container.path)
-                            .unwrap();
-                        let mut unit = unit_from_row(project, wt, row);
-                        unit.path = p.clone();
-                        unit.rel_path = crate::scope::relative_to(p, &wt.path)
-                            .unwrap_or(p)
-                            .display()
-                            .to_string();
-                        unit.bytes = group.members.iter().map(|m| m.bytes).sum();
-                        unit.dedup_stale = false; // selected members were freshly measured
-                        unit.growth_bytes = nested.growth_bytes;
-                        unit.verb = "cargo-group".into();
-                        unit.recovery = "Trash envelope with restore.json; rebuilding may require unavailable source/toolchains".into();
-                        unit.warnings = vec!["exact selected build, NOT proven obsolete; stop non-Cargo writers; advisory Cargo lock held during move".into()];
-                        unit.warnings.push("size is selected allocation, not promised free space; moving to Trash does not free these bytes immediately".into());
-                        if group.shared_storage {
-                            unit.warnings.push("selected files have hardlinks; any links outside the selection remain intact and reclaimable space is unknown".into());
-                        }
-                        unit.warnings.extend(
-                            group
-                                .members
-                                .iter()
-                                .map(|m| format!("member: {}", m.path.display())),
-                        );
-                        unit.cargo_group = Some(group);
-                        units.push(unit);
-                    }
-                    Err(e) => refused.push(Refused {
-                        path: p.clone(),
-                        cause: e.to_string(),
-                    }),
+            // A Cargo group (companions moved together) is offered when
+            // Cargo's own rules cover the path; when they do not, the
+            // path itself goes to Trash, and the rule that did not cover
+            // it is a line on the confirm.
+            let group = match (container, owner) {
+                (Some(container), Some(_)) => {
+                    crate::cargo_cleanup::propose(&report.nested_artifacts, p, &container.path)
+                        .map_err(|e| e.to_string())
                 }
-            } else {
-                refused.push(Refused {
+                _ => Err("no observed owning container".to_string()),
+            };
+            match (group, container, owner) {
+                (Ok(group), Some(container), Some((project, wt))) => {
+                    let row = wt
+                        .artifacts
+                        .iter()
+                        .find(|a| a.path == container.path)
+                        .unwrap();
+                    let mut unit = unit_from_row(project, wt, row);
+                    unit.path = p.clone();
+                    unit.rel_path = crate::scope::relative_to(p, &wt.path)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string();
+                    unit.bytes = group.members.iter().map(|m| m.bytes).sum();
+                    unit.dedup_stale = false; // selected members were freshly measured
+                    unit.growth_bytes = nested.growth_bytes;
+                    unit.verb = "cargo-group".into();
+                    unit.recovery = "Trash envelope with restore.json; rebuilding may require unavailable source/toolchains".into();
+                    unit.warnings = vec!["exact selected build, NOT proven obsolete; stop non-Cargo writers; advisory Cargo lock held during move".into()];
+                    unit.warnings.push("size is selected allocation, not promised free space; moving to Trash does not free these bytes immediately".into());
+                    if group.shared_storage {
+                        unit.warnings.push("selected files have hardlinks; any links outside the selection remain intact and reclaimable space is unknown".into());
+                    }
+                    unit.warnings.extend(
+                        group
+                            .members
+                            .iter()
+                            .map(|m| format!("member: {}", m.path.display())),
+                    );
+                    unit.cargo_group = Some(group);
+                    units.push(unit);
+                }
+                (Err(why), _, _) => match single(
+                    vec![format!(
+                        "swamp's selection rules for this build folder do not cover it ({}): only this path moves, companions are not included",
+                        why.replace("inspection-only", "no cleanup rule")
+                    )],
+                    true,
+                ) {
+                    Ok(unit) => units.push(unit),
+                    Err(cause) => refused.push(Refused {
+                        path: p.clone(),
+                        cause,
+                    }),
+                },
+                _ => refused.push(Refused {
                     path: p.clone(),
                     cause: "nested artifact has no observed owning container".into(),
-                });
+                }),
             }
             continue;
         }
@@ -498,18 +529,35 @@ fn propose_refusing_protected(
     store_dir: Option<&Path>,
     protected: &[PathBuf],
 ) -> Result<Vec<PlanUnit>> {
-    let units = propose(report, filter, paths, proposed_by)?;
+    let mut units = propose(report, filter, paths, proposed_by)?;
     // The caller's list is a convenience, never the authority. The PR
     // #123 review's counterexample: an unreadable `agent_protect.json`
     // reached this function as an *empty* list through the CLI's
     // `.unwrap_or_default()`, so a protected unit became plannable
     // exactly when protection state broke. When the report knows which
-    // store it came from, protection is reloaded here and an error is a
-    // refusal (`.oh/guardrails/protection-fails-closed.md`).
+    // store it came from, protection is reloaded here, and a list that
+    // cannot be read is unknown, never empty: it is a warning on every
+    // unit (`.oh/guardrails/protection-fails-closed.md`).
+    let mut unread = None;
     let live = match store_dir {
-        Some(dir) => crate::protection::load_protect(dir)?,
+        Some(dir) => match crate::protection::load_protect(dir) {
+            Ok(list) => list,
+            // Unknown, never an empty list: said on the confirm, where the
+            // person's single confirm decides (2026-09-30).
+            Err(e) => {
+                unread = Some(e.to_string());
+                crate::protection::ProtectList::empty()
+            }
+        },
         None => crate::protection::ProtectList::empty(),
     };
+    if let Some(why) = &unread {
+        for u in &mut units {
+            u.warnings.push(format!(
+                "could not read your protect list ({why}): your keep marks were not checked for this path"
+            ));
+        }
+    }
     let protected = live.including(protected);
     if protected.is_empty() {
         return Ok(units);
@@ -522,7 +570,7 @@ fn propose_refusing_protected(
         if protected.conflict(&u.path).is_some() {
             refused.push(Refused {
                 path: u.path.clone(),
-                cause: "human-protected path (swamp protect); remove protection first if this unit should be actionable".into(),
+                cause: "protected by you (swamp protect); `swamp protect remove <path>` takes the mark off".into(),
             });
         } else {
             kept.push(u);
@@ -948,7 +996,22 @@ fn is_sqlite_like(path: &Path) -> bool {
 /// unit, or `None` if it can be listed for the Trash. Occupancy is never
 /// checked here: it is shown as a fact at mark/confirm time, never a
 /// veto against building the row at all.
-fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
+///
+/// Two readers. A plan made for an agent or a script (`for_human` false)
+/// keeps every rule: a tool that may not act on its own decision does not
+/// move credentials, config, a database file or a category nobody verified.
+/// A plan made for the person at the keyboard (the TUI) refuses none of
+/// those: what they see and own they may move to Trash, and each of those
+/// facts is a warning on the confirm (`agent_advisories`). What still
+/// refuses a person is their own `swamp protect` mark.
+fn agent_refusal(u: &crate::agents::AgentUnit, for_human: bool) -> Option<String> {
+    if for_human {
+        return u
+            .protect_reason
+            .as_deref()
+            .filter(|r| r.contains("`swamp protect`"))
+            .map(|r| format!("protected by you: {r}"));
+    }
     if u.protected {
         let reason = u
             .protect_reason
@@ -973,6 +1036,43 @@ fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
     None
 }
 
+/// What a person is told about a unit the agent-facing plan would refuse:
+/// plain facts, not a veto.
+fn agent_advisories(u: &crate::agents::AgentUnit) -> Vec<String> {
+    let mut out = Vec::new();
+    if u.protected {
+        let reason = u
+            .protect_reason
+            .clone()
+            .unwrap_or_else(|| format!("{} is kept by default", u.category.label()));
+        out.push(format!(
+            "swamp keeps this by default ({reason}): the tool may stop working, sign out or lose settings until it is restored from Trash"
+        ));
+    }
+    if u.action == crate::agents::AgentActionCapability::None {
+        out.push(format!(
+            "swamp has no rule for {} and no record of what getting it back costs; only this exact path moves",
+            u.category.label()
+        ));
+    }
+    if u.category == crate::agents::AgentCategory::ManagedWorktrees {
+        out.push(
+            "a managed worktree is a real linked git worktree: changes and unpushed commits in it are in it, and swamp has not checked them"
+                .to_string(),
+        );
+    }
+    let db = std::iter::once(&u.path)
+        .chain(u.members.iter().map(|m| &m.path))
+        .any(|p| is_sqlite_like(p));
+    if db {
+        out.push(
+            "it includes a database file (SQLite, WAL or SHM): moving one of them alone can lose recent writes or leave the database unreadable; close the tool first"
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// Builds a list of Trash-able units from selected `AgentUnit`s (#101).
 /// Every unit that reaches the list carries `agent_meta`; anything
 /// `agent_refusal` names is refused here, never silently downgraded.
@@ -981,18 +1081,44 @@ pub fn propose_agents(
     paths: &[PathBuf],
     proposed_by: &str,
 ) -> Result<Vec<PlanUnit>> {
+    propose_agents_for(units, paths, proposed_by, false)
+}
+
+/// [`propose_agents`] for the person at the keyboard: only their own
+/// `swamp protect` mark refuses; every other rule the agent-facing plan
+/// keeps is a warning on the confirm (see [`agent_refusal`]).
+pub fn propose_agents_for_human(
+    units: &[crate::agents::AgentUnit],
+    paths: &[PathBuf],
+    proposed_by: &str,
+) -> Result<Vec<PlanUnit>> {
+    propose_agents_for(units, paths, proposed_by, true)
+}
+
+fn propose_agents_for(
+    units: &[crate::agents::AgentUnit],
+    paths: &[PathBuf],
+    proposed_by: &str,
+    for_human: bool,
+) -> Result<Vec<PlanUnit>> {
     let mut plan_units = Vec::new();
     let mut refused = Vec::new();
     for u in units {
         if !paths.is_empty() && !paths.iter().any(|p| p == &u.path) {
             continue;
         }
-        match agent_refusal(u) {
+        match agent_refusal(u, for_human) {
             Some(cause) => refused.push(Refused {
                 path: u.path.clone(),
                 cause,
             }),
-            None => plan_units.push(unit_from_agent(u)),
+            None => {
+                let mut unit = unit_from_agent(u);
+                if for_human {
+                    unit.warnings.extend(agent_advisories(u));
+                }
+                plan_units.push(unit)
+            }
         }
     }
     for p in paths {
@@ -1142,10 +1268,14 @@ fn agent_single_path_consequence(category: crate::agents::AgentCategory) -> &'st
 /// pressing Enter.
 pub fn trash_agent_cache(path: &Path, trash: &Path, at: u64) -> Result<(PathBuf, u64)> {
     let meta = fs_gate::symlink_metadata(path).context("path no longer exists")?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        bail!("path is no longer a directory (or is a symlink)");
+    if meta.file_type().is_symlink() || !(meta.is_dir() || meta.is_file()) {
+        bail!("path is no longer a folder or file (or is a symlink)");
     }
-    let (bytes, _mtime, _truncated) = crate::agents::folded_bytes(path, 2_000_000);
+    let bytes = if meta.is_dir() {
+        crate::agents::folded_bytes(path, 2_000_000).0
+    } else {
+        meta.len()
+    };
     let basename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1411,6 +1541,133 @@ pub fn trash_cargo_group(
     trash: &Path,
 ) -> Result<PathBuf> {
     crate::cargo_cleanup::move_group(group, trash)
+}
+
+/// The facts of one marked row the ledger keeps beside the move.
+#[derive(Debug, Clone)]
+pub struct ReclaimMoveFacts {
+    pub label: String,
+    pub bytes: u64,
+    pub observed_at: u64,
+    pub warnings: Vec<String>,
+    pub category: String,
+}
+
+fn reclaim_record(
+    id: &str,
+    r: &crate::reclaim_trash::Reviewed,
+    facts: &ReclaimMoveFacts,
+    outcome: &str,
+    recovery: Option<PathBuf>,
+    state: &str,
+) -> crate::ledger::ActionRecord {
+    crate::ledger::ActionRecord {
+        id: id.to_string(),
+        verb: crate::ledger::Verb::Delete,
+        entity_id: crate::entities::id_for(&r.path.display().to_string()),
+        evidence: vec![
+            crate::ledger::LedgerFact::new("label", crate::reclaim_trash::plain(&facts.label)),
+            crate::ledger::LedgerFact::new("bytes", facts.bytes),
+            crate::ledger::LedgerFact::new("observed_at", facts.observed_at),
+            crate::ledger::LedgerFact::new(
+                "warnings_shown",
+                crate::reclaim_trash::plain(&facts.warnings.join("; ")),
+            ),
+            crate::ledger::LedgerFact::new("reclaim_category", &facts.category),
+            crate::ledger::LedgerFact::new(
+                "canonical",
+                crate::reclaim_trash::plain(&r.canonical.display().to_string()),
+            ),
+        ],
+        grant_id: crate::ledger::NO_GRANT.to_string(),
+        actor: "human:tui".to_string(),
+        outcome: outcome.to_string(),
+        recovery_location: recovery,
+        measured_free_space_delta: None,
+        observed_path_state: Some(state.to_string()),
+        recorded_at: now(),
+    }
+}
+
+/// Moves one reviewed Reclaim/External row to the Trash: recheck, a `started`
+/// ledger row, the move, the final row. Returns where it went. A started
+/// row that cannot be written means nothing moved.
+pub fn trash_reclaim(
+    r: &crate::reclaim_trash::Reviewed,
+    facts: &ReclaimMoveFacts,
+    store: Option<&Path>,
+    ledger: &crate::ledger::Ledger,
+    trash_root: &Path,
+) -> Result<PathBuf, String> {
+    crate::reclaim_trash::recheck(r, store)?;
+    let id = crate::entities::new_id();
+    if let Err(e) = ledger.append(&reclaim_record(
+        &id,
+        r,
+        facts,
+        "started",
+        None,
+        "moving to Trash",
+    )) {
+        // Only an append that did write the row (into a new ledger, the
+        // unreadable one kept aside) lets the move go on.
+        if !crate::ledger::wrote_into_new_ledger(&e) {
+            return Err(format!(
+                "swamp could not write its ledger ({e}), so nothing moved"
+            ));
+        }
+    }
+    let name = r
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("item");
+    // The record id keeps two folders with the same name, moved in one
+    // confirm, from colliding on `<name>-<second>`.
+    let unique: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let moved = match fs_gate::destroy::trash_move(
+        &r.path,
+        trash_root,
+        &format!("{name}-{}-{unique}", now()),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            // A move that did not happen must not read as one in progress.
+            // The whole chain, so the OS error (Permission denied, ...) is
+            // the reason, not only the outermost context.
+            let why = format!("the move to Trash failed: {e:#}");
+            let _ = ledger.replace(&reclaim_record(
+                &id,
+                r,
+                facts,
+                &format!("failed:{why}"),
+                None,
+                "not moved",
+            ));
+            return Err(why);
+        }
+    };
+    let dest = moved.path().to_path_buf();
+    ledger
+        .replace(&reclaim_record(
+            &id,
+            r,
+            facts,
+            "completed",
+            Some(dest.clone()),
+            "trashed",
+        ))
+        .map_err(|e| {
+            format!(
+                "moved to Trash at {}, but the final ledger row could not be written ({e}); the started row stays",
+                dest.display()
+            )
+        })?;
+    Ok(dest)
 }
 
 /// The Trash root `fs_gate::destroy::trash_move`/`Envelope::open` write

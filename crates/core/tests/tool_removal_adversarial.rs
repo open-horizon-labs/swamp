@@ -312,12 +312,12 @@ fn preview_text(p: &Preview) -> String {
     all.join("\n")
 }
 
-/// Tempting wrong patch: "trust `mise uninstall` to refuse a version a
-/// config asks for". mise's own dry run exits 0 for the global node; even
-/// with a fake prune that (wrongly) lists it, swamp refuses and names the
-/// global config.
+/// Tempting wrong patch: "trust `mise uninstall` to say a config asks for
+/// the version". mise's own dry run exits 0 for the global node. Swamp
+/// says so on the confirm (a warning, not a refusal: the person decides,
+/// 2026-09-30) and runs nothing at review; the removal still needs `Y`.
 #[test]
-fn global_config_version_refused_even_though_mise_dry_run_exits_0() {
+fn global_config_version_is_a_warning_even_though_mise_dry_run_exits_0() {
     let sb = Sandbox::new();
     sb.standard_mise();
     sb.answer(
@@ -326,21 +326,34 @@ fn global_config_version_refused_even_though_mise_dry_run_exits_0() {
         &sb.prune_text(&["go@1.23.5", "node@24.14.1"]),
         0,
     );
+    sb.answer(
+        "-C / uninstall --dry-run node@24.14.1",
+        "",
+        "mise node@24.14.1       uninstall\nmise node@24.14.1       remove ~/.local/share/mise/installs/node/24.14.1\nmise node@24.14.1     \u{2713} uninstalled (dry-run)\n",
+        0,
+    );
     let target = Target::MiseVersion {
         tool: "node".into(),
         version: "24.14.1".into(),
     };
-    let r = refused(tool_removal::review_target(&sb.host(), &target, &[]));
-    assert!(r.reason.contains("global config"), "{}", r.reason);
-    assert!(r.next.contains("mise unuse -g node"), "{}", r.next);
-    assert_refusal_plain(&r);
-    assert_eq!(sb.ran("-C / uninstall node@24.14.1"), 0);
+    let p = tool_removal::review_target(&sb.host(), &target, &[])
+        .unwrap_or_else(|r| panic!("a config request is a warning: {}", r.reason));
+    let w = p.warnings().join("\n");
+    assert!(w.contains("global config"), "{w}");
+    assert!(w.contains("mise unuse -g node"), "{w}");
+    assert_plain(&preview_text(&p));
+    assert_eq!(
+        sb.ran("-C / uninstall node@24.14.1"),
+        0,
+        "review runs nothing"
+    );
     assert_eq!(sb.ran("-C / prune --tools"), 0);
 }
 
 /// Tempting wrong patch: "`source: null` in `mise ls` means nothing asks
 /// for it". `mise ls` answers from its cwd; only mise's prune knows the
-/// configs it tracks, so a version prune does not list is refused.
+/// configs it tracks, so a version prune does not list carries a warning
+/// that mise does not report it as unneeded.
 #[test]
 fn source_null_from_cwd_is_not_no_consumer() {
     let sb = Sandbox::new();
@@ -351,13 +364,13 @@ fn source_null_from_cwd_is_not_no_consumer() {
         &sb.prune_text(&["java@temurin-17.0.20+101"]),
         0,
     );
-    let r = refused(tool_removal::review_target(&sb.host(), &go(), &[]));
-    assert!(
-        r.reason.contains("prune does not list go@1.23.5"),
-        "{}",
-        r.reason
-    );
-    assert_refusal_plain(&r);
+    sb.go_uninstall_removes(0);
+    let p = tool_removal::review_target(&sb.host(), &go(), &[])
+        .unwrap_or_else(|r| panic!("not in prune is a warning: {}", r.reason));
+    let w = p.warnings().join("\n");
+    assert!(w.contains("prune does not list go@1.23.5"), "{w}");
+    assert!(w.contains("does not report it as unneeded"), "{w}");
+    assert_plain(&w);
 }
 
 /// Tempting wrong patch: a bulk `mise prune` removal ("--tools is the
@@ -472,27 +485,23 @@ fn simctl_all_and_set_flags_are_never_an_operand() {
     );
 }
 
-/// Tempting wrong patch: "simctl handles booted simulators". It shuts
-/// them down and deletes anyway.
+/// Tempting wrong patch: "simctl handles booted simulators" (and so nothing
+/// is said). It shuts them down and deletes anyway: the confirm says so,
+/// and a device that boots after review is a changed confirm at `Y`.
 #[test]
-fn a_booted_simulator_refuses_its_runtime() {
+fn a_booted_simulator_is_a_warning_on_the_runtime_confirm() {
     let sb = Sandbox::new();
     sb.standard_simctl("Booted");
-    let r = refused(tool_removal::review_target(
-        &sb.host(),
-        &Target::SimRuntime { uuid: UUID.into() },
-        &[],
-    ));
-    assert!(
-        r.reason.contains("iPhone 17 Pro (Booted) is not shut down"),
-        "{}",
-        r.reason
-    );
-    assert!(r.next.contains("Shut it down"), "{}", r.next);
-    assert_refusal_plain(&r);
+    let p = tool_removal::review_target(&sb.host(), &Target::SimRuntime { uuid: UUID.into() }, &[])
+        .unwrap_or_else(|r| panic!("a booted simulator is a warning: {}", r.reason));
+    let w = p.warnings().join("\n");
+    assert!(w.contains("iPhone 17 Pro (Booted) is not shut down"), "{w}");
+    assert!(w.contains("shuts it down and deletes anyway"), "{w}");
+    assert_plain(&preview_text(&p));
     assert_eq!(
-        sb.ran(&format!("simctl runtime delete {UUID} --dry-run")),
-        0
+        sb.ran(&format!("simctl runtime delete {UUID}")),
+        0,
+        "review never deletes"
     );
 }
 
@@ -601,7 +610,7 @@ fn a_preview_gone_out_of_date_refuses_at_enter() {
     let Status::Refused(r) = &out.status else {
         panic!("expected a refusal: {}", out.line)
     };
-    assert!(r.reason.contains("Since review"), "{}", r.reason);
+    assert!(r.reason.contains("changed since review"), "{}", r.reason);
     assert_eq!(sb.ran("-C / uninstall go@1.23.5"), 0);
     assert!(sb.install_dir("go", "1.23.5").exists());
     let rec = sb.ledger().all().unwrap();
@@ -630,26 +639,33 @@ fn a_prune_set_that_changed_since_review_refuses() {
 }
 
 /// Tempting wrong patch: "`.ok()` means nothing is open". An open-file
-/// check that could not finish blocks the removal (owner decision 4), and
-/// a held file blocks too.
+/// check that could not finish is said on the confirm (never read as
+/// free), and so is a held file; neither refuses (2026-09-30), but a
+/// reading that changes between review and `Y` refuses the run.
 #[test]
-fn an_open_file_check_that_could_not_finish_blocks() {
+fn an_open_file_check_that_could_not_finish_is_a_warning_never_free() {
     let sb = Sandbox::new();
     sb.standard_mise();
-    let r = refused(tool_removal::review_target(
+    let p = tool_removal::review_target(
         &sb.host().with_open_files_unknown("lsof: timed out"),
         &go(),
         &[],
-    ));
-    assert!(r.reason.contains("could not be checked"), "{}", r.reason);
-    assert_refusal_plain(&r);
+    )
+    .unwrap_or_else(|r| panic!("an unanswered check is a warning: {}", r.reason));
+    assert!(p.open_files().contains("not checked"), "{}", p.open_files());
+    let w = p.warnings().join("\n");
+    assert!(w.contains("could not be checked"), "{w}");
+    assert_plain(&preview_text(&p));
     let held = sb.install_dir("go", "1.23.5").join("bin/go");
-    let r = refused(tool_removal::review_target(
-        &sb.host().with_open_file_held(&held, "go"),
-        &go(),
-        &[],
-    ));
-    assert!(r.reason.contains("go has"), "{}", r.reason);
+    let held_host = sb.host().with_open_file_held(&held, "go");
+    let held_preview = tool_removal::review_target(&held_host, &go(), &[]).unwrap();
+    let w = held_preview.warnings().join("\n");
+    assert!(w.contains("go has"), "{w}");
+    assert_eq!(sb.ran("-C / uninstall go@1.23.5"), 0, "review runs nothing");
+    // A free reading at review and a held one at Y: a different confirm.
+    let free = tool_removal::review_target(&sb.host(), &go(), &[]).unwrap();
+    let out = tool_removal::execute(&held_host, &free, &[], &sb.ledger());
+    assert!(matches!(out.status, Status::Refused(_)), "{}", out.line);
     assert_eq!(sb.ran("-C / uninstall go@1.23.5"), 0);
 }
 

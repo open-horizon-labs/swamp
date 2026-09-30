@@ -365,43 +365,48 @@ impl Host {
     }
 }
 
-/// The open-file answer as a fact for the confirm, or the refusal it is.
-/// `Unknown` refuses: there is no Trash to recover from a removal made
-/// while something was running from it.
+/// The open-file answer as a fact for the confirm, and the warning it
+/// carries when something holds the path open or the check could not
+/// finish. Tri-state, never read as free: `Unknown` says it was not
+/// checked. A warning on the confirm, not a refusal: the manager's own
+/// command still runs only on the person's `Y`, after the fresh review
+/// shows the same facts (2026-09-30).
 fn open_files_fact(
     host: &Host,
     paths: &[PathBuf],
     manager_own: &[&str],
     manager: Manager,
-) -> Result<String, Refusal> {
+) -> (String, Option<String>) {
     let (state, who) = host.open_state(paths, manager_own);
     match state {
-        OccupancyState::Free => Ok(if manager_own.is_empty() {
-            "none held (lsof, just now)".to_string()
-        } else {
-            format!(
-                "none held apart from {}'s own {} (lsof, just now)",
-                manager.name(),
-                manager_own.join(", ")
+        OccupancyState::Free => (
+            if manager_own.is_empty() {
+                "none held (lsof, just now)".to_string()
+            } else {
+                format!(
+                    "none held apart from {}'s own {} (lsof, just now)",
+                    manager.name(),
+                    manager_own.join(", ")
+                )
+            },
+            None,
+        ),
+        OccupancyState::Occupied(path) => {
+            let who = who.unwrap_or_else(|| "A process".to_string());
+            (
+                format!("held: {who} has {} open (lsof, just now)", path.display()),
+                Some(format!(
+                    "{who} has {} open: removing it now can break that process, and there is no Trash to put it back from.",
+                    path.display()
+                )),
             )
-        }),
-        OccupancyState::Occupied(path) => Err(Refusal::new(
-            format!(
-                "{} has {} open (lsof).",
-                who.unwrap_or_else(|| "A process".to_string()),
-                path.display()
-            ),
-            "Stop it, then review again.",
-        )),
-        OccupancyState::Unknown(why) => Err(Refusal::new(
-            format!(
-                "Open files could not be checked ({why}). Swamp does not remove without that check."
-            ),
-            format!(
-                "Review again; if it keeps failing, remove it with {} yourself.",
-                manager.name()
-            ),
-        )),
+        }
+        OccupancyState::Unknown(why) => (
+            format!("not checked ({why})"),
+            Some(format!(
+                "Open files could not be checked ({why}): swamp cannot say that nothing is running from it, and there is no Trash to put it back from."
+            )),
+        ),
     }
 }
 
@@ -674,6 +679,28 @@ fn changed_since(preview: &Preview, now: &Preview) -> Option<Refusal> {
     if now.state.len() != preview.state.len() {
         return Some(Refusal::new(
             "The manager's list changed since review.",
+            again,
+        ));
+    }
+    // The warnings the person read are facts too: a config that began to
+    // request the version, a device that booted, a process that opened a
+    // file since review is a different confirm.
+    if now.warnings != preview.warnings {
+        let new_ones: Vec<&str> = now
+            .warnings
+            .iter()
+            .filter(|w| !preview.warnings.contains(w))
+            .map(String::as_str)
+            .collect();
+        return Some(Refusal::new(
+            format!(
+                "What the confirm warned about changed since review{}.",
+                if new_ones.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (now: {})", new_ones.join("; "))
+                }
+            ),
             again,
         ));
     }

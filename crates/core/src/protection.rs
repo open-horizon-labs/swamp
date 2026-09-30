@@ -90,7 +90,7 @@ impl ProtectList {
     /// The returned string carries which direction matched, so a refusal can
     /// say *why*. It is the only query this type has, so there is no
     /// second (one-directional) predicate to reach for.
-    pub fn conflict(&self, candidate: &Path) -> Option<String> {
+    pub fn conflict(&self, candidate: &Path) -> Option<Conflict> {
         // One spelling for both sides. `external::discover_and_measure`
         // canonicalizes every candidate and `agents::discover_and_measure`
         // does not, so the same home comes back as `/var/folders/.../claude`
@@ -102,20 +102,44 @@ impl ProtectList {
         for p in &self.paths {
             let prot = crate::scope::comparable(p);
             if cand == prot {
-                return Some(format!("{} is kept by `swamp protect`", p.display()));
+                return Some(Conflict {
+                    entry: p.clone(),
+                    reason: format!("{} is kept by `swamp protect`", p.display()),
+                });
             }
             if cand.starts_with(&prot) {
-                return Some(format!(
-                    "{} is beneath the human-protected path {}",
-                    candidate.display(),
-                    p.display()
-                ));
+                return Some(Conflict {
+                    entry: p.clone(),
+                    reason: format!(
+                        "{} is beneath the human-protected path {}",
+                        candidate.display(),
+                        p.display()
+                    ),
+                });
             }
             if prot.starts_with(&cand) {
-                return Some(format!("contains human-protected path {}", p.display()));
+                return Some(Conflict {
+                    entry: p.clone(),
+                    reason: format!("contains human-protected path {}", p.display()),
+                });
             }
         }
         None
+    }
+}
+
+/// Which keep entry covers a candidate, and why. `entry` is the stored
+/// entry itself (not the candidate), so the command that takes the mark
+/// off is `swamp protect remove <entry>`, whichever direction matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conflict {
+    pub entry: PathBuf,
+    reason: String,
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
     }
 }
 
@@ -159,8 +183,8 @@ fn load_rows(swamp_dir: &Path) -> Result<Vec<ProtectRow>> {
             for r in &rows {
                 if r.path.trim().is_empty() {
                     anyhow::bail!(
-                        "protection state unknown: {} contains an empty path entry. Every action \
-                         is refused until it is repaired or removed.",
+                        "protection state unknown: {} contains an empty path entry. Your keep marks \
+                         are not being checked until it is repaired or removed.",
                         path.display()
                     );
                 }
@@ -168,8 +192,8 @@ fn load_rows(swamp_dir: &Path) -> Result<Vec<ProtectRow>> {
             Ok(rows)
         }
         Err(e) => Err(anyhow::anyhow!(
-            "protection state unknown: {} could not be read ({e}). Every action is refused \
-             until it is repaired or removed; `swamp protect list` shows this same error.",
+            "protection state unknown: {} could not be read ({e}). Your keep marks are not \
+             being checked until it is repaired or removed; `swamp protect list` shows this same error.",
             path.display()
         )),
     }
@@ -267,9 +291,13 @@ fn protect_remove_unchecked(swamp_dir: &Path, path: &Path) -> Result<()> {
     let target = path.display().to_string();
     let before = rows.len();
     rows.retain(|r| r.path != target);
-    if rows.len() != before {
-        save_rows(swamp_dir, &rows)?;
+    if rows.len() == before {
+        anyhow::bail!(
+            "nothing matched {}: no keep entry has exactly that path (`swamp protect list` shows the entries)",
+            path.display()
+        );
     }
+    save_rows(swamp_dir, &rows)?;
     Ok(())
 }
 

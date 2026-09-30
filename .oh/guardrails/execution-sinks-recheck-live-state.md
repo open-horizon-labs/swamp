@@ -6,7 +6,7 @@ outcome: decision-relevant-storage-evidence
 ---
 
 
-**Exception (2026-09-30, #177):** tool-managed removal (a mise version, a simulator runtime), which has no Trash, keeps automated refusals, a review-to-confirm recheck and a TUI-only, human-only confirm: `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`.
+**Exception (2026-09-30, #177):** tool-managed removal (a mise version, a simulator runtime), which has no Trash, keeps a review-to-confirm recheck and a TUI-only, human-only confirm: `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`. **Second exception (2026-09-30, G6):** a Reclaim/External/Disk move to Trash rechecks, at Enter, that the marked entry is the same entry in the same place (device and inode, kind, where the path resolves) and writes a `started` ledger row first (`reclaim_trash::recheck`, `actions::trash_reclaim`). That is a correctness check on the reviewed plan (a symlink swapped in after the mark moves nothing), not a veto on what the person decided; it never looks at category, use or occupancy.
 
 ## Why this was retired
 

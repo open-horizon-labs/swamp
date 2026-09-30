@@ -21,4 +21,4 @@
 "cost from: detector recovery hint                                               "
 "                                                                                "
 "                                                                                "
-"Tab section  v view  / filter  R refresh  ↑↓ move  →/← in/out  ? help  q quit   "
+"Tab section  v view  / filter  R refresh  ⌫ trash  Space mark  ? help  q quit   "

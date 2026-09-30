@@ -118,7 +118,7 @@ pub fn guidance_at(unit: &NestedArtifact, now: u64) -> Guidance {
                 "output",
                 "blocked",
                 "unsupported_role",
-                "This output is inspection-only; selective cleanup is not supported.",
+                "No cleanup rule covers this output.",
                 "inspect",
             )
         };
@@ -407,7 +407,7 @@ fn snapshot(path: &Path) -> Result<Member> {
 fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member> {
     *visited += 1;
     if depth > 128 || *visited > 100_000 {
-        bail!("cleanup review exceeds depth/member limit; inspection-only");
+        bail!("cleanup review exceeds depth/member limit; no group is offered");
     }
     let canonical = fs::canonicalize(path)?;
     if canonical != path {
@@ -478,7 +478,7 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
 fn local_filesystem(path: &Path) -> Result<()> {
     if !fs::sys::volume_info(path)?.is_local() {
         bail!(
-            "Cargo cleanup requires a supported local filesystem; network/unknown mounts are inspection-only"
+            "Cargo cleanup requires a supported local filesystem; network/unknown mounts get no group"
         );
     }
     Ok(())
@@ -497,7 +497,7 @@ fn locks(profile: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     if paths.is_empty() {
-        bail!("no established Cargo build lock; inspection-only");
+        bail!("no established Cargo build lock; no group is offered");
     }
     Ok(paths)
 }
@@ -580,7 +580,7 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
             ArtifactRole::TestExecutable | ArtifactRole::Example
         ) || unit.is_dir)
     {
-        bail!("this Cargo role is inspection-only; select a test or example executable");
+        bail!("no group rule covers this Cargo role (a test or example executable has one)");
     }
     let relative = crate::scope::relative_to(selected, container)
         .context("selection is not inside its container")?;

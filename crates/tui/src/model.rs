@@ -162,6 +162,10 @@ pub struct Row {
     /// consumer sentence, a manager's quoted statement). Shown after the
     /// last-used line; empty for every other view.
     pub detail_lines: Vec<String>,
+    /// A row the person may mark with Space but that `A` and a project's
+    /// mark leave out: a path swamp's cleanup rules do not cover, where
+    /// marking it is a deliberate act on that one path.
+    pub individual_only: bool,
 }
 
 impl Row {
@@ -192,6 +196,7 @@ impl Row {
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
+            individual_only: false,
         }
     }
 }
@@ -570,6 +575,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
+            individual_only: false,
         });
     }
     out
@@ -703,6 +709,7 @@ pub fn tree_rows_with_agents(
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
+            individual_only: false,
         });
         if is_collapsed {
             continue;
@@ -1011,9 +1018,11 @@ fn family_tree_children_of(
             .filter(|u| u.action == swamp_core::artifact::NestedActionCapability::TrashPath)
             .count();
         signals.push(if actionable > 0 {
-            format!("Space marks {actionable} exact paths; remaining items are inspection only")
+            format!(
+                "Space marks {actionable} exact paths; any other item is marked one at a time, on its own row"
+            )
         } else {
-            "inspection only: selective cleanup unsupported here".into()
+            "no cleanup rule covers these: Space on an item moves that exact path to Trash".into()
         });
         signals.push(match f.basis {
             swamp_core::artifact::AccountingBasis::Unknown => {
@@ -1024,8 +1033,10 @@ fn family_tree_children_of(
         if !f.complete {
             signals.push("measurement incomplete".into());
         }
+        // A group header that no cleanup rule covers is a category of
+        // paths, not a path: Space says so and points at the items inside.
         if actionable == 0 {
-            signals.push("blocked".into());
+            signals.push("category".into());
         }
         row.signals = signals;
         rows.push(row);
@@ -1052,7 +1063,9 @@ fn family_tree_children_of(
                 );
                 more.rail = format!("{child_prefix}└─ ");
                 more.allocated = true;
-                more.signals = vec!["blocked".into()];
+                more.signals = vec!["not listed here; open the folder in the tree".into()];
+                more.detail_lines
+                    .push("these rows are not one folder: nothing to mark on this line".into());
                 rows.push(more);
             }
         }
@@ -1137,9 +1150,11 @@ fn family_member_row(
             "Space marks this exact path for Trash".into()
         }
         swamp_core::artifact::NestedActionCapability::Unsupported { reason } => {
-            format!("selective cleanup unsupported: {reason}")
+            format!("no cleanup rule ({reason}); Space still moves this exact path to Trash")
         }
-        swamp_core::artifact::NestedActionCapability::InspectionOnly => "inspection only".into(),
+        swamp_core::artifact::NestedActionCapability::InspectionOnly => {
+            "no cleanup rule; Space still moves this exact path to Trash".into()
+        }
     };
     row.signals = vec![
         u.role.label().to_string(),
@@ -1153,13 +1168,13 @@ fn family_member_row(
         ),
     ];
     row.signals.extend(u.coverage.limits.iter().cloned());
-    if u.action == swamp_core::artifact::NestedActionCapability::TrashPath {
-        row.unit = Some(UnitId::for_artifact(&u.path));
-        row.kind = Some(ArtifactKind::BuildOutput);
-        row.evidence = u.decision_evidence.clone();
-    } else {
-        row.signals.push("blocked".into());
-    }
+    // Every present path is one the person may move to Trash. A path no
+    // cleanup rule covers is marked one at a time, and its confirm lists
+    // what swamp did not establish about it.
+    row.unit = Some(UnitId::for_artifact(&u.path));
+    row.kind = Some(ArtifactKind::BuildOutput);
+    row.evidence = u.decision_evidence.clone();
+    row.individual_only = u.action != swamp_core::artifact::NestedActionCapability::TrashPath;
     row
 }
 
@@ -1278,23 +1293,23 @@ fn cargo_children_from_index(
         } else if unit.role == swamp_core::artifact::ArtifactRole::FinalOutput {
             row.signals.insert(
                 0,
-                "Compiled output: review manually; selective removal not supported here".into(),
+                "Compiled output: Space moves this exact path to Trash; companions are not included"
+                    .into(),
             );
             format!(
-                "Inspect only: removes built output · modified {}",
+                "Removes built output · modified {}",
                 age_label(swamp_core::cargo_cleanup::modified_age_secs(
                     unit,
                     observed_at
                 ))
             )
         } else {
-            "Selective cleanup unsupported".into()
+            "No cleanup rule covers it; Space moves this exact path to Trash".into()
         });
         row.mtime_max = unit.mtime_max;
-        if swamp_core::cargo_cleanup::candidate(unit) {
-            row.unit = Some(UnitId::for_artifact(&unit.path));
-            row.kind = Some(ArtifactKind::BuildOutput);
-        }
+        row.unit = Some(UnitId::for_artifact(&unit.path));
+        row.kind = Some(ArtifactKind::BuildOutput);
+        row.individual_only = !swamp_core::cargo_cleanup::candidate(unit);
         rows.push(row);
         if has_children && !closed {
             let child_prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
@@ -1682,6 +1697,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
+            individual_only: false,
         })
         .collect()
 }
@@ -2018,7 +2034,7 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 match swamp_core::cargo_cleanup::guidance(u).next_action.as_str() {
                                     "inspect_groups" => "category",
                                     "review_cleanup" => "unchecked",
-                                    _ => "inspection-only",
+                                    _ => "no cleanup rule",
                                 },
                                 u.path.strip_prefix(&a.path).unwrap_or(&u.path).display(),
                             ),
@@ -2041,18 +2057,24 @@ fn append_cargo_breakdowns(report: &Report, filter: &Filter, rows: &mut Vec<Row>
                                 "review required".into(),
                             ];
                         } else {
-                            row.signals = if u.coverage.supported {
-                                vec![
-                                    if swamp_core::cargo_cleanup::guidance(u).scope == "summary" {
-                                        "category"
-                                    } else {
-                                        "blocked"
-                                    }
-                                    .into(),
-                                ]
+                            // A summary row is an aggregate of a category,
+                            // not one path. Every other row is a real path:
+                            // markable on its own, with what swamp did not
+                            // establish about it on the confirm.
+                            let summary = u.coverage.supported
+                                && swamp_core::cargo_cleanup::guidance(u).scope == "summary";
+                            row.signals = if summary {
+                                vec!["category".into()]
+                            } else if u.coverage.supported {
+                                Vec::new()
                             } else {
                                 vec!["coverage-limited".into()]
                             };
+                            if !summary {
+                                row.unit = Some(UnitId::for_artifact(&u.path));
+                                row.kind = Some(ArtifactKind::BuildOutput);
+                                row.individual_only = true;
+                            }
                         }
                         let guidance = swamp_core::cargo_cleanup::guidance(u);
                         if guidance.check_status != "unchecked" {
@@ -2214,10 +2236,19 @@ pub fn external_rows_with(
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        // What the person sees, the person may move to Trash (maintainer
+        // decision 2026-09-30): the row is a real path, so it is a unit.
+        // The mark's review says what swamp does not know about it.
+        row.unit = Some(UnitId::for_artifact(&u.path));
         row.tool = swamp_core::tool_removal::manager_for_unit(&u.detector_id, &u.path);
+        let mut tool_signal = None;
         if let Some(m) = row.tool {
-            row.signals
-                .push(format!("removed by {} itself · Backspace", m.name()));
+            let line = format!(
+                "{} removes these itself · Backspace for its list, Space for Trash",
+                m.name()
+            );
+            tool_signal = Some(line.clone());
+            row.signals.push(line);
         }
         row.last_used = Some(u.last_used.describe(observed_at));
         // The interior this unit itself owns: not the interior of another
@@ -2266,7 +2297,7 @@ pub fn external_rows_with(
                 header.expansion_key = Some(ikey);
                 header.rail = if iopen { "▾ ".into() } else { "▸ ".into() };
                 header.collapsed_children = (!iopen).then_some(fams.len());
-                header.signals = vec!["inspection only".into(), "blocked".into()];
+                header.signals = vec!["a grouping of the folders above, not a folder".into()];
                 children.push(header);
                 if iopen {
                     children.extend(fams);
@@ -2276,13 +2307,14 @@ pub fn external_rows_with(
             row.expansion_key = Some(key);
             row.rail = if open { "▾ ".into() } else { "▸ ".into() };
             row.collapsed_children = (!open).then_some(children.len());
-            row.signals
-                .insert(0, "store interior below · inspection only".into());
-            row.signals = vec![if has_interior {
-                "store interior below · inspection only".into()
+            // The opening hint leads; the tool's own signal stays after it.
+            let mut signals = vec![if has_interior {
+                "store interior below (Enter opens it)".to_string()
             } else {
-                "folders below · inspection only".into()
+                "folders below (Enter opens them)".to_string()
             }];
+            signals.extend(tool_signal);
+            row.signals = signals;
             rows.push(row);
             if open {
                 rows.extend(children);
@@ -2311,6 +2343,7 @@ fn compact_signed(bytes: i64) -> String {
 /// row is the remainder that makes the rows add up to the unit's total.
 fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row> {
     use swamp_core::drilldown::{ChildKind, ChildMeasure};
+    use swamp_core::reclaim_trash::{child_not_markable, row_path};
     let count = u.children.len();
     u.children
         .iter()
@@ -2349,12 +2382,15 @@ fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row>
             };
             row.allocated = row.size_text.is_none();
             row.mtime_max = c.mtime_max;
-            row.signals = vec![
-                swamp_core::render::describe_unit_child(c, now),
-                "blocked".into(),
-            ];
+            row.signals = vec![swamp_core::render::describe_unit_child(c, now)];
             if c.kind == ChildKind::Entry {
                 row.last_used = Some(c.last_used.describe(now));
+            }
+            match row_path(&u.path.display().to_string(), Some((c.kind, &c.name))) {
+                Some(path) => row.unit = Some(UnitId::for_artifact(&path)),
+                None => row
+                    .detail_lines
+                    .push(child_not_markable(c.kind, &c.name).to_string()),
             }
             row
         })
@@ -2363,10 +2399,11 @@ fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row>
 
 /// The Reclaim view (#175): one row per unit of developer storage,
 /// largest first, from the stored facts `swamp_core::reclaim::build` joins.
-/// Never markable (`unit: None`): removal is the reviewed Trash flow in the
-/// unowned view for a standalone Cargo target, the manager's own command
-/// (not built yet) for an installation, and nothing for the rest. A row
-/// opens (`Enter`) onto the unit's folders, whose rows add up to its size.
+/// Every unit and every listed folder is a real path and is markable
+/// (Space, then Backspace for the reviewed Trash confirm); the remainder
+/// and size-correction rows are not folders and say why in the detail
+/// pane. A row opens (`Enter`) onto the unit's folders, whose rows add up
+/// to its size.
 ///
 /// The layout is fixed like every other view: the name column leads with
 /// the unit and its kind, and the cost, last-used fact and removal path
@@ -2391,6 +2428,10 @@ pub fn reclaim_rows(
             r.bytes,
             r.growth_bytes,
         );
+        // A real path: Space marks it, Backspace opens the reviewed
+        // confirm for the Trash move. The mark's review states what
+        // swamp does not know about it.
+        row.unit = Some(UnitId::for_artifact(std::path::Path::new(&r.path)));
         row.signals = vec![
             r.regeneration.words.clone(),
             format!("last used {}", r.last_used_text),
@@ -2423,7 +2464,7 @@ pub fn reclaim_rows(
             .children
             .iter()
             .enumerate()
-            .map(|(i, c)| reclaim_child_row(c, i + 1 == count))
+            .map(|(i, c)| reclaim_child_row(&r.path, c, i + 1 == count))
             .collect();
         row.expandable = true;
         row.expansion_key = Some(key);
@@ -2437,7 +2478,7 @@ pub fn reclaim_rows(
     rows
 }
 
-fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
+fn reclaim_child_row(unit: &str, c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
     use swamp_core::drilldown::ChildKind;
     let flag = c
         .hold
@@ -2477,6 +2518,15 @@ fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
         .map(swamp_core::reclaim::hold_line)
         .chain(c.manager.iter().map(|q| q.line()))
         .collect();
+    // One folder of the unit can be marked like the unit; a row that is
+    // not a folder says so here, where the keys that would act are not
+    // offered.
+    match swamp_core::reclaim_trash::row_path(unit, Some((c.kind, &c.name))) {
+        Some(path) => row.unit = Some(UnitId::for_artifact(&path)),
+        None => row
+            .detail_lines
+            .push(swamp_core::reclaim_trash::child_not_markable(c.kind, &c.name).to_string()),
+    }
     row
 }
 
@@ -2547,6 +2597,15 @@ pub fn disk_rows(
             r.exactness.as_str().replace('_', " "),
             format!("measured {}", age(r.measured_at)),
         ];
+        // A measured folder is a real path the person may move to Trash.
+        // A ledger row for "files directly here" is a figure, not a path.
+        if std::path::Path::new(&r.path).is_absolute()
+            && !r
+                .path
+                .ends_with(swamp_core::volume_ledger::pass::FILES_SUFFIX)
+        {
+            c.unit = Some(UnitId::for_artifact(std::path::Path::new(&r.path)));
+        }
         rows.push(c);
     }
     if elsewhere.len() > shown {
@@ -2789,6 +2848,14 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
         };
         c.allocated = true;
         c.signals = vec![r.exactness.as_str().replace('_', " ")];
+        if r.bytes.is_some()
+            && std::path::Path::new(&r.path).is_absolute()
+            && !r
+                .path
+                .ends_with(swamp_core::volume_ledger::pass::FILES_SUFFIX)
+        {
+            c.unit = Some(UnitId::for_artifact(std::path::Path::new(&r.path)));
+        }
         rows.push(c);
     }
     rows
@@ -2829,7 +2896,13 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
                 swamp_core::agents::ProjectLinkState::NotApplicable => "tool-wide".to_string(),
                 other => format!("{other:?}"),
             };
-            let protect = if u.protected { " [protected]" } else { "" };
+            // Kept by default, not forbidden: Space marks it, and the confirm says
+            // what the tool loses. `A` leaves it out.
+            let protect = if u.protected {
+                " [kept by default]"
+            } else {
+                ""
+            };
             let mut row = Row::leaf(
                 0,
                 format!(
@@ -2843,6 +2916,8 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
             );
             row.mtime_max = u.mtime_max;
             row.unit = Some(crate::units::UnitId::for_artifact(&u.path));
+            row.individual_only =
+                u.protected || u.action == swamp_core::agents::AgentActionCapability::None;
             row.evidence = u.evidence.clone();
             row
         })

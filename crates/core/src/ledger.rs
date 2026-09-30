@@ -39,6 +39,12 @@ pub const NO_GRANT: &str = "human-marked";
 /// (the old one could not be read and was kept aside), begins its error.
 pub const KEPT_ASIDE: &str = "the previous ledger could not be read";
 
+/// Whether an append error is the one that still wrote the record (into
+/// a new ledger, the unreadable old one kept aside): the action may go on.
+pub fn wrote_into_new_ledger(e: &anyhow::Error) -> bool {
+    e.to_string().starts_with(KEPT_ASIDE)
+}
+
 /// One fact the human saw before the action ran, as a key and its
 /// rendered value (`bytes`, `label`, `observed_at`, ...). Typed rows in
 /// `ledger_facts.parquet`, never a JSON blob.
@@ -136,6 +142,11 @@ impl Ledger {
         let path = self.path();
         let facts_path = self.facts_path();
         self.store.create()?;
+        // One writer at a time across processes: the table is read, a row
+        // added and the table rewritten, and two writers would lose rows.
+        let _lock = StoreDir::lock_ledger_writes(&path).map_err(|e| {
+            anyhow::anyhow!("swamp's ledger could not be locked ({e}), so nothing was written")
+        })?;
         let mut kept: Vec<String> = Vec::new();
         let mut rows = if crate::fs_gate::exists(&path) {
             match c::read_ledger_rows(&path) {

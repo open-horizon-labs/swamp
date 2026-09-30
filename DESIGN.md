@@ -48,11 +48,11 @@ unit claims. Groups start closed. Each group row leads with review guidance of a
 most 32 characters ("Start here: slower next build", "Review: reinstall from
 registry", "Shared: other projects may link"), then the count and oldest known
 modification; the adapter's own consequence, the accounting basis and
-"inspection only" are the row's details. That order is the point: an 80-column
+what its cleanup rule does not cover are the row's details. That order is the point: an 80-column
 advice column shows the guidance whole and gives up the numbers first. An opened
 group lists its members oldest first (unknown ages last), each leading with its
 consequence in that ecosystem's words. Supported project-local output units can
-be selected for Trash; shared stores and unsupported units remain inspection-only.
+be selected for Trash by family; shared stores and units without a cleanup rule are marked one at a time on their own row.
 Action support comes from the adapter contract, not the role label alone. Which
 presentation a container gets follows the roles its units carry,
 never a comparison with an adapter id; Cargo containers keep the purpose groups
@@ -127,11 +127,13 @@ chunk; all three now ship:
 
 - **External rows.** `ViewKind::External` (`'9'`) lists `ExternalUnit`s
   the same shape as `ViewKind::Unowned` lists unowned rows: path,
-  category, size, growth, consumer count. The row is never markable
-  (`Row.unit: None`): an external unit is shared, detector-resolved
-  storage (a package manager's cache, a toolchain install), shown for
-  review, and there is no delete affordance to offer -- act on it with
-  the manager's own tools, not swamp. A unit that is a
+  category, size, growth, consumer count. Every unit and listed folder
+  is a real path (`Row.unit` set): an external unit is shared,
+  detector-resolved storage (a package manager's cache, a toolchain
+  install), and Space marks it for the reviewed Trash move like any
+  path, the confirm saying what swamp does not know and that the
+  manager will not know it is gone. A unit whose manager swamp runs
+  removal for also opens that manager's own list on Backspace. A unit that is a
   machine-wide build store (a Maven repository, Go's module cache,
   DerivedData, the Android SDK, ...) is expandable: `Enter`/`→` opens it
   onto the **same** family groups a project container shows (closed
@@ -161,9 +163,10 @@ chunk; all three now ship:
   path (`actions::execute_plan_progress`) every other markable view
   already uses -- never a new blocking call on the event/render thread,
   and with no re-check between marking and moving. A protected row, or
-  one whose category has no Trash move at all, cannot be marked:
-  `propose_agents`'s own refusal (protected category, no Trash move for
-  this category, database-like file) becomes the status text, never a
+  one whose category has no Trash move at all, marks with a warning
+  (`propose_agents_for_human`: kept by default, no rule for the category,
+  database-like file); only the person's own `swamp protect` mark
+  refuses, and its reason becomes the status text, never a
   generic "nothing to delete." Bulk marking (`Shift+A`,
   `mark_all_in_view`) reaches agent rows too: since `model::agent_rows`
   sets `Row.unit` but never `Row.kind` (there is no `ArtifactKind` for
@@ -259,7 +262,7 @@ row is marked, in both directions: a row beneath a protected path, and a
 row that *contains* one. Protecting a single file inside a build
 directory therefore refuses the directory, in the status rows, at the moment
 you press Space -- not silently at execution. Protection state that
-cannot be read is *unknown*, so it refuses too. This used to be reached
+cannot be read is *unknown*: the confirm says the keep marks were not checked. This used to be reached
 only for the two row kinds that happened to propose through core, which
 is how a one-directional protection bug survived every test; see
 `.oh/guardrails/protection-fails-closed.md`.

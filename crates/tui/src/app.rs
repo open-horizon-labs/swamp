@@ -648,16 +648,14 @@ pub struct BlockedItem {
 /// safe one: refresh and check again.
 pub fn blocked_next_step(reason: &str) -> &'static str {
     let r = reason.to_lowercase();
-    if r.contains("human-protected") {
-        "remove the protection (swamp protect), then check again"
-    } else if r.contains("protection state could not be read") {
-        "fix the protect file in the swamp store, then check again"
+    if r.contains("protected by you") {
+        "run the `swamp protect remove ...` command named in the reason (it names the entry that covers this path), then check again"
     } else if r.contains("nothing reclaimable") {
         "open the project with Enter and mark what you want inside it"
     } else if r.contains("category total") {
         "open the category and mark one of its items"
-    } else if r.contains("inspection-only") {
-        "nothing to do here: swamp only shows this, it cannot clean it"
+    } else if r.contains("not a path swamp can move") {
+        "mark a folder or file listed under it instead"
     } else if r.contains("agent-storage") || r.contains("active") {
         "close the agent session that uses it, then check again"
     } else {
@@ -1323,7 +1321,22 @@ impl App {
             // A hierarchy (a unit, then its folders): sort never
             // reorders it, like the tree.
             ViewKind::Reclaim => {
-                return model::reclaim_rows(&self.reclaim_view(), &self.collapsed);
+                let mut rows = model::reclaim_rows(&self.reclaim_view(), &self.collapsed);
+                // A unit its manager removes itself also opens that
+                // manager's list on Backspace, as in the External view.
+                for row in rows.iter_mut().filter(|r| r.depth == 0) {
+                    let Some(id) = row.unit.as_ref() else {
+                        continue;
+                    };
+                    row.tool = self
+                        .external_units
+                        .iter()
+                        .find(|u| u.path.display().to_string() == id.0)
+                        .and_then(|u| {
+                            swamp_core::tool_removal::manager_for_unit(&u.detector_id, &u.path)
+                        });
+                }
+                return rows;
             }
             ViewKind::Agents => model::agent_rows(&self.agent_units),
             // Parts of one disk, largest meaning first as the ledger
@@ -1734,7 +1747,36 @@ impl App {
         // skipped and why, rather than folding it into the single
         // static per-kind refusal strings below.
         let mut agent_skipped = 0usize;
+        let mut path_skipped = 0usize;
+        let mut individual = 0usize;
         for row in rows {
+            // A path no cleanup rule covers is marked one at a time.
+            if row.individual_only {
+                individual += 1;
+                continue;
+            }
+            // Reclaim and External: each top-level row is a real path. Its
+            // listed folders are inside it (marking both would overlap) and
+            // stay for Space on the folder itself. A row already marked is
+            // left marked: `A` adds, it does not toggle.
+            if matches!(
+                self.view,
+                ViewKind::Reclaim | ViewKind::External | ViewKind::Disk | ViewKind::DiskGaps
+            ) && row.kind.is_none()
+                && row.project.is_none()
+                && let Some(id) = row.unit.clone()
+            {
+                if row.depth > 0 || self.marked.contains_key(&id.0) {
+                    continue;
+                }
+                self.mark_row(&row);
+                if self.marked.contains_key(&id.0) {
+                    marked += 1;
+                } else {
+                    path_skipped += 1;
+                }
+                continue;
+            }
             let Some(kind) = row.kind.clone() else {
                 // Projects view: each row stands for a whole project.
                 if let Some(project) = row.project.clone() {
@@ -1781,6 +1823,19 @@ impl App {
                     refused.push(why.into())
                 }
             }
+        }
+        if individual > 0 && marked > 0 {
+            refused.push(format!(
+                "{individual} row{} can only be marked one at a time (Space): {} left out of mark all",
+                if individual == 1 { "" } else { "s" },
+                if individual == 1 { "it was" } else { "they were" }
+            ));
+        }
+        if path_skipped > 0 {
+            refused.push(format!(
+                "{path_skipped} row{} could not be marked (b lists each with its reason)",
+                if path_skipped == 1 { "" } else { "s" }
+            ));
         }
         if agent_skipped > 0 {
             refused.push(format!(
@@ -1930,6 +1985,7 @@ impl App {
             .iter()
             .filter(|r| {
                 r.unit.is_some()
+                    && !r.individual_only
                     && r.kind
                         .as_ref()
                         .is_some_and(|k| crate::units::markable(k).is_ok())
@@ -2045,6 +2101,12 @@ impl App {
             }
             return;
         }
+        if let Some(id) = row.unit.clone()
+            && let Some(target) = self.path_target(&id.0, row)
+        {
+            self.mark_reclaim_row(row, &id, target);
+            return;
+        }
         let Some(unit_id) = row.unit.clone() else {
             if row.signals.iter().any(|s| s == "category") {
                 self.refuse("Category total: pick one of the items inside it. Nothing changed.");
@@ -2052,7 +2114,7 @@ impl App {
             }
             if row.signals.iter().any(|s| s == "blocked") {
                 self.refuse(
-                    "Inspection-only: this output cannot be selected for cleanup. Nothing changed.",
+                    "Not a path swamp can move: this row stands for an aggregate or a daemon's record, not a folder or file. Nothing changed.",
                 );
                 return;
             }
@@ -2118,29 +2180,29 @@ impl App {
         // protected descendant".
         //
         // Both directions, from the one predicate
-        // (`.oh/guardrails/protection-fails-closed.md`); protection
-        // state that cannot be read is *unknown*, so it refuses too.
+        // (`.oh/guardrails/protection-fails-closed.md`). The person's own
+        // mark refuses; a list that could not be read is unknown (never an
+        // empty list) and is said so on the confirm, where their single
+        // confirm decides.
+        let mut warnings: Vec<String> = Vec::new();
         if let Some(store) = self.store_dir.clone() {
             let candidate = PathBuf::from(&unit_id.0);
             match swamp_core::agents::load_protect(&store) {
                 Ok(protected) => {
-                    if let Some(reason) = protected.conflict(&candidate) {
+                    if let Some(c) = protected.conflict(&candidate) {
                         self.refuse(&format!(
-                            "human-protected path (swamp protect): {reason}; remove protection \
-                             first if this unit should be actionable"
+                            "protected by you ({c}); `swamp protect remove {}` takes the \
+                             mark off",
+                            c.entry.display()
                         ));
                         return;
                     }
                 }
-                Err(e) => {
-                    self.refuse(&format!(
-                        "protection state could not be read, so nothing may be marked: {e}"
-                    ));
-                    return;
-                }
+                Err(e) => warnings.push(format!(
+                    "could not read your protect list ({e}): your keep marks were not checked for this path"
+                )),
             }
         }
-        let mut warnings: Vec<String> = Vec::new();
         let worktree = row.worktree.clone().map(|wt| {
             let whole_checkout = !wt.linked;
             if whole_checkout && wt.remote.is_none() {
@@ -2285,7 +2347,7 @@ impl App {
             .find(|u| u.path == unit_path)
             .map(|u| u.observed_at);
         let agent_unit = if agent_unit_observed_at.is_some() {
-            match swamp_core::actions::propose_agents(
+            match swamp_core::actions::propose_agents_for_human(
                 &self.agent_units,
                 std::slice::from_ref(&unit_path),
                 "human:tui",
@@ -2328,6 +2390,7 @@ impl App {
             MarkedUnit {
                 cargo_unit: cargo_unit.filter(|u| u.cargo_group().is_some()),
                 agent_unit,
+                reclaim: None,
                 path: unit_path,
                 docker,
                 worktree_path,
@@ -2341,6 +2404,165 @@ impl App {
         if let Some(tx) = &self.review_progress {
             let _ = tx.send(OperationEvent::ReviewReady);
         }
+    }
+
+    /// What marking this row's path needs to know, when the row is a real
+    /// path that goes to the reviewed Trash flow without a project behind
+    /// it: a row of the Reclaim view (a unit, or one of its listed
+    /// folders) reached from Reclaim or External, a store interior folder
+    /// under no checkout, or a measured folder in the Disk views. A
+    /// standalone Cargo target keeps its own reviewed flow.
+    fn path_target(&self, id: &str, row: &Row) -> Option<swamp_core::reclaim_trash::ReclaimTarget> {
+        use swamp_core::reclaim_trash::{ReclaimTarget, find_target};
+        let path = Path::new(id);
+        if matches!(self.view, ViewKind::Reclaim | ViewKind::External) {
+            let standalone = self.report.unowned.iter().any(|u| {
+                u.reason == swamp_core::report::UnownedReason::StandaloneCargoTarget
+                    && Path::new(&u.path_or_object) == path
+            });
+            if !standalone && let Ok(t) = find_target(&self.reclaim_view(), path) {
+                return Some(t);
+            }
+        }
+        // A build-store interior no checkout owns: there is no project to
+        // plan it through, so it is the path and what its adapter said.
+        let owned = self
+            .report
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .any(|wt| path != wt.path && swamp_core::scope::under(path, &wt.path));
+        if !owned
+            && let Some(n) = self
+                .report
+                .nested_artifacts
+                .iter()
+                .chain(self.store_interiors.iter())
+                .find(|n| n.present && n.path == path && n.reported_by.is_none())
+        {
+            return Some(ReclaimTarget::for_path(
+                n.path.clone(),
+                "store interior",
+                Some(n.bytes),
+                n.consequence.as_deref(),
+                n.advisories(),
+            ));
+        }
+        if matches!(self.view, ViewKind::Disk | ViewKind::DiskGaps) && path.is_absolute() {
+            return Some(ReclaimTarget::for_path(
+                path.to_path_buf(),
+                "outside developer storage",
+                Some(row.bytes),
+                None,
+                vec![format!(
+                    "measured by the disk ledger ({}); swamp has no record of what uses it",
+                    row.signals.first().cloned().unwrap_or_default()
+                )],
+            ));
+        }
+        None
+    }
+
+    /// Space/Backspace on a Reclaim or External row: a real path goes to
+    /// the same reviewed Trash flow as every other unit. What refuses is
+    /// only that it is not a real entry, the person's own `swamp protect`
+    /// mark, or an overlap with another mark; everything else swamp knows
+    /// or does not know is a line on the confirm. Marking again unmarks.
+    fn mark_reclaim_row(
+        &mut self,
+        row: &Row,
+        id: &UnitId,
+        target: swamp_core::reclaim_trash::ReclaimTarget,
+    ) {
+        if self.marked.remove(&id.0).is_some() {
+            return; // toggle off
+        }
+        let path = PathBuf::from(&id.0);
+        let observed_at = self.report.observed_at;
+        if let Some(other) = self
+            .marked
+            .values()
+            .find(|m| swamp_core::scope::overlapping(&m.path, &path))
+        {
+            let msg = format!(
+                "overlaps {}, already marked: unmark one of them, or mark the larger one alone",
+                other.path.display()
+            );
+            self.refuse(&msg);
+            return;
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let trash = actions::trash_root();
+        // What swamp already knows by path: a folder above it takes it along.
+        let view = self.reclaim_view();
+        let mut known: Vec<swamp_core::reclaim_trash::Known> = view
+            .rows
+            .iter()
+            .map(|r| swamp_core::reclaim_trash::Known {
+                path: PathBuf::from(&r.path),
+                class: "Reclaim units",
+            })
+            .collect();
+        known.extend(
+            self.agent_units
+                .iter()
+                .map(|u| swamp_core::reclaim_trash::Known {
+                    path: u.path.clone(),
+                    class: if u.protected {
+                        "AI-tool units kept by default (credentials, settings)"
+                    } else {
+                        "AI-tool units"
+                    },
+                }),
+        );
+        let cwd = std::env::current_dir().ok();
+        let review = match swamp_core::reclaim_trash::review_in(
+            &target,
+            &swamp_core::reclaim_trash::Surroundings {
+                home: home.as_deref(),
+                store: self.store_dir.as_deref(),
+                trash_root: Some(&trash),
+                cwd: cwd.as_deref(),
+                known: &known,
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                self.refuse(&e);
+                return;
+            }
+        };
+        let worktree_path = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        self.marked.insert(
+            id.0.clone(),
+            MarkedUnit {
+                cargo_unit: None,
+                agent_unit: None,
+                reclaim: Some(actions::ReclaimMark {
+                    reviewed: review.reviewed,
+                    category: target.category.clone(),
+                    store: self.store_dir.clone(),
+                }),
+                path,
+                docker: None,
+                worktree_path,
+                bytes: target.bytes.unwrap_or(0),
+                observed_at,
+                worktree: None,
+                label: row.label.trim().to_string(),
+                warnings: review.warnings,
+            },
+        );
+        if let Some(tx) = &self.review_progress {
+            let _ = tx.send(OperationEvent::ReviewReady);
+        }
+    }
+
+    /// Whether the row under the cursor has a mark to make: what the key
+    /// legend names `Space mark` and `Backspace trash` for in Reclaim. A
+    /// row that is not a folder shows its reason in the detail pane.
+    pub fn selected_row_markable(&self) -> bool {
+        self.selected_row().is_some_and(|r| r.unit.is_some())
     }
 
     pub fn cancel_operation(&mut self) {
@@ -2442,23 +2664,26 @@ impl App {
         // A row whose installs its own manager removes (#177) never goes
         // to Trash: Backspace with nothing marked opens its sheet, Space
         // says why it cannot be marked.
+        // Backspace on its row opens the manager's own list; Space marks
+        // the folder for Trash like any other (the confirm says the
+        // manager will not know it is gone). Backspace while this very row
+        // is marked is the Trash confirm.
         if !all && let Some(manager) = self.selected_row().and_then(|r| r.tool) {
+            let own_mark = self
+                .selected_row()
+                .and_then(|r| r.unit)
+                .is_some_and(|u| self.marked.contains_key(&u.0));
             if confirm && self.marked.is_empty() {
                 self.open_tool_sheet(manager);
-            } else if confirm {
+                return;
+            } else if confirm && !own_mark {
                 self.set_refusal(&format!(
                     "{} removes these installs itself, one at a time: confirm or clear the \
                      marked items first.",
                     manager.name()
                 ));
-            } else {
-                self.set_refusal(&format!(
-                    "Removed by {} itself, never moved to Trash: press Backspace on this row to \
-                     see its own list.",
-                    manager.name()
-                ));
+                return;
             }
-            return;
         }
         if confirm && !self.marked.is_empty() {
             self.note_confirm_base();
@@ -2513,6 +2738,15 @@ impl App {
         worker.selected_project = self.selected_project.clone();
         worker.collapsed = self.collapsed.clone();
         worker.track = self.track.clone();
+        // The protect marks live in the store: a worker without it would
+        // skip the check the main thread makes. The Reclaim view is the
+        // one this screen shows, not one rebuilt from nothing.
+        worker.store_dir = self.store_dir.clone();
+        worker.store_interiors = self.store_interiors.clone();
+        worker.agent_units = self.agent_units.clone();
+        if matches!(self.view, ViewKind::Reclaim | ViewKind::External) {
+            *worker.reclaim_cache.borrow_mut() = Some(self.reclaim_view());
+        }
         worker.review_cancel = Some(cancel.clone());
         worker.review_progress = Some(tx.clone());
         self.operation = Some(Operation {
@@ -2793,6 +3027,9 @@ impl App {
 
     pub fn open_confirm(&mut self) {
         if !self.marked.is_empty() {
+            // A confirm opened by a key press has not been seen: input
+            // already queued is dropped, as for the review path.
+            self.confirm_drain |= !self.confirm_open;
             self.confirm_open = true;
         }
     }
@@ -2885,7 +3122,17 @@ impl App {
     /// so; below that size Enter is not offered and does nothing.
     pub fn confirm_fits(&self, width: u16, height: u16) -> bool {
         let permanent = self.marked.values().any(|u| u.docker.is_some());
-        !permanent || (height >= CONFIRM_MIN_ROWS && width >= CONFIRM_MIN_COLS)
+        let roomy = height >= CONFIRM_MIN_ROWS && width >= CONFIRM_MIN_COLS;
+        if self.marked.values().any(|u| u.reclaim.is_some()) {
+            return roomy && crate::ui::reclaim_plan_fits(self, width, height);
+        }
+        // Any plan that carries warnings must show every one of them: the
+        // sheet has no scroll, so Enter is offered only when they fit.
+        let warned = self.marked.values().any(|u| !u.warnings.is_empty());
+        if warned && height != 0 && !crate::ui::reclaim_plan_fits(self, width, height) {
+            return false;
+        }
+        !permanent || roomy
     }
 
     pub fn confirm_summary(&self) -> String {
@@ -2945,21 +3192,25 @@ impl App {
         self.blocked_open = false;
         crate::worker::spawn(move || {
             let ledger = swamp_core::ledger::Ledger::resolved(&store);
-            let results = actions::execute_plan_progress(
-                &units,
-                &ledger,
-                &trash,
-                keep,
-                |completed, path, outcome| {
-                    let _ = tx.send(OperationEvent::Progress {
-                        completed,
-                        total,
-                        path: path.to_path_buf(),
-                        outcome,
-                    });
-                    !cancel.load(std::sync::atomic::Ordering::SeqCst)
-                },
-            );
+            // One open-file snapshot, taken now (after the confirm), serves
+            // every Reclaim recheck in this run.
+            let results = swamp_core::occupancy::OccupancySnapshot::scoped(|| {
+                actions::execute_plan_progress(
+                    &units,
+                    &ledger,
+                    &trash,
+                    keep,
+                    |completed, path, outcome| {
+                        let _ = tx.send(OperationEvent::Progress {
+                            completed,
+                            total,
+                            path: path.to_path_buf(),
+                            outcome,
+                        });
+                        !cancel.load(std::sync::atomic::Ordering::SeqCst)
+                    },
+                )
+            });
             let _ = tx.send(OperationEvent::Deleted { results, total });
         });
     }
@@ -2988,6 +3239,7 @@ impl App {
         // sizes, read before the marks of finished units are dropped.
         let (mut trash_n, mut trash_bytes, mut docker_n, mut docker_bytes) =
             (0usize, 0u64, 0usize, 0u64);
+        let mut reclaim_moved = false;
         for r in results.iter().filter(|r| r.outcome.is_ok()) {
             match self.marked.get(&r.path.display().to_string()) {
                 Some(u) if u.docker.is_some() => {
@@ -2995,6 +3247,7 @@ impl App {
                     docker_bytes += u.bytes;
                 }
                 Some(u) => {
+                    reclaim_moved |= u.reclaim.is_some();
                     trash_n += 1;
                     trash_bytes += u.bytes;
                 }
@@ -3040,8 +3293,16 @@ impl App {
         } else if trash_n > 0 {
             // No "freed" figure: on the same volume the move to Trash frees
             // nothing until Trash is emptied, so a measured change is noise.
+            // Sizes of a Reclaim move are the last observation's, not a
+            // measurement of what left; nothing is freed until Trash is
+            // emptied, and the next observation remeasures.
+            let sizes = if reclaim_moved {
+                " Sizes are from the last observation."
+            } else {
+                ""
+            };
             format!(
-                "{moved}{} Space is freed when Trash is emptied.",
+                "{moved}{sizes}{} Space is freed when Trash is emptied.",
                 could_not(failed.len())
             )
         } else {
@@ -3059,6 +3320,41 @@ impl App {
     /// in-memory report -- artifacts, whole worktrees, Source directory
     /// rollups -- and takes their bytes off the header totals, so the
     /// screen is right before the re-observe lands.
+    /// What left the disk leaves the Reclaim and External rows now: a unit
+    /// at or under a moved path is dropped, and a moved folder of a unit
+    /// comes off the unit and its size (the next observation remeasures).
+    fn prune_reclaim(&mut self, removed: &[PathBuf]) {
+        let under = |p: &Path| removed.iter().any(|r| p == r || p.starts_with(r));
+        let mut changed = false;
+        self.external_units.retain(|u| {
+            let gone = under(&u.path);
+            changed |= gone;
+            !gone
+        });
+        for u in &mut self.external_units {
+            let unit = u.path.display().to_string();
+            let mut freed = 0i64;
+            let before = u.children.len();
+            u.children.retain(|c| {
+                match swamp_core::reclaim_trash::row_path(&unit, Some((c.kind, &c.name))) {
+                    Some(p) if under(&p) => {
+                        freed += c.bytes.unwrap_or(0);
+                        false
+                    }
+                    _ => true,
+                }
+            });
+            if u.children.len() != before {
+                u.bytes = u.bytes.saturating_sub(freed.max(0) as u64);
+                changed = true;
+            }
+        }
+        if changed {
+            self.reclaim_cache.borrow_mut().take();
+            self.headline_cache.borrow_mut().take();
+        }
+    }
+
     pub fn prune_removed(&mut self, results: &[actions::UnitResult]) {
         let removed: Vec<PathBuf> = results
             .iter()
@@ -3068,6 +3364,7 @@ impl App {
         if removed.is_empty() {
             return;
         }
+        self.prune_reclaim(&removed);
         if let Some(estimate) = self.report.reconciliation.unique_estimate.as_mut() {
             estimate.needs_reconciliation = true;
         }
@@ -3612,6 +3909,7 @@ mod tests {
                 MarkedUnit {
                     cargo_unit: None,
                     agent_unit: None,
+                    reclaim: None,
                     path,
                     docker: None,
                     worktree_path: PathBuf::new(),
@@ -3686,6 +3984,7 @@ mod tests {
             MarkedUnit {
                 cargo_unit: None,
                 agent_unit: None,
+                reclaim: None,
                 path: path.clone(),
                 docker: None,
                 worktree_path: tmp.path().into(),
@@ -3823,11 +4122,18 @@ mod tests {
         assert!(claude_home.path().join("settings.json").exists());
     }
 
+    /// Tempting wrong patch: a unit swamp keeps by default (settings,
+    /// credentials) stays unmarkable, or becomes markable with no word
+    /// about it. It marks, and its confirm says what the tool loses; the
+    /// person's own `swamp protect` mark still refuses, by name.
     #[test]
-    fn agents_view_mark_row_refuses_a_protected_unit_with_the_reason_not_a_generic_message() {
+    fn agents_view_mark_row_marks_a_default_kept_unit_with_a_warning_and_respects_the_persons_mark()
+    {
         let claude_home = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
         let units = fixture_agent_units(claude_home.path());
         let mut app = App::new(fixture_report(), "/root".into());
+        app.store_dir = Some(store.path().to_path_buf());
         app.set_view(ViewKind::Agents);
         app.set_agent_units(units);
         let settings_row = model::agent_rows(&app.agent_units)
@@ -3835,18 +4141,25 @@ mod tests {
             .find(|r| r.label.contains("settings.json"))
             .expect("settings row present");
         app.mark_row(&settings_row);
-        assert!(
-            app.marked.is_empty(),
-            "a protected unit must never be marked"
-        );
+        assert_eq!(app.marked.len(), 1, "{:?}", app.refusal_active());
+        let warned = app.confirm_summary();
+        assert!(warned.contains("swamp keeps this by default"), "{warned}");
+        assert!(claude_home.path().join("settings.json").exists());
+        app.marked.clear();
+        swamp_core::protection::protect_add(
+            store.path(),
+            &claude_home.path().join("settings.json"),
+        )
+        .unwrap();
+        app.mark_row(&settings_row);
+        assert!(app.marked.is_empty());
         assert!(
             app.refusal_active()
                 .unwrap_or_default()
-                .contains("protected"),
+                .contains("protected by you"),
             "{:?}",
             app.refusal_active()
         );
-        assert!(claude_home.path().join("settings.json").exists());
     }
 
     /// Shift+A over the Agents view (chunk D follow-up): the actionable
@@ -3881,11 +4194,12 @@ mod tests {
                     .display()
                     .to_string()
             ),
-            "the protected unit must never be swept up by bulk marking"
+            "a unit swamp keeps by default is marked on its own row, never swept up by mark all"
         );
         assert!(app.confirm_open, "one confirm for what could be marked");
         assert!(
-            app.refusal_active().is_some_and(|m| m.contains("skipped")),
+            app.refusal_active()
+                .is_some_and(|m| m.contains("left out of mark all")),
             "the footer must explain the skip, not stay silent: {:?}",
             app.refusal_active()
         );
@@ -4716,7 +5030,7 @@ mod tests {
     /// uses -- closed until opened, every row blocked, and nothing
     /// selectable -- at both a narrow and a wide terminal.
     #[test]
-    fn a_store_interior_opens_under_its_external_row_and_stays_inspection_only() {
+    fn a_store_interior_opens_under_its_external_row_in_family_groups() {
         use swamp_core::artifact::{AccountingBasis, ArtifactRole, TimeSource};
         use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
         let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
@@ -4779,13 +5093,22 @@ mod tests {
             "the family group appears: {:?}",
             open.iter().map(|r| r.label.clone()).collect::<Vec<_>>()
         );
+        // Tempting wrong patch: interior rows are "blocked" and never
+        // selectable. A family header groups paths (no single path, no
+        // unit, and it no longer says "blocked" or "inspection only"); the
+        // paths under it are marked on their own rows.
         for r in open.iter().skip(1) {
             assert!(
                 r.unit.is_none(),
-                "{}: an interior row is never selectable",
+                "{}: a group header is not one path",
                 r.label
             );
-            assert!(r.signals.iter().any(|s| s == "blocked"), "{}", r.label);
+            assert!(r.signals.iter().all(|s| s != "blocked"), "{}", r.label);
+            assert!(
+                r.signals.iter().all(|s| !s.contains("inspection only")),
+                "{:?}",
+                r.signals
+            );
         }
         for width in [80u16, 160] {
             let backend = ratatui::backend::TestBackend::new(width, 24);
@@ -4872,9 +5195,27 @@ mod tests {
             "never a bare size for an unreadable folder: {}",
             locked.label
         );
+        // Tempting wrong patch: the folders are tagged "blocked" with no
+        // unit, so what the person sees cannot be moved. Every listed
+        // folder is a real path and markable; only the remainder row, which
+        // is not a folder, is not, and it says why.
         for r in open.iter().skip(1) {
-            assert!(r.unit.is_none() && r.signals.iter().any(|s| s == "blocked"));
+            assert!(r.signals.iter().all(|s| s != "blocked"), "{:?}", r.signals);
+            if r.label.contains("other") || r.label.contains("3 ") {
+                continue;
+            }
         }
+        let folders = open.iter().skip(1).filter(|r| r.unit.is_some()).count();
+        assert_eq!(folders, 3, "stable, nightly and the unmeasured folder");
+        let remainder = open.iter().skip(1).find(|r| r.unit.is_none()).unwrap();
+        assert!(
+            remainder
+                .detail_lines
+                .iter()
+                .any(|l| l.contains("mark the unit")),
+            "{:?}",
+            remainder.detail_lines
+        );
         let stable = open.iter().find(|r| r.label == "stable").unwrap();
         assert!(
             stable
@@ -4889,6 +5230,64 @@ mod tests {
             lines.iter().any(|l| l.starts_with("Last run or opened:")),
             "{lines:?}"
         );
+    }
+
+    /// Tempting wrong patch: a warning (here: the protect list could not
+    /// be read, and swamp has no record of use) blocks the move, or the
+    /// move happens with no confirm. The warning is on the confirm, Enter's
+    /// own path (`start_delete`) moves exactly what was marked to Trash,
+    /// writes one ledger row that names the way back, and the result says
+    /// space is freed only when Trash is emptied.
+    #[test]
+    fn a_warned_reclaim_mark_moves_on_enter_and_says_trash_frees_nothing_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let folder = root.join("Caches");
+        std::fs::create_dir_all(folder.join("x")).unwrap();
+        std::fs::write(folder.join("x/f"), b"12345").unwrap();
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        app.set_external_units(vec![drilled_unit(folder.to_str().unwrap(), vec![])]);
+        // A store whose protect list cannot be read: a warning, not a block.
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(swamp_core::protection::protect_path(&store), b"not parquet").unwrap();
+        app.store_dir = Some(store.clone());
+        app.set_view(ViewKind::Reclaim);
+        app.selected = 0;
+        app.mark_selected();
+        assert_eq!(app.marked.len(), 1, "{:?}", app.refusal_active());
+        let summary = app.confirm_summary();
+        assert!(
+            summary.contains("could not read your protect list"),
+            "{summary}"
+        );
+        assert!(summary.contains("last used"), "{summary}");
+        assert!(folder.exists(), "marking moves nothing");
+        app.confirm_open = true;
+        app.start_delete(
+            swamp_core::fs_gate::StoreDir::at(&store).unwrap(),
+            root.join("Trash"),
+        );
+        wait_operation(&mut app);
+        assert!(!folder.exists(), "Enter moved what was marked");
+        let result = app.last_result.clone().unwrap();
+        assert!(
+            result.contains("Space is freed when Trash is emptied"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Sizes are from the last observation"),
+            "{result}"
+        );
+        let rows = swamp_core::ledger::Ledger::open(store.join("ledger.parquet"))
+            .unwrap()
+            .all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "completed");
+        assert!(rows[0].recovery_location.as_ref().unwrap().exists());
     }
 
     /// Reviewer M2: the same bytes never appear twice under one row. The

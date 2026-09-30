@@ -210,9 +210,13 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
             .contains("1 candidate ·"),
         "empty and unsupported groups are not cleanup opportunities"
     );
+    // Tempting wrong patch: the category's own folder is swept into an
+    // exact cleanup selection (bulk mark, a group mark, a project mark).
+    // It is a real folder, so Space on its own row may move it, but it is
+    // marked one at a time and never by `A` or a group.
     assert!(
-        rows[incremental].unit.is_none(),
-        "category must not become an exact cleanup selection"
+        rows[incremental].unit.is_some() && rows[incremental].individual_only,
+        "the folder is markable on its own row only"
     );
     assert!(!rows.iter().any(|r| r.label.contains("crate-a")));
     // Advice must be visible while a different row is selected, not just in
@@ -929,10 +933,11 @@ fn agents_view_confirm_row_shows_session_removal_consequences() {
     }
 }
 
-/// The mirror case: a protected/unsupported row's footer names the exact
-/// reason (`propose_agents`'s own refusal text), never a generic
-/// "nothing to delete on this row" -- see `model::agent_rows`'s doc
-/// comment on why `unit` is set even for a row that cannot be acted on.
+/// The mirror case: a row swamp keeps by default (a config file, no swamp
+/// rule for its category) marks, drawn `✗` and labelled `[kept by
+/// default]`; its confirm says what the tool loses (asserted in the lib
+/// tests). Tempting wrong patch: it is refused as "protected" with no way
+/// to act on what the person plainly sees. The fixture name is the old one.
 #[test]
 fn agents_view_refusal_state_names_the_protection_reason() {
     for (w, h) in [(80, 24), (200, 60)] {
@@ -1274,6 +1279,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         last_used: None,
         size_text: None,
         detail_lines: Vec::new(),
+        individual_only: false,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [
@@ -1372,6 +1378,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     let unit = |path: &std::path::Path| MarkedUnit {
         cargo_unit: None,
         agent_unit: None,
+        reclaim: None,
         path: path.to_path_buf(),
         docker: None,
         worktree_path: PathBuf::new(),
@@ -1620,14 +1627,15 @@ fn node_and_gradle_family_group_frames() {
             .find(|r| r.label == "Build outputs")
             .expect("the Gradle outputs group");
         assert!(outputs.expandable && outputs.collapsed_children == Some(1));
-        // Marking a group is refused as inspection-only, and nothing is
-        // marked.
+        // Marking a group header no cleanup rule covers is a category of
+        // paths, not a path: it says so and points at the items inside;
+        // nothing is marked.
         app.mark_row(outputs);
         assert!(app.marked.is_empty());
         assert!(
             app.refusal
                 .as_ref()
-                .is_some_and(|(m, _)| m.contains("Inspection-only")),
+                .is_some_and(|(m, _)| m.contains("Category total: pick one of the items")),
             "{:?}",
             app.refusal
         );
@@ -1660,7 +1668,10 @@ fn node_and_gradle_family_group_frames() {
             classes.cleanup_summary
         );
         assert!(
-            classes.signals.iter().any(|s| s == "inspection only"),
+            classes
+                .signals
+                .iter()
+                .any(|s| s == "no cleanup rule; Space still moves this exact path to Trash"),
             "{:?}",
             classes.signals
         );
@@ -1671,8 +1682,8 @@ fn node_and_gradle_family_group_frames() {
         assert!(
             pnpm.signals
                 .iter()
-                .any(|s| s.starts_with("selective cleanup unsupported")),
-            "a shared store says what it cannot do, separately from what it is: {:?}",
+                .any(|s| s.starts_with("no cleanup rule (")),
+            "a shared store says what no rule covers, separately from what it is: {:?}",
             pnpm.signals
         );
         check(
@@ -1688,6 +1699,7 @@ fn plain_unit(path: &str, bytes: u64) -> swamp_tui::actions::MarkedUnit {
     swamp_tui::actions::MarkedUnit {
         cargo_unit: None,
         agent_unit: None,
+        reclaim: None,
         path: PathBuf::from(path),
         docker: None,
         worktree_path: PathBuf::from(path),
@@ -1905,7 +1917,9 @@ fn a_checkout_is_named_as_a_checkout() {
 }
 
 /// On a short screen the confirm drops whole tail lines and says so; it
-/// never cuts a warning mid-sentence, and the numbers stay.
+/// never cuts a warning mid-sentence, and the numbers stay. A plan that
+/// folds a warning offers no Enter (audit G6 item 12): the footer says the
+/// plan does not fit.
 #[test]
 fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
     let mut app = App::new(fixture_report(), "/Users/dev/src".into());
@@ -1920,7 +1934,9 @@ fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
     let f = capture(&app, 40, 14);
     assert!(f.contains("Move 4 items (4.0GB) → Trash"), "{f}");
     assert!(f.contains("more lines"), "{f}");
-    assert!(f.contains("Enter confirm · Esc back"), "{f}");
+    assert!(!app.confirm_fits(40, 14));
+    assert!(!f.contains("Enter confirm · Esc back"), "{f}");
+    assert!(f.contains("Plan does not fit"), "{f}");
 }
 
 // ---- steady layout: nothing moves, nothing goes quiet ----------------
@@ -2833,11 +2849,13 @@ fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
         assert!(reclaim_footer.contains("v view"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("q quit"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("? help"), "{reclaim_footer}");
-        // Reclaim shows no key that only refuses: nothing in it is
-        // markable, so no delete or mark keys.
-        for gone in ["⌫ delete", "Space mark", "A mark all"] {
-            assert!(!reclaim_footer.contains(gone), "{reclaim_footer}");
+        // Reclaim names `Space mark` and `⌫ trash` while the row under the
+        // cursor is a real path (a unit, or a listed folder), and never
+        // the old "delete" word, which Reclaim did not do.
+        for want in ["⌫ trash", "Space mark"] {
+            assert!(reclaim_footer.contains(want), "{reclaim_footer}");
         }
+        assert!(!reclaim_footer.contains("⌫ delete"), "{reclaim_footer}");
         // Every other view keeps its footer, on the same screen row.
         let external = {
             app.set_view(ViewKind::External);

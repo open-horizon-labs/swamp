@@ -343,7 +343,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 /// person reaches for first: filter, view, refresh and delete come before
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
-fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
+fn footer_legend(width: usize, blocked: bool, markable: bool, trash: bool) -> String {
     const BASE: [&str; 12] = [
         "Tab section",
         "v view",
@@ -360,10 +360,19 @@ fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
     ];
     const TAIL: &str = "q quit";
     let mut items: Vec<&str> = BASE.to_vec();
+    if trash {
+        // Reclaim and External: what Backspace does on a row that has a
+        // mark to make is the Trash confirm.
+        for k in items.iter_mut() {
+            if *k == "⌫ delete" {
+                *k = "⌫ trash";
+            }
+        }
+    }
     if !markable {
         // A view whose rows cannot be marked shows no key that only
         // answers with a refusal.
-        items.retain(|k| !matches!(*k, "⌫ delete" | "Space mark" | "A mark all"));
+        items.retain(|k| !matches!(*k, "⌫ delete" | "⌫ trash" | "Space mark" | "A mark all"));
     }
     if blocked {
         // What the last check could not include, one key from the list.
@@ -485,6 +494,21 @@ fn items(n: usize) -> String {
 /// confirm text; its first line is the headline shown in the status rows.
 fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
     let rest: &[String] = summary.get(1..).unwrap_or(&[]);
+    // A plan of only Reclaim/External folders: the exact paths and sizes,
+    // what swamp knows and does not know about each, and the way back.
+    if !app.marked.is_empty() && app.marked.values().all(|u| u.reclaim.is_some()) {
+        return rest
+            .iter()
+            .map(|l| {
+                let c = if l.starts_with('⚠') {
+                    Color::Yellow
+                } else {
+                    Color::Reset
+                };
+                (l.clone(), c)
+            })
+            .collect();
+    }
     let irreversible = rest
         .iter()
         .take_while(|l| l.starts_with("Remove ") || l.starts_with("Gone for good"))
@@ -561,6 +585,22 @@ fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
     out
 }
 
+/// Whether the plan sheet can show every line of a Reclaim/External plan
+/// at this terminal size. The sheet has no scroll and no key is free to
+/// scroll it, so a plan that would hide a line behind a count does not
+/// offer Enter: the terminal has to be larger.
+pub fn reclaim_plan_fits(app: &App, width: u16, height: u16) -> bool {
+    let summary: Vec<String> = app.confirm_summary().lines().map(str::to_string).collect();
+    let inner_w = usize::from(width.saturating_sub(2)).max(1);
+    let need: usize = plan_sheet(app, &summary)
+        .iter()
+        .map(|(l, _)| wrapped_rows(l, inner_w))
+        .sum::<usize>()
+        + 2;
+    let chrome = 1 + usize::from(headline_rows(height)) + 1 + 1 + usize::from(STATUS_ROWS) + 1;
+    need <= usize::from(height).saturating_sub(chrome)
+}
+
 /// The plan by project, largest first, the tail folded into one line.
 fn project_breakdown(app: &App) -> Vec<(String, Color)> {
     let mut by: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
@@ -613,11 +653,12 @@ fn blocked_sheet(app: &App) -> Vec<(String, Color)> {
 fn draw_sheet(
     frame: &mut Frame,
     body: Rect,
+    rows: u16,
     title: &str,
     lines: &[(String, Color)],
     more: &dyn Fn(usize) -> String,
 ) {
-    let h = SHEET_ROWS.min(body.height);
+    let h = rows.min(body.height);
     if h < 3 {
         return;
     }
@@ -773,6 +814,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_sheet(
                 frame,
                 chunks[4],
+                SHEET_ROWS,
                 &if app.blocked_scroll > 0 {
                     format!(
                         "Blocked: {} · from item {}",
@@ -786,9 +828,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 &|_| "more below (↓ to scroll)".to_string(),
             );
         } else if app.confirm_open {
+            // A Reclaim plan lists exact paths and what swamp knows of each:
+            // it takes the whole body, and Enter is offered only when all
+            // of it fits (`reclaim_plan_fits`).
+            let rows = if app.marked.values().any(|u| u.reclaim.is_some()) {
+                chunks[4].height
+            } else {
+                SHEET_ROWS
+            };
             draw_sheet(
                 frame,
                 chunks[4],
+                rows,
                 "Plan · nothing has changed yet",
                 &plan_sheet(app, &summary),
                 &|n| format!("+{n} more lines"),
@@ -815,27 +866,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
             "↑↓ scroll · r check again · Esc close".to_string()
         }
     } else if app.confirm_open && !app.confirm_fits(size.width, size.height) {
-        let need = format!(
-            "{}x{}",
-            crate::app::CONFIRM_MIN_COLS,
-            crate::app::CONFIRM_MIN_ROWS
-        );
-        let long = format!("Terminal too small to confirm: enlarge to at least {need} · Esc back");
+        // The limit is whether the whole plan (every path and warning)
+        // fits the sheet, not a fixed size.
+        let long =
+            "The whole plan does not fit: enlarge the terminal or mark fewer rows · Esc back"
+                .to_string();
         if crate::model::display_width(&long) <= size.width as usize {
             long
         } else {
-            format!("Too small: need {need}")
+            "Plan does not fit · Esc back".to_string()
         }
     } else if app.confirm_open {
         let mut clauses = vec!["Enter confirm".to_string(), "Esc back".to_string()];
         if !app.blocked.is_empty() {
             clauses.push("d blocked".to_string());
         }
-        clauses.push(if app.keep_executables {
-            "keep executables → bin/ (k)".to_string()
-        } else {
-            "k keep executables".to_string()
-        });
+        // `k` copies executables out of a build folder before a move: it
+        // does nothing for a plan of Reclaim/External folders alone.
+        if !app.marked.values().all(|u| u.reclaim.is_some()) {
+            clauses.push(if app.keep_executables {
+                "keep executables → bin/ (k)".to_string()
+            } else {
+                "k keep executables".to_string()
+            });
+        }
         fit_clauses(&clauses, size.width as usize)
     } else if app.picker.is_some() {
         fit_clauses(
@@ -855,7 +909,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
         footer_legend(
             size.width as usize,
             !app.blocked.is_empty(),
-            !matches!(
+            match app.view {
+                // The keys are named only while the row under the cursor
+                // has a mark to make; a row that is not a folder shows why
+                // in the detail pane instead.
+                crate::app::ViewKind::Reclaim
+                | crate::app::ViewKind::Disk
+                | crate::app::ViewKind::DiskGaps => app.selected_row_markable(),
+                _ => true,
+            },
+            matches!(
                 app.view,
                 crate::app::ViewKind::Reclaim
                     | crate::app::ViewKind::Disk
@@ -2061,7 +2124,11 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "Space",
         "mark or unmark the row. On a project row: everything in it that can be rebuilt",
     );
-    entry(&mut out, "A", "mark every row here that can be cleaned up");
+    entry(
+        &mut out,
+        "A",
+        "mark every row here that swamp has a cleanup rule for. Rows it keeps by default or has no rule for are marked one at a time with Space; in Reclaim and External each unit is marked once",
+    );
     entry(
         &mut out,
         "Backspace",
@@ -2080,7 +2147,12 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "",
-        "mise installs and simulator runtimes: the manager's own list and dry run, then its command, permanently: no Trash.",
+        "Reclaim, External and Disk rows, and the folders listed under them: Space marks the real folder, Backspace opens a confirm with its exact path, size and what swamp does not know (last used, regeneration cost, who has it open), and Trash is the way back. Refused only for a path that is not a real folder or file, an OS refusal, a mark that changed since you made it, an unwritable ledger, an overlap, your own protect mark, or swamp's own ledger or Trash (or a folder holding them).",
+    );
+    entry(
+        &mut out,
+        "",
+        "mise installs and simulator runtimes: Backspace on an unmarked row opens the manager's own list and dry run, then its command, permanently: no Trash. Space marks the folder for Trash instead.",
     );
     entry(
         &mut out,

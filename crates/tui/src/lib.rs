@@ -1292,6 +1292,7 @@ mod tests {
         crate::actions::MarkedUnit {
             cargo_unit: None,
             agent_unit: None,
+            reclaim: None,
             path: path.into(),
             docker: docker.then(|| swamp_core::docker::Removal::Volume {
                 name: "pgdata".into(),
