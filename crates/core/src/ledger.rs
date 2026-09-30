@@ -35,6 +35,10 @@ impl Verb {
 
 pub const NO_GRANT: &str = "human-marked";
 
+/// How an append that did write its record, but only into a new ledger
+/// (the old one could not be read and was kept aside), begins its error.
+pub const KEPT_ASIDE: &str = "the previous ledger could not be read";
+
 /// One fact the human saw before the action ran, as a key and its
 /// rendered value (`bytes`, `label`, `observed_at`, ...). Typed rows in
 /// `ledger_facts.parquet`, never a JSON blob.
@@ -194,8 +198,7 @@ impl Ledger {
             .with_context(|| format!("write {}", facts_path.display()))?;
         if !kept.is_empty() {
             anyhow::bail!(
-                "the previous ledger could not be read; it was kept as {}, and this record \
-                 starts a new ledger",
+                "{KEPT_ASIDE}; it was kept as {}, and this record starts a new ledger",
                 kept.join(", ")
             );
         }

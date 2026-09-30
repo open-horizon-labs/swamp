@@ -895,7 +895,7 @@ fn draw_tool_sheet(frame: &mut Frame, sheet: &crate::tool_sheet::ToolSheet, size
         return;
     }
     frame.render_widget(Clear, popup);
-    sheet.note_drawn();
+    sheet.note_drawn(size.width, size.height);
     let (width, rows) = crate::tool_sheet::body_size(size.width, size.height);
     let mut lines: Vec<Line> = sheet
         .body(width, rows)

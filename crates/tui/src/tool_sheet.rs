@@ -40,7 +40,9 @@ pub struct ToolSheet {
     pub cursor: usize,
     /// When the confirm was first drawn (set by the drawing code, which
     /// only has `&self`): `Y` counts from there.
-    first_drawn: std::cell::Cell<Option<std::time::Instant>>,
+    /// When the confirm was first painted in full, and at which terminal
+    /// size (set by the drawing code, which only has `&self`).
+    first_drawn: std::cell::Cell<Option<(std::time::Instant, u16, u16)>>,
 }
 
 /// How long a confirm must have been on screen before `Y` runs it.
@@ -65,10 +67,23 @@ impl ToolSheet {
         }
     }
 
-    /// The drawing code calls this each time it paints the sheet.
-    pub fn note_drawn(&self) {
-        if matches!(self.stage, Stage::Confirm(_)) && self.first_drawn.get().is_none() {
-            self.first_drawn.set(Some(std::time::Instant::now()));
+    /// The drawing code calls this each time it paints the sheet at
+    /// `w`x`h`. The hold-off starts at the first paint where the whole
+    /// confirm fits, restarts when the size changes, and is cleared by a
+    /// paint where it does not fit.
+    pub fn note_drawn(&self, w: u16, h: u16) {
+        let Stage::Confirm(p) = &self.stage else {
+            return;
+        };
+        if !confirm_fits(p, w, h) {
+            self.first_drawn.set(None);
+            return;
+        }
+        match self.first_drawn.get() {
+            Some((_, dw, dh)) if (dw, dh) == (w, h) => {}
+            _ => self
+                .first_drawn
+                .set(Some((std::time::Instant::now(), w, h))),
         }
     }
 
@@ -77,13 +92,14 @@ impl ToolSheet {
         self.first_drawn.set(None);
     }
 
-    /// Whether the confirm has been drawn at least once, [`HOLD_OFF`] ago.
-    pub fn armed(&self) -> bool {
+    /// Whether the whole confirm has been on screen at exactly `w`x`h`
+    /// for at least [`HOLD_OFF`].
+    pub fn armed(&self, w: u16, h: u16) -> bool {
         matches!(self.stage, Stage::Confirm(_))
             && self
                 .first_drawn
                 .get()
-                .is_some_and(|t| t.elapsed() >= HOLD_OFF)
+                .is_some_and(|(t, dw, dh)| (dw, dh) == (w, h) && t.elapsed() >= HOLD_OFF)
     }
 
     /// Whether a worker is running for this sheet.

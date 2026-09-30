@@ -574,6 +574,15 @@ pub struct CargoLayout {
 use serde::{Deserialize, Serialize};
 
 pub fn layout_for(worktree: &Path) -> CargoLayout {
+    layout_with_env(worktree, |k| std::env::var_os(k))
+}
+
+/// [`layout_for`] with the environment given (a test's is empty, so a
+/// `CARGO_TARGET_DIR` in the shell running the tests cannot change it).
+fn layout_with_env(
+    worktree: &Path,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> CargoLayout {
     let mut layout = CargoLayout::default();
     let mut config = None;
     let mut cursor = Some(worktree);
@@ -608,12 +617,10 @@ pub fn layout_for(worktree: &Path) -> CargoLayout {
         layout.target_dir = target.map(|p| resolve_config_path(config.as_deref(), p));
         layout.build_dir = build.map(|p| resolve_config_path(config.as_deref(), p));
     }
-    if let Some(p) =
-        std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"))
-    {
+    if let Some(p) = env("CARGO_TARGET_DIR").or_else(|| env("CARGO_BUILD_TARGET_DIR")) {
         layout.target_dir = Some(p.into());
     }
-    if let Some(p) = std::env::var_os("CARGO_BUILD_BUILD_DIR") {
+    if let Some(p) = env("CARGO_BUILD_BUILD_DIR") {
         layout.build_dir = Some(p.into());
     }
     for p in [&mut layout.target_dir, &mut layout.build_dir] {
@@ -1504,7 +1511,7 @@ mod tests {
             "[build]\ntarget-dir = \"../shared-target\"\nbuild-dir = \"../shared-build\""
         )
         .unwrap();
-        let layout = layout_for(tmp.path());
+        let layout = layout_with_env(tmp.path(), |_| None);
         assert_eq!(layout.target_dir, Some(tmp.path().join("../shared-target")));
         assert_eq!(layout.build_dir, Some(tmp.path().join("../shared-build")));
     }

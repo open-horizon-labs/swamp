@@ -103,7 +103,9 @@ The managers do not protect the human themselves (verified read-only
 9. **Anything changed between the confirm and `Y`**: `Y` runs the whole
    review again (listing, refusals, dry run, open files) and refuses if
    the command, the dry run's full text, the manager's own reason lines,
-   its targets or any reviewed fact differs.
+   its targets or any reviewed fact differs. What changes in the
+   milliseconds between that re-review and the command starting is not
+   seen: the re-review narrows the window, it does not close it.
 10. **The confirm was not seen**: Enter never runs a removal; `Y` runs
     nothing until the confirm has been drawn in full at a known terminal
     size and 1 s has passed; input queued when it appears is dropped;
@@ -123,6 +125,12 @@ for xcrun a `DEVELOPER_DIR` only when validated (a real directory owned
 by the user or root, not writable by others, holding a trusted `simctl`),
 otherwise "DEVELOPER_DIR ignored" on the confirm and the developer dir
 used in the ledger row.
+
+Not locked: two swamp processes against each other. A second instance
+confirming the same removal finds the manager with nothing to do (a
+no-op or an error), and the ledger's read-then-rewrite can lose one of
+the two rows (a store lock is a filed follow-up). Within one process,
+tool removals run one at a time.
 
 Not built: a bulk `mise prune --tools` removal (a set decided at exec
 time, whose path list cannot always be shown), `brew`, `rustup`.

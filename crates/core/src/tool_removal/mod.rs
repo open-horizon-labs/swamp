@@ -511,6 +511,11 @@ pub fn execute(
     sizes: &[(PathBuf, u64)],
     ledger: &Ledger,
 ) -> Outcome {
+    // One tool removal at a time in this process: a second confirm waits,
+    // then its re-review sees what the first did. Two swamp processes are
+    // not locked against each other (documented).
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let fresh = review_target(host, &preview.target, sizes);
     let changed = match &fresh {
         Err(r) => Some(Refusal {
@@ -552,7 +557,9 @@ pub fn execute(
     );
     let mut ledger_note = None;
     if let Err(e) = &started {
-        if !crate::fs_gate::exists(ledger.path()) {
+        // Only an append that did write the row (into a new ledger, the
+        // unreadable one kept aside) lets the removal go on.
+        if !e.starts_with(crate::ledger::KEPT_ASIDE) {
             let refusal = Refusal::new(
                 format!("swamp could not write its ledger ({e})."),
                 "Fix the store directory, then review again.",
@@ -982,9 +989,17 @@ pub(crate) fn clean_line(line: &str) -> String {
 /// Bidi controls, zero-width characters and line/paragraph separators: a
 /// manager line holding one could reorder or hide text on the confirm.
 fn invisible(c: char) -> bool {
+    // Every Unicode format (Cf) character: bidi controls, zero-width
+    // characters, tag characters (U+E0000..U+E007F), the Mongolian vowel
+    // separator, interlinear annotation marks; plus the line and
+    // paragraph separators.
     matches!(c,
-        '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{061C}' | '\u{00AD}')
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+            | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
 /// A whole stream as cleaned lines, bounded to [`SHOWN_OUTPUT_LINES`].

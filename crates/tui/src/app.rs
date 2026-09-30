@@ -3189,7 +3189,8 @@ impl App {
         let Stage::Confirm(preview) = &sheet.stage else {
             return;
         };
-        if w == 0 || h == 0 || !crate::tool_sheet::confirm_fits(preview, w, h) || !sheet.armed() {
+        if w == 0 || h == 0 || !crate::tool_sheet::confirm_fits(preview, w, h) || !sheet.armed(w, h)
+        {
             return;
         }
         let preview = preview.clone();
