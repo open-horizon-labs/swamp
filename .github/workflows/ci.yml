@@ -66,7 +66,7 @@ env:
 jobs:
   linux-x86_64:
     name: Linux x86_64 (Ubuntu 24.04)
-    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
+    if: github.ref_name != 'diag/fleet-fs' && (github.event_name != 'pull_request' || github.event.label.name == 'ci')
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
@@ -168,7 +168,7 @@ jobs:
 
   linux-x86_64-package:
     name: Linux x86_64 release archive, smoke and validation (Ubuntu 24.04)
-    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
+    if: github.ref_name != 'diag/fleet-fs' && (github.event_name != 'pull_request' || github.event.label.name == 'ci')
     runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
@@ -219,7 +219,7 @@ jobs:
   linux-newer-smoke:
     name: Linux x86_64 archive on the newest hosted Ubuntu (test-only)
     needs: linux-x86_64-package
-    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
+    if: github.ref_name != 'diag/fleet-fs' && (github.event_name != 'pull_request' || github.event.label.name == 'ci')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -249,9 +249,45 @@ jobs:
           name: swamp-linux-newer-validation
           path: newer/*
 
+  fleet-diag:
+    name: Fleet filesystem diagnostic
+    if: github.ref_name == 'diag/fleet-fs'
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Filesystems and mounts
+        run: |
+          set +e
+          uname -a; id; echo; df -T . /tmp /dev/shm /var/tmp "$HOME" "$RUNNER_TEMP" 2>&1
+          echo; mount | grep -E ' / | /opt| /tmp| /home| _work|overlay' | head -20
+          echo; for d in . /tmp /dev/shm /var/tmp "$HOME" "$RUNNER_TEMP"; do printf '%s: ' "$d"; stat -f -c 'type=%T bsize=%S' "$d" 2>&1; done
+          echo; cat /proc/self/cgroup | head -3; ls -ld /opt/actions-runner/_work /tmp 2>&1
+      - name: The vanishing-file test in each temp location
+        run: |
+          set +e
+          for d in "$RUNNER_TEMP" /tmp /dev/shm /var/tmp; do
+            echo "=== TMPDIR=$d"
+            TMPDIR="$d" cargo test --locked -p swamp-core --test traversal_accounting_and_volume_identity -- --nocapture 2>&1 | grep -E "^test |test result|panicked|collapsed" | head -14
+          done
+      - name: Incremental vs full equivalence, in each location
+        run: |
+          set +e
+          cargo build --locked -p swamp 2>&1 | tail -1
+          bin="$PWD/target/debug/swamp"
+          for d in "$RUNNER_TEMP" /tmp /dev/shm /var/tmp; do
+            echo "=== $d"
+            w="$(mktemp -d -p "$d")"; mkdir -p "$w/src/a/b" "$w/src/c"
+            for i in $(seq 1 200); do head -c 20000 /dev/urandom > "$w/src/a/b/f$i"; head -c 5000 /dev/urandom > "$w/src/c/g$i"; done
+            SWAMP_DIR="$w/store" "$bin" observe "$w/src" --full --no-enrich 2>&1 | grep -E '^observed_at=' | sed 's/^/full1: /' | cut -c1-140
+            for r in 1 2 3; do head -c 30000 /dev/urandom > "$w/src/a/b/new$r"; sleep 1; SWAMP_DIR="$w/store" "$bin" observe "$w/src" --no-enrich 2>&1 | grep -E '^observed_at=' | sed "s/^/incr$r: /" | cut -c1-140; done
+            SWAMP_DIR="$w/ref" "$bin" observe "$w/src" --full --no-enrich 2>&1 | grep -E '^observed_at=' | sed 's/^/full2: /' | cut -c1-140
+            rm -rf "$w"
+          done
+
   macos-arm64:
     name: macOS arm64
-    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
+    if: github.ref_name != 'diag/fleet-fs' && (github.event_name != 'pull_request' || github.event.label.name == 'ci')
     runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v5
