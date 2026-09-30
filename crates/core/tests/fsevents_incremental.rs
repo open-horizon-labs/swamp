@@ -1140,7 +1140,8 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
     assert_eq!(target_row(&second).growth_bytes, None);
     assert_eq!(
         target_row(&second).allocated_bytes.unwrap(),
-        target_row(&first).allocated_bytes.unwrap() + 8192
+        target_row(&first).allocated_bytes.unwrap()
+            + fixture::allocated_of(&target.join("touched.bin"))
     );
     assert!(!target_row(&full).dedup_stale);
     assert!(second.notes.iter().any(|n| n.contains("reconciliation")));

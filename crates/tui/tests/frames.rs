@@ -90,7 +90,16 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
         .find(|r| r.label == "Compiler caches")
         .unwrap()
         .clone();
-    assert_eq!(cache.bytes, 4096);
+    // What the filesystem reports for the one incremental file (4096 on
+    // APFS, tmpfs and ext4; a 512-byte sector multiple on ZFS).
+    let on_disk = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(target.join("debug/incremental/crate-a/state"))
+            .unwrap()
+            .blocks()
+            * 512
+    };
+    assert_eq!(cache.bytes, on_disk);
     assert!(
         cache.unit.is_none(),
         "virtual group must never select a directory"
