@@ -470,3 +470,25 @@ pub fn mount_points() -> Vec<MountPoint> {
 pub fn mount_points() -> Vec<MountPoint> {
     Vec::new()
 }
+
+/// A group's id by name (`getgrnam`); `None` when there is no such group.
+pub(crate) fn group_id(name: &str) -> Option<u32> {
+    let c = std::ffi::CString::new(name).ok()?;
+    // SAFETY: getgrnam returns null or a pointer into static storage; one
+    // field is read at once and nothing is kept.
+    let g = unsafe { libc::getgrnam(c.as_ptr()) };
+    (!g.is_null()).then(|| unsafe { (*g).gr_gid })
+}
+
+/// A group's name by id (`getgrgid`), for plain refusal text; `gid N` when
+/// the id has no name.
+pub(crate) fn group_name(gid: u32) -> String {
+    // SAFETY: as in `group_id`.
+    let g = unsafe { libc::getgrgid(gid) };
+    if g.is_null() {
+        return format!("gid {gid}");
+    }
+    unsafe { std::ffi::CStr::from_ptr((*g).gr_name) }
+        .to_string_lossy()
+        .into_owned()
+}

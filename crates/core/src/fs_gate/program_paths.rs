@@ -129,18 +129,80 @@ fn trusted_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A directory owned by root or the current user that neither the group
-/// nor the world can write.
-pub(super) fn trusted_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !m.is_dir() || !trusted_owner(&m) || m.mode() & 0o022 != 0 {
+/// Who may be trusted to own or write a program directory: the current
+/// user, root, and, on macOS only, the `admin` group.
+struct Trust {
+    uid: u32,
+    /// The macOS `admin` group's id, looked up by name; `None` on Linux
+    /// (there is no such group, and Linuxbrew directories are user-owned
+    /// and not group-writable).
+    admin_gid: Option<u32>,
+}
+
+impl Trust {
+    fn current() -> Self {
+        Self {
+            uid: super::current_uid(),
+            admin_gid: if cfg!(target_os = "macos") {
+                super::sys::group_id("admin")
+            } else {
+                None
+            },
+        }
+    }
+}
+
+/// The directory rule, on plain metadata so tests can state any owner and
+/// group (#205 follow-up to the #190 resolver). A directory is trusted when
+/// it is owned by the current user or root, is not world-writable, and is
+/// group-writable only for the macOS `admin` group: admin members can
+/// already use sudo, so letting them write where Homebrew keeps its
+/// programs grants no power they lack. Any other group, any other owner,
+/// or world-write is refused, and so is any group-write on Linux.
+fn check_dir(
+    path: &Path,
+    is_dir: bool,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    trust: &Trust,
+    names: &dyn Fn(u32) -> String,
+) -> Result<(), String> {
+    if !is_dir {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    if uid != 0 && uid != trust.uid {
         return Err(format!(
-            "{} is writable by another user or owned by one",
+            "{} is owned by another user; swamp runs a program only you or root can change",
             path.display()
         ));
     }
+    if mode & 0o002 != 0 {
+        return Err(format!("{} is writable by every user", path.display()));
+    }
+    if mode & 0o020 != 0 && trust.admin_gid != Some(gid) {
+        return Err(format!(
+            "{} is writable by group {}",
+            path.display(),
+            names(gid)
+        ));
+    }
     Ok(())
+}
+
+/// A directory the rule in [`check_dir`] trusts.
+pub(super) fn trusted_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    check_dir(
+        path,
+        m.is_dir(),
+        m.mode(),
+        m.uid(),
+        m.gid(),
+        &Trust::current(),
+        &super::sys::group_name,
+    )
 }
 
 /// A resolved program: the canonical executable, and the directory that
@@ -156,8 +218,8 @@ pub(super) struct Resolved {
 /// become `~/.cargo/bin/mise`). The real file (symlinks followed:
 /// Homebrew's `bin/mise` links into the Cellar) and its directory must be
 /// trusted. The child's `PATH` starts with the candidate's own directory
-/// only when that is trusted too; otherwise (Homebrew's `bin` is
-/// group-writable by design) with the real file's directory.
+/// only when that is trusted too; otherwise with the real file's
+/// directory.
 pub(super) fn resolve_strict(candidates: &[PathBuf]) -> Result<Resolved, String> {
     let Some(found) = candidates
         .iter()
@@ -346,6 +408,110 @@ pub fn plan(program: Program) -> io::Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ME: u32 = 501;
+    const ADMIN: u32 = 80;
+    const STAFF: u32 = 20;
+    fn names(gid: u32) -> String {
+        match gid {
+            ADMIN => "admin".into(),
+            STAFF => "staff".into(),
+            g => format!("gid {g}"),
+        }
+    }
+    fn mac() -> Trust {
+        Trust {
+            uid: ME,
+            admin_gid: Some(ADMIN),
+        }
+    }
+    fn linux() -> Trust {
+        Trust {
+            uid: ME,
+            admin_gid: None,
+        }
+    }
+    fn dir(mode: u32, uid: u32, gid: u32, t: &Trust) -> Result<(), String> {
+        check_dir(
+            Path::new("/opt/homebrew/bin"),
+            true,
+            mode,
+            uid,
+            gid,
+            t,
+            &names,
+        )
+    }
+
+    /// The standard Apple Silicon Homebrew layout: user-owned, admin
+    /// group-writable. Tempting wrong patch (the one this replaces):
+    /// refusing every group-writable directory, which refuses brew on
+    /// most Macs.
+    #[test]
+    fn an_admin_group_writable_dir_you_own_is_trusted_on_macos() {
+        assert_eq!(dir(0o40775, ME, ADMIN, &mac()), Ok(()));
+        assert_eq!(dir(0o40775, 0, ADMIN, &mac()), Ok(()));
+        assert_eq!(dir(0o40755, ME, STAFF, &mac()), Ok(()));
+    }
+
+    /// Tempting wrong patch: accepting any group-write, or matching the
+    /// group by "is the user a member".
+    #[test]
+    fn another_group_world_write_or_another_owner_is_refused() {
+        assert_eq!(
+            dir(0o40775, ME, STAFF, &mac()),
+            Err("/opt/homebrew/bin is writable by group staff".into())
+        );
+        assert!(
+            dir(0o40777, ME, ADMIN, &mac())
+                .unwrap_err()
+                .contains("every user")
+        );
+        assert!(
+            dir(0o40757, ME, STAFF, &mac())
+                .unwrap_err()
+                .contains("every user")
+        );
+        assert!(
+            dir(0o40755, 502, ADMIN, &mac())
+                .unwrap_err()
+                .contains("another user")
+        );
+        assert!(
+            check_dir(Path::new("/x"), false, 0o100755, ME, STAFF, &mac(), &names).is_err(),
+            "a non-directory is never a trusted directory"
+        );
+    }
+
+    /// Linux has no admin group: any group-write is refused, even with a
+    /// group numbered like macOS's admin.
+    #[test]
+    fn linux_refuses_any_group_writable_dir() {
+        assert!(dir(0o40775, ME, ADMIN, &linux()).is_err());
+        assert_eq!(dir(0o40755, ME, ADMIN, &linux()), Ok(()));
+    }
+
+    /// The binary itself is still held to the strict rule: owned by you or
+    /// root and not group- or world-writable, whatever its directory.
+    #[test]
+    fn the_binary_checks_still_apply_under_a_trusted_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("brew");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            trusted_file(&exe).is_err(),
+            "a group-writable binary is refused"
+        );
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            trusted_file(&exe).is_err(),
+            "a non-executable file is refused"
+        );
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(trusted_file(&exe).is_ok());
+    }
 
     #[test]
     fn a_program_that_is_not_migrated_keeps_its_old_behavior() {
