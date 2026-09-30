@@ -248,4 +248,158 @@ mod tests {
             }
         }
     }
+    /// Adversarial (audit/v080-g0): every user-facing string any adapter
+    /// renders for the v0.8.0 store kinds, and every note/name/version
+    /// note of the new detectors, carries no verdict word and no em
+    /// dash. Tempting wrong patch: scanning only `consequence` and only
+    /// this adapter, while `xcode_swift`'s system rows, reasons and
+    /// no-action texts go unchecked.
+    #[test]
+    fn audit_no_verdict_or_em_dash_in_any_new_catalog_string() {
+        let banned = [
+            concat!("un", "used"),
+            concat!("obso", "lete"),
+            concat!("st", "ale"),
+            concat!("orph", "an"),
+            "safe to",
+            "can be deleted",
+        ];
+        let words = |t: &str| -> Vec<String> {
+            t.to_ascii_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .map(str::to_string)
+                .collect()
+        };
+        let check = |who: &str, text: &str| {
+            assert!(!text.contains('\u{2014}'), "{who}: em dash in {text}");
+            let lower = text.to_ascii_lowercase();
+            for b in banned {
+                let hit = if b.contains(' ') {
+                    lower.contains(b)
+                } else {
+                    words(text).iter().any(|w| w == b)
+                };
+                assert!(!hit, "{who}: verdict word {b:?} in {text}");
+            }
+            assert!(
+                !words(text).iter().any(|w| w == concat!("sa", "fe")),
+                "{who}: verdict word in {text}"
+            );
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let dirs = vec![
+            FoldedDir {
+                path: root.join("child"),
+                allocated_total: 4096,
+                mtime_max: 5,
+                complete: true,
+            },
+            FoldedDir {
+                path: root.clone(),
+                allocated_total: 8192,
+                mtime_max: 5,
+                complete: true,
+            },
+        ];
+        let idx = FoldedIndex::from_dirs(dirs);
+        let none = EventCoverage::untrusted();
+        let cache = ContainerCache::disabled();
+        let kinds = [
+            BuildStoreKind::EspressifDist,
+            BuildStoreKind::EspressifTools,
+            BuildStoreKind::EspressifPythonEnv,
+            BuildStoreKind::AgentScratch,
+            BuildStoreKind::XcodeCommandLineTools,
+            BuildStoreKind::XcodeDeveloperDiskImages,
+            BuildStoreKind::SimulatorSystemSupport,
+            BuildStoreKind::AndroidSdkPackages,
+        ];
+        let registry = crate::build_adapters::registry::Registry::with_builtins();
+        let mut seen = 0;
+        for adapter in registry.adapters() {
+            for kind in kinds {
+                if !adapter.store_kinds().contains(&kind) {
+                    continue;
+                }
+                for leaf in ["store", "Images", "Cryptex", "Profiles", "ndk"] {
+                    let path = if leaf == "store" {
+                        root.clone()
+                    } else {
+                        tmp.path().join(leaf)
+                    };
+                    let c = BuildContainer::shared_store_of(adapter.id(), path, kind);
+                    for u in adapter.identify(&c, &BuildCtx::new(1_000_000, &idx, &none, &cache)) {
+                        seen += 1;
+                        let json = serde_json::to_string(&u).unwrap();
+                        check(&format!("{}/{kind:?}", adapter.id()), &json);
+                        assert!(
+                            !matches!(u.action, crate::artifact::NestedActionCapability::TrashPath),
+                            "{}/{kind:?}: a system or tool store offers Trash",
+                            adapter.id()
+                        );
+                    }
+                }
+            }
+        }
+        assert!(seen >= 16, "only {seen} units rendered");
+
+        let env = crate::locations::Environment::fixture(
+            PathBuf::from("/Users/dev"),
+            std::collections::HashMap::new(),
+            crate::locations::Platform::MacOS,
+        );
+        for d in crate::locations::Registry::with_builtins().detectors() {
+            if ![
+                "espressif",
+                "android",
+                "xcode-system",
+                "core-simulator",
+                "claude-code-scratch",
+            ]
+            .contains(&d.id())
+            {
+                continue;
+            }
+            check(d.id(), d.name());
+            check(d.id(), d.version_note());
+            for l in d.detect(&env) {
+                check(d.id(), l.note.as_deref().unwrap_or(""));
+            }
+        }
+    }
+
+    /// Adversarial (audit/v080-g0): `label` ids unique across ALL
+    /// kinds, and every new kind is served by exactly one adapter.
+    /// Tempting wrong patch: add a variant to the enum and `label` but
+    /// forget `ALL`, or claim a kind from two adapters.
+    #[test]
+    fn audit_store_kind_ids_unique_and_each_new_kind_has_one_adapter() {
+        let mut ids: Vec<&str> = BuildStoreKind::ALL.iter().map(|k| k.label()).collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "duplicate BuildStoreKind ids");
+        let registry = crate::build_adapters::registry::Registry::with_builtins();
+        for kind in [
+            BuildStoreKind::EspressifDist,
+            BuildStoreKind::EspressifTools,
+            BuildStoreKind::EspressifPythonEnv,
+            BuildStoreKind::AgentScratch,
+            BuildStoreKind::XcodeCommandLineTools,
+            BuildStoreKind::XcodeDeveloperDiskImages,
+            BuildStoreKind::SimulatorSystemSupport,
+        ] {
+            assert!(BuildStoreKind::ALL.contains(&kind), "{kind:?} not in ALL");
+            let owners: Vec<_> = registry
+                .adapters()
+                .iter()
+                .filter(|a| a.store_kinds().contains(&kind))
+                .map(|a| a.id())
+                .collect();
+            assert_eq!(owners.len(), 1, "{kind:?}: {owners:?}");
+        }
+    }
 }
