@@ -377,14 +377,21 @@ fn no_prune_removal_shape_exists() {
     ] {
         assert!(!is_tool_exec(Program::Mise, &words(bulk)), "{bulk}");
     }
-    assert!(is_tool_read(Program::Mise, &words("-C / prune --tools --dry-run")));
+    assert!(is_tool_read(
+        Program::Mise,
+        &words("-C / prune --tools --dry-run")
+    ));
     let sb = Sandbox::new();
     sb.standard_mise();
     sb.go_uninstall_removes(0);
     let p = tool_removal::review_target(&sb.host(), &go(), &[]).unwrap();
     tool_removal::execute(&sb.host(), &p, &[], &sb.ledger());
     assert_eq!(sb.ran("-C / prune"), 0, "bare prune never runs");
-    assert_eq!(sb.ran("-C / prune --tools"), 0, "prune never runs as a removal");
+    assert_eq!(
+        sb.ran("-C / prune --tools"),
+        0,
+        "prune never runs as a removal"
+    );
 }
 
 /// Tempting wrong patch: "one shape with an optional `--dry-run`". Each
@@ -476,7 +483,11 @@ fn a_booted_simulator_refuses_its_runtime() {
         &Target::SimRuntime { uuid: UUID.into() },
         &[],
     ));
-    assert!(r.reason.contains("iPhone 17 Pro is booted"), "{}", r.reason);
+    assert!(
+        r.reason.contains("iPhone 17 Pro (Booted) is not shut down"),
+        "{}",
+        r.reason
+    );
     assert!(r.next.contains("Shut it down"), "{}", r.next);
     assert_refusal_plain(&r);
     assert_eq!(
@@ -765,7 +776,8 @@ fn the_child_environment_is_built_from_nothing() {
     let host = sb.host().with_parent_env(&[
         ("RUSTUP_TOOLCHAIN", "poisoned"),
         ("MISE_ENV", "poisoned"),
-        ("MISE_DATA_DIR", "/poisoned"),
+        ("MISE_YES", "poisoned"),
+        ("MISE_NODE_VERSION", "poisoned"),
         ("HOMEBREW_PREFIX", "/poisoned"),
         ("PATH", "/poisoned/bin:/usr/bin"),
         (
@@ -780,15 +792,18 @@ fn the_child_environment_is_built_from_nothing() {
     for name in [
         "RUSTUP_TOOLCHAIN=",
         "MISE_ENV=",
-        "MISE_DATA_DIR=",
+        "MISE_YES=",
+        "MISE_NODE_VERSION=",
         "HOMEBREW_PREFIX=",
+        "DEVELOPER_DIR=",
     ] {
         assert!(
             !env.lines().any(|l| l.starts_with(name)),
             "{name} leaked: {env}"
         );
     }
-    assert!(env.contains("DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer"));
+    // mise's own directory settings pass (program_paths::MISE_PASSTHROUGH);
+    // DEVELOPER_DIR never reaches mise, and reaches xcrun only validated.
     assert!(env.contains("NO_COLOR=1") && env.contains("PAGER=cat"));
     assert!(
         env.contains(&format!("HOME={}", sb.home().display())),
@@ -886,7 +901,7 @@ fn the_ledger_record_is_its_own_verb_and_old_readers_see_a_removal() {
     assert_eq!(fact("argv_exec"), "mise -C / uninstall go@1.23.5");
     assert_eq!(fact("permanent"), "true");
     assert_eq!(fact("exit_code"), "0");
-    assert!(fact("env_policy").starts_with("tool-env-1"));
+    assert!(fact("env_policy").starts_with("tool-env-2"));
     assert_eq!(
         command_line("mise", &[OsString::from("-C")]),
         "mise -C",

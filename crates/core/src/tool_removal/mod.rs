@@ -513,6 +513,8 @@ pub fn execute(
         let line = format!("Nothing ran. {} {}", refusal.reason, refusal.next);
         let recorded = record(
             ledger,
+            &crate::entities::new_id(),
+            false,
             preview,
             &format!("refused:{}", refusal.reason),
             "not run",
@@ -523,6 +525,34 @@ pub fn execute(
             line,
             recorded,
         };
+    }
+    // A `started` row before anything runs: a removal cut short (the
+    // terminal closed, swamp killed) still leaves a trace. The final row
+    // replaces it. A ledger swamp cannot write at all means nothing runs.
+    let id = crate::entities::new_id();
+    let started = record(
+        ledger,
+        &id,
+        false,
+        preview,
+        "started",
+        "running; not re-read",
+        None,
+    );
+    let mut ledger_note = None;
+    if let Err(e) = &started {
+        if !crate::fs_gate::exists(ledger.path()) {
+            let refusal = Refusal::new(
+                format!("swamp could not write its ledger ({e})."),
+                "Fix the store directory, then review again.",
+            );
+            return Outcome {
+                line: format!("Nothing ran. {} {}", refusal.reason, refusal.next),
+                status: Status::Refused(refusal),
+                recorded: started,
+            };
+        }
+        ledger_note = Some(e.clone());
     }
     let run =
         crate::fs_gate::destroy::tool_remove(&preview.bin, &preview.exec_argv, host.exec_timeout);
@@ -535,14 +565,26 @@ pub fn execute(
         ),
         Ok(out) => classify(out, &after, preview),
     };
-    let line = result_line(
+    let mut line = result_line(
         preview,
         &status,
         run.as_ref().ok(),
         &after,
         host.exec_timeout.as_secs(),
     );
-    let recorded = record(ledger, preview, &outcome, &observed, run.as_ref().ok());
+    let mut recorded = record(
+        ledger,
+        &id,
+        true,
+        preview,
+        &outcome,
+        &observed,
+        run.as_ref().ok(),
+    );
+    if let Some(note) = ledger_note {
+        line.push_str(&format!(" Note: {note}."));
+        recorded = Err(note);
+    }
     Outcome {
         status,
         line,
@@ -713,6 +755,8 @@ fn result_line(
 /// observed afterwards.
 fn record(
     ledger: &Ledger,
+    id: &str,
+    replace: bool,
     preview: &Preview,
     outcome: &str,
     observed: &str,
@@ -722,6 +766,13 @@ fn record(
         LedgerFact::new("manager", preview.manager.name()),
         LedgerFact::new("manager_version", &preview.manager_version),
         LedgerFact::new("program", preview.bin.path().display()),
+        LedgerFact::new(
+            "developer_dir",
+            preview
+                .bin
+                .developer_dir()
+                .unwrap_or("not set (xcrun's default)"),
+        ),
         LedgerFact::new("argv_exec", preview.command_line()),
         LedgerFact::new(
             "argv_dry",
@@ -765,22 +816,26 @@ fn record(
             head_bytes(&clean_block(&out.stderr).join("\n"), 2048),
         ));
     }
-    ledger
-        .append(&ActionRecord {
-            id: crate::entities::new_id(),
-            verb: Verb::ToolRemove,
-            entity_id: crate::entities::id_for(&preview.command_line()),
-            evidence,
-            grant_id: NO_GRANT.to_string(),
-            actor: "human:tui".to_string(),
-            outcome: outcome.to_string(),
-            // A manager has no Trash: there is nowhere to point at.
-            recovery_location: None,
-            measured_free_space_delta: None,
-            observed_path_state: Some(observed.to_string()),
-            recorded_at: crate::entities::now(),
-        })
-        .map_err(|e| e.to_string())
+    let rec = ActionRecord {
+        id: id.to_string(),
+        verb: Verb::ToolRemove,
+        entity_id: crate::entities::id_for(&preview.command_line()),
+        evidence,
+        grant_id: NO_GRANT.to_string(),
+        actor: "human:tui".to_string(),
+        outcome: outcome.to_string(),
+        // A manager has no Trash: there is nowhere to point at.
+        recovery_location: None,
+        measured_free_space_delta: None,
+        observed_path_state: Some(observed.to_string()),
+        recorded_at: crate::entities::now(),
+    };
+    if replace {
+        ledger.replace(&rec)
+    } else {
+        ledger.append(&rec)
+    }
+    .map_err(|e| e.to_string())
 }
 
 fn head_bytes(s: &str, max: usize) -> String {

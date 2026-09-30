@@ -261,16 +261,19 @@ struct Dirs {
 }
 
 fn dirs(bin: &ToolBin, home: &Path) -> Dirs {
-    let var = |k: &str| bin.env_value(k).filter(|v| v.starts_with('/')).map(PathBuf::from);
+    let var = |k: &str| {
+        bin.env_value(k)
+            .filter(|v| v.starts_with('/'))
+            .map(PathBuf::from)
+    };
     let data = var("MISE_DATA_DIR")
         .or_else(|| var("XDG_DATA_HOME").map(|d| d.join("mise")))
         .unwrap_or_else(|| home.join(".local/share/mise"));
-    let caches = match var("MISE_CACHE_DIR")
-        .or_else(|| var("XDG_CACHE_HOME").map(|d| d.join("mise")))
-    {
-        Some(c) => vec![c],
-        None => vec![home.join("Library/Caches/mise"), home.join(".cache/mise")],
-    };
+    let caches =
+        match var("MISE_CACHE_DIR").or_else(|| var("XDG_CACHE_HOME").map(|d| d.join("mise"))) {
+            Some(c) => vec![c],
+            None => vec![home.join("Library/Caches/mise"), home.join(".cache/mise")],
+        };
     let config = var("MISE_CONFIG_DIR")
         .or_else(|| var("XDG_CONFIG_HOME").map(|d| d.join("mise")))
         .unwrap_or_else(|| home.join(".config/mise"));

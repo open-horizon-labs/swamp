@@ -241,7 +241,11 @@ impl OccupancySnapshot {
                         && TRUSTED_HOST_ROOTS.iter().any(|r| p.starts_with(r))
                         && !p.components().any(|x| x.as_os_str() == "..")
                 });
-                if verified { format!("{VERIFIED}{c}") } else { c }
+                if verified {
+                    format!("{VERIFIED}{c}")
+                } else {
+                    c
+                }
             });
             for path in paths {
                 let holders = open.entry(path).or_default();
@@ -1409,15 +1413,15 @@ mod tests {
     /// same name elsewhere blocks), and an incomplete listing is `Unknown`, never `Free`.
     #[test]
     fn tool_removal_holders_skip_only_the_managers_own_process() {
-        let listing =
-            "p1\ncSimLaunchHost.arm64\nn/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/SimLaunchHost.arm64.xpc/Contents/MacOS/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\np2\ncnode\nn/m/node/24/bin/node\n";
+        let listing = "p1\ncSimLaunchHost.arm64\nn/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/SimLaunchHost.arm64.xpc/Contents/MacOS/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\np2\ncnode\nn/m/node/24/bin/node\n";
         let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
         let (s, who) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
         assert_eq!((s, who), (OccupancyState::Free, None));
         let impostor = "p3\ncSimLaunchHost.arm64\nn/tmp/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\n";
         let fake = OccupancySnapshot::from_lsof_run(Some(0), false, impostor, "");
         assert!(matches!(
-            fake.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]).0,
+            fake.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"])
+                .0,
             OccupancyState::Occupied(_)
         ));
         let (s, who) = snap.holders_of(&[PathBuf::from("/m/node/24")], &["SimLaunchHost"]);
