@@ -82,6 +82,7 @@ pub mod store;
 pub mod systemd_user;
 pub mod toolchain_declarations;
 pub mod tree;
+pub mod volume_ledger;
 pub mod walk;
 pub mod work_counters;
 

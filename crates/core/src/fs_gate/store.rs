@@ -229,6 +229,63 @@ enum MarkerState {
     Newer,
 }
 
+/// The volume pass's own lock and the ledger's quarantine: additive, so
+/// they sit apart from the format and reset logic above.
+impl StoreDir {
+    /// Takes `volume-pass.lock` without blocking: `Ok(None)` when another
+    /// volume pass holds it. Separate from the observation locks, so a
+    /// stuck pass can never make an observe report "another observation is
+    /// running". Transient: it is a lock file, never data.
+    pub fn try_lock_volume_pass(&self) -> io::Result<Option<super::continuity::FileLock>> {
+        self.create()?;
+        super::continuity::try_lock(&self.0.join("volume-pass.lock"), true)
+    }
+
+    /// Removes `volume_ledger*.parquet.corrupt-<stamp>` files whose stamp is
+    /// older than `max_age_secs` before `now`. Only those names.
+    pub fn remove_stale_quarantine(&self, now: u64, max_age_secs: u64) -> io::Result<usize> {
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&self.0)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some((base, stamp)) = name.rsplit_once(".corrupt-") else {
+                continue;
+            };
+            if !matches!(base, "volume_ledger.parquet" | "volume_ledger_meta.parquet") {
+                continue;
+            }
+            let Ok(stamp) = stamp.parse::<u64>() else {
+                continue;
+            };
+            if now.saturating_sub(stamp) > max_age_secs && entry.file_type()?.is_file() {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Moves a file swamp wrote inside this store aside as
+    /// `<name>.corrupt-<stamp>` (never over an existing file), so a
+    /// ledger that cannot be read stops blocking the next pass and is
+    /// still there to look at. `name` is a plain file name, never a path.
+    pub fn quarantine_file(&self, name: &str, stamp: u64) -> io::Result<()> {
+        if name.contains('/') || name.contains("..") || name.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a plain file name",
+            ));
+        }
+        let from = self.0.join(name);
+        let to = self.0.join(format!("{name}.corrupt-{stamp}"));
+        if !to.exists() && from.exists() {
+            std::fs::rename(from, to)?;
+        }
+        Ok(())
+    }
+}
+
 fn read_housekeeping_marker(path: &Path) -> io::Result<Option<String>> {
     let Some(bytes) = read_small_regular_file(path, 64)? else {
         return Ok(None);

@@ -55,6 +55,10 @@ pub const DEFAULT_OBSERVE_STALL_SECS: u64 = 300;
 /// Floor for `observe_stall_secs`: below this a slow disk under load
 /// could be mistaken for a stall.
 pub const MIN_OBSERVE_STALL_SECS: u64 = 30;
+/// A scheduled `observe` runs the volume pass when the last is older than this.
+pub const DEFAULT_VOLUME_PASS_INTERVAL_HOURS: u64 = 24;
+/// Seconds of measuring one volume-pass run may take.
+pub const DEFAULT_VOLUME_PASS_BUDGET_SECS: u64 = 120;
 /// Delta files beyond this count trigger compaction into a single file.
 const COMPACTION_THRESHOLD: usize = 20;
 
@@ -89,6 +93,13 @@ pub struct GrowthConfig {
     /// (and the TUI's refresh) refuse to run. `None` = the greater of
     /// 1 GiB and 1% of the volume; `Some(0)` disables the check.
     pub min_free_bytes: Option<u64>,
+    /// Hours after which a scheduled `observe` runs the volume pass again
+    /// (`volume_pass_interval_hours`; `swamp observe --volume` forces it
+    /// now). An unfinished pass continues at every observe regardless.
+    pub volume_pass_interval_hours: u64,
+    /// Seconds of measuring one volume-pass run may take
+    /// (`volume_pass_budget_secs`); what is not done resumes next run.
+    pub volume_pass_budget_secs: u64,
     /// The `[scan]` table: built-in defaults, includes, excludes, and
     /// disabled detectors (#41). See `crate::scope`.
     pub scan: crate::scope::ScanConfig,
@@ -103,6 +114,8 @@ impl Default for GrowthConfig {
             observe_timeout_sec: DEFAULT_OBSERVE_TIMEOUT_SEC,
             observe_stall_secs: DEFAULT_OBSERVE_STALL_SECS,
             min_free_bytes: None,
+            volume_pass_interval_hours: DEFAULT_VOLUME_PASS_INTERVAL_HOURS,
+            volume_pass_budget_secs: DEFAULT_VOLUME_PASS_BUDGET_SECS,
             scan: crate::scope::ScanConfig::default(),
         }
     }
@@ -130,6 +143,11 @@ observe_stall_secs = {}\n\
 # than this many bytes free. Default (unset): the greater of 1 GiB and 1% of the volume.\n\
 # 0 disables the check.\n\
 {}\
+# Hours between volume passes (the whole-disk ledger behind `report --view disk`); a scheduled\n\
+# `observe` runs one when the last is older. `swamp observe --volume` runs one now.\n\
+volume_pass_interval_hours = {}\n\
+# Seconds one volume-pass run may measure before it stops and resumes at the next observe.\n\
+volume_pass_budget_secs = {}\n\
 {}",
             self.since,
             self.retention_days,
@@ -140,6 +158,8 @@ observe_stall_secs = {}\n\
                 Some(n) => format!("min_free_bytes = {n}\n"),
                 None => "# min_free_bytes = 1073741824\n".to_string(),
             },
+            self.volume_pass_interval_hours,
+            self.volume_pass_budget_secs,
             self.scan.to_toml_table(),
         )
     }
@@ -160,6 +180,8 @@ struct RawConfig {
     observe_timeout_sec: u64,
     observe_stall_secs: u64,
     min_free_bytes: Option<u64>,
+    volume_pass_interval_hours: u64,
+    volume_pass_budget_secs: u64,
     scan: crate::scope::ScanConfig,
 }
 
@@ -173,6 +195,8 @@ impl Default for RawConfig {
             observe_timeout_sec: d.observe_timeout_sec,
             observe_stall_secs: d.observe_stall_secs,
             min_free_bytes: d.min_free_bytes,
+            volume_pass_interval_hours: d.volume_pass_interval_hours,
+            volume_pass_budget_secs: d.volume_pass_budget_secs,
             scan: d.scan,
         }
     }
@@ -187,6 +211,8 @@ impl From<RawConfig> for GrowthConfig {
             observe_timeout_sec: r.observe_timeout_sec,
             observe_stall_secs: r.observe_stall_secs,
             min_free_bytes: r.min_free_bytes,
+            volume_pass_interval_hours: r.volume_pass_interval_hours,
+            volume_pass_budget_secs: r.volume_pass_budget_secs,
             scan: r.scan,
         }
     }
@@ -3246,6 +3272,87 @@ fn unit_consumers_path(swamp_dir: &Path) -> PathBuf {
 
 fn unit_meta_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_meta.parquet")
+}
+
+/// The stored volume-ledger rows and their meta row, as the volume pass
+/// wrote them (#169). Never walks, never spawns: two small Parquet reads.
+pub use columns::{StoredVolumeLedgerRow as VolumeLedgerRow, StoredVolumeMetaRow as VolumeMetaRow};
+
+fn volume_ledger_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("volume_ledger.parquet")
+}
+
+fn volume_meta_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("volume_ledger_meta.parquet")
+}
+
+/// Whether the store carries a format marker that is not this build's
+/// generation: a NEWER swamp wrote it (this build never modifies such a
+/// store), or an older one that has not been reset yet. The volume pass
+/// writes nothing then: its files are new and independent of the marker,
+/// but a store this build does not understand is not one to add to.
+pub fn store_marker_is_foreign(swamp_dir: &Path) -> Result<bool> {
+    let dir = store::StoreDir::at(swamp_dir)?;
+    Ok(dir.has_incompatible_marker()? || dir.is_newer_generation()?)
+}
+
+/// The volume pass's own lock (`volume-pass.lock`): `Ok(None)` when
+/// another pass holds it.
+pub fn try_lock_volume_pass(
+    swamp_dir: &Path,
+) -> Result<Option<crate::fs_gate::continuity::FileLock>> {
+    Ok(store::StoreDir::at(swamp_dir)?.try_lock_volume_pass()?)
+}
+
+/// Deletes quarantined ledger files older than seven days.
+pub fn remove_stale_quarantined_ledgers(swamp_dir: &Path, now: u64) -> Result<usize> {
+    Ok(store::StoreDir::at(swamp_dir)?.remove_stale_quarantine(now, 7 * 86_400)?)
+}
+
+/// Moves an unreadable ledger (and its meta) aside so the next pass can
+/// start fresh.
+pub fn quarantine_volume_ledger(swamp_dir: &Path, stamp: u64) -> Result<()> {
+    let dir = store::StoreDir::at(swamp_dir)?;
+    dir.quarantine_file("volume_ledger.parquet", stamp)?;
+    dir.quarantine_file("volume_ledger_meta.parquet", stamp)?;
+    Ok(())
+}
+
+/// `(rows, meta)`; an absent ledger is `(empty, None)`, not an error.
+pub fn read_volume_ledger(
+    swamp_dir: &Path,
+) -> Result<(Vec<VolumeLedgerRow>, Option<VolumeMetaRow>)> {
+    let rows = columns::read_volume_ledger_rows(&volume_ledger_path(swamp_dir))?;
+    let meta = columns::read_volume_meta_rows(&volume_meta_path(swamp_dir))?
+        .into_iter()
+        .next();
+    Ok((rows, meta))
+}
+
+/// Replaces the ledger. Takes the observation writer lock for the two
+/// small writes only (never while the pass walks), rows first and the
+/// meta row last: the meta row is what says a run finished. The write is
+/// refused when another writer changed the meta row since the caller
+/// read it (`read_measured_at` is that read's `measured_at`, `None` for
+/// no meta row).
+pub fn write_volume_ledger(
+    swamp_dir: &Path,
+    rows: &[VolumeLedgerRow],
+    meta: &VolumeMetaRow,
+    read_measured_at: Option<u64>,
+) -> Result<()> {
+    let dir = store::StoreDir::at(swamp_dir)?;
+    dir.create()?;
+    let _lock = dir.lock_observation_writes()?;
+    let now = columns::read_volume_meta_rows(&volume_meta_path(swamp_dir))?
+        .into_iter()
+        .next()
+        .map(|m| m.measured_at);
+    if now != read_measured_at {
+        anyhow::bail!("the volume ledger was written by another process during this pass");
+    }
+    columns::write_volume_ledger_rows(&volume_ledger_path(swamp_dir), rows)?;
+    columns::write_volume_meta_rows(&volume_meta_path(swamp_dir), std::slice::from_ref(meta))
 }
 
 fn unit_children_path(swamp_dir: &Path) -> PathBuf {

@@ -323,6 +323,18 @@ Two kinds of check, because each misses what the other catches.
 
 Call edges resolve to *definitions*, not names. The first version keyed them by name and so let `work_counters::install` (called by every subcommand) hide `schedule::install` from the rule entirely; ten fixtures in `crates/source-audit/tests/mutations/platform_capabilities_gate_their_backends/` now pin that and the other bypasses. What the audit cannot see — trait-object dispatch, function pointers, a writing helper genuinely shared with another subcommand — is listed in `.oh/guardrails/platform-capabilities-are-refused-not-approximated.md`, and is what the runtime tests are for.
 
+## The volume ledger off macOS
+
+`swamp observe --volume` needs `statfs`, a directory listing and `lstat`, all
+on both platforms. What is macOS only is asked, not assumed: `diskutil` and
+`tmutil` are spawned only on macOS, so on Linux there are no system-volume,
+purgeable or snapshot rows and no note about their absence (there is nothing to
+ask). The container is the filesystem under `/`; other filesystems are found in
+`/proc/self/mounts`, and one on its own storage is a mounted view, a network
+share has no size, and pseudo filesystems (`proc`, `sysfs`, `tmpfs`, ...) are not
+listed. Linux folders one level under `/home`, `/var`, `/usr` and `/opt` are
+listed the way `~/`, `/Library` and `/private` are on macOS.
+
 ## Volume identity, and its limit
 
 The growth store is keyed by `root_scoped_volume_id`: a hash of `(st_dev, canonical path)`. The canonical path means two spellings of one root — including a symlinked one — share a history instead of silently starting a second, empty one. The device means two roots that happen to share a path string on different filesystems do not.

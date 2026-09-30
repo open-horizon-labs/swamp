@@ -39,6 +39,7 @@ pub fn cmd_observe(
     verify_du: bool,
     since: Option<String>,
     enrich: bool,
+    volume: bool,
 ) -> Result<()> {
     let config = load_config(&store_dir);
     let timeout = Duration::from_secs(config.observe_timeout_sec.max(1));
@@ -79,6 +80,7 @@ pub fn cmd_observe(
     }
     let (tx, rx) = mpsc::channel();
     let work_dir = store_dir.clone();
+    let pass_scope = scope.clone();
     thread::spawn(move || {
         let res = swamp_core::report::observe_scope(
             &scope,
@@ -171,7 +173,12 @@ pub fn cmd_observe(
             };
             append_log(&log_file(), &outcome)?;
             write_last_run(&store_dir, &outcome)?;
+            // The observation is over: its lock is released before the volume
+            // pass starts, and the pass takes its own (`volume-pass.lock`), so
+            // a slow or stuck pass never makes a scheduled observe say
+            // "another observation is running".
             drop(lock);
+            volume_step(&store_dir, &config, &pass_scope, &observation, volume)?;
             Ok(())
         }
         Ok(Err(e)) => {
@@ -271,6 +278,48 @@ fn timeout_outcome(stuck: Option<&(&'static str, PathBuf, Duration)>) -> String 
         ),
         None => "timeout".to_string(),
     }
+}
+
+/// The volume pass, after a successful observation and still under the
+/// single-flight observe lock. It never fails the observation: its result
+/// is one line, and what it could not do is in the ledger's own rows.
+fn volume_step(
+    store_dir: &std::path::Path,
+    config: &swamp_core::growth::GrowthConfig,
+    scope: &swamp_core::scope::EffectiveScope,
+    observation: &swamp_core::report::ScopeObservation,
+    force: bool,
+) -> Result<()> {
+    use swamp_core::volume_ledger::pass::{PassOutcome, allowed, run_after_observation};
+    let home = swamp_core::locations::Environment::from_process().home;
+    let account_home = swamp_core::volume_ledger::pass::account_home();
+    if let Err(swamp_core::volume_ledger::pass::NotAllowed(why)) = allowed(
+        scope.explicit,
+        force,
+        config.volume_pass_interval_hours,
+        &home,
+        account_home.as_deref(),
+    ) {
+        if force {
+            safe_println!("volume pass skipped: {why}");
+        }
+        return Ok(());
+    }
+    let mut config = config.clone();
+    if config.volume_pass_budget_secs < 5 {
+        safe_println!(
+            "volume_pass_budget_secs = {} is below the 5 s minimum; using 5",
+            config.volume_pass_budget_secs
+        );
+        config.volume_pass_budget_secs = 5;
+    }
+    match run_after_observation(store_dir, &config, scope, observation, &home, force) {
+        Ok(PassOutcome::Ran(summary)) => safe_println!("{}", summary.line()),
+        Ok(PassOutcome::Skipped(line)) => safe_println!("{line}"),
+        Ok(PassOutcome::NotDue(_)) => {}
+        Err(e) => safe_println!("volume pass failed: {e}"),
+    }
+    Ok(())
 }
 
 /// `swamp schedule [--every <interval>] [--off] <root>...`.
