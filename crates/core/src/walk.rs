@@ -344,6 +344,30 @@ fn a_failing_entry_costs_only_that_entry() {
     assert_eq!(measured.unmeasured_entries, 4);
 }
 
+/// Two sibling directories whose names are different non-UTF-8 byte
+/// strings (`x\xff`, `x\xfe`) must not share one interior-row key: the
+/// rows are keyed by this string, so a lossy rendering (both become
+/// `x\u{FFFD}`) made the second overwrite the first and the drilldown
+/// show one folder where there are two. No filesystem is needed: APFS
+/// refuses such names, Linux keeps them, and the key is pure.
+///
+/// Tempting wrong patch this fails: keying by `Path::display()` or any
+/// lossy conversion.
+#[test]
+fn non_utf8_sibling_names_get_distinct_relative_keys() {
+    use std::os::unix::ffi::OsStrExt;
+    let root = Path::new("/r");
+    let a = root.join(std::ffi::OsStr::from_bytes(b"x\xff"));
+    let b = root.join(std::ffi::OsStr::from_bytes(b"x\xfe"));
+    assert_ne!(rel_path_string(root, &a), rel_path_string(root, &b));
+    // Valid names are untouched, the root stays empty, and a parent of an
+    // escaped key is the escaped parent.
+    assert_eq!(rel_path_string(root, &root.join("ok/deep")), "ok/deep");
+    assert_eq!(rel_path_string(root, root), "");
+    let nested = rel_path_string(root, &a.join("child"));
+    assert_eq!(parent_rel_path_of(&nested), Some(rel_path_string(root, &a)));
+}
+
 #[test]
 fn shallow_parallel_measurement_counts_allocations_without_following_links_or_children() {
     let tmp = tempfile::tempdir().unwrap();
@@ -488,9 +512,21 @@ fn worktree_root_path<'a>(worktrees: &'a [KnownWorktree], id: &str) -> Option<&'
         .map(|w| w.path.as_path())
 }
 
-fn rel_path_string(root: &Path, path: &Path) -> String {
+/// The relative key interior rows are stored and joined by. A valid
+/// UTF-8 path renders exactly as before. Each invalid byte becomes
+/// U+FFFD followed by its two hex digits, so two different non-UTF-8
+/// names never share a key (a lossy rendering made `x\xff` and `x\xfe`
+/// one row; the drilldown then showed one folder for two).
+pub(crate) fn rel_path_string(root: &Path, path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
     let rel = path.strip_prefix(root).unwrap_or(path);
-    let s = rel.display().to_string();
+    let mut s = String::new();
+    for chunk in rel.as_os_str().as_bytes().utf8_chunks() {
+        s.push_str(chunk.valid());
+        for b in chunk.invalid() {
+            s.push_str(&format!("\u{FFFD}{b:02x}"));
+        }
+    }
     if s == "." { String::new() } else { s }
 }
 

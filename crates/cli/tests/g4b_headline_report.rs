@@ -13,6 +13,10 @@ fn bin() -> PathBuf {
 }
 
 fn swamp(store: &Path, home: &Path, args: &[&str]) -> Output {
+    if args.first() == Some(&"observe") {
+        // #197: settle fixture writes before they are measured.
+        swamp_core::fs_gate::settle::settle();
+    }
     Command::new(bin())
         .args(args)
         .env("SWAMP_DIR", store)
@@ -41,7 +45,11 @@ fn git_project(dir: &Path) {
         assert!(status.success());
     };
     run(&["init", "-q", "-b", "main"]);
-    std::fs::write(dir.join("README.md"), vec![b'x'; 200_000]).unwrap();
+    std::fs::write(
+        dir.join("README.md"),
+        swamp_core::fs_gate::settle::noise(200_000),
+    )
+    .unwrap();
     run(&["add", "README.md"]);
     run(&["commit", "-q", "-m", "initial"]);
 }

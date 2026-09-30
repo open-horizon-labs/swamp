@@ -51,7 +51,7 @@ fn set_times(path: &Path, atime: i64, mtime: i64) {
 
 fn write(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 fn scope_for(detector: &str, vars: &[(&str, &Path)], home: &Path) -> EffectiveScope {
@@ -72,6 +72,7 @@ fn scope_for(detector: &str, vars: &[(&str, &Path)], home: &Path) -> EffectiveSc
 }
 
 fn measure(scope: &EffectiveScope, store: &Path) -> Vec<ExternalUnit> {
+    swamp_core::fs_gate::settle::settle();
     discover_and_measure(
         scope,
         Some(store),
@@ -563,7 +564,7 @@ fn adv_two_non_utf8_child_names_stay_two_rows_and_still_add_up() {
             eprintln!("this filesystem refuses non-UTF-8 names: {e}");
             return;
         }
-        fs::write(dir.join("f"), vec![1u8; size]).unwrap();
+        fs::write(dir.join("f"), swamp_core::fs_gate::settle::noise(size)).unwrap();
     }
     let scope = fx.scope.clone();
     let store = fx.store.path().to_path_buf();
@@ -686,7 +687,7 @@ fn adv_a_child_deleted_mid_walk_never_breaks_the_identity() {
                 let d = root.join(format!("c{:02}", i % 30));
                 let _ = fs::remove_dir_all(&d);
                 let _ = fs::create_dir_all(&d);
-                let _ = fs::write(d.join("f"), vec![0u8; 5_000]);
+                let _ = fs::write(d.join("f"), swamp_core::fs_gate::settle::noise(5_000));
                 i += 1;
             }
         })
@@ -722,6 +723,7 @@ impl swamp_core::fs_events::FsEventsSource for Quiet {
 }
 
 fn report(root: &Path, store: &Path) -> swamp_core::Report {
+    swamp_core::fs_gate::settle::settle();
     swamp_core::report::report_full_mode_scoped(
         root,
         None,
@@ -1105,7 +1107,19 @@ fn adv_registering_and_unregistering_a_worktree_inside_a_unit_is_not_growth_and_
     write(&inner.join("target/blob"), 200_000);
     let scope = scope_for("rustup", &[("RUSTUP_HOME", &rustup)], &home);
     let store = tempfile::tempdir().unwrap();
+    // The worktree's reported size is what the filesystem says its files
+    // occupy (the figure a project row carries), not a constant that only
+    // holds where 200,000 bytes allocate as 200,704 (APFS; ZFS differs).
+    swamp_core::fs_gate::settle::settle();
+    let inner_allocated: u64 = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(inner.join("target/blob"))
+            .unwrap()
+            .blocks()
+            * 512
+    };
     let with = |wts: &[NestedWorktree]| {
+        swamp_core::fs_gate::settle::settle();
         toolchains_of(
             &discover_and_measure_with_worktrees(
                 &scope,
@@ -1124,7 +1138,7 @@ fn adv_registering_and_unregistering_a_worktree_inside_a_unit_is_not_growth_and_
     assert_eq!(rows_total(&whole.children), whole.bytes as i64);
     let registered = with(&[NestedWorktree {
         path: inner.clone(),
-        reported_bytes: 200_704,
+        reported_bytes: inner_allocated,
     }]);
     assert_eq!(
         rows_total(&registered.children),

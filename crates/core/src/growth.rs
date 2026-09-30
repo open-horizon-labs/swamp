@@ -6393,9 +6393,7 @@ fn compute_unconfirmed_worktrees(
 }
 
 fn rel_path_string(root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    let s = rel.display().to_string();
-    if s == "." { String::new() } else { s }
+    crate::walk::rel_path_string(root, path)
 }
 
 /// `rel` is `root` or lies under it (`root` empty = the worktree root).

@@ -21,6 +21,7 @@ fn observe(
     logs: &Path,
     park: &Path,
 ) -> (std::process::Output, Duration) {
+    swamp_core::fs_gate::settle::settle();
     let t = Instant::now();
     swamp_core::work_counters::record_spawn();
     let out = Command::new(env!("CARGO_BIN_EXE_swamp"))
@@ -209,7 +210,7 @@ fn a_pass_parked_inside_an_external_unit_is_skipped_next_time() {
     let pip = home.join("Library/Caches/pip");
     let stuck = pip.join("http/stuck");
     std::fs::create_dir_all(&stuck).unwrap();
-    std::fs::write(pip.join("http/f"), vec![1u8; 8192]).unwrap();
+    std::fs::write(pip.join("http/f"), swamp_core::fs_gate::settle::noise(8192)).unwrap();
 
     let (out, took) = observe(&store, &home, &logs, &stuck);
     assert!(took < Duration::from_secs(30), "{took:?}");
