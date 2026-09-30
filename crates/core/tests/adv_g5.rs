@@ -634,3 +634,57 @@ fn adv_non_utf8_remove_path_refuses() {
     // on the file name; assert only that it is not a preview.
     assert!(review(&sb, &go()).is_err());
 }
+
+/// Attack 8 / diff-adjacent bug (pre-existing in Ledger::append, now the
+/// only record of a permanent removal): a ledger that does not parse
+/// (truncated write, garbage) is read as empty by `append`
+/// (`read_ledger_rows(..).unwrap_or_default()`) and rewritten with just
+/// the new row: every earlier record, including `tool-remove` rows, is
+/// silently gone. Tempting wrong patch: "an unreadable ledger is a fresh
+/// ledger". Must refuse to append (Err), never drop history.
+#[test]
+fn adv_append_to_an_unreadable_ledger_never_drops_history() {
+    let sb = Sandbox::new();
+    sb.standard_mise();
+    sb.go_uninstall_removes(0);
+    let host = sb.host();
+    let p = tool_removal::review_target(&host, &go(), &[]).unwrap();
+    let ledger = sb.ledger();
+    let first = tool_removal::execute(&host, &p, &[], &ledger);
+    assert!(first.recorded.is_ok());
+    let path = sb.root.join("store/ledger.parquet");
+    let good = fs::read(&path).unwrap();
+    // Truncate the file (a crash mid-write).
+    fs::write(&path, &good[..good.len() / 2]).unwrap();
+    // Any later append (here: a refused re-run, which records too).
+    let again = tool_removal::execute(&host, &p, &[], &ledger);
+    let after = Ledger::open(&path).unwrap().all();
+    match (again.recorded, after) {
+        (Err(_), _) => {} // refused to overwrite: fine
+        (Ok(()), Ok(recs)) => assert!(
+            recs.len() >= 2,
+            "append over an unreadable ledger kept {} record(s); the earlier tool-remove row is gone",
+            recs.len()
+        ),
+        (Ok(()), Err(e)) => panic!("recorded Ok but the ledger does not read: {e}"),
+    }
+}
+
+/// Attack 8: writes a store copy's ledger with a tool-remove row, for
+/// the v0.7.5 binary check (run by hand with ADV_LEDGER_DIR set).
+#[test]
+#[ignore]
+fn adv_write_tool_remove_row_into_store_copy() {
+    let dir = PathBuf::from(std::env::var_os("ADV_LEDGER_DIR").expect("ADV_LEDGER_DIR"));
+    assert!(dir.starts_with("/private/tmp") || dir.starts_with("/tmp"), "a copy only");
+    let sb = Sandbox::new();
+    sb.standard_mise();
+    sb.go_uninstall_removes(0);
+    let host = sb.host();
+    let p = tool_removal::review_target(&host, &go(), &[]).unwrap();
+    let ledger = Ledger::open(dir.join("ledger.parquet")).unwrap();
+    let before = ledger.all().map(|r| r.len()).unwrap_or(0);
+    let out = tool_removal::execute(&host, &p, &[], &ledger);
+    assert!(out.recorded.is_ok());
+    assert_eq!(ledger.all().unwrap().len(), before + 1);
+}
