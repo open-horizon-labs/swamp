@@ -898,3 +898,85 @@ fn the_does_not_fit_footer_is_true_and_k_is_not_offered_for_reclaim_plans() {
         "{big}"
     );
 }
+
+/// Tempting wrong patch: only Reclaim plans escape what they print. An
+/// ordinary plan's warning with a newline forges a plan line, and a bidi
+/// override in a Reclaim path reaches the produced string (the frame drops
+/// it, so the string is what is asserted).
+#[test]
+fn plan_strings_hold_no_forged_lines_or_bidi_overrides() {
+    use swamp_tui::actions::{MarkedUnit, confirm_summary};
+    let plain = |path: &str, warning: &str| MarkedUnit {
+        cargo_unit: None,
+        agent_unit: None,
+        reclaim: None,
+        path: PathBuf::from(path),
+        docker: None,
+        worktree_path: PathBuf::from(path),
+        bytes: 1,
+        observed_at: 0,
+        worktree: None,
+        label: path.to_string(),
+        warnings: vec![warning.to_string()],
+    };
+    let u = plain("/x/a", "tracked\n⚠ nothing will be moved\u{202e}");
+    let s = confirm_summary(std::slice::from_ref(&u));
+    assert!(
+        !s.lines().any(|l| l.starts_with("⚠ nothing will be moved")),
+        "{s}"
+    );
+    assert!(!s.contains('\u{202e}'), "{s}");
+
+    let f = fx();
+    let folder = f.root.join("abc\u{202e}gnp.exe");
+    dir(&folder);
+    let mut a = app_with(
+        &f,
+        vec![unit(StorageCategory::Cache, &folder, 5, vec![])],
+        ViewKind::Reclaim,
+    );
+    handle_key(&mut a, KeyCode::Char(' '));
+    wait(&mut a);
+    assert_eq!(a.marked.len(), 1, "{:?}", a.refusal_active());
+    assert!(!a.confirm_summary().contains('\u{202e}'));
+}
+
+/// Tempting wrong patch: the generic mark path names the row's own path in
+/// `swamp protect remove`, though the mark is on a folder above it. The
+/// command named is the entry's.
+#[test]
+fn the_generic_mark_path_names_the_covering_protect_entry() {
+    let f = fx();
+    let parent = f.root.join("keep");
+    let p = parent.join("leftover");
+    dir(&p);
+    swamp_core::protection::protect_add(&f.store, &parent).unwrap();
+    let mut report = swamp_core::report::Report::empty(f.root.clone());
+    report.observed_at = 1_000;
+    report.unowned.push(swamp_core::report::UnownedRow {
+        measurement: None,
+        path_or_object: p.display().to_string(),
+        bytes: 5,
+        reason: swamp_core::report::UnownedReason::SharedCache,
+        docker_kind: None,
+        shared_bytes: None,
+        note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
+        evidence: Vec::new(),
+    });
+    let mut a = App::new(report, f.root.clone());
+    a.store_dir = Some(f.store.clone());
+    a.views_seen = true;
+    a.set_view(ViewKind::Unowned);
+    let row = a.rows().into_iter().next().unwrap();
+    a.mark_row(&row);
+    assert!(a.marked.is_empty());
+    let why = a.refusal_active().unwrap().to_string();
+    assert!(
+        why.contains(&format!("swamp protect remove {}`", parent.display())),
+        "{why}"
+    );
+}

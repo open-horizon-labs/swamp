@@ -2500,7 +2500,7 @@ impl App {
             .iter()
             .map(|r| swamp_core::reclaim_trash::Known {
                 path: PathBuf::from(&r.path),
-                class: "Reclaim unit",
+                class: "Reclaim units",
             })
             .collect();
         known.extend(
@@ -2509,9 +2509,9 @@ impl App {
                 .map(|u| swamp_core::reclaim_trash::Known {
                     path: u.path.clone(),
                     class: if u.protected {
-                        "AI-tool unit kept by default (credentials, settings)"
+                        "AI-tool units kept by default (credentials, settings)"
                     } else {
-                        "AI-tool unit"
+                        "AI-tool units"
                     },
                 }),
         );

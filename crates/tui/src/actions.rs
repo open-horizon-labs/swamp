@@ -491,7 +491,12 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
         .sum::<u64>()
         - permanent;
     let mut lines: Vec<String> = Vec::new();
-    let inside_extra = if reclaim_units.iter().any(|u| {
+    let frees_nothing = reclaim_units
+        .iter()
+        .any(|u| u.warnings.iter().any(|w| w.contains("frees about nothing")));
+    let inside_extra = if frees_nothing {
+        ", mounted volumes inside hold most of these bytes: moving it frees about nothing"
+    } else if reclaim_units.iter().any(|u| {
         u.warnings
             .iter()
             .any(|w| w.contains("counted under projects"))

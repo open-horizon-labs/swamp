@@ -468,9 +468,9 @@ pub struct Surroundings<'a> {
     pub known: &'a [Known],
 }
 
-/// A path swamp knows something about, by class (`class` is plain words
-/// for a line on the confirm: "Reclaim unit", "AI-tool unit kept by
-/// default").
+/// A path swamp knows something about, by class (`class` is plain words,
+/// plural, for a line on the confirm: "Reclaim units", "AI-tool units kept
+/// by default").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Known {
     pub path: PathBuf,
@@ -556,9 +556,8 @@ fn inside_facts(path: &Path, around: &Surroundings<'_>) -> Vec<String> {
         let few: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
         let more = names.len().saturating_sub(3);
         w.push(format!(
-            "this contains {} {class}{}: {}{}",
+            "this contains {class} ({}): {}{}",
             names.len(),
-            if names.len() == 1 { "" } else { "s" },
             few.join(", "),
             if more > 0 {
                 format!(" and {more} more")
@@ -792,6 +791,9 @@ pub fn review_in(t: &ReclaimTarget, around: &Surroundings<'_>) -> Result<Review,
     if let Some(line) = &occupancy {
         warnings.insert(0, line.clone());
     }
+    // Each fact once, in order (two sources can word the same coverage gap).
+    let mut seen = std::collections::HashSet::new();
+    warnings.retain(|w| seen.insert(w.clone()));
     Ok(Review {
         reviewed: Reviewed {
             path: t.path.clone(),

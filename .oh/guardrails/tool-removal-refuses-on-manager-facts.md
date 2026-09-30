@@ -148,10 +148,7 @@ by the user or root, not writable by others, holding a trusted `simctl`),
 otherwise "DEVELOPER_DIR ignored" on the confirm and the developer dir
 used in the ledger row.
 
-Not locked: two swamp processes against each other. A second instance
-confirming the same removal finds the manager with nothing to do (a
-no-op or an error), and the ledger's read-then-rewrite can lose one of
-the two rows (a store lock is a filed follow-up). Within one process,
+Not locked: two swamp processes against each other for the removal itself. A second instance confirming the same removal finds the manager with nothing to do (a no-op or an error). The ledger IS locked (2026-09-30, G6): every ledger write takes an advisory lock beside it, so neither row is lost. Within one process,
 tool removals run one at a time.
 
 Not built: a bulk `mise prune --tools` removal (a set decided at exec

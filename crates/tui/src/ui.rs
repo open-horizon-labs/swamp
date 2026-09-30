@@ -2147,7 +2147,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "",
-        "Reclaim, External and Disk rows, and the folders listed under them: Space marks the real folder, Backspace opens a confirm with its exact path, size and what swamp does not know (last used, regeneration cost, who has it open), and Trash is the way back. Refused only for a path that is not a real folder or file, an OS refusal, a mark that changed since you made it, an unwritable ledger, an overlap, or your own protect mark.",
+        "Reclaim, External and Disk rows, and the folders listed under them: Space marks the real folder, Backspace opens a confirm with its exact path, size and what swamp does not know (last used, regeneration cost, who has it open), and Trash is the way back. Refused only for a path that is not a real folder or file, an OS refusal, a mark that changed since you made it, an unwritable ledger, an overlap, your own protect mark, or swamp's own ledger or Trash (or a folder holding them).",
     );
     entry(
         &mut out,

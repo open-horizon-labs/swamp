@@ -940,15 +940,15 @@ fn a_folder_says_what_it_contains_not_only_what_it_is() {
     let known = vec![
         Known {
             path: codex.join("auth.json"),
-            class: "AI-tool unit kept by default",
+            class: "AI-tool units kept by default",
         },
         Known {
             path: codex.join("config.toml"),
-            class: "AI-tool unit kept by default",
+            class: "AI-tool units kept by default",
         },
         Known {
             path: codex.join("sessions"),
-            class: "AI-tool unit",
+            class: "AI-tool units",
         },
     ];
     let cwd = f.home.join("src/repo");
@@ -963,10 +963,10 @@ fn a_folder_says_what_it_contains_not_only_what_it_is() {
     t.path = codex.clone();
     let c = text(&t);
     assert!(
-        c.contains("contains 2 AI-tool unit kept by defaults"),
+        c.contains("contains AI-tool units kept by default (2)"),
         "{c}"
     );
-    assert!(c.contains("contains 1 AI-tool unit"), "{c}");
+    assert!(c.contains("contains AI-tool units (1)"), "{c}");
     t.path = f.home.clone();
     let h = text(&t);
     assert!(
@@ -981,4 +981,32 @@ fn a_folder_says_what_it_contains_not_only_what_it_is() {
         t.path = PathBuf::from(path);
         assert!(text(&t).contains(needle), "{path}: {}", text(&t));
     }
+}
+
+/// Tempting wrong patch: the ledger keeps a folder name raw, so a newline
+/// or a right-to-left override written into a label, a warning or the path
+/// forges a ledger line or reorders it. The produced strings hold no
+/// control or bidi characters.
+#[test]
+fn ledger_facts_hold_no_control_or_bidi_characters() {
+    let f = fx();
+    let p = f.home.join("cache");
+    make_dir(&p);
+    let (t, r, _w) = reviewed(&f, StorageCategory::Cache, &p);
+    let mut facts = facts_of(&t, vec!["w\nforged: line\u{202e}x".to_string()]);
+    facts.label = "lab\nel\u{202e}".to_string();
+    trash(&r, &facts, Some(&f.store), &ledger(&f), &f.trash).unwrap();
+    let rows = ledger(&f).all().unwrap();
+    for fact in &rows[0].evidence {
+        assert!(
+            !fact
+                .value
+                .chars()
+                .any(|c| c.is_control() || c == '\u{202e}'),
+            "{}: {:?}",
+            fact.key,
+            fact.value
+        );
+    }
+    assert!(rows[0].evidence.iter().any(|e| e.value.contains("\\u{a}")));
 }
