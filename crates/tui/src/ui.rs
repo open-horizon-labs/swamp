@@ -1074,6 +1074,10 @@ fn empty_state(app: &App) -> String {
         V::Agents => {
             "No AI-tool storage found. Press v for another view, or R to scan again.".to_string()
         }
+        V::Reclaim => format!(
+            "No storage units in the stored observation. {}. Press v for another view, or R to scan again.",
+            app.reclaim_view().scope.statement
+        ),
         _ => "Nothing here yet. Press v for another view, or R to scan again.".to_string(),
     }
 }
@@ -1096,6 +1100,22 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let narrow = width < 120;
     // Half the diverging bar, each side; plus one cell for the axis.
     let cleanup_view = rows.iter().any(|r| r.cleanup_summary.is_some());
+    // The Reclaim view says, under its heading, what its consumer evidence
+    // was checked against (and how many coverage notes `swamp report
+    // --view reclaim` prints): one line, the same on every screen size.
+    let reclaim_line = (app.view == crate::app::ViewKind::Reclaim).then(|| {
+        let view = app.reclaim_view();
+        let notes = view.coverage_notes.len();
+        if notes == 0 {
+            view.scope.statement.clone()
+        } else {
+            format!(
+                "{} · {notes} coverage note{} in swamp report --view reclaim",
+                view.scope.statement,
+                if notes == 1 { "" } else { "s" }
+            )
+        }
+    });
     let show_growth = !cleanup_view || width >= 100;
     let half: usize = if width >= 140 && !cleanup_view { 6 } else { 0 };
     // name | bytes(10) | sp | growth(10) | sp | half│half | sp | signals
@@ -1132,6 +1152,8 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         pad_display(
             if cleanup_view {
                 "Cleanup advice / consequence"
+            } else if reclaim_line.is_some() {
+                "Cost · last used · removal"
             } else {
                 "Cleanup / facts"
             },
@@ -1145,6 +1167,12 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     if cleanup_view {
         lines.push(Line::raw(
             "* allocated incl. shared links; not additive with report totals. Age = modified",
+        ));
+    }
+    if let Some(line) = &reclaim_line {
+        lines.push(Line::styled(
+            clip_end(line, width),
+            Style::default().add_modifier(Modifier::DIM),
         ));
     }
     let mark_states = app.project_mark_states();
@@ -1331,7 +1359,11 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     // the table never resizes under the cursor.
     let detail_height = DETAIL_ROWS.min(area.height / 3);
     let table_height = area.height.saturating_sub(detail_height);
-    let header_count = if cleanup_view { 2 } else { 1 };
+    let header_count = if cleanup_view || reclaim_line.is_some() {
+        2
+    } else {
+        1
+    };
     let visible = table_height.saturating_sub(header_count) as usize;
     // One page is a screenful with a row of overlap.
     app.page.set(visible.saturating_sub(1).max(1));
@@ -1598,7 +1630,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "v  1-9",
-        "next view, or pick one: 1 projects 2 tree 3 builds 4 deps 5 docker 6 kinds 7 unowned 8 types 9 external. v also reaches agents. Esc returns to projects.",
+        "next view, or pick one: 1 projects 2 tree 3 builds 4 deps 5 docker 6 kinds 7 unowned 8 types 9 external. v also reaches reclaim (what each unit costs to get back) and agents. Esc returns to projects.",
     );
     entry(
         &mut out,

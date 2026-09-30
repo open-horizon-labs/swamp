@@ -80,6 +80,11 @@ pub enum ViewKind {
     /// External/shared storage units (#43), the minimal shape DESIGN.md
     /// recorded: read-only, one row per detector-resolved unit.
     External,
+    /// The Reclaim view (#175): one row per unit of developer storage,
+    /// largest first, with what getting it back costs, when it was last
+    /// used, who is known to need it and which removal path exists.
+    /// Read-only and built from stored facts: opening it scans nothing.
+    Reclaim,
     /// Agent-tool storage (#91/#92/#100): read-only, one row per
     /// `AgentUnit`. See `model::agent_rows`'s doc comment for why
     /// marking is not wired up in this chunk.
@@ -88,8 +93,9 @@ pub enum ViewKind {
 
 impl ViewKind {
     /// `'0'` is not a view digit here: it is already the global "clear
-    /// filter" key (see `crate::handle_key_mod`), so `ViewKind::Agents`
-    /// has no dedicated digit and is reached only by cycling with `v`
+    /// filter" key (see `crate::handle_key_mod`), so `ViewKind::Reclaim`
+    /// and `ViewKind::Agents` have no dedicated digit and are reached
+    /// only by cycling with `v`
     /// (`ViewKind::next`) -- documented, not a silent omission.
     pub fn from_digit(d: char) -> Option<Self> {
         Some(match d {
@@ -106,7 +112,7 @@ impl ViewKind {
         })
     }
     /// Every view, in the order `v` walks them.
-    pub const ALL: [ViewKind; 10] = [
+    pub const ALL: [ViewKind; 11] = [
         ViewKind::Projects,
         ViewKind::Tree,
         ViewKind::Builds,
@@ -116,6 +122,7 @@ impl ViewKind {
         ViewKind::Unowned,
         ViewKind::Types,
         ViewKind::External,
+        ViewKind::Reclaim,
         ViewKind::Agents,
     ];
 
@@ -134,7 +141,8 @@ impl ViewKind {
             ViewKind::Kinds => ViewKind::Unowned,
             ViewKind::Unowned => ViewKind::Types,
             ViewKind::Types => ViewKind::External,
-            ViewKind::External => ViewKind::Agents,
+            ViewKind::External => ViewKind::Reclaim,
+            ViewKind::Reclaim => ViewKind::Agents,
             ViewKind::Agents => ViewKind::Projects,
         }
     }
@@ -149,6 +157,7 @@ impl ViewKind {
             ViewKind::Unowned => "unowned",
             ViewKind::Types => "types",
             ViewKind::External => "external",
+            ViewKind::Reclaim => "reclaim",
             ViewKind::Agents => "agents",
         }
     }
@@ -440,6 +449,17 @@ pub struct App {
     /// prints. From the scope and the stored coverage; never a walk.
     pub declared_note: Option<String>,
     pub declared_lines: Vec<String>,
+    /// The declared roots and their state as of the stored observation,
+    /// for the Reclaim view's statement of what its consumer evidence was
+    /// checked against. Set with `declared_lines`; never a walk.
+    pub declared_roots: Vec<swamp_core::roots::DeclaredRoot>,
+    /// What package managers reported in the last scheduled `observe`
+    /// (`swamp_core::manager_facts`), read from the store with the rest of
+    /// the snapshot. The TUI never asks a manager anything itself.
+    pub manager_facts: swamp_core::manager_facts::ManagerFacts,
+    /// The Reclaim view built from the stored facts above, kept until one
+    /// of them changes: building it joins every unit to its interior.
+    reclaim_cache: std::cell::RefCell<Option<std::sync::Arc<swamp_core::reclaim::ReclaimView>>>,
     /// The authorized scope this TUI is showing. Every refresh --
     /// background, post-action re-observe -- goes through it,
     /// so exclusions and external pruning survive an update rather than
@@ -678,6 +698,9 @@ impl App {
             previous_scope_roots: None,
             declared_note: None,
             declared_lines: Vec::new(),
+            declared_roots: Vec::new(),
+            manager_facts: swamp_core::manager_facts::ManagerFacts::default(),
+            reclaim_cache: std::cell::RefCell::new(None),
             scope: None,
         }
     }
@@ -691,6 +714,40 @@ impl App {
             .skip(1)
             .map(str::to_string)
             .collect();
+        self.declared_roots = roots.to_vec();
+        self.reclaim_cache.borrow_mut().take();
+    }
+
+    /// Sets what package managers reported in the last scheduled
+    /// `observe`, from the same stored snapshot as the units.
+    pub fn set_manager_facts(&mut self, facts: swamp_core::manager_facts::ManagerFacts) {
+        self.manager_facts = facts;
+        self.reclaim_cache.borrow_mut().take();
+    }
+
+    /// The Reclaim view over the stored facts this app holds. A pure
+    /// function of them (`swamp_core::reclaim::build`): opening the view
+    /// lists nothing, stats nothing and starts no process.
+    pub fn reclaim_view(&self) -> std::sync::Arc<swamp_core::reclaim::ReclaimView> {
+        let mut cache = self.reclaim_cache.borrow_mut();
+        if let Some(v) = cache.as_ref()
+            && v.observed_at == self.report.observed_at
+        {
+            return v.clone();
+        }
+        let view = std::sync::Arc::new(swamp_core::reclaim::build(
+            &swamp_core::reclaim::ReclaimInput {
+                units: &self.external_units,
+                interiors: &self.store_interiors,
+                unowned: &self.report.unowned,
+                manager_facts: &self.manager_facts,
+                declared_roots: &self.declared_roots,
+                projects: self.report.projects.len(),
+                observed_at: self.report.observed_at,
+            },
+        ));
+        *cache = Some(view.clone());
+        view
     }
 
     /// Sets `external_units` for `ViewKind::External` (#43). Called once
@@ -698,12 +755,14 @@ impl App {
     /// resolution and measurement are disk I/O.
     pub fn set_external_units(&mut self, units: Vec<swamp_core::external::ExternalUnit>) {
         self.external_units = units;
+        self.reclaim_cache.borrow_mut().take();
     }
 
     /// Sets the store interiors shown under `ViewKind::External`. Same
     /// contract as `set_external_units`, and always from the same pass.
     pub fn set_store_interiors(&mut self, units: Vec<swamp_core::artifact::NestedArtifact>) {
         self.store_interiors = units;
+        self.reclaim_cache.borrow_mut().take();
     }
 
     /// Sets `agent_units` for `ViewKind::Agents` (#91/#100). Same
@@ -883,6 +942,7 @@ impl App {
         self.set_external_units(snap.external_units);
         self.set_store_interiors(snap.store_interiors);
         self.set_agent_units(snap.agent_units);
+        self.set_manager_facts(snap.manager_facts);
         self.observed_label = "just now".into();
         self.status = None;
         self.drop_marks_missing_from_report();
@@ -1030,6 +1090,11 @@ impl App {
                 // Standalone Cargo targets are their own kind here too.
                 rows.extend(model::standalone_target_rows(&self.report));
                 rows
+            }
+            // A hierarchy (a unit, then its folders): sort never
+            // reorders it, like the tree.
+            ViewKind::Reclaim => {
+                return model::reclaim_rows(&self.reclaim_view(), &self.collapsed);
             }
             ViewKind::Agents => model::agent_rows(&self.agent_units),
         };

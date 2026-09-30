@@ -224,8 +224,15 @@ pub(crate) fn self_declared_cache(dir: &Path) -> Option<ArtifactKind> {
 /// own terms. Said on the row and on the confirm line. It claims only what
 /// swamp does: no project is linked. Any source path the directory itself
 /// recorded is shown separately, as a recorded link.
-pub(crate) const STANDALONE_CARGO_TARGET_NOTE: &str =
-    "standalone Cargo target: rebuild with `cargo build`; swamp does not link it to a project";
+pub(crate) const STANDALONE_CARGO_TARGET_NOTE: &str = concat!(
+    "standalone Cargo target: ",
+    "rebuild with `cargo build`",
+    "; swamp does not link it to a project"
+);
+
+/// Just the cost half of [`STANDALONE_CARGO_TARGET_NOTE`], as the Reclaim
+/// view words the regeneration column. A test pins the two together.
+pub(crate) const STANDALONE_CARGO_TARGET_COST: &str = "rebuild with `cargo build`";
 
 /// A directory `CARGO_TARGET_DIR` built into: Cargo's own signature, both
 /// halves. The Cache Directory Tagging signature at byte 0 of a regular

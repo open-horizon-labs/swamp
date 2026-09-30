@@ -154,6 +154,10 @@ pub struct Row {
     /// would be a lie: `unmeasured` for a folder that could not be read
     /// (never `0B`), a signed figure for an adjustment. At most ten cells.
     pub size_text: Option<String>,
+    /// Extra lines for the detail pane, already worded (the Reclaim view's
+    /// consumer sentence, a manager's quoted statement). Shown after the
+    /// last-used line; empty for every other view.
+    pub detail_lines: Vec<String>,
 }
 
 impl Row {
@@ -182,6 +186,7 @@ impl Row {
             evidence: Vec::new(),
             last_used: None,
             size_text: None,
+            detail_lines: Vec::new(),
         }
     }
 }
@@ -558,6 +563,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             evidence: Vec::new(),
             last_used: None,
             size_text: None,
+            detail_lines: Vec::new(),
         });
     }
     out
@@ -689,6 +695,7 @@ pub fn tree_rows_with_agents(
                 .unwrap_or_default(),
             last_used: None,
             size_text: None,
+            detail_lines: Vec::new(),
         });
         if is_collapsed {
             continue;
@@ -1666,6 +1673,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             evidence: Vec::new(),
             last_used: None,
             size_text: None,
+            detail_lines: Vec::new(),
         })
         .collect()
 }
@@ -2336,6 +2344,113 @@ fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row>
             row
         })
         .collect()
+}
+
+/// The Reclaim view (#175): one row per unit of developer storage,
+/// largest first, from the stored facts `swamp_core::reclaim::build` joins.
+/// Never markable (`unit: None`): removal is the reviewed Trash flow in the
+/// unowned view for a standalone Cargo target, the manager's own command
+/// (not built yet) for an installation, and nothing for the rest. A row
+/// opens (`Enter`) onto the unit's folders, whose rows add up to its size.
+///
+/// The layout is fixed like every other view: the name column leads with
+/// the unit and its kind, and the cost, last-used fact and removal path
+/// are the signals (and the detail pane's first lines at any width), so
+/// no width rule moves.
+pub fn reclaim_rows(
+    view: &swamp_core::reclaim::ReclaimView,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for r in &view.rows {
+        let mut row = Row::leaf(0, format!("{} · {}", r.kind, r.path), r.bytes, r.growth_bytes);
+        row.signals = vec![
+            r.regeneration.words.clone(),
+            format!("last used {}", r.last_used_text),
+            r.removal.text.clone(),
+        ];
+        row.last_used = Some(format!("Last used: {}", r.last_used_text));
+        row.mtime_max = r
+            .children
+            .iter()
+            .map(|c| c.last_used.at.unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let mut standing: Vec<String> = Vec::new();
+        if let Some(h) = &r.hold {
+            standing.push(swamp_core::reclaim::hold_line(h));
+        }
+        standing.extend(r.manager.iter().take(2).map(|q| q.line()));
+        if standing.is_empty() {
+            standing.push(format!("cost from: {}", r.regeneration.source));
+        }
+        row.detail_lines = vec![r.consumers.summary.clone(), standing.join(" · ")];
+        let key = format!("reclaim-open:{}", r.path);
+        if r.children.is_empty() {
+            rows.push(row);
+            continue;
+        }
+        let open = collapsed.contains(&key);
+        let count = r.children.len();
+        let children: Vec<Row> = r
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| reclaim_child_row(c, i + 1 == count))
+            .collect();
+        row.expandable = true;
+        row.expansion_key = Some(key);
+        row.rail = if open { "▾ ".into() } else { "▸ ".into() };
+        row.collapsed_children = (!open).then_some(children.len());
+        rows.push(row);
+        if open {
+            rows.extend(children);
+        }
+    }
+    rows
+}
+
+fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
+    use swamp_core::drilldown::ChildKind;
+    let flag = c
+        .hold
+        .as_ref()
+        .map(|h| format!("  [{}]", h.label))
+        .unwrap_or_default();
+    let mut row = Row::leaf(
+        1,
+        format!("{}{flag}", c.text),
+        c.bytes.unwrap_or(0).max(0) as u64,
+        None,
+    );
+    // A number would be a lie for these: unreadable is not zero, and a
+    // negative correction is not 0B.
+    row.size_text = match (c.kind, c.bytes) {
+        (_, None) => Some("unmeasured".to_string()),
+        (ChildKind::Adjustment | ChildKind::NotRemeasured, Some(b)) => Some(compact_signed(b)),
+        _ => None,
+    };
+    row.allocated = row.size_text.is_none();
+    row.rail = if last {
+        "└─ ".into()
+    } else {
+        "├─ ".into()
+    };
+    row.signals = c
+        .last_used_text
+        .iter()
+        .map(|t| format!("last used {t}"))
+        .chain(c.hold.iter().map(swamp_core::reclaim::hold_line))
+        .chain(c.manager.iter().map(|q| q.line()))
+        .collect();
+    row.last_used = c.last_used_text.as_ref().map(|t| format!("Last used: {t}"));
+    row.detail_lines = c
+        .hold
+        .iter()
+        .map(swamp_core::reclaim::hold_line)
+        .chain(c.manager.iter().map(|q| q.line()))
+        .collect();
+    row
 }
 
 /// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped

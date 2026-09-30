@@ -1794,6 +1794,9 @@ pub struct ReportSnapshot {
     pub external_units: Vec<crate::external::ExternalUnit>,
     pub agent_units: Vec<crate::agents::AgentUnit>,
     pub store_interiors: Vec<crate::artifact::NestedArtifact>,
+    /// What package managers' own tooling said in the last scheduled
+    /// `observe` (`manager_facts`): stored, never asked at read time.
+    pub manager_facts: crate::manager_facts::ManagerFacts,
 }
 
 // ---------------------------------------------------------------------
@@ -3240,6 +3243,9 @@ pub fn write_manager_fact_table(
     facts: &[crate::manager_facts::ManagerFact],
 ) -> Result<()> {
     let store = store::StoreDir::at(swamp_dir)?;
+    if store.is_newer_generation()? {
+        anyhow::bail!("store written by a newer swamp; not modifying it");
+    }
     let _writer_lock = store.lock_observation_writes()?;
     let rows: Vec<columns::StoredManagerFactRow> = facts
         .iter()
