@@ -1,0 +1,779 @@
+//! What a package manager's own tooling says about the storage it
+//! manages, recorded by a scheduled `observe` and only read afterwards.
+//!
+//! Homebrew's dry-run autoremove lists the formulae it calls unneeded,
+//! mise's dry-run prune lists the versions it calls prunable, Homebrew
+//! records which formulae were installed on request, mise's global
+//! configuration lists the tools a person asked for, and rustup's
+//! settings name the default toolchain. Each is the manager's own
+//! statement. Swamp stores it verbatim beside the manager's name and
+//! shows it attributed ("Homebrew reports unneeded (brew autoremove)"):
+//! it never turns one into a statement of its own.
+//!
+//! **Where it runs.** [`collect`] is called from `swamp observe` after
+//! the observation succeeded, and nowhere else. `swamp report` and the
+//! TUI read the stored rows (`growth::read_manager_fact_table`) and
+//! start no process. Every command is an allow-listed argument shape in
+//! `fs_gate::spawn` (a dry run, never the real run), counted as a spawn,
+//! killed on a time-out, and run with pagers and colour off.
+//!
+//! **Failure is a coverage note.** A missing binary, a time-out, a
+//! non-zero exit, output that is not the shape this module knows, or
+//! output larger than [`MAX_OUTPUT`] becomes one `not-observed` row
+//! naming the reason. The view says the report was not observed; it
+//! never fails and never shows an older answer as current.
+
+use crate::external::ExternalUnit;
+use crate::fs_gate::spawn::{Program, RunOutput};
+use crate::locations::{
+    ConventionRole, GlobalDefaultFormat, ManagerDecl, ManagerProbe, Registry, SubjectShape,
+};
+use std::time::{Duration, Instant};
+
+/// The most output one manager report may print before swamp treats it
+/// as garbage: far above any real answer (a machine's whole formula
+/// list is a few kilobytes).
+pub const MAX_OUTPUT: usize = 1024 * 1024;
+
+/// The longest one command may run.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The longest the whole pass may take. Later probes are skipped, with a
+/// note, once it is spent.
+pub const PASS_BUDGET: Duration = Duration::from_secs(45);
+
+/// What one stored row says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FactKind {
+    /// Homebrew's dry-run autoremove lists this formula.
+    ReportsUnneeded,
+    /// mise's dry-run prune lists this version.
+    ReportsPrunable,
+    /// The manager's default (rustup's default toolchain, a tool in
+    /// mise's global configuration).
+    ActiveDefault,
+    /// Homebrew records this formula as installed on request.
+    InstalledOnRequest,
+    /// The probe ran and its answer was read (it may have listed
+    /// nothing): the marker that lets a view say "checked".
+    Checked,
+    /// The probe could not be run or read; `text` says why.
+    NotObserved,
+    /// One row per pass: the marker that the pass ran at all.
+    Pass,
+}
+
+impl FactKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            FactKind::ReportsUnneeded => "reports-unneeded",
+            FactKind::ReportsPrunable => "reports-prunable",
+            FactKind::ActiveDefault => "active-default",
+            FactKind::InstalledOnRequest => "installed-on-request",
+            FactKind::Checked => "checked",
+            FactKind::NotObserved => "not-observed",
+            FactKind::Pass => "pass",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<FactKind> {
+        [
+            FactKind::ReportsUnneeded,
+            FactKind::ReportsPrunable,
+            FactKind::ActiveDefault,
+            FactKind::InstalledOnRequest,
+            FactKind::Checked,
+            FactKind::NotObserved,
+            FactKind::Pass,
+        ]
+        .into_iter()
+        .find(|k| k.label() == label)
+    }
+
+    /// Whether a unit that has this fact is held out of the reclaimable
+    /// total (a default, or installed because a person asked for it).
+    pub fn holds(self) -> bool {
+        matches!(self, FactKind::ActiveDefault | FactKind::InstalledOnRequest)
+    }
+}
+
+/// One stored fact: what `manager`'s `probe` said about `subject`, in
+/// the manager's own words (`text`, verbatim).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerFact {
+    pub manager: String,
+    pub probe: String,
+    pub kind: FactKind,
+    pub subject: Option<String>,
+    pub text: String,
+    pub observed_at: u64,
+}
+
+/// The stored facts, and whether any pass has ever stored them (an
+/// older store has no table: "not observed yet", not "nothing reported").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagerFacts {
+    pub observed: bool,
+    pub facts: Vec<ManagerFact>,
+}
+
+impl ManagerFacts {
+    /// Whether `probe` of `manager` ran and was read in the stored pass.
+    pub fn checked(&self, manager: &str, probe: ManagerProbe) -> bool {
+        self.facts.iter().any(|f| {
+            f.manager == manager && f.probe == probe.label() && f.kind == FactKind::Checked
+        })
+    }
+
+    /// The reason `probe` of `manager` was not observed, when the stored
+    /// pass says so.
+    pub fn not_observed(&self, manager: &str, probe: ManagerProbe) -> Option<&str> {
+        self.facts
+            .iter()
+            .find(|f| {
+                f.manager == manager && f.probe == probe.label() && f.kind == FactKind::NotObserved
+            })
+            .map(|f| f.text.as_str())
+    }
+}
+
+impl ManagerProbe {
+    /// The stable label stored in the `probe` column.
+    pub fn label(self) -> &'static str {
+        match self {
+            ManagerProbe::BrewAutoremoveDryRun => "autoremove-dry-run",
+            ManagerProbe::BrewInstalledOnRequest => "installed-on-request",
+            ManagerProbe::MisePruneDryRun => "prune-dry-run",
+            ManagerProbe::MiseGlobalTools => "global-tools",
+            ManagerProbe::SettingsDefault => "settings-default",
+        }
+    }
+
+    /// The kind of fact this probe yields.
+    pub fn kind(self) -> FactKind {
+        match self {
+            ManagerProbe::BrewAutoremoveDryRun => FactKind::ReportsUnneeded,
+            ManagerProbe::MisePruneDryRun => FactKind::ReportsPrunable,
+            ManagerProbe::BrewInstalledOnRequest => FactKind::InstalledOnRequest,
+            ManagerProbe::MiseGlobalTools | ManagerProbe::SettingsDefault => {
+                FactKind::ActiveDefault
+            }
+        }
+    }
+
+    /// The command as a person would type it, for the attribution.
+    pub fn command(self) -> &'static str {
+        match self {
+            ManagerProbe::BrewAutoremoveDryRun => "brew autoremove",
+            ManagerProbe::BrewInstalledOnRequest => "brew list --installed-on-request",
+            ManagerProbe::MisePruneDryRun => "mise prune --dry-run",
+            ManagerProbe::MiseGlobalTools => "mise global config",
+            ManagerProbe::SettingsDefault => "settings.toml default_toolchain",
+        }
+    }
+
+    /// The command this probe runs, when it runs one.
+    fn invocation(self) -> Option<(Program, &'static [&'static str])> {
+        match self {
+            ManagerProbe::BrewAutoremoveDryRun => {
+                Some((Program::Brew, &["autoremove", "--dry-run"]))
+            }
+            ManagerProbe::BrewInstalledOnRequest => Some((
+                Program::Brew,
+                &["list", "--formula", "--installed-on-request"],
+            )),
+            ManagerProbe::MisePruneDryRun => Some((Program::Mise, &["prune", "--dry-run"])),
+            ManagerProbe::MiseGlobalTools => Some((Program::Mise, &["ls", "--global", "--json"])),
+            ManagerProbe::SettingsDefault => None,
+        }
+    }
+}
+
+/// The attribution a row shows for a fact: the manager's name, what it
+/// said and the command that said it. Never a statement swamp makes.
+pub fn attribution(display: &str, probe: ManagerProbe) -> String {
+    match probe.kind() {
+        FactKind::ReportsUnneeded => format!("{display} reports unneeded ({})", probe.command()),
+        FactKind::ReportsPrunable => format!("{display} reports prunable ({})", probe.command()),
+        FactKind::ActiveDefault => format!("active default ({})", probe.command()),
+        FactKind::InstalledOnRequest => format!("installed on request ({})", probe.command()),
+        FactKind::Checked | FactKind::NotObserved | FactKind::Pass => probe.command().to_string(),
+    }
+}
+
+/// Whether a manager's `subject` names the folder `folder` of its store,
+/// by the shape its detector declared. A channel that matches more than
+/// one folder matches each of them: a default is never narrowed by a
+/// guess.
+pub fn subject_matches(shape: SubjectShape, subject: &str, folder: &str) -> bool {
+    match shape {
+        SubjectShape::FolderName => subject == folder,
+        SubjectShape::NameBeforeAt => {
+            subject.split_once('@').map_or(subject, |(name, _)| name) == folder
+        }
+        SubjectShape::ChannelWithHostTriple => {
+            folder == subject || folder.split_once('-').map(|(channel, _)| channel) == Some(subject)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Parsing: defensive, pure.
+// ---------------------------------------------------------------------
+
+/// Why an answer was not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable(pub String);
+
+fn valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && !s.starts_with('-')
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '+' | '/' | '-' | ':')
+        })
+}
+
+fn text_of(bytes: &[u8]) -> Result<&str, Unreadable> {
+    if bytes.len() > MAX_OUTPUT {
+        return Err(Unreadable(format!(
+            "the output was larger than {MAX_OUTPUT} bytes"
+        )));
+    }
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| Unreadable("the output was not text".into()))?;
+    if text.contains('\0') {
+        return Err(Unreadable("the output was not text".into()));
+    }
+    Ok(text)
+}
+
+/// The names `brew autoremove --dry-run` lists, with the header line
+/// that introduced them (kept verbatim as the quote). Empty output is a
+/// list of nothing.
+pub fn parse_brew_autoremove(stdout: &[u8]) -> Result<(String, Vec<String>), Unreadable> {
+    let text = text_of(stdout)?;
+    let mut lines = text.lines();
+    let mut header: Option<String> = None;
+    for line in lines.by_ref() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("Would autoremove ") && line.contains("unneeded formula") {
+            header = Some(line.to_string());
+            break;
+        }
+        return Err(Unreadable("the output was not the list this reads".into()));
+    }
+    let Some(header) = header else {
+        return Ok((String::new(), Vec::new()));
+    };
+    let mut names = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        if !valid_name(line) {
+            return Err(Unreadable("a listed name was not a formula name".into()));
+        }
+        names.push(line.to_string());
+    }
+    if let Some(n) = header
+        .strip_prefix("Would autoremove ")
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|n| n.parse::<usize>().ok())
+        && n != names.len()
+    {
+        return Err(Unreadable(
+            "the count in the header did not match the names listed".into(),
+        ));
+    }
+    Ok((header, names))
+}
+
+/// The formulae `brew list --formula --installed-on-request` prints, one
+/// per line.
+pub fn parse_name_lines(stdout: &[u8]) -> Result<Vec<String>, Unreadable> {
+    let text = text_of(stdout)?;
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !valid_name(line) {
+            return Err(Unreadable("a listed name was not a formula name".into()));
+        }
+        names.push(line.to_string());
+    }
+    Ok(names)
+}
+
+/// The `(subject, line)` pairs of mise's `... is prunable: ...` lines.
+/// The line is the manager's own sentence, kept verbatim; any other line
+/// (the action lines of the dry run) is not a report and is skipped.
+pub fn parse_mise_prune(output: &[u8]) -> Result<Vec<(String, String)>, Unreadable> {
+    let text = text_of(output)?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("mise ") else {
+            continue;
+        };
+        let Some((subject, reason)) = rest.split_once(" is prunable: ") else {
+            continue;
+        };
+        if !valid_name(subject) || !subject.contains('@') || reason.trim().is_empty() {
+            continue;
+        }
+        out.push((subject.to_string(), line.to_string()));
+    }
+    Ok(out)
+}
+
+/// The tools of `mise ls --global --json`: `(tool, source file,
+/// requested version)`.
+pub fn parse_mise_global(stdout: &[u8]) -> Result<Vec<(String, String, String)>, Unreadable> {
+    let text = text_of(stdout)?;
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| Unreadable("the output was not JSON".into()))?;
+    let Some(map) = value.as_object() else {
+        return Err(Unreadable("the JSON was not a table of tools".into()));
+    };
+    let mut out = Vec::new();
+    for (tool, entries) in map {
+        let Some(entries) = entries.as_array() else {
+            return Err(Unreadable("a tool's entry was not a list".into()));
+        };
+        if tool.is_empty() || tool.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(Unreadable("a tool name was not a name".into()));
+        }
+        let source = entries
+            .iter()
+            .find_map(|e| e.pointer("/source/path").and_then(|p| p.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let requested = entries
+            .iter()
+            .find_map(|e| e.get("requested_version").and_then(|p| p.as_str()))
+            .unwrap_or("")
+            .to_string();
+        out.push((tool.clone(), source, requested));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------
+// The pass.
+// ---------------------------------------------------------------------
+
+/// How a probe's command is run. The real one is the gate's spawn; a
+/// test hands in a fake that answers, times out, or fails.
+pub trait ProbeRunner {
+    fn run(
+        &self,
+        program: Program,
+        args: &[&str],
+        timeout: Duration,
+    ) -> std::io::Result<RunOutput>;
+    /// The text of a settings file, or why it could not be read.
+    fn read_settings(&self, path: &std::path::Path) -> Result<String, String>;
+}
+
+/// The gate's spawn and bounded file read.
+pub struct SystemProbeRunner;
+
+impl ProbeRunner for SystemProbeRunner {
+    fn run(
+        &self,
+        program: Program,
+        args: &[&str],
+        timeout: Duration,
+    ) -> std::io::Result<RunOutput> {
+        crate::fs_gate::spawn::run(program, args, timeout)
+    }
+
+    fn read_settings(&self, path: &std::path::Path) -> Result<String, String> {
+        crate::fs_gate::read::bounded_string(path, crate::fs_gate::read::BoundedCap::LOCKFILE)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn row(
+    manager: &str,
+    probe: &str,
+    kind: FactKind,
+    subject: Option<String>,
+    text: String,
+    now: u64,
+) -> ManagerFact {
+    ManagerFact {
+        manager: manager.to_string(),
+        probe: probe.to_string(),
+        kind,
+        subject,
+        text,
+        observed_at: now,
+    }
+}
+
+/// Runs one command probe and turns its answer into rows: the facts and
+/// one `checked` row, or one `not-observed` row saying why.
+fn run_probe(
+    runner: &dyn ProbeRunner,
+    decl: &ManagerDecl,
+    probe: ManagerProbe,
+    program: Program,
+    args: &[&str],
+    timeout: Duration,
+    now: u64,
+) -> Vec<ManagerFact> {
+    let manager = decl.manager;
+    let label = probe.label();
+    let not_observed =
+        |why: String| vec![row(manager, label, FactKind::NotObserved, None, why, now)];
+    let out = match runner.run(program, args, timeout) {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return not_observed(format!(
+                "{} is not installed or not on PATH",
+                program.binary()
+            ));
+        }
+        Err(e) => {
+            return not_observed(format!(
+                "{} could not be run ({})",
+                program.binary(),
+                e.kind()
+            ));
+        }
+    };
+    if out.timed_out {
+        return not_observed(format!(
+            "{} did not answer within {} seconds and was stopped",
+            program.binary(),
+            timeout.as_secs()
+        ));
+    }
+    if out.code != Some(0) {
+        return not_observed(match out.code {
+            Some(c) => format!("{} exited with status {c}", program.binary()),
+            None => format!("{} was ended by a signal", program.binary()),
+        });
+    }
+    let mut facts: Vec<ManagerFact> = Vec::new();
+    let parsed: Result<(), Unreadable> = match probe {
+        ManagerProbe::BrewAutoremoveDryRun => {
+            parse_brew_autoremove(&out.stdout).map(|(header, names)| {
+                for n in names {
+                    facts.push(row(
+                        manager,
+                        label,
+                        probe.kind(),
+                        Some(n),
+                        header.clone(),
+                        now,
+                    ));
+                }
+            })
+        }
+        ManagerProbe::BrewInstalledOnRequest => parse_name_lines(&out.stdout).map(|names| {
+            for n in names {
+                facts.push(row(
+                    manager,
+                    label,
+                    probe.kind(),
+                    Some(n),
+                    "installed on request".to_string(),
+                    now,
+                ));
+            }
+        }),
+        ManagerProbe::MisePruneDryRun => {
+            // mise prints its dry run on standard error.
+            let mut all = out.stderr.clone();
+            all.extend_from_slice(&out.stdout);
+            parse_mise_prune(&all).map(|pairs| {
+                for (subject, line) in pairs {
+                    facts.push(row(manager, label, probe.kind(), Some(subject), line, now));
+                }
+            })
+        }
+        ManagerProbe::MiseGlobalTools => parse_mise_global(&out.stdout).map(|tools| {
+            for (tool, source, requested) in tools {
+                let text = match (source.is_empty(), requested.is_empty()) {
+                    (false, false) => format!(
+                        "listed in the global configuration {source} (requested {requested})"
+                    ),
+                    (false, true) => format!("listed in the global configuration {source}"),
+                    _ => "listed in the global configuration".to_string(),
+                };
+                facts.push(row(manager, label, probe.kind(), Some(tool), text, now));
+            }
+        }),
+        ManagerProbe::SettingsDefault => Ok(()),
+    };
+    match parsed {
+        Ok(()) => {
+            facts.push(row(
+                manager,
+                label,
+                FactKind::Checked,
+                None,
+                String::new(),
+                now,
+            ));
+            facts
+        }
+        Err(Unreadable(why)) => not_observed(format!(
+            "{} answered, but it could not be read: {why}",
+            program.binary()
+        )),
+    }
+}
+
+/// The settings-file probe: the default the manager's own settings name.
+fn settings_probe(
+    runner: &dyn ProbeRunner,
+    registry: &Registry,
+    decl: &ManagerDecl,
+    units: &[ExternalUnit],
+    now: u64,
+) -> Vec<ManagerFact> {
+    let manager = decl.manager;
+    let label = ManagerProbe::SettingsDefault.label();
+    let not_observed =
+        |why: String| vec![row(manager, label, FactKind::NotObserved, None, why, now)];
+    // The file and its shape are what the manager's detector declared for
+    // the same purpose (`DeclaredVersions::global_default`).
+    let Some((detector_id, file)) = registry.detectors().iter().find_map(|d| {
+        d.manager().filter(|m| m.manager == manager)?;
+        d.manager_conventions().iter().find_map(|c| match c.role {
+            ConventionRole::DeclaredVersions {
+                global_default: Some(g),
+                ..
+            } => Some((d.id(), g)),
+            _ => None,
+        })
+    }) else {
+        return not_observed("no settings file is declared for this manager".into());
+    };
+    let Some(state_unit) = units.iter().find(|u| {
+        u.detector_id == detector_id && u.category == crate::locations::StorageCategory::LocalState
+    }) else {
+        return not_observed("the manager's home was not measured".into());
+    };
+    let path = state_unit.path.join(file.file_name);
+    let text = match runner.read_settings(&path) {
+        Ok(t) => t,
+        Err(e) => return not_observed(format!("{} could not be read ({e})", file.file_name)),
+    };
+    let declared = match file.format {
+        GlobalDefaultFormat::TomlTopLevelString => match toml::from_str::<toml::Table>(&text) {
+            Ok(table) => table
+                .get(file.field)
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            Err(_) => {
+                return not_observed(format!("{} is not valid TOML", file.file_name));
+            }
+        },
+    };
+    let mut out = Vec::new();
+    if let Some(name) = declared {
+        out.push(row(
+            manager,
+            label,
+            FactKind::ActiveDefault,
+            Some(name.clone()),
+            format!("{} \"{name}\" in {}", file.field, file.file_name),
+            now,
+        ));
+    }
+    out.push(row(
+        manager,
+        label,
+        FactKind::Checked,
+        None,
+        String::new(),
+        now,
+    ));
+    out
+}
+
+/// One scheduled pass: every manager that owns a measured unit is asked
+/// its own read-only questions, each bounded by [`PROBE_TIMEOUT`] and the
+/// pass by [`PASS_BUDGET`]. The result replaces the stored table whole.
+pub fn collect(units: &[ExternalUnit], runner: &dyn ProbeRunner, now: u64) -> Vec<ManagerFact> {
+    let registry = Registry::with_builtins();
+    let started = Instant::now();
+    let mut rows = vec![row("", "", FactKind::Pass, None, String::new(), now)];
+    // One entry per manager, with the union of its detectors' probes, for
+    // the managers that own at least one measured unit.
+    let mut managers: Vec<(ManagerDecl, Vec<ManagerProbe>)> = Vec::new();
+    for detector in registry.detectors() {
+        let Some(decl) = detector.manager() else {
+            continue;
+        };
+        let published: Vec<(crate::locations::StorageCategory, &std::path::Path)> = units
+            .iter()
+            .filter(|u| u.detector_id == detector.id())
+            .map(|u| (u.category, u.path.as_path()))
+            .collect();
+        if decl.anchor.select(&published).is_empty() {
+            continue;
+        }
+        match managers.iter_mut().find(|(d, _)| d.manager == decl.manager) {
+            Some((_, probes)) => {
+                for p in decl.probes {
+                    if !probes.contains(p) {
+                        probes.push(*p);
+                    }
+                }
+            }
+            None => managers.push((decl, decl.probes.to_vec())),
+        }
+    }
+    for (decl, probes) in &managers {
+        for probe in probes {
+            let remaining = PASS_BUDGET.saturating_sub(started.elapsed());
+            let Some((program, args)) = probe.invocation() else {
+                rows.extend(settings_probe(runner, &registry, decl, units, now));
+                continue;
+            };
+            if remaining < Duration::from_secs(1) {
+                rows.push(row(
+                    decl.manager,
+                    probe.label(),
+                    FactKind::NotObserved,
+                    None,
+                    "the time budget for this pass was spent before it ran".into(),
+                    now,
+                ));
+                continue;
+            }
+            rows.extend(run_probe(
+                runner,
+                decl,
+                *probe,
+                program,
+                args,
+                remaining.min(PROBE_TIMEOUT),
+                now,
+            ));
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brew_autoremove_lists_names_under_the_managers_own_header() {
+        let out = b"Would autoremove 4 unneeded formulae:\nlibevent\nlibnghttp2\nunbound\nusage\n";
+        let (header, names) = parse_brew_autoremove(out).unwrap();
+        assert_eq!(header, "Would autoremove 4 unneeded formulae:");
+        assert_eq!(names, vec!["libevent", "libnghttp2", "unbound", "usage"]);
+    }
+
+    #[test]
+    fn brew_autoremove_with_nothing_to_list_is_a_list_of_nothing() {
+        assert_eq!(parse_brew_autoremove(b"").unwrap(), (String::new(), vec![]));
+        assert_eq!(
+            parse_brew_autoremove(b"\n\n").unwrap(),
+            (String::new(), vec![])
+        );
+    }
+
+    #[test]
+    fn brew_autoremove_refuses_garbage_and_a_count_that_does_not_match() {
+        assert!(parse_brew_autoremove(b"Error: something else entirely\n").is_err());
+        assert!(parse_brew_autoremove(b"\x00\x01\x02").is_err());
+        assert!(parse_brew_autoremove(&[0xff, 0xfe, 0xfd]).is_err());
+        assert!(
+            parse_brew_autoremove(b"Would autoremove 3 unneeded formulae:\na\nb\n").is_err(),
+            "a header that promises three names over two is not read"
+        );
+        assert!(
+            parse_brew_autoremove(b"Would autoremove 1 unneeded formulae:\nrm -rf /\n").is_err()
+        );
+        let huge = vec![b'a'; MAX_OUTPUT + 1];
+        assert!(parse_brew_autoremove(&huge).is_err());
+    }
+
+    #[test]
+    fn mise_prune_keeps_the_managers_own_sentence_and_skips_action_lines() {
+        let out = "mise pruned configuration links [dryrun]\n\
+mise poetry@2.1.3 is prunable: no tracked config or tool stub requires poetry\n\
+mise poetry@2.1.3 [dryrun]  uninstall\n\
+mise poetry@2.1.3 [dryrun]  remove ~/.local/share/mise/installs/poetry/2.1.3\n";
+        let got = parse_mise_prune(out.as_bytes()).unwrap();
+        assert_eq!(
+            got,
+            vec![(
+                "poetry@2.1.3".to_string(),
+                "mise poetry@2.1.3 is prunable: no tracked config or tool stub requires poetry"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn mise_global_reads_the_tools_and_their_source() {
+        let json = br#"{"node":[{"version":"24.1","requested_version":"latest","source":{"type":"mise.toml","path":"/h/.config/mise/config.toml"}}]}"#;
+        assert_eq!(
+            parse_mise_global(json).unwrap(),
+            vec![(
+                "node".to_string(),
+                "/h/.config/mise/config.toml".to_string(),
+                "latest".to_string()
+            )]
+        );
+        assert!(parse_mise_global(b"not json").is_err());
+        assert!(parse_mise_global(b"[1,2]").is_err());
+    }
+
+    #[test]
+    fn subjects_join_folders_by_the_declared_shape_only() {
+        use SubjectShape::*;
+        assert!(subject_matches(FolderName, "libevent", "libevent"));
+        assert!(!subject_matches(FolderName, "libevent", "libevent2"));
+        assert!(subject_matches(NameBeforeAt, "poetry@2.1.3", "poetry"));
+        assert!(!subject_matches(NameBeforeAt, "poetry@2.1.3", "poet"));
+        assert!(subject_matches(
+            ChannelWithHostTriple,
+            "stable",
+            "stable-aarch64-apple-darwin"
+        ));
+        assert!(subject_matches(
+            ChannelWithHostTriple,
+            "stable-aarch64-apple-darwin",
+            "stable-aarch64-apple-darwin"
+        ));
+        assert!(!subject_matches(
+            ChannelWithHostTriple,
+            "stable",
+            "nightly-aarch64-apple-darwin"
+        ));
+    }
+
+    #[test]
+    fn every_kind_label_round_trips() {
+        for k in [
+            FactKind::ReportsUnneeded,
+            FactKind::ReportsPrunable,
+            FactKind::ActiveDefault,
+            FactKind::InstalledOnRequest,
+            FactKind::Checked,
+            FactKind::NotObserved,
+            FactKind::Pass,
+        ] {
+            assert_eq!(FactKind::from_label(k.label()), Some(k));
+        }
+        assert_eq!(FactKind::from_label("something-else"), None);
+    }
+}

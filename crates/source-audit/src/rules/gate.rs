@@ -282,9 +282,16 @@ const GROUPS: &[Group] = &[
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Brew",
-        allowed: &[],
-        why: "brew runs only as an allow-listed detector command (`Program::named` in \
-              `locations`)",
+        allowed: &[(Krate::Core, &["manager_facts"])],
+        why: "brew runs as an allow-listed detector command (`Program::named` in `locations`) \
+              and, in a scheduled observe only, as the manager's two read-only reports \
+              (`manager_facts`)",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Mise",
+        allowed: &[(Krate::Core, &["manager_facts"])],
+        why: "mise runs only as the manager's two read-only reports in a scheduled observe \
+              (`manager_facts`)",
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Defaults",

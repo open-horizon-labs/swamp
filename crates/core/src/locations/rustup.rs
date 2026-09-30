@@ -10,8 +10,8 @@
 use super::{
     ConventionRole, Detector, Environment, GlobalDefaultFile, GlobalDefaultFormat,
     InstalledVersionLayout, InstalledVersionNaming, LastUseDecl, LastUseSource, LocationStatus,
-    ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint,
-    StorageCategory, StoreAnchor,
+    ManagerConvention, ManagerDecl, ManagerProbe, Platform, ProposedLocation, Provenance,
+    RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor, SubjectShape,
 };
 
 pub const RUSTUP_DETECTOR_ID: &str = "rustup";
@@ -57,6 +57,22 @@ impl Detector for RustupDetector {
         Some(RecoveryHint {
             command: "rustup toolchain install <toolchain>",
             cost: RecoveryCost::NetworkRefetch,
+        })
+    }
+
+    /// `toolchains/<channel>-<host triple>`; the default is the one
+    /// `settings.toml` names.
+    fn manager(&self) -> Option<ManagerDecl> {
+        Some(ManagerDecl {
+            manager: "rustup",
+            display: "rustup",
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["toolchains"],
+            },
+            subject: SubjectShape::ChannelWithHostTriple,
+            catch_all: true,
+            probes: &[ManagerProbe::SettingsDefault],
         })
     }
 

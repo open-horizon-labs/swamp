@@ -12,8 +12,9 @@
 
 use super::{
     ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
-    LastUseDecl, LastUseSource, LocationStatus, ManagerConvention, Platform, ProposedLocation,
-    Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
+    LastUseDecl, LastUseSource, LocationStatus, ManagerConvention, ManagerDecl, ManagerProbe,
+    Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
+    StoreAnchor, SubjectShape,
 };
 
 pub const MISE_DETECTOR_ID: &str = "mise";
@@ -65,6 +66,22 @@ impl Detector for MiseDetector {
         Some(RecoveryHint {
             command: "mise install",
             cost: RecoveryCost::NetworkRefetch,
+        })
+    }
+
+    /// mise's `installs/<tool>/<version>`: its prune report names
+    /// `<tool>@<version>`, its global configuration names the tool.
+    fn manager(&self) -> Option<ManagerDecl> {
+        Some(ManagerDecl {
+            manager: "mise",
+            display: "mise",
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["installs"],
+            },
+            subject: SubjectShape::NameBeforeAt,
+            catch_all: true,
+            probes: &[ManagerProbe::MisePruneDryRun, ManagerProbe::MiseGlobalTools],
         })
     }
 

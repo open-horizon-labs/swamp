@@ -308,8 +308,8 @@ fn is_derived_table(name: &str) -> bool {
         | "docker_images" | "docker_build_cache" | "docker_volumes" | "docker_builders"
         | "docker_values" | "docker_containers" | "runs" | "coverage" | "projects"
         | "worktrees" | "worktree_facts" | "artifact_shape" | "artifact_shape_lists"
-        | "external_units" | "unit_children" | "unit_meta" | "agent_units" | "agent_unit_members"
-        | "unit_consumers"
+        | "external_units" | "unit_children" | "unit_meta" | "manager_facts" | "agent_units"
+        | "agent_unit_members" | "unit_consumers"
         | "agent_identifications" | "agent_containers" | "nested_artifacts"
         | "nested_artifact_lists" | "nested_artifact_evidence" | "evidence"
         // Historical rendered caches and removed derived views.

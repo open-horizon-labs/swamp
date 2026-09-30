@@ -3227,6 +3227,62 @@ fn unit_children_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_children.parquet")
 }
 
+fn manager_facts_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("manager_facts.parquet")
+}
+
+/// Replaces `manager_facts.parquet` with the rows of one scheduled pass
+/// (`manager_facts::collect`), under the same writer lock every
+/// observation write takes. The table is machine wide, so the whole file
+/// is the last pass.
+pub fn write_manager_fact_table(
+    swamp_dir: &Path,
+    facts: &[crate::manager_facts::ManagerFact],
+) -> Result<()> {
+    let store = store::StoreDir::at(swamp_dir)?;
+    let _writer_lock = store.lock_observation_writes()?;
+    let rows: Vec<columns::StoredManagerFactRow> = facts
+        .iter()
+        .map(|f| columns::StoredManagerFactRow {
+            manager: f.manager.clone(),
+            probe: f.probe.clone(),
+            kind: f.kind.label().to_string(),
+            subject: f.subject.clone(),
+            text: f.text.clone(),
+            observed_at: f.observed_at,
+        })
+        .collect();
+    let file = manager_facts_path(swamp_dir);
+    columns::write_manager_fact_rows(&file, &rows)
+        .with_context(|| format!("write {}", file.display()))
+}
+
+/// The stored manager facts. A store with no such table (never observed
+/// by a swamp that records them, or a table that cannot be read) is
+/// `observed: false`: the view says "not observed yet", never an error
+/// and never "nothing reported". A row of a kind this build does not
+/// know is skipped, so a newer swamp's table reads as far as it can.
+pub(crate) fn read_manager_fact_table(swamp_dir: &Path) -> crate::manager_facts::ManagerFacts {
+    let rows = columns::read_manager_fact_rows(&manager_facts_path(swamp_dir)).unwrap_or_default();
+    let observed = rows
+        .iter()
+        .any(|r| r.kind == crate::manager_facts::FactKind::Pass.label());
+    let facts = rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(crate::manager_facts::ManagerFact {
+                kind: crate::manager_facts::FactKind::from_label(&r.kind)?,
+                manager: r.manager,
+                probe: r.probe,
+                subject: r.subject,
+                text: r.text,
+                observed_at: r.observed_at,
+            })
+        })
+        .collect();
+    crate::manager_facts::ManagerFacts { observed, facts }
+}
+
 /// One `unit_children.parquet` row per drilldown line, in display order.
 fn stored_child_rows(
     scope_key: &str,

@@ -55,8 +55,13 @@ pub enum Program {
     Launchctl,
     /// Liveness of the observation lock holder (`kill -0 <pid>`).
     Kill,
-    /// `brew --prefix` (detector query).
+    /// `brew --prefix` (detector query) and, in a scheduled `observe`
+    /// only, the two read-only manager reports (`autoremove --dry-run`,
+    /// `list --formula --installed-on-request`).
     Brew,
+    /// mise's two read-only reports, in a scheduled `observe` only:
+    /// `prune --dry-run` and `ls --global --json`.
+    Mise,
     /// `defaults read com.apple.dt.Xcode …` (detector query).
     Defaults,
     /// `systemd --user`'s own manager (#83): `crate::systemd_user`'s
@@ -85,6 +90,7 @@ impl Program {
         Program::Launchctl,
         Program::Kill,
         Program::Brew,
+        Program::Mise,
         Program::Defaults,
         Program::Systemctl,
         Program::Loginctl,
@@ -105,6 +111,7 @@ impl Program {
             Program::Launchctl => "launchctl",
             Program::Kill => "kill",
             Program::Brew => "brew",
+            Program::Mise => "mise",
             Program::Defaults => "defaults",
             Program::Systemctl => "systemctl",
             Program::Loginctl => "loginctl",
@@ -248,7 +255,20 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("unload"), Lit("-w"), SwampPlist],
         ],
         Program::Kill => &[&[Lit("-0"), Number]],
-        Program::Brew => &[&[Lit("--prefix")]],
+        Program::Brew => &[
+            &[Lit("--prefix")],
+            // The manager's own dry run: it lists, it removes nothing.
+            &[Lit("autoremove"), Lit("--dry-run")],
+            &[
+                Lit("list"),
+                Lit("--formula"),
+                Lit("--installed-on-request"),
+            ],
+        ],
+        Program::Mise => &[
+            &[Lit("prune"), Lit("--dry-run")],
+            &[Lit("ls"), Lit("--global"), Lit("--json")],
+        ],
         Program::Defaults => &[&[
             Lit("read"),
             Lit("com.apple.dt.Xcode"),
@@ -579,6 +599,13 @@ impl Running {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GH_PROMPT_DISABLED", "1")
             .env("GCM_INTERACTIVE", "never")
+            // A package manager's own reports must not update, phone home
+            // or colour their answer.
+            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .env("HOMEBREW_NO_ANALYTICS", "1")
+            .env("HOMEBREW_NO_ENV_HINTS", "1")
+            .env("HOMEBREW_PAGER", "cat")
+            .env("NO_COLOR", "1")
             .spawn()?;
         let pgid = child.id() as i32;
         let slot = LIVE.iter().position(|s| {
@@ -631,6 +658,10 @@ impl Drop for Running {
     }
 }
 
+/// The most output one run returns (see `run_command`). Far above any
+/// answer swamp parses; a full buffer means "more than this".
+const CAPTURE_CAP: u64 = 8 * 1024 * 1024;
+
 /// Runs `binary args…` under the lifetime rules above.
 fn run_command(binary: &str, args: &[OsString], timeout: Duration) -> io::Result<RunOutput> {
     let mut out_file = tempfile::tempfile()?;
@@ -650,10 +681,13 @@ fn run_command(binary: &str, args: &[OsString], timeout: Duration) -> io::Result
             Err(e) => return Err(e), // `Drop` kills and reaps
         }
     };
+    // A program that floods its output cannot fill memory: only the
+    // first `CAPTURE_CAP` bytes come back, and a caller that needs the
+    // whole answer treats a full buffer as too large.
     let read_back = |f: &mut std::fs::File| -> Vec<u8> {
         let mut buf = Vec::new();
         let _ = f.seek(SeekFrom::Start(0));
-        let _ = f.read_to_end(&mut buf);
+        let _ = f.take(CAPTURE_CAP).read_to_end(&mut buf);
         buf
     };
     let stdout = read_back(&mut out_file);
@@ -767,11 +801,11 @@ mod tests {
 
     #[test]
     fn stdin_is_null_and_pagers_and_prompts_are_disabled() {
-        let script = "cat; printf '%s|%s|%s' \"$GIT_PAGER\" \"$GIT_TERMINAL_PROMPT\" \"$GH_PROMPT_DISABLED\"";
+        let script = "cat; printf '%s|%s|%s|%s|%s' \"$GIT_PAGER\" \"$GIT_TERMINAL_PROMPT\" \"$GH_PROMPT_DISABLED\" \"$HOMEBREW_NO_AUTO_UPDATE\" \"$NO_COLOR\"";
         let out =
             run_command("sh", &["-c".into(), script.into()], Duration::from_secs(10)).unwrap();
         assert!(!out.timed_out);
-        assert_eq!(out.stdout_lossy(), "cat|0|1");
+        assert_eq!(out.stdout_lossy(), "cat|0|1|1|1");
     }
 
     #[test]
@@ -799,6 +833,17 @@ mod tests {
             (Program::Kill, vec!["1"]),
             (Program::Launchctl, vec!["remove", "com.apple.something"]),
             (Program::Brew, vec!["uninstall", "x"]),
+            // The manager reports are the dry runs only. The tempting wrong
+            // patch is a looser shape that also lets the real run through.
+            (Program::Brew, vec!["autoremove"]),
+            (Program::Brew, vec!["autoremove", "--dry-run", "--force"]),
+            (Program::Brew, vec!["list", "--formula"]),
+            (Program::Brew, vec!["cleanup", "--dry-run"]),
+            (Program::Mise, vec!["prune"]),
+            (Program::Mise, vec!["prune", "--dry-run", "--yes"]),
+            (Program::Mise, vec!["uninstall", "node@1"]),
+            (Program::Mise, vec!["ls", "--global"]),
+            (Program::Mise, vec!["exec", "--", "true"]),
             (
                 Program::Defaults,
                 vec!["write", "com.apple.dt.Xcode", "x", "y"],
@@ -879,6 +924,14 @@ mod tests {
                 ],
             ),
             (Program::Kill, vec!["-0", "123"]),
+            (Program::Brew, vec!["--prefix"]),
+            (Program::Brew, vec!["autoremove", "--dry-run"]),
+            (
+                Program::Brew,
+                vec!["list", "--formula", "--installed-on-request"],
+            ),
+            (Program::Mise, vec!["prune", "--dry-run"]),
+            (Program::Mise, vec!["ls", "--global", "--json"]),
             (Program::Id, vec!["-u"]),
             (Program::Df, vec!["-k", "/"]),
         ] {

@@ -4639,6 +4639,26 @@ table! {
 }
 
 table! {
+    /// `<store>/manager_facts.parquet`: what a package manager's own
+    /// tooling said in the last scheduled `observe` (Homebrew's dry-run
+    /// autoremove, mise's dry-run prune, what each records as installed
+    /// on request or as a default), one row per fact, verbatim in `text`.
+    /// `kind` is `reports-unneeded`, `reports-prunable`, `active-default`,
+    /// `installed-on-request`, `checked` (the probe ran and was read),
+    /// `not-observed` (`text` says why) or `pass` (the pass ran). Machine
+    /// wide, so it carries no scope key; the whole table is replaced by
+    /// each pass. A fact of a probe, never a verdict of swamp's.
+    StoredManagerFactRow, write_manager_fact_rows, read_manager_fact_rows {
+        manager: String,
+        probe: String,
+        kind: String,
+        subject: Option<String>,
+        text: String,
+        observed_at: u64,
+    }
+}
+
+table! {
     /// `<store>/scope.parquet`: the last resolved effective scope's
     /// scalars (coverage bookkeeping only, never byte history --
     /// `coverage_changes` compares root sets). Replaces `scope.json`.
