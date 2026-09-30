@@ -1119,7 +1119,7 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
     let (pair_inc, rest_inc) = split(rows(&second));
     let (pair_full, rest_full) = split(rows(&full));
     assert_eq!(
-        pair_inc + 8192,
+        pair_inc + fixture::allocated_of(&target.join("touched.bin")),
         pair_full,
         "full reconciliation accounts for the added probe exactly once"
     );

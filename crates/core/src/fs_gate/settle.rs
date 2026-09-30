@@ -53,7 +53,23 @@ pub fn noise<N: TryInto<usize>>(len: N) -> Vec<u8> {
 /// Blocks until everything written before this call reports its
 /// allocation. Panics, never continues silently, when the filesystem
 /// still reports the token allocation after the cap.
+///
+/// Two probes in a row, not one. A file's `st_blocks` on ZFS changes when
+/// its own write I/O completes *inside* the transaction group that is
+/// syncing, so under load one probe can look real while other files
+/// written before it are still mid-sync (seen on the fleet: some units of
+/// one fixture read 512 bytes and others their real size in the same
+/// measurement). A second probe is written only after the first is
+/// visible; it lands in the next group, which starts syncing only when the
+/// previous one has finished, so its allocation appearing means every
+/// earlier write is settled. Where blocks are assigned at write time the
+/// first poll of each succeeds at once.
 pub fn settle() {
+    probe_until_real();
+    probe_until_real();
+}
+
+fn probe_until_real() {
     let data = noise(PROBE_BYTES);
     let probe = tempfile::Builder::new()
         .prefix("swamp-settle-probe-")
@@ -63,7 +79,6 @@ pub fn settle() {
         .as_file()
         .write_all(&data)
         .expect("settle: write probe");
-    probe.as_file().sync_all().expect("settle: sync probe");
     let start = Instant::now();
     loop {
         let blocks = std::os::unix::fs::MetadataExt::blocks(
