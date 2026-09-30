@@ -288,11 +288,12 @@ impl Hold {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemovalKind {
-    /// The reviewed move to Trash, in the TUI.
+    /// The reviewed move to Trash, in the TUI (Space marks, Backspace
+    /// opens the confirm).
     TrashReviewed,
-    /// The manager's own command; not built yet.
-    ToolCommandNotAvailable,
-    ViewOnly,
+    /// An installation: the reviewed move to Trash, or the tool's own
+    /// removal command (`Y` on its Tools row, where the tool has one).
+    TrashOrToolCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -305,9 +306,10 @@ fn removal(kind: RemovalKind) -> Removal {
     Removal {
         kind,
         text: match kind {
-            RemovalKind::TrashReviewed => "Trash after review (mark it in the unowned view)",
-            RemovalKind::ToolCommandNotAvailable => "tool command, not available yet",
-            RemovalKind::ViewOnly => "view only",
+            RemovalKind::TrashReviewed => "Trash after review (Space, then Backspace)",
+            RemovalKind::TrashOrToolCommand => {
+                "Trash after review (Space, Backspace), or the tool's own command (Y)"
+            }
         }
         .to_string(),
     }
@@ -1104,9 +1106,9 @@ fn unit_row(
         manager: unit_quotes,
         hold: unit_hold,
         removal: removal(if u.category == StorageCategory::Installation {
-            RemovalKind::ToolCommandNotAvailable
+            RemovalKind::TrashOrToolCommand
         } else {
-            RemovalKind::ViewOnly
+            RemovalKind::TrashReviewed
         }),
         regenerable_bytes,
         held_bytes,

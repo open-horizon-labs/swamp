@@ -1102,9 +1102,11 @@ fn rustup_default_comes_from_the_settings_file_the_detector_declared() {
 // Removal paths, kinds and delivered wording
 // ---------------------------------------------------------------------
 
-/// The tempting wrong patch: every row offers Trash. Only a standalone
-/// Cargo target (the existing reviewed flow) does; an installation names
-/// the tool command that is not built yet; everything else is view only.
+/// The tempting wrong patch: a row is labelled `view only`, or an
+/// installation hides that its own tool command is one way and Trash the
+/// other. Every row offers the reviewed Trash move (maintainer decision
+/// 2026-09-30: what the person can see, the person may move); an
+/// installation names both ways.
 #[test]
 fn removal_paths_are_only_the_ones_that_exist() {
     let v = view_of(
@@ -1131,11 +1133,19 @@ fn removal_paths_are_only_the_ones_that_exist() {
         KIND_STANDALONE_CARGO_TARGET
     );
     assert_eq!(
-        row(&v, "/h/.rustup/toolchains").removal.text,
-        "tool command, not available yet"
+        row(&v, "/h/.rustup/toolchains").removal.kind,
+        RemovalKind::TrashOrToolCommand
     );
-    assert_eq!(row(&v, "/h/.cache/uv").removal.text, "view only");
-    assert_eq!(row(&v, "/h/.codex").removal.text, "view only");
+    assert!(
+        row(&v, "/h/.rustup/toolchains")
+            .removal
+            .text
+            .contains("tool's own command")
+    );
+    for p in ["/h/.cache/uv", "/h/.codex"] {
+        assert_eq!(row(&v, p).removal.kind, RemovalKind::TrashReviewed);
+        assert!(!row(&v, p).removal.text.contains("view only"));
+    }
     assert_eq!(
         row(&v, "/tmp/cargo-target").regeneration.words,
         "rebuild with `cargo build`"

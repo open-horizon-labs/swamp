@@ -70,6 +70,7 @@ pub mod platform;
 pub mod preserve;
 pub mod protection;
 pub mod reclaim;
+pub mod reclaim_trash;
 pub mod reclaimability;
 pub mod recovery;
 pub mod render;
