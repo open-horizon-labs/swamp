@@ -623,7 +623,8 @@ pub fn first_run(
 // --- status ------------------------------------------------------------
 
 /// How one declared root stands right now.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
 pub enum DeclaredState {
     /// On disk. `bytes` is from the stored observation, `None` when this
     /// scope has none yet (never measured, not zero); `complete` is false
@@ -633,15 +634,22 @@ pub enum DeclaredState {
         complete: bool,
     },
     Missing,
-    Unreadable(String),
+    Unreadable {
+        reason: String,
+    },
     /// Folded into a wider root's own walk.
-    CoveredBy(PathBuf),
-    Excluded(String),
+    CoveredBy {
+        parent: PathBuf,
+    },
+    Excluded {
+        pattern: String,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DeclaredRoot {
     pub path: PathBuf,
+    #[serde(flatten)]
     pub state: DeclaredState,
 }
 
@@ -664,7 +672,9 @@ pub fn declared_roots(scope: &EffectiveScope, coverage: &[RootCoverage]) -> Vec<
                     if let Err(e) = crate::fs_gate::probe_listable(&r.path) {
                         return DeclaredRoot {
                             path: r.path.clone(),
-                            state: DeclaredState::Unreadable(e.to_string()),
+                            state: DeclaredState::Unreadable {
+                                reason: e.to_string(),
+                            },
                         };
                     }
                     match row.map(|c| &c.status) {
@@ -683,9 +693,15 @@ pub fn declared_roots(scope: &EffectiveScope, coverage: &[RootCoverage]) -> Vec<
                     }
                 }
                 RootStatus::Missing => DeclaredState::Missing,
-                RootStatus::Unreadable { reason } => DeclaredState::Unreadable(reason.clone()),
-                RootStatus::SkippedAsNested { parent } => DeclaredState::CoveredBy(parent.clone()),
-                RootStatus::Excluded { pattern } => DeclaredState::Excluded(pattern.clone()),
+                RootStatus::Unreadable { reason } => DeclaredState::Unreadable {
+                    reason: reason.clone(),
+                },
+                RootStatus::SkippedAsNested { parent } => DeclaredState::CoveredBy {
+                    parent: parent.clone(),
+                },
+                RootStatus::Excluded { pattern } => DeclaredState::Excluded {
+                    pattern: pattern.clone(),
+                },
             },
         })
         .collect()
@@ -731,11 +747,41 @@ pub fn render_declared_roots(roots: &[DeclaredRoot]) -> String {
                  removed"
                     .to_string(),
             ),
-            DeclaredState::Unreadable(why) => ("unreadable", format!("not measured ({why})")),
-            DeclaredState::CoveredBy(p) => ("covered", format!("by {}", p.display())),
-            DeclaredState::Excluded(p) => ("excluded", format!("by {p}")),
+            DeclaredState::Unreadable { reason: why } => {
+                ("unreadable", format!("not measured ({why})"))
+            }
+            DeclaredState::CoveredBy { parent } => ("covered", format!("by {}", parent.display())),
+            DeclaredState::Excluded { pattern } => ("excluded", format!("by {pattern}")),
         };
         let _ = writeln!(out, "  {label:<10} {}  {detail}", r.path.display());
     }
     out
+}
+
+/// A short clause for a narrow header: how many declared roots are
+/// present and how many are not, e.g. `2 declared roots` or
+/// `3 declared roots (1 missing)`. `None` when none are declared.
+pub fn declared_summary(roots: &[DeclaredRoot]) -> Option<String> {
+    if roots.is_empty() {
+        return None;
+    }
+    let count = |f: fn(&DeclaredState) -> bool| roots.iter().filter(|r| f(&r.state)).count();
+    let missing = count(|s| matches!(s, DeclaredState::Missing));
+    let unreadable = count(|s| matches!(s, DeclaredState::Unreadable { .. }));
+    let mut out = format!(
+        "{} declared root{}",
+        roots.len(),
+        if roots.len() == 1 { "" } else { "s" }
+    );
+    let mut bad = Vec::new();
+    if missing > 0 {
+        bad.push(format!("{missing} missing"));
+    }
+    if unreadable > 0 {
+        bad.push(format!("{unreadable} unreadable"));
+    }
+    if !bad.is_empty() {
+        out.push_str(&format!(" ({})", bad.join(", ")));
+    }
+    Some(out)
 }

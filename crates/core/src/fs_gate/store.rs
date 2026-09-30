@@ -99,14 +99,24 @@ impl StoreDir {
 
     /// Serializes read-modify-write edits of `config.toml` (`swamp config
     /// add-root` / `remove-root`, the first-run answer) so two of them
-    /// racing never lose one's change. Blocks until held; the lock is
+    /// racing never lose one's change. Waits up to ten seconds; the lock is
     /// advisory and held only for the edit, never for an observation.
     pub fn lock_config_edits(&self) -> io::Result<super::continuity::FileLock> {
         self.create()?;
         let path = self.0.join("config.lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if let Some(lock) = super::continuity::try_lock(&path, true)? {
                 return Ok(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "config.lock is held by another swamp process (waited 10 s): {}",
+                        path.display()
+                    ),
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

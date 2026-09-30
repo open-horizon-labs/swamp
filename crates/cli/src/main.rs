@@ -942,6 +942,8 @@ fn report_json_envelope(
     Ok(value)
 }
 
+const PREVIOUS_SCOPE_NOTE: &str = "the scope's roots changed since this observation; nothing was walked and no growth is computed across the two scopes";
+
 /// Where a typed root path is read from: the real home and working
 /// directory.
 fn roots_reach() -> swamp_core::roots::Reach {
@@ -1156,14 +1158,19 @@ fn main() -> Result<()> {
             // The declared source roots, from this same stored
             // observation: present/missing/unreadable with bytes. Never a
             // walk; `report` stays a pure read.
-            let declared_block = if scope.explicit {
-                String::new()
+            let declared_json_roots = if scope.explicit {
+                Vec::new()
             } else {
-                swamp_core::roots::render_declared_roots(&swamp_core::roots::declared_roots(
-                    &scope,
-                    &snapshot.coverage,
-                ))
+                swamp_core::roots::declared_roots(&scope, &snapshot.coverage)
             };
+            let declared_block = swamp_core::roots::render_declared_roots(&declared_json_roots);
+            let previous_scope = snapshot.previous_scope.clone();
+            if let Some(prev) = &previous_scope {
+                eprintln!(
+                    "showing the previous scope ({} roots); new roots not yet observed; run `swamp observe` ({PREVIOUS_SCOPE_NOTE})",
+                    prev.roots
+                );
+            }
             // An explicit root is a scope of one (#42): it never carried
             // scope-level coverage noise even when the underlying pass
             // is now the same coherent scope pipeline the catalog uses,
@@ -1217,6 +1224,23 @@ fn main() -> Result<()> {
                     &store_interiors,
                 )?;
                 bound_interior_units(&mut value, unit_limit, unit_offset);
+                if let Some(obj) = value.as_object_mut() {
+                    // From this same stored observation; never a walk.
+                    obj.insert(
+                        "declared_roots".to_string(),
+                        serde_json::to_value(declared_json_roots)?,
+                    );
+                    if let Some(prev) = &previous_scope {
+                        obj.insert(
+                            "previous_scope".to_string(),
+                            serde_json::json!({
+                                "roots": prev.roots,
+                                "observed_at": prev.observed_at,
+                                "note": PREVIOUS_SCOPE_NOTE,
+                            }),
+                        );
+                    }
+                }
                 safe_println!("{}", serde_json::to_string_pretty(&value)?);
             } else if let Some(wt_path) = worktree {
                 match render_worktree_signals(&r, &wt_path) {

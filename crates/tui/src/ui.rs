@@ -199,6 +199,7 @@ fn header_line(app: &App, width: usize) -> String {
         format!("{} unowned", human_bytes(unowned)),
         format!("docker {} unowned", human_bytes(docker_unowned)),
         app.scope_note.clone().unwrap_or_default(),
+        app.declared_note.clone().unwrap_or_default(),
     ];
     // The chip owns the left edge at every width; the clauses share what
     // is left and are the ones that give way.
@@ -291,6 +292,11 @@ pub fn stale_warning(app: &App) -> Option<String> {
     }
     if !app.has_index {
         return Some("no index yet · press R to scan".to_string());
+    }
+    if let Some(n) = app.previous_scope_roots {
+        return Some(format!(
+            "showing the previous scope ({n} roots) · new roots not yet observed · press R"
+        ));
     }
     let observed = app.report.observed_at;
     if !app.live_age || observed == 0 {
@@ -1653,6 +1659,18 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "  🔨 has build output   ⎇ N  N linked worktrees",
     ] {
         plain(&mut out, l, 2);
+    }
+    if !app.declared_lines.is_empty() {
+        blank(&mut out);
+        heading(&mut out, "Declared source roots");
+        for l in &app.declared_lines {
+            plain(&mut out, l, 4);
+        }
+        plain(
+            &mut out,
+            "  swamp config add-root <path> declares one; the state is from the last observation",
+            4,
+        );
     }
     // The activity-evidence inventory (#54): which domains this pass can
     // establish a real activity fact for, and which it reports as

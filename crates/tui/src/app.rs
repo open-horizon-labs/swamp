@@ -426,6 +426,15 @@ pub struct App {
     /// multi-root, #50's still-open job -- see DESIGN.md). Populated
     /// once at startup, same contract as `external_units`/`agent_units`.
     pub scope_note: Option<String>,
+    /// Set when the report shown is the last observation of an earlier,
+    /// overlapping scope (the roots changed since): how many roots that
+    /// observation covered. The header says so and points at `R`.
+    pub previous_scope_roots: Option<usize>,
+    /// The header clause for declared source roots (`2 declared roots`,
+    /// `3 declared roots (1 missing)`), and the full lines the help screen
+    /// prints. From the scope and the stored coverage; never a walk.
+    pub declared_note: Option<String>,
+    pub declared_lines: Vec<String>,
     /// The authorized scope this TUI is showing. Every refresh --
     /// background, post-action re-observe -- goes through it,
     /// so exclusions and external pruning survive an update rather than
@@ -660,8 +669,22 @@ impl App {
             store_interiors: Vec::new(),
             agent_units: Vec::new(),
             scope_note: None,
+            previous_scope_roots: None,
+            declared_note: None,
+            declared_lines: Vec::new(),
             scope: None,
         }
+    }
+
+    /// Sets the declared-roots header clause and help lines from the
+    /// resolved scope and the stored per-root coverage.
+    pub fn set_declared_roots(&mut self, roots: &[swamp_core::roots::DeclaredRoot]) {
+        self.declared_note = swamp_core::roots::declared_summary(roots);
+        self.declared_lines = swamp_core::roots::render_declared_roots(roots)
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect();
     }
 
     /// Sets `external_units` for `ViewKind::External` (#43). Called once
@@ -4224,6 +4247,62 @@ mod tests {
         assert!(app.confirm_open);
         app.cancel_confirm();
         assert_eq!(app.marked.keys().cloned().collect::<Vec<_>>(), space);
+    }
+
+    // ---- v0.8.0 G1: previous scope and declared roots in the header ----
+
+    /// The header says it is showing the previous scope and points at `R`;
+    /// declared roots are a clause; both fit 80 columns and change nothing
+    /// below the header line (no row shifts).
+    #[test]
+    fn the_header_labels_a_previous_scope_and_lists_declared_roots_without_moving_rows() {
+        let base = App::new_multi_root(fixture_report(), vec!["/root".into()]);
+        let plain = paint(&base, 80, 24);
+        let mut app = App::new_multi_root(fixture_report(), vec!["/root".into()]);
+        app.previous_scope_roots = Some(3);
+        app.set_declared_roots(&[
+            swamp_core::roots::DeclaredRoot {
+                path: "/root".into(),
+                state: swamp_core::roots::DeclaredState::Present {
+                    bytes: Some(10),
+                    complete: true,
+                },
+            },
+            swamp_core::roots::DeclaredRoot {
+                path: "/gone".into(),
+                state: swamp_core::roots::DeclaredState::Missing,
+            },
+        ]);
+        let shown = paint(&app, 80, 24);
+        let first = shown.lines().next().unwrap();
+        assert!(
+            first.contains("showing the previous scope (3 roots)"),
+            "{first}"
+        );
+        assert!(first.contains("press R"), "{first}");
+        for line in shown.lines() {
+            // `TestBackend` prints each row between two quote marks.
+            assert!(crate::model::display_width(line) <= 82, "{line}");
+        }
+        assert_eq!(shown.lines().count(), plain.lines().count());
+        // At a wide width the declared-roots clause fits after the rest.
+        let wide = paint(&app, 200, 24);
+        assert!(
+            wide.lines()
+                .next()
+                .unwrap()
+                .contains("2 declared roots (1 missing)"),
+            "{}",
+            wide.lines().next().unwrap()
+        );
+        // The help screen lists them.
+        let mut helped = App::new_multi_root(fixture_report(), vec!["/root".into()]);
+        helped.set_declared_roots(&[swamp_core::roots::DeclaredRoot {
+            path: "/gone".into(),
+            state: swamp_core::roots::DeclaredState::Missing,
+        }]);
+        helped.toggle_help();
+        assert!(paint(&helped, 100, 60).contains("Declared source roots"));
     }
 
     // ---- v0.7.5 adversarial fixes ----
