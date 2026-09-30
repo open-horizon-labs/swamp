@@ -294,8 +294,22 @@ pub fn warnings_for(t: &ReclaimTarget, kind_note: &str, home: Option<&Path>) -> 
                 .to_string(),
         ),
         Some(_) => {
-            if let Some(note) = &t.coverage_note {
-                w.push(format!("bytes are a lower bound ({note})"));
+            // The unit's one note joins a coverage gap and the project
+            // worktrees inside it (counted under their projects): they say
+            // different things on a confirm.
+            for part in t
+                .coverage_note
+                .iter()
+                .flat_map(|n| n.split("; "))
+                .filter(|p| !p.is_empty())
+            {
+                if part.contains("counted under projects") {
+                    w.push(format!(
+                        "project worktrees are inside it and go to Trash too: {part}"
+                    ));
+                } else {
+                    w.push(format!("bytes are a lower bound ({part})"));
+                }
             }
         }
     }

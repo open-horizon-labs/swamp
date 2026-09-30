@@ -24,6 +24,9 @@ pub struct MarkedUnit {
     /// Set when the row is an agent-storage unit (#101): a single-path
     /// cache/log move, or a session's member list.
     pub agent_unit: Option<swamp_core::actions::PlanUnit>,
+    /// Set when the row is a Reclaim/External unit or folder: the review
+    /// it was marked on, rechecked at the move. Plain path Trash move.
+    pub reclaim: Option<ReclaimMark>,
     pub path: PathBuf,
     /// Set for a Docker object: what removing it actually runs, and the
     /// fact that it never reaches Trash.
@@ -40,6 +43,15 @@ pub struct MarkedUnit {
     /// unpushed, untracked content, no remote, git store, what has files
     /// open…). Shown on the confirm banner; never a veto.
     pub warnings: Vec<String>,
+}
+
+/// What a Reclaim mark carries to the move: the reviewed identity of the
+/// entry, its category and the store whose protect marks are rechecked.
+#[derive(Debug, Clone)]
+pub struct ReclaimMark {
+    pub reviewed: swamp_core::reclaim_trash::Reviewed,
+    pub category: String,
+    pub store: Option<PathBuf>,
 }
 
 /// The terms a worktree removal was authorized on; recorded in the ledger.
@@ -175,7 +187,9 @@ fn execute_one(
             outcome: result.map_err(|e| e.to_string()),
         };
     }
-    let outcome = if let Some(terms) = &unit.worktree {
+    let outcome = if let Some(mark) = &unit.reclaim {
+        trash_reclaim(unit, mark, ledger, trash_root)
+    } else if let Some(terms) = &unit.worktree {
         remove_worktree(unit, terms, ledger, trash_root, actor)
     } else if let Some(target) = &unit.docker {
         remove_docker(unit, target, ledger, actor)
@@ -195,6 +209,40 @@ fn execute_one(
         path: unit.path.clone(),
         outcome: outcome.map_err(|e| e.to_string()),
     }
+}
+
+/// Moves one marked Reclaim/External row to the Trash: the core's
+/// recheck (same entry, same place, protect marks), a `started` ledger
+/// row before the move, the final row after. Nothing moves when the
+/// entry changed since review or the ledger cannot take the first row.
+fn trash_reclaim(
+    unit: &MarkedUnit,
+    mark: &ReclaimMark,
+    ledger: &Ledger,
+    trash_root: &Path,
+) -> Result<Outcome> {
+    let facts = swamp_core::reclaim_trash::MoveFacts {
+        label: unit.label.clone(),
+        bytes: unit.bytes,
+        observed_at: unit.observed_at,
+        warnings: unit.warnings.clone(),
+        category: mark.category.clone(),
+    };
+    swamp_core::reclaim_trash::trash(
+        &mark.reviewed,
+        &facts,
+        mark.store.as_deref(),
+        ledger,
+        trash_root,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(Outcome {
+        unit_id: id_for(&unit.path.display().to_string()),
+        status: "completed".into(),
+        reason: None,
+        intended_bytes: unit.bytes,
+        observed_free_space_delta: None,
+    })
 }
 
 /// Removes one Docker object, permanently, through the daemon. The
@@ -425,10 +473,23 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
             format!("{n} {many}")
         }
     };
+    let reclaim_units: Vec<&MarkedUnit> = units.iter().filter(|u| u.reclaim.is_some()).collect();
+    let units: Vec<MarkedUnit> = units
+        .iter()
+        .filter(|u| u.reclaim.is_none())
+        .cloned()
+        .collect();
+    let units_all_n = units.len() + reclaim_units.len();
+    let units = &units[..];
     let permanent_units: Vec<&MarkedUnit> = units.iter().filter(|u| u.docker.is_some()).collect();
-    let trash_units = units.len() - permanent_units.len();
+    let trash_units = units_all_n - permanent_units.len();
     let permanent: u64 = permanent_units.iter().map(|u| u.bytes).sum();
-    let trash_bytes: u64 = units.iter().map(|u| u.bytes).sum::<u64>() - permanent;
+    let trash_bytes: u64 = units
+        .iter()
+        .chain(reclaim_units.iter().copied())
+        .map(|u| u.bytes)
+        .sum::<u64>()
+        - permanent;
     let mut lines: Vec<String> = Vec::new();
     // Two destinations, and the difference is the whole point: a path
     // goes to Trash and comes back, a Docker object does not.
@@ -542,7 +603,65 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
     if warned.len() > 3 {
         lines.push(format!("⚠ +{} more warnings", warned.len() - 3));
     }
+    lines.extend(reclaim_lines(&reclaim_units));
     lines.join("\n")
+}
+
+/// Most marked folders whose own warnings are listed one by one; more
+/// than this and the paths are listed and the warnings are merged.
+const RECLAIM_BLOCKS: usize = 3;
+/// Most paths listed when the warnings are merged.
+const RECLAIM_PATHS: usize = 8;
+
+/// The confirm's part for Reclaim/External folders: every exact path and
+/// size, then what swamp does and does not know about each (its own
+/// review lines), then the way back. Nothing is cut to "N more" until the
+/// list is long, and then the count says how many paths are not shown.
+fn reclaim_lines(units: &[&MarkedUnit]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if units.is_empty() {
+        return lines;
+    }
+    if units.len() <= RECLAIM_BLOCKS {
+        for u in units {
+            lines.push(format!("{} ({})", u.path.display(), human_bytes(u.bytes)));
+            for w in &u.warnings {
+                lines.push(format!("⚠ {w}"));
+            }
+        }
+    } else {
+        for u in units.iter().take(RECLAIM_PATHS) {
+            lines.push(format!("{} ({})", u.path.display(), human_bytes(u.bytes)));
+        }
+        if units.len() > RECLAIM_PATHS {
+            let rest: u64 = units.iter().skip(RECLAIM_PATHS).map(|u| u.bytes).sum();
+            lines.push(format!(
+                "+{} more folders ({}); every path is in the ledger row for its move",
+                units.len() - RECLAIM_PATHS,
+                human_bytes(rest)
+            ));
+        }
+        let mut merged: Vec<(String, usize)> = Vec::new();
+        for w in units.iter().flat_map(|u| u.warnings.iter()) {
+            match merged.iter_mut().find(|(t, _)| t == w) {
+                Some((_, n)) => *n += 1,
+                None => merged.push((w.clone(), 1)),
+            }
+        }
+        // The kinds of fact first, each with how many folders carry it.
+        for (text, n) in &merged {
+            if *n > 1 {
+                lines.push(format!("⚠ {text} ({n} folders)"));
+            } else {
+                lines.push(format!("⚠ {text}"));
+            }
+        }
+    }
+    lines.push(
+        "Trash is the way back: move the folder out of the Trash to restore it. Space is freed when Trash is emptied."
+            .to_string(),
+    );
+    lines
 }
 
 #[cfg(test)]
@@ -553,6 +672,7 @@ mod tests {
         MarkedUnit {
             cargo_unit: None,
             agent_unit: None,
+            reclaim: None,
             path: PathBuf::from(path),
             docker,
             worktree_path: PathBuf::from(path),

@@ -291,8 +291,8 @@ pub enum RemovalKind {
     /// The reviewed move to Trash, in the TUI (Space marks, Backspace
     /// opens the confirm).
     TrashReviewed,
-    /// An installation: the reviewed move to Trash, or the tool's own
-    /// removal command (`Y` on its Tools row, where the tool has one).
+    /// A unit whose manager swamp runs removal for (mise, simctl): the
+    /// reviewed move to Trash, or the manager's own command.
     TrashOrToolCommand,
 }
 
@@ -302,16 +302,15 @@ pub struct Removal {
     pub text: String,
 }
 
-fn removal(kind: RemovalKind) -> Removal {
+fn removal(kind: RemovalKind, manager: Option<&str>) -> Removal {
     Removal {
         kind,
-        text: match kind {
-            RemovalKind::TrashReviewed => "Trash after review (Space, then Backspace)",
-            RemovalKind::TrashOrToolCommand => {
-                "Trash after review (Space, Backspace), or the tool's own command (Y)"
-            }
-        }
-        .to_string(),
+        text: match (kind, manager) {
+            (RemovalKind::TrashOrToolCommand, Some(m)) => format!(
+                "Trash after review (Space, then Backspace), or {m}'s own command (Backspace on an unmarked row)"
+            ),
+            _ => "Trash after review (Space, then Backspace)".to_string(),
+        },
     }
 }
 
@@ -1105,11 +1104,10 @@ fn unit_row(
         consumers: consumers_for(&u.evidence, &u.consumers, scope),
         manager: unit_quotes,
         hold: unit_hold,
-        removal: removal(if u.category == StorageCategory::Installation {
-            RemovalKind::TrashOrToolCommand
-        } else {
-            RemovalKind::TrashReviewed
-        }),
+        removal: match crate::tool_removal::manager_for_unit(&u.detector_id, &u.path) {
+            Some(m) => removal(RemovalKind::TrashOrToolCommand, Some(m.name())),
+            None => removal(RemovalKind::TrashReviewed, None),
+        },
         regenerable_bytes,
         held_bytes,
         note: u.display_note(),
@@ -1139,7 +1137,7 @@ fn standalone_row(
         consumers: consumers_for(&row.evidence, &[], scope),
         manager: Vec::new(),
         hold: None,
-        removal: removal(RemovalKind::TrashReviewed),
+        removal: removal(RemovalKind::TrashReviewed, None),
         regenerable_bytes: row.bytes,
         held_bytes: 0,
         note: None,

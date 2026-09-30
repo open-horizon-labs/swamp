@@ -2214,10 +2214,19 @@ pub fn external_rows_with(
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        // What the person sees, the person may move to Trash (maintainer
+        // decision 2026-09-30): the row is a real path, so it is a unit.
+        // The mark's review says what swamp does not know about it.
+        row.unit = Some(UnitId::for_artifact(&u.path));
         row.tool = swamp_core::tool_removal::manager_for_unit(&u.detector_id, &u.path);
+        let mut tool_signal = None;
         if let Some(m) = row.tool {
-            row.signals
-                .push(format!("removed by {} itself · Backspace", m.name()));
+            let line = format!(
+                "{} removes these itself · Backspace for its list, Space for Trash",
+                m.name()
+            );
+            tool_signal = Some(line.clone());
+            row.signals.push(line);
         }
         row.last_used = Some(u.last_used.describe(observed_at));
         // The interior this unit itself owns: not the interior of another
@@ -2266,7 +2275,7 @@ pub fn external_rows_with(
                 header.expansion_key = Some(ikey);
                 header.rail = if iopen { "▾ ".into() } else { "▸ ".into() };
                 header.collapsed_children = (!iopen).then_some(fams.len());
-                header.signals = vec!["inspection only".into(), "blocked".into()];
+                header.signals = vec!["a grouping of the folders above, not a folder".into()];
                 children.push(header);
                 if iopen {
                     children.extend(fams);
@@ -2276,13 +2285,14 @@ pub fn external_rows_with(
             row.expansion_key = Some(key);
             row.rail = if open { "▾ ".into() } else { "▸ ".into() };
             row.collapsed_children = (!open).then_some(children.len());
-            row.signals
-                .insert(0, "store interior below · inspection only".into());
-            row.signals = vec![if has_interior {
-                "store interior below · inspection only".into()
+            // The opening hint leads; the tool's own signal stays after it.
+            let mut signals = vec![if has_interior {
+                "store interior below (Enter opens it)".to_string()
             } else {
-                "folders below · inspection only".into()
+                "folders below (Enter opens them)".to_string()
             }];
+            signals.extend(tool_signal);
+            row.signals = signals;
             rows.push(row);
             if open {
                 rows.extend(children);
@@ -2311,6 +2321,7 @@ fn compact_signed(bytes: i64) -> String {
 /// row is the remainder that makes the rows add up to the unit's total.
 fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row> {
     use swamp_core::drilldown::{ChildKind, ChildMeasure};
+    use swamp_core::reclaim_trash::{child_not_markable, row_path};
     let count = u.children.len();
     u.children
         .iter()
@@ -2349,12 +2360,15 @@ fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row>
             };
             row.allocated = row.size_text.is_none();
             row.mtime_max = c.mtime_max;
-            row.signals = vec![
-                swamp_core::render::describe_unit_child(c, now),
-                "blocked".into(),
-            ];
+            row.signals = vec![swamp_core::render::describe_unit_child(c, now)];
             if c.kind == ChildKind::Entry {
                 row.last_used = Some(c.last_used.describe(now));
+            }
+            match row_path(&u.path.display().to_string(), Some((c.kind, &c.name))) {
+                Some(path) => row.unit = Some(UnitId::for_artifact(&path)),
+                None => row
+                    .detail_lines
+                    .push(child_not_markable(c.kind, &c.name).to_string()),
             }
             row
         })
@@ -2363,10 +2377,11 @@ fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row>
 
 /// The Reclaim view (#175): one row per unit of developer storage,
 /// largest first, from the stored facts `swamp_core::reclaim::build` joins.
-/// Never markable (`unit: None`): removal is the reviewed Trash flow in the
-/// unowned view for a standalone Cargo target, the manager's own command
-/// (not built yet) for an installation, and nothing for the rest. A row
-/// opens (`Enter`) onto the unit's folders, whose rows add up to its size.
+/// Every unit and every listed folder is a real path and is markable
+/// (Space, then Backspace for the reviewed Trash confirm); the remainder
+/// and size-correction rows are not folders and say why in the detail
+/// pane. A row opens (`Enter`) onto the unit's folders, whose rows add up
+/// to its size.
 ///
 /// The layout is fixed like every other view: the name column leads with
 /// the unit and its kind, and the cost, last-used fact and removal path
@@ -2391,6 +2406,10 @@ pub fn reclaim_rows(
             r.bytes,
             r.growth_bytes,
         );
+        // A real path: Space marks it, Backspace opens the reviewed
+        // confirm for the Trash move. The mark's review states what
+        // swamp does not know about it.
+        row.unit = Some(UnitId::for_artifact(std::path::Path::new(&r.path)));
         row.signals = vec![
             r.regeneration.words.clone(),
             format!("last used {}", r.last_used_text),
@@ -2423,7 +2442,7 @@ pub fn reclaim_rows(
             .children
             .iter()
             .enumerate()
-            .map(|(i, c)| reclaim_child_row(c, i + 1 == count))
+            .map(|(i, c)| reclaim_child_row(&r.path, c, i + 1 == count))
             .collect();
         row.expandable = true;
         row.expansion_key = Some(key);
@@ -2437,7 +2456,7 @@ pub fn reclaim_rows(
     rows
 }
 
-fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
+fn reclaim_child_row(unit: &str, c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
     use swamp_core::drilldown::ChildKind;
     let flag = c
         .hold
@@ -2477,6 +2496,15 @@ fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
         .map(swamp_core::reclaim::hold_line)
         .chain(c.manager.iter().map(|q| q.line()))
         .collect();
+    // One folder of the unit can be marked like the unit; a row that is
+    // not a folder says so here, where the keys that would act are not
+    // offered.
+    match swamp_core::reclaim_trash::row_path(unit, Some((c.kind, &c.name))) {
+        Some(path) => row.unit = Some(UnitId::for_artifact(&path)),
+        None => row
+            .detail_lines
+            .push(swamp_core::reclaim_trash::child_not_markable(c.kind, &c.name).to_string()),
+    }
     row
 }
 

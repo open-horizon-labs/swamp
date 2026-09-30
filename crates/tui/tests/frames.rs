@@ -1365,6 +1365,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     let unit = |path: &std::path::Path| MarkedUnit {
         cargo_unit: None,
         agent_unit: None,
+        reclaim: None,
         path: path.to_path_buf(),
         docker: None,
         worktree_path: PathBuf::new(),
@@ -1681,6 +1682,7 @@ fn plain_unit(path: &str, bytes: u64) -> swamp_tui::actions::MarkedUnit {
     swamp_tui::actions::MarkedUnit {
         cargo_unit: None,
         agent_unit: None,
+        reclaim: None,
         path: PathBuf::from(path),
         docker: None,
         worktree_path: PathBuf::from(path),
@@ -2826,11 +2828,13 @@ fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
         assert!(reclaim_footer.contains("v view"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("q quit"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("? help"), "{reclaim_footer}");
-        // Reclaim shows no key that only refuses: nothing in it is
-        // markable, so no delete or mark keys.
-        for gone in ["⌫ delete", "Space mark", "A mark all"] {
-            assert!(!reclaim_footer.contains(gone), "{reclaim_footer}");
+        // Reclaim names `Space mark` and `⌫ trash` while the row under the
+        // cursor is a real path (a unit, or a listed folder), and never
+        // the old "delete" word, which Reclaim did not do.
+        for want in ["⌫ trash", "Space mark"] {
+            assert!(reclaim_footer.contains(want), "{reclaim_footer}");
         }
+        assert!(!reclaim_footer.contains("⌫ delete"), "{reclaim_footer}");
         // Every other view keeps its footer, on the same screen row.
         let external = {
             app.set_view(ViewKind::External);

@@ -343,7 +343,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 /// person reaches for first: filter, view, refresh and delete come before
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
-fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
+fn footer_legend(width: usize, blocked: bool, markable: bool, trash: bool) -> String {
     const BASE: [&str; 12] = [
         "Tab section",
         "v view",
@@ -360,10 +360,19 @@ fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
     ];
     const TAIL: &str = "q quit";
     let mut items: Vec<&str> = BASE.to_vec();
+    if trash {
+        // Reclaim and External: what Backspace does on a row that has a
+        // mark to make is the Trash confirm.
+        for k in items.iter_mut() {
+            if *k == "⌫ delete" {
+                *k = "⌫ trash";
+            }
+        }
+    }
     if !markable {
         // A view whose rows cannot be marked shows no key that only
         // answers with a refusal.
-        items.retain(|k| !matches!(*k, "⌫ delete" | "Space mark" | "A mark all"));
+        items.retain(|k| !matches!(*k, "⌫ delete" | "⌫ trash" | "Space mark" | "A mark all"));
     }
     if blocked {
         // What the last check could not include, one key from the list.
@@ -485,6 +494,21 @@ fn items(n: usize) -> String {
 /// confirm text; its first line is the headline shown in the status rows.
 fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
     let rest: &[String] = summary.get(1..).unwrap_or(&[]);
+    // A plan of only Reclaim/External folders: the exact paths and sizes,
+    // what swamp knows and does not know about each, and the way back.
+    if !app.marked.is_empty() && app.marked.values().all(|u| u.reclaim.is_some()) {
+        return rest
+            .iter()
+            .map(|l| {
+                let c = if l.starts_with('⚠') {
+                    Color::Yellow
+                } else {
+                    Color::Reset
+                };
+                (l.clone(), c)
+            })
+            .collect();
+    }
     let irreversible = rest
         .iter()
         .take_while(|l| l.starts_with("Remove ") || l.starts_with("Gone for good"))
@@ -561,6 +585,22 @@ fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
     out
 }
 
+/// Whether the plan sheet can show every line of a Reclaim/External plan
+/// at this terminal size. The sheet has no scroll and no key is free to
+/// scroll it, so a plan that would hide a line behind a count does not
+/// offer Enter: the terminal has to be larger.
+pub fn reclaim_plan_fits(app: &App, width: u16, height: u16) -> bool {
+    let summary: Vec<String> = app.confirm_summary().lines().map(str::to_string).collect();
+    let inner_w = usize::from(width.saturating_sub(2)).max(1);
+    let need: usize = plan_sheet(app, &summary)
+        .iter()
+        .map(|(l, _)| wrapped_rows(l, inner_w))
+        .sum::<usize>()
+        + 2;
+    let chrome = 1 + usize::from(headline_rows(height)) + 1 + 1 + usize::from(STATUS_ROWS) + 1;
+    need <= usize::from(height).saturating_sub(chrome)
+}
+
 /// The plan by project, largest first, the tail folded into one line.
 fn project_breakdown(app: &App) -> Vec<(String, Color)> {
     let mut by: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
@@ -613,11 +653,12 @@ fn blocked_sheet(app: &App) -> Vec<(String, Color)> {
 fn draw_sheet(
     frame: &mut Frame,
     body: Rect,
+    rows: u16,
     title: &str,
     lines: &[(String, Color)],
     more: &dyn Fn(usize) -> String,
 ) {
-    let h = SHEET_ROWS.min(body.height);
+    let h = rows.min(body.height);
     if h < 3 {
         return;
     }
@@ -773,6 +814,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_sheet(
                 frame,
                 chunks[4],
+                SHEET_ROWS,
                 &if app.blocked_scroll > 0 {
                     format!(
                         "Blocked: {} · from item {}",
@@ -786,9 +828,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 &|_| "more below (↓ to scroll)".to_string(),
             );
         } else if app.confirm_open {
+            // A Reclaim plan lists exact paths and what swamp knows of each:
+            // it takes the whole body, and Enter is offered only when all
+            // of it fits (`reclaim_plan_fits`).
+            let rows = if app.marked.values().any(|u| u.reclaim.is_some()) {
+                chunks[4].height
+            } else {
+                SHEET_ROWS
+            };
             draw_sheet(
                 frame,
                 chunks[4],
+                rows,
                 "Plan · nothing has changed yet",
                 &plan_sheet(app, &summary),
                 &|n| format!("+{n} more lines"),
@@ -855,12 +906,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
         footer_legend(
             size.width as usize,
             !app.blocked.is_empty(),
-            !matches!(
-                app.view,
-                crate::app::ViewKind::Reclaim
-                    | crate::app::ViewKind::Disk
-                    | crate::app::ViewKind::DiskGaps
-            ),
+            match app.view {
+                // The keys are named only while the row under the cursor
+                // has a mark to make; a row that is not a folder shows why
+                // in the detail pane instead.
+                crate::app::ViewKind::Reclaim => app.selected_row_markable(),
+                crate::app::ViewKind::Disk | crate::app::ViewKind::DiskGaps => false,
+                _ => true,
+            },
+            app.view == crate::app::ViewKind::Reclaim,
         )
     };
     frame.render_widget(Paragraph::new(footer_text), chunks[6]);

@@ -1119,6 +1119,12 @@ fn removal_paths_are_only_the_ones_that_exist() {
             ),
             unit("uv", StorageCategory::Cache, "/h/.cache/uv", GB),
             unit("codex", StorageCategory::LocalState, "/h/.codex", GB),
+            unit(
+                "mise",
+                StorageCategory::Installation,
+                "/h/.local/share/mise/installs",
+                GB,
+            ),
         ],
         &[standalone("/tmp/cargo-target", GB)],
         &ManagerFacts::default(),
@@ -1132,17 +1138,19 @@ fn removal_paths_are_only_the_ones_that_exist() {
         row(&v, "/tmp/cargo-target").kind,
         KIND_STANDALONE_CARGO_TARGET
     );
+    // Only a manager swamp runs removal for offers its own command too;
+    // rustup has none in swamp, and its row does not claim one.
     assert_eq!(
-        row(&v, "/h/.rustup/toolchains").removal.kind,
+        row(&v, "/h/.local/share/mise/installs").removal.kind,
         RemovalKind::TrashOrToolCommand
     );
     assert!(
-        row(&v, "/h/.rustup/toolchains")
+        row(&v, "/h/.local/share/mise/installs")
             .removal
             .text
-            .contains("tool's own command")
+            .contains("mise's own command")
     );
-    for p in ["/h/.cache/uv", "/h/.codex"] {
+    for p in ["/h/.cache/uv", "/h/.codex", "/h/.rustup/toolchains"] {
         assert_eq!(row(&v, p).removal.kind, RemovalKind::TrashReviewed);
         assert!(!row(&v, p).removal.text.contains("view only"));
     }
