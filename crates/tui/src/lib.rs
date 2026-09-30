@@ -562,6 +562,7 @@ fn run_terminal_loop(mut guard: term::TerminalGuard, app: &mut App) -> Result<()
 #[derive(Default)]
 struct RedrawGate {
     forced: bool,
+    was_busy: bool,
     last_clock: Option<String>,
 }
 
@@ -574,7 +575,11 @@ impl RedrawGate {
     /// Whether to paint now; records what the clock parts showed.
     fn due(&mut self, app: &App) -> bool {
         let clock = ui::clock_signature(app);
-        let due = self.forced || app.is_busy() || self.last_clock.as_deref() != Some(&clock);
+        let busy = app.is_busy();
+        // The frame after the last busy one shows the finished state.
+        let due =
+            self.forced || busy || self.was_busy || self.last_clock.as_deref() != Some(&clock);
+        self.was_busy = busy;
         self.forced = false;
         self.last_clock = Some(clock);
         due
@@ -594,7 +599,12 @@ impl RedrawGate {
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut gate = RedrawGate::default();
     loop {
-        app.poll_operation();
+        if app.poll_operation() {
+            gate.touch();
+        }
+        if app.apply_held_reload() {
+            gate.touch();
+        }
         if app.operation.is_none()
             && let Some(rx) = &app.pending
             && let Ok(res) = rx.try_recv()
@@ -609,8 +619,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                     // live/background refresh of one or more roots never
                     // touches any other root's rows, and the event thread
                     // only installs what the worker prepared.
-                    app.install_refreshed(fresh);
-                    app.observed_label = "just now".into();
+                    app.land_observation(fresh);
                 }
                 Err(e) => app.status = Some(format!("observation failed: {e}")),
             }
@@ -619,9 +628,10 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             gate.touch();
         }
         if let Ok(sz) = terminal.size()
-            && app.width != sz.width
+            && (app.width != sz.width || app.height != sz.height)
         {
             app.width = sz.width;
+            app.height = sz.height;
             gate.touch();
         }
         if gate.due(app) {

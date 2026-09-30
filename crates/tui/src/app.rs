@@ -189,6 +189,16 @@ enum LockPollMsg {
     Reloaded(Box<swamp_core::report::ReportSnapshot>),
 }
 
+/// A reload waiting for the confirm or check to end.
+enum HeldReload {
+    Fresh(Box<RefreshedObservation>),
+    Snapshot(Box<swamp_core::report::ReportSnapshot>),
+}
+
+/// The smallest terminal that shows the permanent-removal line of a plan.
+pub const CONFIRM_MIN_ROWS: u16 = 8;
+pub const CONFIRM_MIN_COLS: u16 = 40;
+
 type PendingObservation = anyhow::Result<RefreshedObservation>;
 
 /// A merged multi-root report and the per-root cache it came from.
@@ -335,7 +345,14 @@ pub struct App {
     /// or `A` on an unmarked selection). Esc on that confirm unmarks exactly
     /// these, so cancelling never leaves marks the screen did not show
     /// before; marks made earlier with Space stay, and stay visible.
-    pub confirm_added: Vec<String>,
+    /// The marks that existed when the open confirm was first opened; Esc
+    /// undoes whatever was marked beyond them, however many rechecks or
+    /// repeated presses happened since.
+    confirm_base: Option<std::collections::BTreeSet<String>>,
+    /// A newer index that arrived while a check or a confirm was open. It
+    /// is installed when they end, so what Enter would move never changes
+    /// under the human's eyes.
+    held_reload: Option<HeldReload>,
     pub help_open: bool,
     /// The filter picker form, when open.
     pub picker: Option<crate::picker::Picker>,
@@ -373,6 +390,8 @@ pub struct App {
     pub quit: bool,
     /// Terminal width at the last draw; the header fits its clauses to it.
     pub width: u16,
+    /// Terminal height at the last draw; 0 until the first one.
+    pub height: u16,
     /// Seconds of observation history the store holds; bounds the growth
     /// windows a human may pick (the store cannot answer beyond it).
     pub history_secs: Option<u64>,
@@ -636,7 +655,8 @@ impl App {
             collapsed: HashSet::new(),
             marked: BTreeMap::new(),
             confirm_open: false,
-            confirm_added: Vec::new(),
+            confirm_base: None,
+            held_reload: None,
             help_open: false,
             picker: None,
             completions: Vec::new(),
@@ -656,6 +676,7 @@ impl App {
             keep_executables: false,
             quit: false,
             width: 0,
+            height: 0,
             store_dir: None,
             watches: Vec::new(),
             watch_rx: None,
@@ -834,6 +855,116 @@ impl App {
         if let Some(units) = fresh.agent_units {
             self.set_agent_units(units);
         }
+    }
+
+    /// True while a check or a confirm is open: a new index must wait.
+    fn reload_must_wait(&self) -> bool {
+        self.confirm_open || self.operation.is_some()
+    }
+
+    /// Whether a newer index is waiting for the confirm or check to end.
+    pub fn new_data_waiting(&self) -> bool {
+        self.held_reload.is_some()
+    }
+
+    /// Lands the result of our own observation: now, or after the confirm
+    /// or check that is open ends.
+    pub fn land_observation(&mut self, fresh: RefreshedObservation) {
+        if self.reload_must_wait() {
+            self.held_reload = Some(HeldReload::Fresh(Box::new(fresh)));
+            return;
+        }
+        self.install_refreshed(fresh);
+        self.observed_label = "just now".into();
+        self.drop_marks_missing_from_report();
+    }
+
+    fn install_snapshot(&mut self, snap: swamp_core::report::ReportSnapshot) {
+        self.has_index = true;
+        self.replace_report(snap.report);
+        self.set_external_units(snap.external_units);
+        self.set_store_interiors(snap.store_interiors);
+        self.set_agent_units(snap.agent_units);
+        self.observed_label = "just now".into();
+        self.status = None;
+        self.drop_marks_missing_from_report();
+    }
+
+    /// Installs a held reload once no confirm or check is open. True when
+    /// the screen's inputs changed.
+    pub fn apply_held_reload(&mut self) -> bool {
+        if self.reload_must_wait() {
+            return false;
+        }
+        match self.held_reload.take() {
+            Some(HeldReload::Fresh(f)) => {
+                self.install_refreshed(*f);
+                self.observed_label = "just now".into();
+                self.drop_marks_missing_from_report();
+                true
+            }
+            Some(HeldReload::Snapshot(snap)) => {
+                self.install_snapshot(*snap);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every path the current report and unit lists can name.
+    fn known_unit_keys(&self) -> std::collections::HashSet<String> {
+        let mut keys = std::collections::HashSet::new();
+        for wt in self.report.projects.iter().flat_map(|p| &p.worktrees) {
+            keys.insert(wt.path.display().to_string());
+            for a in &wt.artifacts {
+                keys.insert(a.path.display().to_string());
+            }
+        }
+        for u in &self.report.unowned {
+            keys.insert(u.path_or_object.clone());
+        }
+        for n in self
+            .report
+            .nested_artifacts
+            .iter()
+            .chain(&self.store_interiors)
+        {
+            keys.insert(n.path.display().to_string());
+        }
+        for u in &self.external_units {
+            keys.insert(u.path.display().to_string());
+        }
+        for u in &self.agent_units {
+            keys.insert(u.path.display().to_string());
+        }
+        keys
+    }
+
+    /// After a new index lands: a mark for something the index no longer
+    /// lists is dropped, and the result line says how many.
+    fn drop_marks_missing_from_report(&mut self) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let known = self.known_unit_keys();
+        let gone: Vec<String> = self
+            .marked
+            .iter()
+            .filter(|(k, u)| u.observed_at < self.report.observed_at && !known.contains(*k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for k in &gone {
+            self.marked.remove(k);
+        }
+        let n = gone.len();
+        self.set_result(format!(
+            "The new scan no longer lists {n} marked item{}; unmarked. {} still marked.",
+            if n == 1 { "" } else { "s" },
+            self.marked.len()
+        ));
     }
 
     /// Identity of the selected row: its unit path when it has one
@@ -1199,6 +1330,9 @@ impl App {
     /// Enters a project from the projects view into its tree.
     pub fn drill_into_selected(&mut self) {
         if self.confirm_open {
+            if self.height != 0 && !self.confirm_fits(self.width, self.height) {
+                return;
+            }
             self.confirm_delete();
             return;
         }
@@ -1955,13 +2089,16 @@ impl App {
             return;
         }
         if confirm && !self.marked.is_empty() {
-            self.confirm_added.clear();
+            self.note_confirm_base();
             self.open_confirm();
             return;
         }
         let row = self.selected_row();
         if !all && row.is_none() {
             return;
+        }
+        if confirm {
+            self.note_confirm_base();
         }
         let marks = self.marked.clone();
         self.start_review(all, row, confirm, marks);
@@ -2098,7 +2235,10 @@ impl App {
         ids.len() + blocked_rows
     }
 
-    pub fn poll_operation(&mut self) {
+    /// Applies what the worker reported. True when anything arrived, so the
+    /// event loop paints it without waiting for a key.
+    pub fn poll_operation(&mut self) -> bool {
+        let mut changed = false;
         loop {
             let event = match self.operation_rx.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(e)) => e,
@@ -2107,6 +2247,7 @@ impl App {
                 ),
                 _ => break,
             };
+            changed = true;
             match event {
                 OperationEvent::Inspected(lines) => {
                     self.operation = None;
@@ -2196,10 +2337,8 @@ impl App {
                         self.blocked = blocked;
                         self.refusal = refusal.map(|msg| (msg, Instant::now()));
                         self.confirm_open = confirm && !self.marked.is_empty();
-                        if self.confirm_open {
-                            self.confirm_added = added.clone();
-                        } else {
-                            self.confirm_added.clear();
+                        if !self.confirm_open {
+                            self.confirm_base = None;
                             // Space: say where the marks stand, the row
                             // itself may not show a change (a project row
                             // stands for many units).
@@ -2234,11 +2373,13 @@ impl App {
                     self.operation = None;
                     self.operation_rx = None;
                     self.confirm_open = false;
+                    self.confirm_base = None;
                     self.set_refusal(&msg);
                     break;
                 }
             }
         }
+        changed
     }
 
     fn set_refusal(&mut self, msg: &str) {
@@ -2287,12 +2428,20 @@ impl App {
         if self.marked.is_empty()
             && let Some(row) = self.selected_row()
         {
+            self.note_confirm_base();
             self.mark_row(&row);
-            self.confirm_added = self.marked.keys().cloned().collect();
         } else {
-            self.confirm_added.clear();
+            self.note_confirm_base();
         }
         self.open_confirm();
+    }
+
+    /// Records the marks as they stand when a confirm is first opened. A
+    /// press that finds the confirm already open keeps the first record.
+    fn note_confirm_base(&mut self) {
+        if !self.confirm_open {
+            self.confirm_base = Some(self.marked.keys().cloned().collect());
+        }
     }
 
     /// Esc on the confirm: nothing is deleted, and the marks the opening
@@ -2304,7 +2453,13 @@ impl App {
         }
         self.confirm_open = false;
         self.refusal = None;
-        let undone = std::mem::take(&mut self.confirm_added);
+        let base = self.confirm_base.take().unwrap_or_default();
+        let undone: Vec<String> = self
+            .marked
+            .keys()
+            .filter(|k| !base.contains(*k))
+            .cloned()
+            .collect();
         for id in &undone {
             self.marked.remove(id);
         }
@@ -2348,6 +2503,14 @@ impl App {
             "{change}{total} marked in all ({}). Nothing has been moved. Backspace moves them to Trash after you confirm.{blocked}",
             model::human_bytes(bytes)
         )
+    }
+
+    /// Whether a terminal of this size shows what Enter would do. A plan
+    /// that removes anything for good (docker) needs the sheet that says
+    /// so; below that size Enter is not offered and does nothing.
+    pub fn confirm_fits(&self, width: u16, height: u16) -> bool {
+        let permanent = self.marked.values().any(|u| u.docker.is_some());
+        !permanent || (height >= CONFIRM_MIN_ROWS && width >= CONFIRM_MIN_COLS)
     }
 
     pub fn confirm_summary(&self) -> String {
@@ -2400,7 +2563,7 @@ impl App {
         });
         self.operation_rx = Some(rx);
         self.confirm_open = false;
-        self.confirm_added.clear();
+        self.confirm_base = None;
         self.last_result = None;
         self.refusal = None;
         self.blocked.clear();
@@ -3021,13 +3184,11 @@ impl App {
                     if self.pending.is_some() {
                         continue;
                     }
-                    self.has_index = true;
-                    self.replace_report(snap.report);
-                    self.set_external_units(snap.external_units);
-                    self.set_store_interiors(snap.store_interiors);
-                    self.set_agent_units(snap.agent_units);
-                    self.observed_label = "just now".into();
-                    self.status = None;
+                    if self.reload_must_wait() {
+                        self.held_reload = Some(HeldReload::Snapshot(snap));
+                        continue;
+                    }
+                    self.install_snapshot(*snap);
                 }
             }
         }

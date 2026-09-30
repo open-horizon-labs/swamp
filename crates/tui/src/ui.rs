@@ -155,6 +155,11 @@ fn header_line(app: &App, width: usize) -> String {
     let clauses = vec![
         app.disk_banner.clone().unwrap_or_default(),
         app.status.clone().unwrap_or_default(),
+        if app.new_data_waiting() {
+            "new data available".to_string()
+        } else {
+            String::new()
+        },
         warn.clone().unwrap_or_default(),
         if stale
             || app
@@ -250,7 +255,14 @@ fn activity_chip(app: &App, width: usize) -> Option<String> {
 /// counting while the UI stays open and resets when a refresh lands).
 fn age_label(app: &App) -> String {
     if app.live_age && app.report.observed_at > 0 {
-        swamp_core::schedule::format_ago(swamp_core::entities::now(), app.report.observed_at)
+        // Under a minute reads "just now": a label that counted seconds
+        // would repaint an idle screen once a second.
+        let now = swamp_core::entities::now();
+        if now.saturating_sub(app.report.observed_at) < 60 {
+            "just now".to_string()
+        } else {
+            swamp_core::schedule::format_ago(now, app.report.observed_at)
+        }
     } else {
         app.observed_label.clone()
     }
@@ -735,6 +747,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
             "↑↓ scroll · r check again · Esc back to the plan".to_string()
         } else {
             "↑↓ scroll · r check again · Esc close".to_string()
+        }
+    } else if app.confirm_open && !app.confirm_fits(size.width, size.height) {
+        let need = format!(
+            "{}x{}",
+            crate::app::CONFIRM_MIN_COLS,
+            crate::app::CONFIRM_MIN_ROWS
+        );
+        let long = format!("Terminal too small to confirm: enlarge to at least {need} · Esc back");
+        if crate::model::display_width(&long) <= size.width as usize {
+            long
+        } else {
+            format!("Too small: need {need}")
         }
     } else if app.confirm_open {
         let mut clauses = vec!["Enter confirm".to_string(), "Esc back".to_string()];
