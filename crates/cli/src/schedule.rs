@@ -145,7 +145,7 @@ pub fn cmd_observe(
             for note in &quarantine_notes {
                 safe_println!("  {note}");
             }
-            for (path, why) in swamp_core::fs_gate::git::declined() {
+            for (path, why) in swamp_core::signals::declined_repositories() {
                 safe_println!("  {}: git repository not measured ({why})", path.display());
             }
             safe_println!(
