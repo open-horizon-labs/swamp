@@ -84,6 +84,7 @@ fn parse_runtimes(text: &str) -> Result<Vec<Runtime>, String> {
         let s = |k: &str| r.get(k).and_then(|x| x.as_str()).map(str::to_string);
         out.push(Runtime {
             uuid: uuid.clone(),
+            // Absent stays empty, and the review refuses on it.
             runtime_id: s("runtimeIdentifier").unwrap_or_default(),
             version: s("version").unwrap_or_default(),
             build: s("build").unwrap_or_default(),
@@ -105,6 +106,9 @@ fn parse_devices(text: &str, runtime_id: &str) -> Result<Vec<Device>, String> {
         .get("devices")
         .and_then(|d| d.as_object())
         .ok_or("its JSON has no devices map")?;
+    if devices.get(runtime_id).is_some_and(|d| !d.is_array()) {
+        return Err(format!("its devices for {runtime_id} are not a list"));
+    }
     let mut out: Vec<Device> = devices
         .get(runtime_id)
         .and_then(|d| d.as_array())
@@ -116,10 +120,11 @@ fn parse_devices(text: &str, runtime_id: &str) -> Result<Vec<Device>, String> {
                         .and_then(|n| n.as_str())
                         .unwrap_or("unnamed")
                         .to_string(),
+                    // Missing or not a string: not known to be shut down.
                     state: d
                         .get("state")
                         .and_then(|n| n.as_str())
-                        .unwrap_or("unknown")
+                        .unwrap_or("no state")
                         .to_string(),
                 })
                 .collect()
@@ -171,6 +176,23 @@ fn list_devices(bin: &ToolBin, runtime_id: &str) -> Result<Vec<Device>, Refusal>
             "Review again; swamp does not remove without that check.",
         )
     })
+}
+
+/// The Xcode Previews device set's devices on `runtime_id`, when simctl
+/// shows that set; `None` when it cannot (no such set, or output swamp
+/// cannot read), which the confirm says.
+fn previews_devices(bin: &ToolBin, runtime_id: &str) -> Option<Vec<Device>> {
+    let out = super::read(
+        bin,
+        &["simctl", "--set", "previews", "list", "devices", "-j"],
+    )
+    .ok()?;
+    if !out.success() || out.truncated || out.timed_out {
+        return None;
+    }
+    let text = out.stdout_lossy();
+    let json = &text[text.find('{')?..];
+    parse_devices(json, runtime_id).ok()
 }
 
 fn size_text(r: &Runtime) -> String {
@@ -238,22 +260,52 @@ pub(super) fn review(host: &Host, bin: &ToolBin, target: &Target) -> Result<Prev
             "Wait for simctl to finish with it, then review again.",
         ));
     }
-    let devices = list_devices(bin, &rt.runtime_id)?;
-    let booted: Vec<&str> = devices
-        .iter()
-        .filter(|d| d.state == "Booted")
-        .map(|d| d.name.as_str())
-        .collect();
-    if !booted.is_empty() {
+    if rt.runtime_id.is_empty() {
         return Err(Refusal::new(
             format!(
-                "Simulator {} is booted on this runtime; simctl would shut it down and delete \
-                 anyway.",
-                booted.join(", ")
+                "simctl lists {label} without a runtime identifier, so swamp cannot tell which \
+                 simulators use it."
+            ),
+            "Manage it in Xcode > Settings > Components.",
+        ));
+    }
+    let mut devices = list_devices(bin, &rt.runtime_id)?;
+    let mut warnings = Vec::new();
+    match previews_devices(bin, &rt.runtime_id) {
+        Some(p) => devices.extend(p),
+        None => warnings.push(
+            "Xcode Previews and other device sets are not visible to swamp; simctl may shut \
+             down a simulator there."
+                .to_string(),
+        ),
+    }
+    // Only a device simctl reports exactly `Shutdown` is known not to be
+    // running: Booted, Booting, Shutting Down, a missing or unknown state
+    // all refuse (simctl would shut it down and delete anyway).
+    let running: Vec<String> = devices
+        .iter()
+        .filter(|d| d.state != "Shutdown")
+        .map(|d| format!("{} ({})", d.name, d.state))
+        .collect();
+    if !running.is_empty() {
+        return Err(Refusal::new(
+            format!(
+                "Simulator {} is not shut down on this runtime; simctl would shut it down and \
+                 delete anyway.",
+                running.join(", ")
             ),
             "Shut it down in Simulator, then review again.",
         ));
     }
+    let Some(mount) = rt.mount_path.clone() else {
+        return Err(Refusal::new(
+            format!(
+                "simctl reports no mount path for {label}, so open files cannot be checked. \
+                 Swamp does not remove without that check."
+            ),
+            "Manage it in Xcode > Settings > Components.",
+        ));
+    };
     let exec: Vec<OsString> = ["simctl", "runtime", "delete", uuid.as_str()]
         .iter()
         .map(OsString::from)
@@ -298,9 +350,7 @@ pub(super) fn review(host: &Host, bin: &ToolBin, target: &Target) -> Result<Prev
         )
         .with_output(shown));
     }
-    let paths: Vec<PathBuf> = rt.mount_path.iter().cloned().collect();
-    let open_files = super::open_files_fact(host, &paths, MANAGER_OWN, Manager::Simulator)?;
-    let mut warnings = Vec::new();
+    let open_files = super::open_files_fact(host, &[mount], MANAGER_OWN, Manager::Simulator)?;
     if !devices.is_empty() {
         let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
         let shown_names = if names.len() > 6 {
