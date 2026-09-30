@@ -370,6 +370,41 @@ treats anything else as an unknown, never a parse panic or a guess.
   during ordinary identification, which would mean hundreds of process
   spawns on an otherwise-cheap `report`.
 
+### Session scratch outside the home: `/private/tmp/claude-<uid>` (#172)
+
+Claude Code also writes per-project session scratch (task output,
+scratchpad directories, `cache-break-state-*.json`) to
+`/private/tmp/claude-<uid>`, outside `~/.claude`. The `claude-code-scratch`
+detector proposes that one exact path (macOS only) as a `cache` unit with
+the consequence *session scratch; removing it during a session breaks that
+session*, and the same open-file occupancy check every agent unit uses is
+what says a session is writing there; like the rest of this section it runs
+when an action is proposed, not during `report`. It is inspection only.
+
+- **Why a separate detector.** The agent layer identifies a tool's units
+  inside the *first* location its detector resolves. Scratch is not a
+  session store, so it is not given to that layer.
+- **No discovery.** `/private/tmp` also holds other tools' files and this
+  user's own; nothing there is scanned. Only the named path is measured.
+- **It is transient by nature, observed rather than asserted.** macOS is
+  documented to clear `/private/tmp` at boot and to run a daily cleaner that
+  removes files not accessed for about three days (from memory of macOS
+  behaviour; swamp does not check the mechanism). Observed on the machine
+  this was built on: every entry under `/private/tmp` was newer than the
+  last boot (`sysctl kern.boottime`). Measured there: about 6.6 GB
+  (`du`), of which the largest per-project directories were 4.5 GB and
+  1.8 GB.
+- **Codex: no scratch location is added.** Looked for on that machine:
+  `~/.codex/tmp` (an `arg0` directory, 0 bytes on disk) is inside
+  `CODEX_HOME`, so the `codex` home unit already covers it;
+  `/private/tmp/codex-browser-use` holds only sockets (0 bytes) and is
+  created by a bundled browser plugin; `/private/tmp/codex-remote-attachments`
+  (2.3 MB) and `/private/tmp/codex-assembler-*.tar.gz` have no source in
+  Codex's own code or docs that this work could point to. None was added:
+  the rule is one exact, evidenced path per location, never a name guess.
+- **Linux is not covered.** The equivalent was not observed, so none is
+  guessed; the platform table reports the detector as not applicable.
+
 ## Codex (#93)
 
 Session linkage is sourced from the versioned Codex state DB, not from

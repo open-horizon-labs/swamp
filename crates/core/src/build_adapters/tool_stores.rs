@@ -1,7 +1,8 @@
 //! Single-directory tool stores that have no interior worth naming:
 //! ESP-IDF's `dist/`, `tools/` and `python_env/` under `IDF_TOOLS_PATH`
-//! (or `~/.espressif`). Each is one unit, its own root row, with what
-//! removing it costs in the tool's own words.
+//! (or `~/.espressif`), and Claude Code's per-user session scratch
+//! directory. Each is one unit, its own root row, with what removing it
+//! costs in the tool's own words.
 //!
 //! Nothing here reads a file's content, runs a tool, or offers an
 //! action: `swamp` reports, the human removes.
@@ -20,7 +21,7 @@ impl BuildAdapter for Adapter {
     }
 
     fn name(&self) -> &'static str {
-        "Tool stores (ESP-IDF)"
+        "Tool stores (ESP-IDF, agent scratch)"
     }
 
     fn capabilities(&self) -> BuildCapabilities {
@@ -36,6 +37,7 @@ impl BuildAdapter for Adapter {
             BuildStoreKind::EspressifDist,
             BuildStoreKind::EspressifTools,
             BuildStoreKind::EspressifPythonEnv,
+            BuildStoreKind::AgentScratch,
         ]
     }
 
@@ -66,6 +68,13 @@ impl BuildAdapter for Adapter {
                 "ESP-IDF's `python_env/`",
                 "recreate with ESP-IDF's `install.sh` (or `idf_tools.py install-python-env`)",
                 "ESP-IDF's export script activates these environments",
+            ),
+            Some(BuildStoreKind::AgentScratch) => (
+                ArtifactRole::Intermediate,
+                "Claude Code's per-user session scratch directory",
+                "Claude Code's session scratch",
+                "session scratch; removing it during a session breaks that session",
+                "a running Claude Code session may be writing here",
             ),
             _ => return Vec::new(),
         };
@@ -129,6 +138,10 @@ mod tests {
             (BuildStoreKind::EspressifDist, "downloads the archive again"),
             (BuildStoreKind::EspressifTools, "install.sh"),
             (BuildStoreKind::EspressifPythonEnv, "install-python-env"),
+            (
+                BuildStoreKind::AgentScratch,
+                "session scratch; removing it during a session breaks that session",
+            ),
         ];
         for (kind, needle) in cases {
             let path = PathBuf::from("/fixture/store");
@@ -143,6 +156,55 @@ mod tests {
                     crate::artifact::NestedActionCapability::Unsupported { .. }
                 ),
                 "{kind:?} offers an action"
+            );
+        }
+    }
+
+    #[test]
+    fn each_directory_inside_is_its_own_unit_with_the_same_consequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("claude-501");
+        for d in ["-Users-a-proj", "-Users-b-proj"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("cache-break-state-1.json"), b"{}").unwrap();
+        let dirs = vec![
+            FoldedDir {
+                path: root.join("-Users-a-proj"),
+                allocated_total: 4096,
+                mtime_max: 5,
+                complete: true,
+            },
+            FoldedDir {
+                path: root.join("-Users-b-proj"),
+                allocated_total: 8192,
+                mtime_max: 5,
+                complete: true,
+            },
+            FoldedDir {
+                path: root.clone(),
+                allocated_total: 20480,
+                mtime_max: 5,
+                complete: true,
+            },
+        ];
+        let idx = FoldedIndex::from_dirs(dirs);
+        let none = EventCoverage::untrusted();
+        let cache = ContainerCache::disabled();
+        let c = BuildContainer::shared_store_of(
+            "tool-stores",
+            root.clone(),
+            BuildStoreKind::AgentScratch,
+        );
+        let units = Adapter.identify(&c, &BuildCtx::new(1_000_000, &idx, &none, &cache));
+        assert_eq!(units.len(), 3);
+        for u in &units {
+            assert!(
+                u.consequence
+                    .clone()
+                    .unwrap()
+                    .contains("breaks that session"),
+                "{u:?}"
             );
         }
     }
@@ -169,6 +231,7 @@ mod tests {
             BuildStoreKind::EspressifDist,
             BuildStoreKind::EspressifTools,
             BuildStoreKind::EspressifPythonEnv,
+            BuildStoreKind::AgentScratch,
         ] {
             let u = &run(kind, Path::new("/fixture/x"), true)[0];
             let text = u.consequence.clone().unwrap().to_ascii_lowercase();

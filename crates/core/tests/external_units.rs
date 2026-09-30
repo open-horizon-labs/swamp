@@ -320,6 +320,7 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
         ("xcode-system", "/Library/Developer/DeveloperDiskImages"),
         ("xcode-system", "/Library/Developer/CoreDevice"),
         ("xcode-system", "/Library/Developer/DeviceKit"),
+        ("claude-code-scratch", "/private/tmp/claude-501"),
         ("homebrew", "/opt/homebrew"),
         ("homebrew", "/usr/local"),
         ("homebrew", "/opt/homebrew/Cellar"),

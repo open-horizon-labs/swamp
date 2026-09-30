@@ -21,6 +21,12 @@ observations, not general performance guarantees. See the README for current use
   the `AssetsV2` disk images behind them): `CoreSimulator/Caches`, `Images`,
   `Cryptex` and `Profiles`, `CommandLineTools` (reinstall with
   `xcode-select --install`), `DeveloperDiskImages`, `CoreDevice` and `DeviceKit`.
+- **Claude Code's session scratch is reported.** `/private/tmp/claude-<uid>` was
+  several GB here and unmeasured. It shows as one cache row, with a row per project
+  directory, saying that removing it during a session breaks that session. It is one
+  exact path; nothing else in `/private/tmp` is scanned. macOS clears `/private/tmp`
+  at boot, so this is transient by nature.
+
 ## v0.7.5
 
 - **`swamp ui` opens immediately and no longer scans on its own.** v0.7.4 said `swamp ui`

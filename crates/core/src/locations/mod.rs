@@ -512,6 +512,10 @@ impl CommandRunner for FakeCommandRunner {
 /// the developer's real home (#44's fixture-injection requirement).
 pub struct Environment {
     pub home: PathBuf,
+    /// The real uid, for the per-user directory names a tool derives
+    /// from it (`/private/tmp/claude-<uid>`). Injected so a fixture
+    /// names a uid of its own rather than the machine's.
+    pub uid: u32,
     pub env: HashMap<String, String>,
     pub platform: Platform,
     pub runner: Arc<dyn CommandRunner>,
@@ -529,6 +533,7 @@ impl Environment {
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
             home,
+            uid: crate::fs_gate::systemd::current_uid(),
             env: std::env::vars().collect(),
             platform: Platform::current(),
             runner: Arc::new(SystemCommandRunner),
@@ -542,6 +547,7 @@ impl Environment {
     pub fn fixture(home: PathBuf, env: HashMap<String, String>, platform: Platform) -> Self {
         Self {
             home,
+            uid: 501,
             env,
             platform,
             runner: Arc::new(NullCommandRunner),
@@ -770,6 +776,9 @@ pub enum BuildStoreKind {
     EspressifTools,
     /// ESP-IDF's `python_env/` (per-version Python virtual environments).
     EspressifPythonEnv,
+    /// Claude Code's per-user session scratch directory
+    /// (`/private/tmp/claude-<uid>`).
+    AgentScratch,
     /// `/Library/Developer/CommandLineTools`.
     XcodeCommandLineTools,
     /// `/Library/Developer/DeveloperDiskImages`.
@@ -810,6 +819,7 @@ impl BuildStoreKind {
             Self::EspressifDist => "espressif-dist",
             Self::EspressifTools => "espressif-tools",
             Self::EspressifPythonEnv => "espressif-python-env",
+            Self::AgentScratch => "agent-scratch",
             Self::XcodeCommandLineTools => "xcode-command-line-tools",
             Self::XcodeDeveloperDiskImages => "xcode-developer-disk-images",
             Self::SimulatorSystemSupport => "simulator-system-support",
@@ -850,6 +860,7 @@ impl BuildStoreKind {
         Self::EspressifDist,
         Self::EspressifTools,
         Self::EspressifPythonEnv,
+        Self::AgentScratch,
         Self::XcodeCommandLineTools,
         Self::XcodeDeveloperDiskImages,
         Self::SimulatorSystemSupport,
@@ -1060,6 +1071,7 @@ impl Registry {
                 Box::new(rustup::RustupDetector),
                 Box::new(homebrew::HomebrewDetector),
                 Box::new(claude_code::ClaudeCodeDetector),
+                Box::new(claude_code::ClaudeCodeScratchDetector),
                 Box::new(codex::CodexDetector),
                 Box::new(codex_desktop::CodexDesktopDetector),
                 Box::new(oh_my_pi::OhMyPiDetector),
