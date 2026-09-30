@@ -141,6 +141,25 @@ observations, not general performance guarantees. See the README for current use
   header reads differently: 0 writes and no measurable CPU in 10 idle seconds.
   Sort, filter and `k` choices are saved on a worker thread, so a slow or full disk cannot
   stall a keypress; the last choice is flushed on exit.
+- **The screen updates when a check or a move finishes.** It used to stay on the old
+  `Checked 0 of 1 ... starting` rows until you pressed a key. The result, the plan and
+  the header now appear on their own. The age reads `just now` for the first minute, then
+  minutes, so an idle screen stays still.
+- **Esc on a confirm undoes exactly what its own press marked, every time.** That now holds
+  after `r` (check again) in the blocked list and after pressing `A` again while the
+  confirm is open. A scan that finishes while a confirm or a check is open no longer
+  changes what Enter would move: the new data waits (`new data available` in the header)
+  and loads when the confirm closes. Marks for items the new scan no longer lists are
+  dropped, and the result line says how many.
+- **The plan is easier to read at any size.** It has `Ready:` and `Blocked:` headings, the
+  per-project list says `Ready, by project:`, and the `Includes:` line names each kind
+  once with a count (`node_modules (40), .build (3)`). A small terminal fills the sheet
+  with the count, size and destination first. When a plan removes docker items for good
+  and the terminal is smaller than 40x8, Enter is not offered: it says to enlarge the
+  window.
+- **`R` during a check says so** (`A check is running; press R after it finishes`), and
+  `swamp ui` without a terminal says to use `swamp report` instead of `Device not
+  configured`.
 - **Long tree rows keep their outline.** Truncating a long name no longer cuts the tree
   rail (`│  │ … ├─ node-server`); only the name gives way.
 

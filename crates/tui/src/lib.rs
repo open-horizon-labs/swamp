@@ -310,6 +310,10 @@ fn store_dir() -> PathBuf {
 /// Takes the screen before the stored index is read (about half a second
 /// on a large store) so the terminal is never blank while it loads.
 fn enter_with_splash() -> Result<term::TerminalGuard> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!("swamp ui needs an interactive terminal; use swamp report for text");
+    }
     let mut guard = term::TerminalGuard::enter()?;
     guard.splash("swamp · reading the last observation…");
     Ok(guard)
@@ -1356,5 +1360,15 @@ mod tests {
         }
         let s = buffer_text(&app, 100, 24);
         assert!(s.contains("observed just now"), "{s}");
+    }
+
+    #[test]
+    fn without_a_terminal_the_ui_says_what_to_use_instead() {
+        // Test output is captured, so stdout is never a terminal here.
+        let err = enter_with_splash().err().expect("no terminal, no UI");
+        assert_eq!(
+            err.to_string(),
+            "swamp ui needs an interactive terminal; use swamp report for text"
+        );
     }
 }
