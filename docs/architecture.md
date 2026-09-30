@@ -21,6 +21,12 @@ Storage outside a checkout has its own identity. External units represent tool h
 
 Classification, ownership, accounting, and action support are separate facts. An adapter recognizing a path does not make it removable. An old modification timestamp is useful review evidence, not proof of disuse. An ignored directory is not necessarily disposable.
 
+### Recently written files and entries that fail mid-walk
+
+Allocated bytes are `st_blocks * 512`, always the figure the filesystem reports. On ext4, XFS and overlayfs over them a file whose data is still dirty reports a token block count until writeback (measured on a Docker overlayfs: 512 bytes for 5 KB, 20 KB and 1 MiB files alike), so a tree written a moment ago reads near-empty and then "grows" when flushed. A fresh sparse file reports the same token count as a fresh dirty file and no `stat` field tells them apart, so swamp does not substitute a length-based figure (that would invent bytes for sparse images). Instead a regular file modified in the last 120 seconds that reports some blocks but less than one 4 KiB unit is counted exactly as reported and recorded in the work counters as `pending_allocation_files`, with `pending_allocation_bytes` as the most those files can still add. A total with pending files is not final. Zero blocks, a full unit or more, and any file older than the window carry no such flag. APFS and tmpfs assign blocks at write time and never take this path.
+
+Measurement degrades per entry. An entry that vanishes between the listing and its `lstat` (`ENOENT`, or `ESTALE` as overlayfs and network filesystems return it) is skipped. Any other per-entry error (`EIO`, `EACCES`, a listing error mid-stream) makes that entry "not measured": the rest of the directory is still counted, the affected rollup is incomplete, and an incremental refresh falls back to a full walk rather than storing a partial number as complete.
+
 ### Accounting is not a cleanup promise
 
 Rows can contain shared hardlinks. Local allocated sizes therefore need not add up to scope-wide unique bytes. Purpose groups and the physical-directory view can also describe the same storage twice; the latter is a navigation alternative, not extra usage.

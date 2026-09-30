@@ -9,6 +9,31 @@
 use std::io;
 use std::path::Path;
 
+/// Whether a per-entry I/O error means the entry was gone (or its name
+/// no longer resolved) by the time it was looked at: `ENOENT`, or
+/// `ESTALE` (overlayfs and network filesystems return it for an entry
+/// whose lower-layer or server-side object went away between the
+/// directory listing and the `lstat`). A walker skips such an entry; any
+/// other per-entry error is "not measured" for that entry only.
+pub fn is_vanished_entry(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESTALE)
+}
+
+/// A raw OS error for a fault-injection test, by errno name. Test-only:
+/// the tests outside `fs_gate` must not name `libc`.
+#[cfg(test)]
+pub(crate) fn errno_for_test(name: &str) -> io::Error {
+    let code = match name {
+        "ENOENT" => libc::ENOENT,
+        "ESTALE" => libc::ESTALE,
+        "EIO" => libc::EIO,
+        "EACCES" => libc::EACCES,
+        "ENOTEMPTY" => libc::ENOTEMPTY,
+        other => panic!("unknown errno {other}"),
+    };
+    io::Error::from_raw_os_error(code)
+}
+
 /// What `statfs(2)` says about the volume holding a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeInfo {

@@ -336,9 +336,18 @@ fn watched_incremental_observations_equal_a_reference_full_walk() {
         mode(&first)
     );
 
-    std::fs::write(fx.node_modules.join("grown.bin"), vec![7u8; 64 * 1024]).unwrap();
+    std::fs::write(
+        fx.node_modules.join("grown.bin"),
+        swamp_core::fs_gate::settle::noise(64 * 1024),
+    )
+    .unwrap();
     std::fs::create_dir_all(fx.target_dir.join("debug/new-deps")).unwrap();
-    std::fs::write(fx.target_dir.join("debug/new-deps/x.rlib"), vec![1u8; 8192]).unwrap();
+    std::fs::write(
+        fx.target_dir.join("debug/new-deps/x.rlib"),
+        swamp_core::fs_gate::settle::noise(8192),
+    )
+    .unwrap();
+    swamp_core::fs_gate::settle::settle();
     std::thread::sleep(Duration::from_millis(1100));
     let second = observe(&src, true, false);
     assert!(

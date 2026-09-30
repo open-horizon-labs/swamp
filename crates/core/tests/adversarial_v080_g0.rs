@@ -33,10 +33,11 @@ fn only(ids: &[&str]) -> ScanConfig {
 
 fn put(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 fn measure(env: &Environment, ids: &[&str]) -> Vec<ExternalUnit> {
+    swamp_core::fs_gate::settle::settle();
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(env, &only(ids), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

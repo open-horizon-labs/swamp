@@ -2569,8 +2569,31 @@ mod tests {
             ctx.derived("t", "cwd", &f, 4096, &cwd),
             Some("/aaa/one".to_string())
         );
-        // Same byte length, same second.
-        std::fs::write(&f, b"{\"cwd\":\"/bbb/two\"}\n").unwrap();
+        // Same byte length, same second. Kernel timestamps tick every
+        // few milliseconds (the fleet's overlayfs over ZFS: coarse), so
+        // two back-to-back writes can share a stamp; rewrite -- with no
+        // sleep, still inside the same second -- until the stamp moves,
+        // which is the condition this test is about.
+        let stamp = |p: &std::path::Path| {
+            let m = crate::fs_gate::symlink_metadata(p).unwrap();
+            (
+                crate::fs_gate::MetadataExt::ctime(&m),
+                crate::fs_gate::MetadataExt::ctime_nsec(&m),
+            )
+        };
+        let before = stamp(&f);
+        let started = std::time::Instant::now();
+        loop {
+            std::fs::write(&f, b"{\"cwd\":\"/bbb/two\"}\n").unwrap();
+            if stamp(&f) != before {
+                break;
+            }
+            assert!(
+                started.elapsed().as_millis() < 900,
+                "the timestamp never advanced"
+            );
+            std::thread::yield_now();
+        }
         assert_eq!(
             ctx.derived("t", "cwd", &f, 4096, &cwd),
             Some("/bbb/two".to_string()),

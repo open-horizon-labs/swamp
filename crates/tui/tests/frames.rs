@@ -17,9 +17,30 @@ use swamp_core::report::{
 use swamp_tui::app::{App, ViewKind};
 use swamp_tui::ui;
 
+/// A fixture directory on a filesystem Cargo cleanup supports, and
+/// whether one was found. Cleanup refuses (correctly) any filesystem the
+/// gate does not recognise as local; the fleet's container temp dirs are
+/// overlayfs on ZFS, which it does not, but `/dev/shm` (tmpfs) is. The
+/// default temp dir wins where it is supported (macOS, ext4, tmpfs), so
+/// the assertions are the same everywhere a supported location exists.
+fn cleanup_fixture_dir() -> (tempfile::TempDir, bool) {
+    let supported =
+        |p: &std::path::Path| swamp_core::fs_gate::sys::volume_info(p).is_ok_and(|v| v.is_local());
+    let default = tempfile::tempdir().unwrap();
+    if supported(default.path()) {
+        return (default, true);
+    }
+    if let Ok(shm) = tempfile::tempdir_in("/dev/shm")
+        && supported(shm.path())
+    {
+        return (shm, true);
+    }
+    (default, false)
+}
+
 #[test]
 fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
-    let tmp = tempfile::tempdir().unwrap();
+    let (tmp, supported) = cleanup_fixture_dir();
     let root = std::fs::canonicalize(tmp.path()).unwrap();
     let target = root.join("target");
     std::fs::create_dir_all(target.join("debug/incremental/crate-a")).unwrap();
@@ -30,6 +51,8 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
         std::fs::create_dir_all(target.join(format!("debug/incremental/group-{index:02}")))
             .unwrap();
     }
+    // #197: the inspection below reads exact allocated bytes.
+    swamp_core::fs_gate::settle::settle();
     let mut report = fixture_report();
     report.projects.truncate(1);
     report.root = root.clone();
@@ -88,12 +111,29 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
         .find(|r| r.label == "Compiler caches")
         .unwrap()
         .clone();
-    assert_eq!(cache.bytes, 4096);
+    // What the filesystem reports for the one incremental file (4096 on
+    // APFS, tmpfs and ext4; a 512-byte sector multiple on ZFS).
+    let on_disk = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(target.join("debug/incremental/crate-a/state"))
+            .unwrap()
+            .blocks()
+            * 512
+    };
+    assert_eq!(cache.bytes, on_disk);
     assert!(
         cache.unit.is_none(),
         "virtual group must never select a directory"
     );
     app.mark_row(&cache);
+    if !supported {
+        // No supported filesystem on this machine: the exact-member marks
+        // below cannot succeed, and must be refused for that reason alone.
+        assert!(app.marked.is_empty());
+        let why = format!("{:?}", app.refusal_active());
+        assert!(why.contains("supported local filesystem"), "{why}");
+        return;
+    }
     assert_eq!(app.marked.len(), 1, "{:?}", app.refusal_active());
     assert!(
         app.marked.contains_key(

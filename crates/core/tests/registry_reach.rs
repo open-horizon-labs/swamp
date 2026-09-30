@@ -49,6 +49,7 @@ fn init_repo(dir: &Path) {
 }
 
 fn observe(root: &Path, store: &Path) -> swamp_core::Report {
+    swamp_core::fs_gate::settle::settle();
     swamp_core::report::report_full_mode_scoped(
         root,
         None,
@@ -132,7 +133,11 @@ fn add_pool_worktree(fx: &Fixture) {
         ],
     );
     fs::create_dir_all(fx.pool.join("target")).unwrap();
-    fs::write(fx.pool.join("target/blob"), vec![1u8; 1 << 20]).unwrap();
+    fs::write(
+        fx.pool.join("target/blob"),
+        swamp_core::fs_gate::settle::noise(1 << 20),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -174,7 +179,11 @@ fn an_out_of_root_worktree_is_re_measured_every_pass_and_dropped_when_unregister
         .bytes;
 
     // Grows where no FSEvents for `root` will ever say so.
-    fs::write(fx.pool.join("target/blob2"), vec![2u8; 3 << 20]).unwrap();
+    fs::write(
+        fx.pool.join("target/blob2"),
+        swamp_core::fs_gate::settle::noise(3 << 20),
+    )
+    .unwrap();
     let grown = observe(&fx.root, fx.store.path());
     assert_eq!(fsevents_mode(&grown), "incremental");
     let row = target_row(&grown, &fx.pool).expect("still reached");

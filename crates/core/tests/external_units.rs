@@ -43,7 +43,7 @@ fn only_cargo_home_config() -> ScanConfig {
 
 fn write_pattern(path: &std::path::Path, bytes: u64) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes as usize]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes as usize)).unwrap();
 }
 
 fn cargo_home_unit(units: &[ExternalUnit]) -> &ExternalUnit {
@@ -71,6 +71,7 @@ fn external_only_root_is_measured_as_one_unit() {
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
 
     let store = tempfile::tempdir().unwrap();
+    swamp_core::fs_gate::settle::settle();
     let units = discover_and_measure(
         &scope,
         Some(store.path()),

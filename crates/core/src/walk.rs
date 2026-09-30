@@ -173,16 +173,74 @@ pub(crate) struct DirectoryMeasurement {
     pub children: Vec<String>,
     pub mtime: i64,
     pub hardlinked: bool,
+    /// Entries that could be neither measured nor shown to have
+    /// vanished (an `EIO`, `EACCES`, a listing error mid-stream). The
+    /// directory's other entries are still in the totals; a caller that
+    /// needs a complete number must not use this measurement when this
+    /// is non-zero (#196: never a collapsed directory, never a silent
+    /// drop).
+    pub unmeasured_entries: u32,
+}
+
+/// What kind of entry a listing produced, without a `stat`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListedKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// One directory entry as a listing reports it. The seam between "what
+/// readdir said" and "what lstat then says", so a test can hand the
+/// walker names whose `lstat` fails with each errno (an overlayfs
+/// entry whose lower object went away, a whiteout, an `EIO`) without
+/// needing such a filesystem.
+pub(crate) struct ListedEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub kind: ListedKind,
 }
 
 /// Measure one directory, not its descendants. Reuse the walk pool to overlap
 /// metadata reads in wide compiler-output directories. At most 256 entries per
 /// worker are materialized; no per-file measurements survive the call.
 pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasurement> {
-    let entries = Mutex::new(crate::fs_gate::read_dir(path)?);
+    let entries = crate::fs_gate::read_dir(path)?;
     crate::work_counters::record_dir_listed();
+    let listed = entries.map(|entry| {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        Ok(ListedEntry {
+            path: entry.path(),
+            name: entry.file_name().to_string_lossy().into_owned(),
+            kind: if ft.is_symlink() {
+                ListedKind::Symlink
+            } else if ft.is_dir() {
+                ListedKind::Dir
+            } else if ft.is_file() {
+                ListedKind::File
+            } else {
+                ListedKind::Other
+            },
+        })
+    });
+    Ok(measure_listed(listed, &|p| {
+        crate::fs_gate::symlink_metadata(p)
+    }))
+}
+
+/// The per-entry half of [`measure_directory`]: degrades per entry. A
+/// vanished entry (`ENOENT`/`ESTALE` from `stat`) is skipped -- a fact
+/// about the moment, not a failure. Any other error on an entry
+/// (listing or `stat`) counts that entry in `unmeasured_entries` and
+/// moves on; the rest of the directory is still measured.
+pub(crate) fn measure_listed(
+    listed: impl Iterator<Item = std::io::Result<ListedEntry>> + Send,
+    stat: &(dyn Fn(&Path) -> std::io::Result<fs::Metadata> + Sync),
+) -> DirectoryMeasurement {
+    let entries = Mutex::new(listed);
     let result = Mutex::new(DirectoryMeasurement::default());
-    let error = Mutex::new(None);
     let pool = Arc::new(Pool::new());
     let workers = worker_count();
     for _ in 0..workers {
@@ -196,36 +254,27 @@ pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasure
                 break;
             }
             for entry in batch {
-                let entry = entry.and_then(|e| e.file_type().map(|ft| (e, ft)));
-                let (entry, ft) = match entry {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        *error.lock().unwrap() = Some(e);
-                        continue;
-                    }
-                };
-                if ft.is_symlink() {
-                    local.symlinks += 1;
+                let Ok(entry) = entry else {
+                    local.unmeasured_entries += 1;
                     continue;
-                }
-                if ft.is_dir() {
-                    local
-                        .children
-                        .push(entry.file_name().to_string_lossy().into_owned());
-                } else if ft.is_file() {
-                    crate::work_counters::record_files_statted(1);
-                    let m = match crate::fs_gate::symlink_metadata(entry.path()) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            *error.lock().unwrap() = Some(e);
-                            continue;
+                };
+                match entry.kind {
+                    ListedKind::Symlink => local.symlinks += 1,
+                    ListedKind::Dir => local.children.push(entry.name),
+                    ListedKind::Other => {}
+                    ListedKind::File => {
+                        crate::work_counters::record_files_statted(1);
+                        match stat(&entry.path) {
+                            Ok(m) if m.is_file() => {
+                                local.files += 1;
+                                local.allocated += allocated_bytes(&m);
+                                local.mtime = local.mtime.max(m.mtime());
+                                local.hardlinked |= m.nlink() > 1;
+                            }
+                            Ok(_) => {}
+                            Err(e) if crate::fs_gate::is_vanished_entry(&e) => {}
+                            Err(_) => local.unmeasured_entries += 1,
                         }
-                    };
-                    if m.is_file() {
-                        local.files += 1;
-                        local.allocated += allocated_bytes(&m);
-                        local.mtime = local.mtime.max(m.mtime());
-                        local.hardlinked |= m.nlink() > 1;
                     }
                 }
             }
@@ -237,11 +286,62 @@ pub(crate) fn measure_directory(path: &Path) -> std::io::Result<DirectoryMeasure
         out.children.extend(local.children);
         out.mtime = out.mtime.max(local.mtime);
         out.hardlinked |= local.hardlinked;
+        out.unmeasured_entries += local.unmeasured_entries;
     });
-    if let Some(e) = error.into_inner().unwrap() {
-        return Err(e);
+    result.into_inner().unwrap()
+}
+
+/// #196: one entry that fails between the listing and its `lstat` must
+/// cost that entry only. Names come from a fake listing and `stat`
+/// fails per errno, so this holds on any filesystem (overlayfs returns
+/// such entries for real; tmpfs and APFS never do).
+///
+/// Tempting wrong patches this fails: (1) remember the first per-entry
+/// error and return `Err` for the directory (the old `measure_directory`,
+/// which discarded every good entry: `allocated` would be 0 and the
+/// call an error); (2) `continue` on every error without counting it
+/// (a silent drop: `unmeasured_entries` would be 0 for `EIO`); (3) count
+/// `ENOENT`/`ESTALE` as unmeasured (a file a compiler deleted would
+/// force a full re-walk every time).
+#[test]
+fn a_failing_entry_costs_only_that_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("listed");
+    std::fs::create_dir(&root).unwrap();
+    let mut expected = 0;
+    let mut listed: Vec<std::io::Result<ListedEntry>> = Vec::new();
+    for i in 0..8 {
+        let path = root.join(format!("real{i}.bin"));
+        std::fs::write(&path, vec![1u8; 8192]).unwrap();
+        expected += allocated_bytes(&std::fs::symlink_metadata(&path).unwrap());
+        listed.push(Ok(ListedEntry {
+            path,
+            name: format!("real{i}.bin"),
+            kind: ListedKind::File,
+        }));
     }
-    Ok(result.into_inner().unwrap())
+    for name in ["ENOENT", "ESTALE", "EIO", "EACCES", "ENOTEMPTY"] {
+        listed.push(Ok(ListedEntry {
+            path: root.join(format!("fault-{name}")),
+            name: format!("fault-{name}"),
+            kind: ListedKind::File,
+        }));
+    }
+    // A listing error mid-stream (getdents failing after some entries).
+    listed.insert(4, Err(std::io::Error::from(std::io::ErrorKind::Other)));
+    let stat = |p: &Path| -> std::io::Result<std::fs::Metadata> {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        match name.strip_prefix("fault-") {
+            Some(errno) => Err(crate::fs_gate::sys::errno_for_test(errno)),
+            None => std::fs::symlink_metadata(p),
+        }
+    };
+    let measured = measure_listed(listed.into_iter(), &stat);
+    assert_eq!(measured.allocated, expected, "good entries must all count");
+    assert_eq!(measured.files, 8);
+    // EIO, EACCES, ENOTEMPTY and the listing error: four entries not
+    // measured. ENOENT and ESTALE vanished: skipped, not unmeasured.
+    assert_eq!(measured.unmeasured_entries, 4);
 }
 
 #[test]
@@ -253,10 +353,10 @@ fn shallow_parallel_measurement_counts_allocations_without_following_links_or_ch
     for i in 0..513 {
         let path = root.join(format!("{i}.o"));
         std::fs::write(&path, vec![1u8; 4096]).unwrap();
-        expected += fs::symlink_metadata(path).unwrap().blocks() * 512;
+        expected += allocated_bytes(&fs::symlink_metadata(path).unwrap());
     }
     std::fs::hard_link(root.join("0.o"), root.join("alias.o")).unwrap();
-    expected += fs::symlink_metadata(root.join("0.o")).unwrap().blocks() * 512;
+    expected += allocated_bytes(&fs::symlink_metadata(root.join("0.o")).unwrap());
     std::fs::create_dir(root.join("child")).unwrap();
     std::fs::write(root.join("child/not-counted"), vec![1u8; 8192]).unwrap();
     std::os::unix::fs::symlink(root.join("child"), root.join("symlink")).unwrap();
@@ -1363,9 +1463,15 @@ fn process_size(
             });
         } else if ft.is_file() {
             crate::work_counters::record_files_statted(1);
-            let Ok(meta) = crate::fs_gate::symlink_metadata(entry.path()) else {
-                shared.incomplete.store(true, Ordering::Relaxed);
-                continue;
+            let meta = match crate::fs_gate::symlink_metadata(entry.path()) {
+                Ok(m) => m,
+                // Gone between the listing and the lstat: skipped, not
+                // "incomplete" (a build directory under a compiler).
+                Err(e) if crate::fs_gate::is_vanished_entry(&e) => continue,
+                Err(_) => {
+                    shared.incomplete.store(true, Ordering::Relaxed);
+                    continue;
+                }
             };
             if meta.file_type().is_symlink() || !meta.is_file() {
                 continue;
@@ -1656,6 +1762,11 @@ pub(crate) fn refresh_unowned(
             continue;
         }
         let measured = measure_directory(&path).ok()?;
+        if measured.unmeasured_entries > 0 {
+            // Not a complete number: the full walk records it as
+            // incomplete coverage.
+            return None;
+        }
         sharing |= measured.hardlinked;
         let children: HashSet<PathBuf> = measured
             .children
@@ -2247,6 +2358,8 @@ mod registry_reach_tests {
         AttributionResult,
         Vec<crate::coverage::RegistryReach>,
     ) {
+        // #197: fixtures are settled before every measurement.
+        crate::fs_gate::settle::settle();
         discover_and_attribute(&crate::bus::Stage::for_tests(), root, 1, 1 << 40, &[], &[]).unwrap()
     }
 
@@ -2282,7 +2395,11 @@ mod registry_reach_tests {
         let pool = tmp.path().join("pool/task/proj");
         add_worktree(&main, &pool, "task");
         fs::create_dir_all(pool.join("target/debug")).unwrap();
-        fs::write(pool.join("target/debug/blob"), vec![7u8; 1 << 20]).unwrap();
+        fs::write(
+            pool.join("target/debug/blob"),
+            crate::fs_gate::settle::noise(1 << 20),
+        )
+        .unwrap();
 
         let (root, pool, main) = (canon(&root), canon(&pool), canon(&main));
         let (discovered, attribution, reach) = walk(&root);
@@ -2333,7 +2450,11 @@ mod registry_reach_tests {
         let main = root.join("proj");
         init_repo(&main);
         fs::create_dir_all(main.join("target")).unwrap();
-        fs::write(main.join("target/blob"), vec![1u8; 64 << 10]).unwrap();
+        fs::write(
+            main.join("target/blob"),
+            crate::fs_gate::settle::noise(64 << 10),
+        )
+        .unwrap();
         let root = canon(&root);
         let main_id = id_for(&canon(&main).display().to_string());
 
@@ -2341,7 +2462,11 @@ mod registry_reach_tests {
         let pool = tmp.path().join("pool/task/proj");
         add_worktree(&main, &pool, "task");
         fs::create_dir_all(pool.join("target")).unwrap();
-        fs::write(pool.join("target/blob"), vec![2u8; 1 << 20]).unwrap();
+        fs::write(
+            pool.join("target/blob"),
+            crate::fs_gate::settle::noise(1 << 20),
+        )
+        .unwrap();
         let (_, after, _) = walk(&root);
 
         // `git worktree add` itself writes the new entry's registry

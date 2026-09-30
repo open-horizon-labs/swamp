@@ -17,7 +17,7 @@ use swamp_core::walk::resize_artifact;
 
 fn put(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 struct Fixture {
@@ -97,6 +97,7 @@ fn config_running(keep: &[&str], registry: &Registry) -> ScanConfig {
 }
 
 fn measure(env: &Environment, cfg: &ScanConfig) -> Vec<ExternalUnit> {
+    swamp_core::fs_gate::settle::settle();
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(env, cfg, &[], &registry, 1_000);
     swamp_core::external::discover_and_measure(
@@ -121,6 +122,7 @@ fn defaults_only(env: &Environment) -> Vec<ExternalUnit> {
 }
 
 fn total(prefix: &Path) -> u64 {
+    swamp_core::fs_gate::settle::settle();
     resize_artifact(prefix, swamp_core::report::ArtifactKind::Unknown, 1_000).bytes
 }
 

@@ -5,6 +5,13 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.8.0
 
+- **Fresh files no longer read as near-empty, and one unreadable entry no longer collapses a directory (Linux).**
+  On Docker's overlayfs a 5 MB tree written a moment earlier measured 204,800 bytes,
+  then 5.97 MB after the kernel flushed it. Recent files that report almost no blocks
+  are still counted as the filesystem reports them but are now flagged as pending,
+  with the most they can still add. Entries
+  that vanish mid-walk are skipped; other per-entry errors mark only that entry as
+  not measured. Closes #196, #197.
 - **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
   8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
   `dist/` (downloaded archives) and `python_env/` as separate rows, each with what

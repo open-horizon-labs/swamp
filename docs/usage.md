@@ -531,6 +531,15 @@ it fetches or rebuilds it again the next time it is needed. The
 double-count, but the two bases (a walked root vs. a detector-resolved
 location) are different enough that summing them would be misleading.
 
+Sizes are allocated bytes, exactly as the filesystem reports them. On
+filesystems that assign blocks late (ext4, XFS, overlayfs over them) a file
+written in the last two minutes may report almost nothing until it is
+flushed; such files are counted as reported and listed as
+`pending_allocation_files` in the work counters, with
+`pending_allocation_bytes` as the most they can still add, so a rising total
+right after a big write is explained rather than surprising. A file that
+cannot be read mid-walk is not measured; the rest of its directory still is.
+
 The TUI has a dedicated, read-only External view (`v`/`9`): the same
 one-row-per-unit facts as `--view external`, never markable -- act on
 what it shows with the manager's own tools, not swamp.

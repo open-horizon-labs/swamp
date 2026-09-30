@@ -25,7 +25,11 @@ fn growth_appears_on_file_row_and_every_directory_in_the_chain() {
     // first observation, so a `FileRow` baseline exists to diff against;
     // below that threshold the file is never tracked as a row at all.
     let big_path = deep_dir.join("big.bin");
-    fs::write(&big_path, vec![b'x'; 2 * 1024 * 1024]).expect("write initial file");
+    fixture::write_settled(
+        &big_path,
+        swamp_core::fs_gate::settle::noise(2 * 1024 * 1024),
+    )
+    .expect("write initial file");
 
     // First observation: baseline.
     let first = report_with_dirs(&fx.root, None, false, Some(store.path()), Some("1h"), true)
@@ -38,7 +42,8 @@ fn growth_appears_on_file_row_and_every_directory_in_the_chain() {
     // Grow the file to 50 MiB, three levels deep in Source (not inside
     // any folded artifact).
     let big_bytes = 50 * 1024 * 1024;
-    fs::write(&big_path, vec![b'x'; big_bytes]).expect("write big file");
+    fixture::write_settled(&big_path, swamp_core::fs_gate::settle::noise(big_bytes))
+        .expect("write big file");
 
     let second = report_with_dirs(&fx.root, None, false, Some(store.path()), Some("1h"), true)
         .expect("second report");
@@ -229,7 +234,7 @@ fn directory_with_only_subdirs_reports_its_own_mtime_not_epoch() {
     // a subdirectory containing the one file.
     let only_dirs = fx.checkout.join("only-dirs");
     fs::create_dir_all(only_dirs.join("leaf")).expect("mkdir only-dirs/leaf");
-    fs::write(only_dirs.join("leaf/file.txt"), b"x").expect("write leaf file");
+    fixture::write_settled(only_dirs.join("leaf/file.txt"), b"x").expect("write leaf file");
 
     let report = report_with_dirs(&fx.root, None, false, None, None, true).expect("report");
     let worktree_id = report

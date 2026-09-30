@@ -25,6 +25,7 @@ impl FsEventsSource for Live {
 }
 
 fn git_init(root: &Path) {
+    DIRTY.set(true);
     fs::create_dir_all(root).unwrap();
     assert!(
         std::process::Command::new("git")
@@ -36,9 +37,22 @@ fn git_init(root: &Path) {
     );
 }
 
+// #197: settling costs seconds on a filesystem with late allocation, so it
+// is paid once per write phase: every fixture write goes through
+// `write_file`/`git_init`, which mark the thread dirty, and `observe`
+// settles only when something was written since the last settle.
+thread_local! {
+    static DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn write_file(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    DIRTY.set(true);
+    fs::write(path, data)
+}
+
 fn write(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    write_file(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 /// A Node checkout: an installed dependency, a build output and a
@@ -47,14 +61,14 @@ fn node_fixture() -> (tempfile::TempDir, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap().join("web");
     git_init(&root);
-    fs::write(
+    write_file(
         root.join("package.json"),
         br#"{"name":"web","version":"1.0.0"}"#,
     )
     .unwrap();
-    fs::write(root.join(".gitignore"), "node_modules/\ndist/\ncoverage/\n").unwrap();
+    write_file(root.join(".gitignore"), "node_modules/\ndist/\ncoverage/\n").unwrap();
     fs::create_dir_all(root.join("node_modules/left-pad")).unwrap();
-    fs::write(
+    write_file(
         root.join("node_modules/left-pad/package.json"),
         br#"{"name":"left-pad","version":"1.3.0"}"#,
     )
@@ -81,6 +95,10 @@ fn observe_excluding(
     force_full: bool,
     excluded: &[PathBuf],
 ) -> swamp_core::Report {
+    // #197: every fixture change is settled before it is measured.
+    if DIRTY.replace(false) {
+        swamp_core::fs_gate::settle::settle();
+    }
     // `docker_in_scope: false`: these fixtures assert exact
     // `containers_identified`/`containers_reused` counts for adapters
     // that have nothing to do with Docker. `report_full_mode_with_source`
@@ -485,7 +503,7 @@ fn removed_cache_tag_reconciles_the_unowned_boundary() {
     let store = tempfile::tempdir().unwrap();
     write(&root.join("tagged/deep/file"), 8192);
     let tag = root.join("tagged/CACHEDIR.TAG");
-    fs::write(&tag, b"Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
+    write_file(&tag, b"Signature: 8a477f597d28d172789f06886806bc55\n").unwrap();
     for _ in 0..3 {
         observe(&root, store.path(), vec![], false);
     }
@@ -589,8 +607,8 @@ fn reclassification_and_new_nesting_never_reach_history_as_growth() {
     let tmp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(tmp.path()).unwrap().join("mixed");
     git_init(&root);
-    fs::write(root.join("package.json"), br#"{"name":"mixed"}"#).unwrap();
-    fs::write(root.join(".gitignore"), "build/\n").unwrap();
+    write_file(root.join("package.json"), br#"{"name":"mixed"}"#).unwrap();
+    write_file(root.join(".gitignore"), "build/\n").unwrap();
     write(&root.join("build/classes/Main.class"), 30_000);
     write(&root.join("build/tmp/scratch"), 5_000);
     let store = tempfile::tempdir().unwrap();
@@ -609,7 +627,7 @@ fn reclassification_and_new_nesting_never_reach_history_as_growth() {
     let b0 = unit(&before, &build);
     assert_eq!(b0.adapter.as_deref(), Some("node"), "{b0:?}");
 
-    fs::write(root.join("settings.gradle"), b"").unwrap();
+    write_file(root.join("settings.gradle"), b"").unwrap();
     let after = observe(
         &root,
         store.path(),
@@ -804,7 +822,7 @@ fn cost_report_real_pipeline_unchanged_and_one_group_change() {
     for i in 0..300 {
         let pkg = root.join(format!("node_modules/pkg-{i:03}"));
         fs::create_dir_all(&pkg).unwrap();
-        fs::write(
+        write_file(
             pkg.join("package.json"),
             format!(r#"{{"name":"pkg-{i:03}","version":"1.0.{i}"}}"#),
         )
@@ -884,35 +902,35 @@ fn polyglot_fixture() -> (tempfile::TempDir, Vec<PathBuf>) {
     let base = fs::canonicalize(tmp.path()).unwrap();
     let py = base.join("py");
     git_init(&py);
-    fs::write(py.join("pyproject.toml"), b"[project]\nname='demo'\n").unwrap();
-    fs::write(py.join(".gitignore"), ".venv/\ndist/\n__pycache__/\n").unwrap();
+    write_file(py.join("pyproject.toml"), b"[project]\nname='demo'\n").unwrap();
+    write_file(py.join(".gitignore"), ".venv/\ndist/\n__pycache__/\n").unwrap();
     fs::create_dir_all(py.join(".venv")).unwrap();
-    fs::write(py.join(".venv/pyvenv.cfg"), b"version = 3.12.4\n").unwrap();
+    write_file(py.join(".venv/pyvenv.cfg"), b"version = 3.12.4\n").unwrap();
     write(&py.join(".venv/lib/python3.12/site-packages/six.py"), 9_000);
     write(&py.join("dist/demo-1.0.0-py3-none-any.whl"), 12_000);
     write(&py.join("pkg/__pycache__/mod.cpython-312.pyc"), 4_000);
 
     let go = base.join("go");
     git_init(&go);
-    fs::write(go.join("go.mod"), b"module example.com/app\n").unwrap();
-    fs::write(go.join(".gitignore"), "bin/\nvendor/\n").unwrap();
+    write_file(go.join("go.mod"), b"module example.com/app\n").unwrap();
+    write_file(go.join(".gitignore"), "bin/\nvendor/\n").unwrap();
     fs::create_dir_all(go.join("vendor")).unwrap();
-    fs::write(go.join("vendor/modules.txt"), b"# example.com/dep v1.2.3\n").unwrap();
+    write_file(go.join("vendor/modules.txt"), b"# example.com/dep v1.2.3\n").unwrap();
     write(&go.join("vendor/example.com/dep/dep.go"), 7_000);
     write(&go.join("bin/app"), 20_000);
 
     let swift = base.join("swift");
     git_init(&swift);
-    fs::write(swift.join("Package.swift"), b"// swift-tools-version:5.9\n").unwrap();
-    fs::write(swift.join(".gitignore"), ".build/\n").unwrap();
+    write_file(swift.join("Package.swift"), b"// swift-tools-version:5.9\n").unwrap();
+    write_file(swift.join(".gitignore"), ".build/\n").unwrap();
     write(&swift.join(".build/arm64-apple-macosx/debug/tool"), 15_000);
 
     let android = base.join("android");
     git_init(&android);
-    fs::write(android.join("settings.gradle"), b"include ':app'\n").unwrap();
-    fs::write(android.join(".gitignore"), "build/\n").unwrap();
+    write_file(android.join("settings.gradle"), b"include ':app'\n").unwrap();
+    write_file(android.join(".gitignore"), "build/\n").unwrap();
     fs::create_dir_all(android.join("app/src/main")).unwrap();
-    fs::write(
+    write_file(
         android.join("app/src/main/AndroidManifest.xml"),
         b"<manifest/>",
     )
@@ -950,8 +968,8 @@ fn project_local_actions_are_plannable_across_non_rust_adapters() {
     ] {
         let root = node_tmp.path().join(name);
         git_init(&root);
-        fs::write(root.join(marker), contents).unwrap();
-        fs::write(root.join(".gitignore"), "build/\ntarget/\n").unwrap();
+        write_file(root.join(marker), contents).unwrap();
+        write_file(root.join(".gitignore"), "build/\ntarget/\n").unwrap();
         write(&root.join(output), 4096);
         roots.push(root);
     }

@@ -53,6 +53,8 @@ pub struct Counters {
     containers_reused: AtomicU64,
     containers_identified: AtomicU64,
     spawns: AtomicU64,
+    pending_files: AtomicU64,
+    pending_bytes: AtomicU64,
 }
 
 impl Counters {
@@ -66,6 +68,8 @@ impl Counters {
             containers_reused: self.containers_reused.load(Ordering::Relaxed),
             containers_identified: self.containers_identified.load(Ordering::Relaxed),
             subprocess_spawns: self.spawns.load(Ordering::Relaxed),
+            pending_allocation_files: self.pending_files.load(Ordering::Relaxed),
+            pending_allocation_bytes: self.pending_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -79,6 +83,8 @@ static GLOBAL: Counters = Counters {
     containers_reused: AtomicU64::new(0),
     containers_identified: AtomicU64::new(0),
     spawns: AtomicU64::new(0),
+    pending_files: AtomicU64::new(0),
+    pending_bytes: AtomicU64::new(0),
 };
 
 thread_local! {
@@ -136,6 +142,15 @@ pub struct WorkCounters {
     /// happens makes the same assertion, through the scoped sink
     /// [`measured`] installs, with no process-wide state at all.
     pub subprocess_spawns: u64,
+    /// Recent files whose blocks were not yet assigned by the filesystem
+    /// (delayed allocation, #197). Each is counted at exactly what
+    /// `st_blocks` said, so the total can still rise.
+    #[serde(default)]
+    pub pending_allocation_files: u64,
+    /// The most those files can still add at writeback: their length
+    /// rounded up to 4 KiB minus what `st_blocks` reported.
+    #[serde(default)]
+    pub pending_allocation_bytes: u64,
 }
 
 pub fn record_dir_listed() {
@@ -174,6 +189,13 @@ pub fn record_spawn() {
     add(|c| &c.spawns, 1);
 }
 
+/// One recent file whose allocation may still rise:
+/// `may_still_grow_by` is the upper bound of that rise.
+pub fn record_pending_allocation(may_still_grow_by: u64) {
+    add(|c| &c.pending_files, 1);
+    add(|c| &c.pending_bytes, may_still_grow_by);
+}
+
 /// The process-global counters. Sees every thread; a caller that wants
 /// an exact number either serializes itself or uses [`measured`].
 pub fn snapshot() -> WorkCounters {
@@ -205,6 +227,8 @@ pub fn reset() {
         &GLOBAL.containers_reused,
         &GLOBAL.containers_identified,
         &GLOBAL.spawns,
+        &GLOBAL.pending_files,
+        &GLOBAL.pending_bytes,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -234,6 +258,12 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         subprocess_spawns: now
             .subprocess_spawns
             .saturating_sub(before.subprocess_spawns),
+        pending_allocation_files: now
+            .pending_allocation_files
+            .saturating_sub(before.pending_allocation_files),
+        pending_allocation_bytes: now
+            .pending_allocation_bytes
+            .saturating_sub(before.pending_allocation_bytes),
     }
 }
 

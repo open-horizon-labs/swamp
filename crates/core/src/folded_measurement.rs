@@ -796,9 +796,13 @@ mod tests {
             .join("unit");
         let sealed = unit.join("sealed");
         std::fs::create_dir_all(sealed.join("a/b")).unwrap();
-        std::fs::write(sealed.join("a/b/big"), vec![b'x'; 65_536]).unwrap();
-        std::fs::write(sealed.join("top"), vec![b'y'; 1024]).unwrap();
-        std::fs::write(unit.join("loose"), vec![b'z'; 512]).unwrap();
+        std::fs::write(
+            sealed.join("a/b/big"),
+            crate::fs_gate::settle::noise(65_536),
+        )
+        .unwrap();
+        std::fs::write(sealed.join("top"), crate::fs_gate::settle::noise(1024)).unwrap();
+        std::fs::write(unit.join("loose"), crate::fs_gate::settle::noise(512)).unwrap();
         testing::set(
             &unit,
             VolumeStamp {
@@ -818,6 +822,7 @@ mod tests {
         };
         testing::set(&sealed, stamp);
 
+        crate::fs_gate::settle::settle();
         // First pass: everything is walked, the sealed part is stamped.
         let (first, counted) = crate::work_counters::measured(|| {
             measure(
@@ -861,7 +866,8 @@ mod tests {
                 ..stamp
             },
         );
-        std::fs::write(sealed.join("a/b/more"), vec![b'w'; 2048]).unwrap();
+        std::fs::write(sealed.join("a/b/more"), crate::fs_gate::settle::noise(2048)).unwrap();
+        crate::fs_gate::settle::settle();
         let (third, counted) = crate::work_counters::measured(|| {
             measure(
                 Some(store.path()),
@@ -894,9 +900,10 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let unit = tmp.path().join("cache");
         std::fs::create_dir_all(unit.join("a/b")).unwrap();
-        std::fs::write(unit.join("a/b/f"), vec![b'x'; 4096]).unwrap();
-        std::fs::write(unit.join("a/g"), vec![b'y'; 4096]).unwrap();
+        std::fs::write(unit.join("a/b/f"), crate::fs_gate::settle::noise(4096)).unwrap();
+        std::fs::write(unit.join("a/g"), crate::fs_gate::settle::noise(4096)).unwrap();
 
+        crate::fs_gate::settle::settle();
         let none = EventCoverage::untrusted();
         let first = measure(Some(store.path()), &unit, &[], 1_000, &none);
         assert!(first.bytes >= 8192, "{}", first.bytes);
@@ -944,7 +951,8 @@ mod tests {
             "an event under the unit must refuse the reuse"
         );
 
-        std::fs::write(unit.join("a/b/new"), vec![b'z'; 4096]).unwrap();
+        std::fs::write(unit.join("a/b/new"), crate::fs_gate::settle::noise(4096)).unwrap();
+        crate::fs_gate::settle::settle();
         let (third, cost) = crate::work_counters::measured(|| {
             measure(Some(store.path()), &unit, &[], 4_000, &noisy)
         });
@@ -963,7 +971,7 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let unit = tmp.path().join("cache");
         std::fs::create_dir_all(unit.join("nested")).unwrap();
-        std::fs::write(unit.join("nested/f"), vec![b'x'; 8192]).unwrap();
+        std::fs::write(unit.join("nested/f"), crate::fs_gate::settle::noise(8192)).unwrap();
         let quiet =
             crate::fs_events::EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 1_000);
         let all = measure(Some(store.path()), &unit, &[], 1_000, &quiet);

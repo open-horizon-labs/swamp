@@ -52,6 +52,8 @@ pub mod inotify;
 // only `occupancy::probe_paths`'s call into it is Linux-only.
 pub mod procfs;
 pub mod read;
+#[cfg(any(test, feature = "testing"))]
+pub mod settle;
 pub mod spawn;
 pub mod store;
 pub mod sys;
@@ -69,6 +71,10 @@ pub fn current_uid() -> u32 {
 /// module can hold or pass one; building one from a caller's path
 /// (`StoreDir::at`) is the store modules' capability.
 pub use store::StoreDir;
+
+/// Whether a per-entry error means the entry vanished (see
+/// [`sys::is_vanished_entry`]).
+pub use sys::is_vanished_entry;
 
 use std::io;
 use std::path::{Path, PathBuf};

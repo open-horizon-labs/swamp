@@ -19,6 +19,10 @@ fn bin() -> PathBuf {
 }
 
 fn run(store: &Path, args: &[&str]) -> Output {
+    if args.first() == Some(&"observe") {
+        // #197: every observe reads fixture files written just before it.
+        swamp_core::fs_gate::settle::settle();
+    }
     Command::new(bin())
         .args(args)
         .env("SWAMP_DIR", store)
@@ -90,7 +94,11 @@ fn make_checkout(root: &Path, name: &str, seed_bytes: usize) -> PathBuf {
     run_git(&dir, &["commit", "-q", "-m", "init"]);
     let deps = dir.join("node_modules");
     fs::create_dir_all(&deps).unwrap();
-    fs::write(deps.join("seed"), vec![b'x'; seed_bytes]).unwrap();
+    fs::write(
+        deps.join("seed"),
+        swamp_core::fs_gate::settle::noise(seed_bytes),
+    )
+    .unwrap();
     dir
 }
 
@@ -165,7 +173,11 @@ fn linked_worktrees_in_separate_roots_are_reported_once() {
         &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
     );
     fs::create_dir_all(linked.join("node_modules")).unwrap();
-    fs::write(linked.join("node_modules/seed"), vec![b'x'; 8192]).unwrap();
+    fs::write(
+        linked.join("node_modules/seed"),
+        swamp_core::fs_gate::settle::noise(8192),
+    )
+    .unwrap();
     let store = tempfile::tempdir().unwrap();
     let a = main.to_str().unwrap();
     let b = linked.to_str().unwrap();
@@ -252,7 +264,11 @@ fn bespoke_json_views_carry_evidence_on_their_rows() {
     // `make_checkout`'s own `node_modules` alone only exercises `deps`.
     fs::write(repo.join("Cargo.toml"), b"[package]\nname = \"repo\"\n").unwrap();
     fs::create_dir_all(repo.join("target/debug")).unwrap();
-    fs::write(repo.join("target/debug/seed"), vec![b'x'; 4096]).unwrap();
+    fs::write(
+        repo.join("target/debug/seed"),
+        swamp_core::fs_gate::settle::noise(4096),
+    )
+    .unwrap();
     let store = tempfile::tempdir().unwrap();
 
     observe(store.path(), root.path(), &[]);
@@ -315,7 +331,7 @@ fn build_interiors_have_independent_explicit_pages() {
         fs::create_dir_all(repo.join(format!("target/debug/incremental/unit-{i}"))).unwrap();
         fs::write(
             repo.join(format!("target/debug/incremental/unit-{i}/cache")),
-            vec![1u8; 4096],
+            swamp_core::fs_gate::settle::noise(4096),
         )
         .unwrap();
     }
@@ -387,7 +403,7 @@ fn rust_json_view_is_filtered_to_the_requested_project() {
     fs::create_dir_all(rust_project.join("target/debug")).unwrap();
     fs::write(
         rust_project.join("target/debug/swamp-bin"),
-        vec![b'r'; 2048],
+        swamp_core::fs_gate::settle::noise(2048),
     )
     .unwrap();
 
@@ -491,7 +507,11 @@ fn rust_text_view_recommends_supported_cleanup_review() {
     let repo = make_checkout(root.path(), "swamp", 1024);
     fs::write(repo.join("Cargo.toml"), b"[package]\nname = \"swamp\"\n").unwrap();
     fs::create_dir_all(repo.join("target/debug")).unwrap();
-    fs::write(repo.join("target/debug/swamp-bin"), vec![b'r'; 2048]).unwrap();
+    fs::write(
+        repo.join("target/debug/swamp-bin"),
+        swamp_core::fs_gate::settle::noise(2048),
+    )
+    .unwrap();
     let store = tempfile::tempdir().unwrap();
     observe(store.path(), root.path(), &[]);
 
@@ -605,7 +625,7 @@ fn grown_view_reports_a_row_after_growth_then_nothing_on_a_no_change_rerun() {
     // A real growth event.
     fs::write(
         checkout.join("node_modules/growth-probe"),
-        vec![b'g'; 2 * 1024 * 1024],
+        swamp_core::fs_gate::settle::noise(2 * 1024 * 1024),
     )
     .unwrap();
 
