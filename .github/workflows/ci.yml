@@ -36,9 +36,11 @@ name: CI
 # and stack/** branches still run it, and `release.yml`'s gate is unchanged
 # (it waits for this workflow on the tagged commit). Runner selection:
 # macOS already runs on the homelab (LOCAL_MACOS_CI_ENABLED); the Linux jobs
-# do the same when LOCAL_LINUX_CI_ENABLED is 'true' (an Ubuntu 24.04 x86_64
-# runner labelled self-hosted, Linux, X64, linux-x86_64: see CONTRIBUTING.md),
-# otherwise they use GitHub's hosted ubuntu-24.04.
+# do the same when LOCAL_LINUX_CI_ENABLED is 'true': the homelab fleet broker
+# (homelab-infra/broker) provisions an ephemeral ubuntu:24.04 runner container
+# on a linux-general host for the job (labels: self-hosted, linux, x64,
+# linux-general; see CONTRIBUTING.md), otherwise they use GitHub's hosted
+# ubuntu-24.04.
 
 on:
   push:
@@ -65,7 +67,7 @@ jobs:
   linux-x86_64:
     name: Linux x86_64 (Ubuntu 24.04)
     if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","Linux","X64","linux-x86_64"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -167,7 +169,7 @@ jobs:
   linux-x86_64-package:
     name: Linux x86_64 release archive, smoke and validation (Ubuntu 24.04)
     if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","Linux","X64","linux-x86_64"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
 
