@@ -648,10 +648,8 @@ pub struct BlockedItem {
 /// safe one: refresh and check again.
 pub fn blocked_next_step(reason: &str) -> &'static str {
     let r = reason.to_lowercase();
-    if r.contains("human-protected") {
-        "remove the protection (swamp protect), then check again"
-    } else if r.contains("protection state could not be read") {
-        "fix the protect file in the swamp store, then check again"
+    if r.contains("protected by you") {
+        "take the mark off with `swamp protect remove <path>`, then check again"
     } else if r.contains("nothing reclaimable") {
         "open the project with Enter and mark what you want inside it"
     } else if r.contains("category total") {
@@ -1828,9 +1826,9 @@ impl App {
         }
         if individual > 0 && marked > 0 {
             refused.push(format!(
-                "{individual} row{} no cleanup rule covers {} left out: Space marks one at a time",
+                "{individual} row{} can only be marked one at a time (Space): {} left out of mark all",
                 if individual == 1 { "" } else { "s" },
-                if individual == 1 { "was" } else { "were" }
+                if individual == 1 { "it was" } else { "they were" }
             ));
         }
         if path_skipped > 0 {
@@ -2182,29 +2180,29 @@ impl App {
         // protected descendant".
         //
         // Both directions, from the one predicate
-        // (`.oh/guardrails/protection-fails-closed.md`); protection
-        // state that cannot be read is *unknown*, so it refuses too.
+        // (`.oh/guardrails/protection-fails-closed.md`). The person's own
+        // mark refuses; a list that could not be read is unknown (never an
+        // empty list) and is said so on the confirm, where their single
+        // confirm decides.
+        let mut warnings: Vec<String> = Vec::new();
         if let Some(store) = self.store_dir.clone() {
             let candidate = PathBuf::from(&unit_id.0);
             match swamp_core::agents::load_protect(&store) {
                 Ok(protected) => {
                     if let Some(reason) = protected.conflict(&candidate) {
                         self.refuse(&format!(
-                            "human-protected path (swamp protect): {reason}; remove protection \
-                             first if this unit should be actionable"
+                            "protected by you ({reason}); `swamp protect remove {}` takes the \
+                             mark off",
+                            candidate.display()
                         ));
                         return;
                     }
                 }
-                Err(e) => {
-                    self.refuse(&format!(
-                        "protection state could not be read, so nothing may be marked: {e}"
-                    ));
-                    return;
-                }
+                Err(e) => warnings.push(format!(
+                    "could not read your protect list ({e}): your keep marks were not checked for this path"
+                )),
             }
         }
-        let mut warnings: Vec<String> = Vec::new();
         let worktree = row.worktree.clone().map(|wt| {
             let whole_checkout = !wt.linked;
             if whole_checkout && wt.remote.is_none() {
@@ -2349,7 +2347,7 @@ impl App {
             .find(|u| u.path == unit_path)
             .map(|u| u.observed_at);
         let agent_unit = if agent_unit_observed_at.is_some() {
-            match swamp_core::actions::propose_agents(
+            match swamp_core::actions::propose_agents_for_human(
                 &self.agent_units,
                 std::slice::from_ref(&unit_path),
                 "human:tui",
@@ -4080,11 +4078,18 @@ mod tests {
         assert!(claude_home.path().join("settings.json").exists());
     }
 
+    /// Tempting wrong patch: a unit swamp keeps by default (settings,
+    /// credentials) stays unmarkable, or becomes markable with no word
+    /// about it. It marks, and its confirm says what the tool loses; the
+    /// person's own `swamp protect` mark still refuses, by name.
     #[test]
-    fn agents_view_mark_row_refuses_a_protected_unit_with_the_reason_not_a_generic_message() {
+    fn agents_view_mark_row_marks_a_default_kept_unit_with_a_warning_and_respects_the_persons_mark()
+    {
         let claude_home = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
         let units = fixture_agent_units(claude_home.path());
         let mut app = App::new(fixture_report(), "/root".into());
+        app.store_dir = Some(store.path().to_path_buf());
         app.set_view(ViewKind::Agents);
         app.set_agent_units(units);
         let settings_row = model::agent_rows(&app.agent_units)
@@ -4092,18 +4097,25 @@ mod tests {
             .find(|r| r.label.contains("settings.json"))
             .expect("settings row present");
         app.mark_row(&settings_row);
-        assert!(
-            app.marked.is_empty(),
-            "a protected unit must never be marked"
-        );
+        assert_eq!(app.marked.len(), 1, "{:?}", app.refusal_active());
+        let warned = app.confirm_summary();
+        assert!(warned.contains("swamp keeps this by default"), "{warned}");
+        assert!(claude_home.path().join("settings.json").exists());
+        app.marked.clear();
+        swamp_core::protection::protect_add(
+            store.path(),
+            &claude_home.path().join("settings.json"),
+        )
+        .unwrap();
+        app.mark_row(&settings_row);
+        assert!(app.marked.is_empty());
         assert!(
             app.refusal_active()
                 .unwrap_or_default()
-                .contains("protected"),
+                .contains("protected by you"),
             "{:?}",
             app.refusal_active()
         );
-        assert!(claude_home.path().join("settings.json").exists());
     }
 
     /// Shift+A over the Agents view (chunk D follow-up): the actionable
@@ -4138,11 +4150,12 @@ mod tests {
                     .display()
                     .to_string()
             ),
-            "the protected unit must never be swept up by bulk marking"
+            "a unit swamp keeps by default is marked on its own row, never swept up by mark all"
         );
         assert!(app.confirm_open, "one confirm for what could be marked");
         assert!(
-            app.refusal_active().is_some_and(|m| m.contains("skipped")),
+            app.refusal_active()
+                .is_some_and(|m| m.contains("left out of mark all")),
             "the footer must explain the skip, not stay silent: {:?}",
             app.refusal_active()
         );

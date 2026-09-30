@@ -275,24 +275,30 @@ fn canonical_of(path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(name))
 }
 
-/// The person's own keep marks: `swamp protect`. Both directions (the
-/// target inside a protected path, or containing one), and a mark list
-/// that cannot be read refuses (`.oh/guardrails/protection-fails-closed.md`).
-fn check_protect(path: &Path, store: Option<&Path>) -> Result<(), String> {
+/// What the person's own keep marks (`swamp protect`) say about a path.
+enum ProtectReading {
+    Clear,
+    /// A mark covers the path (or sits inside it): their own decision.
+    Kept(String),
+    /// The marks could not be read. Unknown, never an empty list: the
+    /// confirm says so, and the person's single confirm decides.
+    Unread(String),
+}
+
+/// Both directions, from the one predicate (`protection::conflict`).
+fn read_protect(path: &Path, store: Option<&Path>) -> ProtectReading {
     let Some(store) = store else {
-        return Err("swamp's protect marks could not be checked (no store folder), so nothing may be marked".into());
+        return ProtectReading::Unread("there is no store folder to read them from".into());
     };
     match crate::protection::load_protect(store) {
         Ok(list) => match list.conflict(path) {
-            Some(why) => Err(format!(
+            Some(why) => ProtectReading::Kept(format!(
                 "protected by you ({why}); `swamp protect remove {}` takes the mark off",
                 path.display()
             )),
-            None => Ok(()),
+            None => ProtectReading::Clear,
         },
-        Err(e) => Err(format!(
-            "swamp's protect marks could not be read ({e}), so nothing may be marked"
-        )),
+        Err(e) => ProtectReading::Unread(e.to_string()),
     }
 }
 
@@ -441,9 +447,23 @@ pub fn review(
 ) -> Result<Review, String> {
     let canonical = canonical_of(&t.path)?;
     let (kind, device, inode) = identify(&t.path)?;
-    check_protect(&t.path, store)?;
-    check_protect(&canonical, store)?;
+    let mut unread = None;
+    for p in [&t.path, &canonical] {
+        match read_protect(p, store) {
+            ProtectReading::Kept(why) => return Err(why),
+            ProtectReading::Unread(why) => unread = Some(why),
+            ProtectReading::Clear => {}
+        }
+    }
     let mut warnings = warnings_for(t, installation_note(&t.category), home);
+    if let Some(why) = unread {
+        warnings.insert(
+            0,
+            format!(
+                "could not read your protect list ({why}): your keep marks were not checked for this path"
+            ),
+        );
+    }
     if kind == EntryKind::Symlink {
         warnings.insert(
             0,
@@ -496,8 +516,14 @@ pub fn recheck(r: &Reviewed, store: Option<&Path>) -> Result<(), String> {
             r.canonical.display()
         )));
     }
-    check_protect(&r.path, store)?;
-    check_protect(&canonical, store)
+    // A list that could not be read at review was said so on the confirm;
+    // a mark that covers the entry now is the person's own decision.
+    for p in [&r.path, &canonical] {
+        if let ProtectReading::Kept(why) = read_protect(p, store) {
+            return Err(why);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

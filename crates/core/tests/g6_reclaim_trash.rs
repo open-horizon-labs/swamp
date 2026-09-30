@@ -410,26 +410,25 @@ fn the_persons_protect_mark_is_respected_at_review_and_at_the_move() {
 }
 
 /// Tempting wrong patch: an unreadable protect list (or no store at all)
-/// is read as "nothing is protected".
+/// is read as an empty list, silently. It is unknown, and it is said so on
+/// the confirm; it does not block the person's own decision (maintainer,
+/// 2026-09-30).
 #[test]
-fn protect_marks_that_cannot_be_read_refuse() {
+fn protect_marks_that_cannot_be_read_are_a_warning_not_an_empty_list() {
     let f = fx();
     let p = f.home.join("cache");
     make_dir(&p);
     let v = view(&[unit(StorageCategory::Cache, &p, 5)]);
     let t = target_of(&v, &p);
-    assert!(
-        review(&t, None, Some(&f.home))
-            .unwrap_err()
-            .contains("could not be checked")
-    );
-    std::fs::write(
-        swamp_core::protection::protect_path(&f.store),
-        b"not parquet",
-    )
-    .unwrap();
-    let err = review(&t, Some(&f.store), Some(&f.home)).unwrap_err();
-    assert!(err.contains("could not be read"), "{err}");
+    let r = review(&t, None, Some(&f.home)).unwrap();
+    assert!(r.warnings[0].contains("could not read your protect list"), "{:?}", r.warnings);
+    std::fs::write(swamp_core::protection::protect_path(&f.store), b"not parquet").unwrap();
+    let r = review(&t, Some(&f.store), Some(&f.home)).unwrap();
+    assert!(r.warnings[0].contains("keep marks were not checked"), "{:?}", r.warnings);
+    // And a readable list still wins over the warning path.
+    std::fs::remove_file(swamp_core::protection::protect_path(&f.store)).unwrap();
+    swamp_core::protection::protect_add(&f.store, &p).unwrap();
+    assert!(review(&t, Some(&f.store), Some(&f.home)).unwrap_err().contains("protected by you"));
 }
 
 /// Tempting wrong patch: a path with `..` or a relative path is

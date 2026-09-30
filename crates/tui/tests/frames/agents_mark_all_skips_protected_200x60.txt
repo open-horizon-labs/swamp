@@ -7,7 +7,7 @@
 "view: Tools › Agents (4 of 4 · v next · Esc: projects) · filter: growth > 100MB in 7d                                                                                                                   "
 "Name                                                                                                              Size     Change Change bar    Cleanup / facts                                         "
 "✗ Claude Code · sessions · projects/-Users-dev-src-mole/fixture-session.jsonl · project: mole                    4.2MB   +100.0KB       │▏                                                              "
-"Claude Code · protected-config · settings.json · tool-wide [protected]                                           4.1KB          —                                                                       "
+"Claude Code · protected-config · settings.json · tool-wide [kept by default]                                     4.1KB          —                                                                       "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "

@@ -2881,7 +2881,9 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
                 swamp_core::agents::ProjectLinkState::NotApplicable => "tool-wide".to_string(),
                 other => format!("{other:?}"),
             };
-            let protect = if u.protected { " [protected]" } else { "" };
+            // Kept by default, not forbidden: Space marks it, and the confirm says
+            // what the tool loses. `A` leaves it out.
+            let protect = if u.protected { " [kept by default]" } else { "" };
             let mut row = Row::leaf(
                 0,
                 format!(
@@ -2895,6 +2897,8 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
             );
             row.mtime_max = u.mtime_max;
             row.unit = Some(crate::units::UnitId::for_artifact(&u.path));
+            row.individual_only =
+                u.protected || u.action == swamp_core::agents::AgentActionCapability::None;
             row.evidence = u.evidence.clone();
             row
         })

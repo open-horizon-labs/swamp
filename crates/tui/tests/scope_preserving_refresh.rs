@@ -361,7 +361,7 @@ fn marking_an_ordinary_row_that_contains_a_protected_file_is_refused_with_the_re
     );
     let refusal = app.refusal_active().unwrap_or_default();
     assert!(
-        refusal.contains("human-protected"),
+        refusal.contains("protected by you"),
         "the refusal must name the cause, not be a generic message: {refusal:?}"
     );
     assert!(keep.exists(), "nothing may be touched at mark time");

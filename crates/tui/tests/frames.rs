@@ -926,10 +926,11 @@ fn agents_view_confirm_row_shows_session_removal_consequences() {
     }
 }
 
-/// The mirror case: a protected/unsupported row's footer names the exact
-/// reason (`propose_agents`'s own refusal text), never a generic
-/// "nothing to delete on this row" -- see `model::agent_rows`'s doc
-/// comment on why `unit` is set even for a row that cannot be acted on.
+/// The mirror case: a row swamp keeps by default (a config file, no swamp
+/// rule for its category) marks, drawn `✗` and labelled `[kept by
+/// default]`; its confirm says what the tool loses (asserted in the lib
+/// tests). Tempting wrong patch: it is refused as "protected" with no way
+/// to act on what the person plainly sees. The fixture name is the old one.
 #[test]
 fn agents_view_refusal_state_names_the_protection_reason() {
     for (w, h) in [(80, 24), (200, 60)] {

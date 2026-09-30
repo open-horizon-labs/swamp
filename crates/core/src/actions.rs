@@ -528,18 +528,35 @@ fn propose_refusing_protected(
     store_dir: Option<&Path>,
     protected: &[PathBuf],
 ) -> Result<Vec<PlanUnit>> {
-    let units = propose(report, filter, paths, proposed_by)?;
+    let mut units = propose(report, filter, paths, proposed_by)?;
     // The caller's list is a convenience, never the authority. The PR
     // #123 review's counterexample: an unreadable `agent_protect.json`
     // reached this function as an *empty* list through the CLI's
     // `.unwrap_or_default()`, so a protected unit became plannable
     // exactly when protection state broke. When the report knows which
-    // store it came from, protection is reloaded here and an error is a
-    // refusal (`.oh/guardrails/protection-fails-closed.md`).
+    // store it came from, protection is reloaded here, and a list that
+    // cannot be read is unknown, never empty: it is a warning on every
+    // unit (`.oh/guardrails/protection-fails-closed.md`).
+    let mut unread = None;
     let live = match store_dir {
-        Some(dir) => crate::protection::load_protect(dir)?,
+        Some(dir) => match crate::protection::load_protect(dir) {
+            Ok(list) => list,
+            // Unknown, never an empty list: said on the confirm, where the
+            // person's single confirm decides (2026-09-30).
+            Err(e) => {
+                unread = Some(e.to_string());
+                crate::protection::ProtectList::empty()
+            }
+        },
         None => crate::protection::ProtectList::empty(),
     };
+    if let Some(why) = &unread {
+        for u in &mut units {
+            u.warnings.push(format!(
+                "could not read your protect list ({why}): your keep marks were not checked for this path"
+            ));
+        }
+    }
     let protected = live.including(protected);
     if protected.is_empty() {
         return Ok(units);
@@ -552,7 +569,7 @@ fn propose_refusing_protected(
         if protected.conflict(&u.path).is_some() {
             refused.push(Refused {
                 path: u.path.clone(),
-                cause: "human-protected path (swamp protect); remove protection first if this unit should be actionable".into(),
+                cause: "protected by you (swamp protect); `swamp protect remove <path>` takes the mark off".into(),
             });
         } else {
             kept.push(u);
@@ -978,7 +995,22 @@ fn is_sqlite_like(path: &Path) -> bool {
 /// unit, or `None` if it can be listed for the Trash. Occupancy is never
 /// checked here: it is shown as a fact at mark/confirm time, never a
 /// veto against building the row at all.
-fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
+///
+/// Two readers. A plan made for an agent or a script (`for_human` false)
+/// keeps every rule: a tool that may not act on its own decision does not
+/// move credentials, config, a database file or a category nobody verified.
+/// A plan made for the person at the keyboard (the TUI) refuses none of
+/// those: what they see and own they may move to Trash, and each of those
+/// facts is a warning on the confirm (`agent_advisories`). What still
+/// refuses a person is their own `swamp protect` mark.
+fn agent_refusal(u: &crate::agents::AgentUnit, for_human: bool) -> Option<String> {
+    if for_human {
+        return u
+            .protect_reason
+            .as_deref()
+            .filter(|r| r.contains("`swamp protect`"))
+            .map(|r| format!("protected by you: {r}"));
+    }
     if u.protected {
         let reason = u
             .protect_reason
@@ -1003,6 +1035,43 @@ fn agent_refusal(u: &crate::agents::AgentUnit) -> Option<String> {
     None
 }
 
+/// What a person is told about a unit the agent-facing plan would refuse:
+/// plain facts, not a veto.
+fn agent_advisories(u: &crate::agents::AgentUnit) -> Vec<String> {
+    let mut out = Vec::new();
+    if u.protected {
+        let reason = u
+            .protect_reason
+            .clone()
+            .unwrap_or_else(|| format!("{} is kept by default", u.category.label()));
+        out.push(format!(
+            "swamp keeps this by default ({reason}): the tool may stop working, sign out or lose settings until it is restored from Trash"
+        ));
+    }
+    if u.action == crate::agents::AgentActionCapability::None {
+        out.push(format!(
+            "swamp has no rule for {} and no record of what getting it back costs; only this exact path moves",
+            u.category.label()
+        ));
+    }
+    if u.category == crate::agents::AgentCategory::ManagedWorktrees {
+        out.push(
+            "a managed worktree is a real linked git worktree: changes and unpushed commits in it are in it, and swamp has not checked them"
+                .to_string(),
+        );
+    }
+    let db = std::iter::once(&u.path)
+        .chain(u.members.iter().map(|m| &m.path))
+        .any(|p| is_sqlite_like(p));
+    if db {
+        out.push(
+            "it includes a database file (SQLite, WAL or SHM): moving one of them alone can lose recent writes or leave the database unreadable; close the tool first"
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// Builds a list of Trash-able units from selected `AgentUnit`s (#101).
 /// Every unit that reaches the list carries `agent_meta`; anything
 /// `agent_refusal` names is refused here, never silently downgraded.
@@ -1011,18 +1080,44 @@ pub fn propose_agents(
     paths: &[PathBuf],
     proposed_by: &str,
 ) -> Result<Vec<PlanUnit>> {
+    propose_agents_for(units, paths, proposed_by, false)
+}
+
+/// [`propose_agents`] for the person at the keyboard: only their own
+/// `swamp protect` mark refuses; every other rule the agent-facing plan
+/// keeps is a warning on the confirm (see [`agent_refusal`]).
+pub fn propose_agents_for_human(
+    units: &[crate::agents::AgentUnit],
+    paths: &[PathBuf],
+    proposed_by: &str,
+) -> Result<Vec<PlanUnit>> {
+    propose_agents_for(units, paths, proposed_by, true)
+}
+
+fn propose_agents_for(
+    units: &[crate::agents::AgentUnit],
+    paths: &[PathBuf],
+    proposed_by: &str,
+    for_human: bool,
+) -> Result<Vec<PlanUnit>> {
     let mut plan_units = Vec::new();
     let mut refused = Vec::new();
     for u in units {
         if !paths.is_empty() && !paths.iter().any(|p| p == &u.path) {
             continue;
         }
-        match agent_refusal(u) {
+        match agent_refusal(u, for_human) {
             Some(cause) => refused.push(Refused {
                 path: u.path.clone(),
                 cause,
             }),
-            None => plan_units.push(unit_from_agent(u)),
+            None => {
+                let mut unit = unit_from_agent(u);
+                if for_human {
+                    unit.warnings.extend(agent_advisories(u));
+                }
+                plan_units.push(unit)
+            }
         }
     }
     for p in paths {
@@ -1172,10 +1267,14 @@ fn agent_single_path_consequence(category: crate::agents::AgentCategory) -> &'st
 /// pressing Enter.
 pub fn trash_agent_cache(path: &Path, trash: &Path, at: u64) -> Result<(PathBuf, u64)> {
     let meta = fs_gate::symlink_metadata(path).context("path no longer exists")?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        bail!("path is no longer a directory (or is a symlink)");
+    if meta.file_type().is_symlink() || !(meta.is_dir() || meta.is_file()) {
+        bail!("path is no longer a folder or file (or is a symlink)");
     }
-    let (bytes, _mtime, _truncated) = crate::agents::folded_bytes(path, 2_000_000);
+    let bytes = if meta.is_dir() {
+        crate::agents::folded_bytes(path, 2_000_000).0
+    } else {
+        meta.len()
+    };
     let basename = path
         .file_name()
         .and_then(|n| n.to_str())
