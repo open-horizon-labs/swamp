@@ -886,33 +886,52 @@ fn identify_devices(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArt
 
 /// Simulator runtimes: installations, by name.
 fn identify_runtimes(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
-    let mut units = vec![store_root(
+    let mut root = store_root(
         container,
         ctx,
         ArtifactRole::Installation,
         "simulator runtimes: installed simulator OS versions",
-        "a removed runtime is downloaded again from Xcode's platform settings -- a multi-gigabyte \
-         download; simulators on it stop booting until then",
+        "a removed runtime is downloaded again from Xcode's platform settings: a multi-gigabyte \
+         download, and simulators on it stop booting until then",
         "simulator devices boot from these runtimes",
-    )];
+    );
+    // `Volumes/` holds the *mounted* runtime images. What is printed is
+    // the size of the files inside them, which is not the space their
+    // backing images take on the data volume, and a runtime that is
+    // installed but not mounted is not here at all.
+    let mounted_volumes = name_of(&container.path) == "Volumes";
+    if mounted_volumes {
+        root = NestedUnitBuilder::amend(root)
+            .limit(
+                "mounted size: the files inside the mounted runtime images, not the space their \
+                 disk images take (those live under /System/Library/AssetsV2, which swamp does \
+                 not read); a runtime installed but not mounted is not measured",
+            )
+            .build();
+    }
+    let mut units = vec![root];
     for r in ctx.folded().children(&container.path) {
         let name = name_of(&r.path).to_string();
         let label = name.trim_end_matches(".simruntime").to_string();
-        units.push(
-            NestedUnitBuilder::known_dir(
-                container,
-                ArtifactRole::Installation,
-                r,
-                format!("`{name}` is an installed simulator runtime"),
-                format!("{label} is downloaded again when a simulator needs it"),
-            )
-            .variant(ArtifactVariant {
-                toolchain: Some(label),
-                ..Default::default()
-            })
-            .no_action_because("simulator devices boot from this runtime")
-            .build(),
-        );
+        let mut b = NestedUnitBuilder::known_dir(
+            container,
+            ArtifactRole::Installation,
+            r,
+            format!("`{name}` is an installed simulator runtime"),
+            format!("{label} is downloaded again when a simulator needs it"),
+        )
+        .variant(ArtifactVariant {
+            toolchain: Some(label),
+            ..Default::default()
+        })
+        .no_action_because("simulator devices boot from this runtime");
+        if mounted_volumes && r.allocated_total == 0 {
+            b = b.limit(
+                "nothing is mounted here, so this runtime is not measured: its disk image is \
+                 under /System/Library/AssetsV2, which swamp does not read",
+            );
+        }
+        units.push(b.build());
     }
     units
 }
@@ -1373,5 +1392,66 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn the_mounted_volumes_row_is_labelled_mounted_size_and_an_empty_mount_is_not_measured() {
+        // Tempting wrong patch: printing the mounted content size as the
+        // runtime's disk footprint, and an empty mount point as a small
+        // exact number.
+        let tmp = tempfile::tempdir().unwrap();
+        let vols = tmp.path().join("Volumes");
+        put(&vols.join("iOS_23F77/System/x"), "0123456789");
+        fs::create_dir_all(vols.join("watchOS_unmounted")).unwrap();
+        let mut idx: Vec<FoldedDir> = Vec::new();
+        for (p, n) in [
+            (vols.clone(), 8192u64),
+            (vols.join("iOS_23F77"), 8192),
+            (vols.join("watchOS_unmounted"), 0),
+        ] {
+            idx.push(FoldedDir {
+                path: p,
+                allocated_total: n,
+                mtime_max: 5,
+                complete: true,
+            });
+        }
+        let units = run(
+            &BuildContainer::shared_store_of(
+                "xcode-swift",
+                vols.clone(),
+                BuildStoreKind::SimulatorRuntimes,
+            ),
+            &FoldedIndex::from_dirs(idx),
+        );
+        let root = units.iter().find(|u| u.path == vols).unwrap();
+        assert!(
+            root.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("mounted size"))
+        );
+        assert!(
+            root.coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("not mounted is not measured"))
+        );
+        let empty = units
+            .iter()
+            .find(|u| u.path == vols.join("watchOS_unmounted"))
+            .unwrap();
+        assert!(
+            empty
+                .coverage
+                .limits
+                .iter()
+                .any(|l| l.contains("not measured"))
+        );
+        let mounted = units
+            .iter()
+            .find(|u| u.path == vols.join("iOS_23F77"))
+            .unwrap();
+        assert!(mounted.coverage.limits.is_empty());
     }
 }
