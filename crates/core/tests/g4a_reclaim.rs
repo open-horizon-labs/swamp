@@ -15,7 +15,7 @@ use swamp_core::evidence::{
     Evidence, EvidenceSource, FactKind as EvKind, FactSubtype, FactValue, Reason,
 };
 use swamp_core::external::ExternalUnit;
-use swamp_core::fs_gate::spawn::{Program, RunOutput};
+use swamp_core::fs_gate::spawn::RunOutput;
 use swamp_core::last_used::LastUsed;
 use swamp_core::locations::{Provenance, RegenClass, StorageCategory};
 use swamp_core::manager_facts::{
@@ -732,7 +732,7 @@ fn manager_statements_are_verbatim_and_attributed_never_swamps_own() {
     assert_eq!(poetry.manager[0].quote, prune, "verbatim");
     assert_eq!(
         poetry.manager[0].attribution,
-        "mise reports prunable (mise prune --dry-run)"
+        "mise reports prunable (mise prune --tools --dry-run)"
     );
     let text = render_text(&v);
     assert!(text.contains(
@@ -783,8 +783,16 @@ fn out(code: Option<i32>, stdout: &[u8], stderr: &[u8], timed_out: bool) -> RunO
 }
 
 impl ProbeRunner for Fake {
-    fn run(&self, program: Program, args: &[&str], _t: Duration) -> io::Result<RunOutput> {
-        let key = format!("{} {}", program.binary(), args.join(" "));
+    fn run(
+        &self,
+        command: swamp_core::fs_gate::spawn::ManagerCommand,
+        _t: Duration,
+    ) -> io::Result<RunOutput> {
+        let key = format!(
+            "{} {}",
+            command.program().binary(),
+            command.args().join(" ")
+        );
         self.seen.lock().unwrap().push(key.clone());
         let map = self.answers.lock().unwrap();
         for (k, v) in map.iter() {
@@ -983,7 +991,7 @@ fn the_pass_asks_only_dry_runs_and_stores_the_answers_it_read() {
             "brew autoremove --dry-run",
             Ok(out(
                 Some(0),
-                b"Would autoremove 4 unneeded formulae:\nlibevent\nlibnghttp2\nunbound\nusage\n",
+                b"==> Would autoremove 4 unneeded formulae:\nlibevent\nlibnghttp2\nunbound\nusage\n",
                 b"",
                 false,
             )),
@@ -993,7 +1001,7 @@ fn the_pass_asks_only_dry_runs_and_stores_the_answers_it_read() {
             Ok(out(Some(0), b"ansible\natuin\n", b"", false)),
         )
         .answer(
-            "mise prune --dry-run",
+            "mise prune --tools --dry-run",
             Ok(out(
                 Some(0),
                 b"",
@@ -1025,7 +1033,7 @@ fn the_pass_asks_only_dry_runs_and_stores_the_answers_it_read() {
             "brew autoremove --dry-run",
             "brew list --formula --installed-on-request",
             "mise ls --global --json",
-            "mise prune --dry-run",
+            "mise prune --tools --dry-run",
         ],
         "exactly the four read-only questions, and no real run"
     );

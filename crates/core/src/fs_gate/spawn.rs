@@ -262,7 +262,7 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("list"), Lit("--formula"), Lit("--installed-on-request")],
         ],
         Program::Mise => &[
-            &[Lit("prune"), Lit("--dry-run")],
+            &[Lit("prune"), Lit("--tools"), Lit("--dry-run")],
             &[Lit("ls"), Lit("--global"), Lit("--json")],
         ],
         Program::Defaults => &[&[
@@ -494,7 +494,46 @@ pub(super) fn run_unchecked(
     args: &[OsString],
     timeout: Duration,
 ) -> io::Result<RunOutput> {
-    run_command(program.binary(), args, timeout)
+    let plan = super::program_paths::plan(program)?;
+    run_command_with(program.binary(), args, timeout, &plan)
+}
+
+/// The only four questions swamp asks a package manager's own tooling,
+/// each a dry run or a read. The manager pass builds its argv from this
+/// enum and cannot name any other: `brew autoremove` without `--dry-run`,
+/// `mise prune` without `--dry-run` and `brew uninstall` are not values of
+/// it, and the generic [`run`] is not what the pass calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerCommand {
+    BrewAutoremoveDryRun,
+    BrewListInstalledOnRequest,
+    MisePruneToolsDryRun,
+    MiseListGlobalJson,
+}
+
+impl ManagerCommand {
+    pub fn program(self) -> Program {
+        match self {
+            Self::BrewAutoremoveDryRun | Self::BrewListInstalledOnRequest => Program::Brew,
+            Self::MisePruneToolsDryRun | Self::MiseListGlobalJson => Program::Mise,
+        }
+    }
+
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::BrewAutoremoveDryRun => &["autoremove", "--dry-run"],
+            Self::BrewListInstalledOnRequest => &["list", "--formula", "--installed-on-request"],
+            Self::MisePruneToolsDryRun => &["prune", "--tools", "--dry-run"],
+            Self::MiseListGlobalJson => &["ls", "--global", "--json"],
+        }
+    }
+}
+
+/// Runs one [`ManagerCommand`]: the program resolved from its fixed
+/// locations, a from-scratch environment, a fixed working directory
+/// (`program_paths`), counted and killed on the time-out like any spawn.
+pub fn run_manager(command: ManagerCommand, timeout: Duration) -> io::Result<RunOutput> {
+    run(command.program(), command.args(), timeout)
 }
 
 // ---- child lifetime (#156) ------------------------------------------
@@ -574,11 +613,20 @@ impl Running {
         args: &[OsString],
         out: std::fs::File,
         err: std::fs::File,
+        plan: &super::program_paths::Plan,
     ) -> io::Result<Self> {
         use std::os::unix::process::CommandExt;
         install_cleanup_once();
         crate::work_counters::record_spawn();
-        let child = Command::new(binary)
+        let mut command = match plan {
+            super::program_paths::Plan::Inherit => Command::new(binary),
+            super::program_paths::Plan::Scrubbed(s) => {
+                let mut c = Command::new(&s.exe);
+                c.env_clear().envs(s.env.iter().cloned()).current_dir(&s.cwd);
+                c
+            }
+        };
+        let child = command
             .args(args)
             .stdin(Stdio::null())
             .stdout(out)
@@ -595,13 +643,6 @@ impl Running {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GH_PROMPT_DISABLED", "1")
             .env("GCM_INTERACTIVE", "never")
-            // A package manager's own reports must not update, phone home
-            // or colour their answer.
-            .env("HOMEBREW_NO_AUTO_UPDATE", "1")
-            .env("HOMEBREW_NO_ANALYTICS", "1")
-            .env("HOMEBREW_NO_ENV_HINTS", "1")
-            .env("HOMEBREW_PAGER", "cat")
-            .env("NO_COLOR", "1")
             .spawn()?;
         let pgid = child.id() as i32;
         let slot = LIVE.iter().position(|s| {
@@ -659,10 +700,26 @@ impl Drop for Running {
 const CAPTURE_CAP: u64 = 8 * 1024 * 1024;
 
 /// Runs `binary args…` under the lifetime rules above.
+#[cfg(test)]
 fn run_command(binary: &str, args: &[OsString], timeout: Duration) -> io::Result<RunOutput> {
+    run_command_with(binary, args, timeout, &super::program_paths::Plan::Inherit)
+}
+
+fn run_command_with(
+    binary: &str,
+    args: &[OsString],
+    timeout: Duration,
+    plan: &super::program_paths::Plan,
+) -> io::Result<RunOutput> {
     let mut out_file = tempfile::tempfile()?;
     let mut err_file = tempfile::tempfile()?;
-    let mut child = Running::start(binary, args, out_file.try_clone()?, err_file.try_clone()?)?;
+    let mut child = Running::start(
+        binary,
+        args,
+        out_file.try_clone()?,
+        err_file.try_clone()?,
+        plan,
+    )?;
     let started = Instant::now();
     let (code, timed_out) = loop {
         match child.try_wait() {
@@ -734,7 +791,14 @@ mod tests {
     fn dropping_the_guard_kills_the_group() {
         let out = tempfile::tempfile().unwrap();
         let err = tempfile::tempfile().unwrap();
-        let mut r = Running::start("sh", &hung_tree(), out.try_clone().unwrap(), err).unwrap();
+        let mut r = Running::start(
+            "sh",
+            &hung_tree(),
+            out.try_clone().unwrap(),
+            err,
+            &super::program_paths::Plan::Inherit,
+        )
+        .unwrap();
         let leader = r.child.id() as i32;
         std::thread::sleep(Duration::from_millis(300));
         let mut buf = String::new();
@@ -797,11 +861,11 @@ mod tests {
 
     #[test]
     fn stdin_is_null_and_pagers_and_prompts_are_disabled() {
-        let script = "cat; printf '%s|%s|%s|%s|%s' \"$GIT_PAGER\" \"$GIT_TERMINAL_PROMPT\" \"$GH_PROMPT_DISABLED\" \"$HOMEBREW_NO_AUTO_UPDATE\" \"$NO_COLOR\"";
+        let script = "cat; printf '%s|%s|%s' \"$GIT_PAGER\" \"$GIT_TERMINAL_PROMPT\" \"$GH_PROMPT_DISABLED\"";
         let out =
             run_command("sh", &["-c".into(), script.into()], Duration::from_secs(10)).unwrap();
         assert!(!out.timed_out);
-        assert_eq!(out.stdout_lossy(), "cat|0|1|1|1");
+        assert_eq!(out.stdout_lossy(), "cat|0|1");
     }
 
     #[test]
@@ -837,6 +901,8 @@ mod tests {
             (Program::Brew, vec!["cleanup", "--dry-run"]),
             (Program::Mise, vec!["prune"]),
             (Program::Mise, vec!["prune", "--dry-run", "--yes"]),
+            (Program::Mise, vec!["prune", "--dry-run"]),
+            (Program::Mise, vec!["prune", "--tools"]),
             (Program::Mise, vec!["uninstall", "node@1"]),
             (Program::Mise, vec!["ls", "--global"]),
             (Program::Mise, vec!["exec", "--", "true"]),
@@ -926,7 +992,7 @@ mod tests {
                 Program::Brew,
                 vec!["list", "--formula", "--installed-on-request"],
             ),
-            (Program::Mise, vec!["prune", "--dry-run"]),
+            (Program::Mise, vec!["prune", "--tools", "--dry-run"]),
             (Program::Mise, vec!["ls", "--global", "--json"]),
             (Program::Id, vec!["-u"]),
             (Program::Df, vec!["-k", "/"]),

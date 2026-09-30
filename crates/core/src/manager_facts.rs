@@ -24,7 +24,7 @@
 //! never fails and never shows an older answer as current.
 
 use crate::external::ExternalUnit;
-use crate::fs_gate::spawn::{Program, RunOutput};
+use crate::fs_gate::spawn::{ManagerCommand, RunOutput};
 use crate::locations::{
     ConventionRole, GlobalDefaultFormat, ManagerDecl, ManagerProbe, Registry, SubjectShape,
 };
@@ -52,6 +52,8 @@ pub enum FactKind {
     /// The manager's default (rustup's default toolchain, a tool in
     /// mise's global configuration).
     ActiveDefault,
+    /// A toolchain the manager's settings pin for a directory.
+    PinnedByOverride,
     /// Homebrew records this formula as installed on request.
     InstalledOnRequest,
     /// The probe ran and its answer was read (it may have listed
@@ -69,6 +71,7 @@ impl FactKind {
             FactKind::ReportsUnneeded => "reports-unneeded",
             FactKind::ReportsPrunable => "reports-prunable",
             FactKind::ActiveDefault => "active-default",
+            FactKind::PinnedByOverride => "pinned-by-override",
             FactKind::InstalledOnRequest => "installed-on-request",
             FactKind::Checked => "checked",
             FactKind::NotObserved => "not-observed",
@@ -81,6 +84,7 @@ impl FactKind {
             FactKind::ReportsUnneeded,
             FactKind::ReportsPrunable,
             FactKind::ActiveDefault,
+            FactKind::PinnedByOverride,
             FactKind::InstalledOnRequest,
             FactKind::Checked,
             FactKind::NotObserved,
@@ -93,7 +97,10 @@ impl FactKind {
     /// Whether a unit that has this fact is held out of the reclaimable
     /// total (a default, or installed because a person asked for it).
     pub fn holds(self) -> bool {
-        matches!(self, FactKind::ActiveDefault | FactKind::InstalledOnRequest)
+        matches!(
+            self,
+            FactKind::ActiveDefault | FactKind::PinnedByOverride | FactKind::InstalledOnRequest
+        )
     }
 }
 
@@ -166,24 +173,32 @@ impl ManagerProbe {
         match self {
             ManagerProbe::BrewAutoremoveDryRun => "brew autoremove",
             ManagerProbe::BrewInstalledOnRequest => "brew list --installed-on-request",
-            ManagerProbe::MisePruneDryRun => "mise prune --dry-run",
+            ManagerProbe::MisePruneDryRun => "mise prune --tools --dry-run",
             ManagerProbe::MiseGlobalTools => "mise global config",
             ManagerProbe::SettingsDefault => "settings.toml default_toolchain",
         }
     }
 
-    /// The command this probe runs, when it runs one.
-    fn invocation(self) -> Option<(Program, &'static [&'static str])> {
+    /// The kinds of fact this probe yields (its primary one first).
+    pub fn kinds(self) -> &'static [FactKind] {
         match self {
-            ManagerProbe::BrewAutoremoveDryRun => {
-                Some((Program::Brew, &["autoremove", "--dry-run"]))
+            ManagerProbe::BrewAutoremoveDryRun => &[FactKind::ReportsUnneeded],
+            ManagerProbe::MisePruneDryRun => &[FactKind::ReportsPrunable],
+            ManagerProbe::BrewInstalledOnRequest => &[FactKind::InstalledOnRequest],
+            ManagerProbe::MiseGlobalTools => &[FactKind::ActiveDefault],
+            ManagerProbe::SettingsDefault => &[FactKind::ActiveDefault, FactKind::PinnedByOverride],
+        }
+    }
+
+    /// The command this probe runs, when it runs one.
+    fn invocation(self) -> Option<ManagerCommand> {
+        match self {
+            ManagerProbe::BrewAutoremoveDryRun => Some(ManagerCommand::BrewAutoremoveDryRun),
+            ManagerProbe::BrewInstalledOnRequest => {
+                Some(ManagerCommand::BrewListInstalledOnRequest)
             }
-            ManagerProbe::BrewInstalledOnRequest => Some((
-                Program::Brew,
-                &["list", "--formula", "--installed-on-request"],
-            )),
-            ManagerProbe::MisePruneDryRun => Some((Program::Mise, &["prune", "--dry-run"])),
-            ManagerProbe::MiseGlobalTools => Some((Program::Mise, &["ls", "--global", "--json"])),
+            ManagerProbe::MisePruneDryRun => Some(ManagerCommand::MisePruneToolsDryRun),
+            ManagerProbe::MiseGlobalTools => Some(ManagerCommand::MiseListGlobalJson),
             ManagerProbe::SettingsDefault => None,
         }
     }
@@ -191,14 +206,76 @@ impl ManagerProbe {
 
 /// The attribution a row shows for a fact: the manager's name, what it
 /// said and the command that said it. Never a statement swamp makes.
-pub fn attribution(display: &str, probe: ManagerProbe) -> String {
-    match probe.kind() {
+pub fn attribution(display: &str, probe: ManagerProbe, kind: FactKind) -> String {
+    match kind {
         FactKind::ReportsUnneeded => format!("{display} reports unneeded ({})", probe.command()),
         FactKind::ReportsPrunable => format!("{display} reports prunable ({})", probe.command()),
         FactKind::ActiveDefault => format!("active default ({})", probe.command()),
+        FactKind::PinnedByOverride => "pinned by override (settings.toml [overrides])".to_string(),
         FactKind::InstalledOnRequest => format!("installed on request ({})", probe.command()),
         FactKind::Checked | FactKind::NotObserved | FactKind::Pass => probe.command().to_string(),
     }
+}
+
+/// A rustup toolchain name taken apart: `<channel>[-<date>][-<host triple>]`.
+/// Host triples contain dashes, so the name is never split at the first
+/// one: the channel is `stable`, `beta`, `nightly` or a version, and a date
+/// is exactly `YYYY-MM-DD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toolchain<'a> {
+    pub channel: &'a str,
+    pub date: Option<&'a str>,
+    pub host: Option<&'a str>,
+}
+
+pub fn parse_toolchain(name: &str) -> Option<Toolchain<'_>> {
+    let is_version = |c: &str| {
+        let mut parts = c.split('.');
+        let (Some(a), Some(b)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        let c3 = parts.next();
+        parts.next().is_none()
+            && [Some(a), Some(b), c3]
+                .into_iter()
+                .flatten()
+                .all(|p| !p.is_empty() && p.bytes().all(|x| x.is_ascii_digit()))
+    };
+    let (channel, mut rest) = match name.split_once('-') {
+        Some((c, r)) => (c, Some(r)),
+        None => (name, None),
+    };
+    if !(matches!(channel, "stable" | "beta" | "nightly") || is_version(channel)) {
+        return None;
+    }
+    let mut date = None;
+    if let Some(r) = rest {
+        let b = r.as_bytes();
+        let looks_dated = r.len() >= 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && r[..4].bytes().all(|x| x.is_ascii_digit())
+            && r[5..7].bytes().all(|x| x.is_ascii_digit())
+            && r[8..10].bytes().all(|x| x.is_ascii_digit())
+            && (r.len() == 10 || b[10] == b'-');
+        if looks_dated {
+            date = Some(&r[..10]);
+            rest = if r.len() > 11 { Some(&r[11..]) } else { None };
+        }
+    }
+    let host = rest.filter(|h| !h.is_empty());
+    Some(Toolchain {
+        channel,
+        date,
+        host,
+    })
+}
+
+/// mise names a tool's install folder from its identifier by turning the
+/// backend separators into dashes: `npm:prettier` is `npm-prettier`,
+/// `aqua:cli/cli` is `aqua-cli-cli`.
+fn mise_folder_name(tool: &str) -> String {
+    tool.replace([':', '/'], "-")
 }
 
 /// Whether a manager's `subject` names the folder `folder` of its store,
@@ -207,12 +284,35 @@ pub fn attribution(display: &str, probe: ManagerProbe) -> String {
 /// guess.
 pub fn subject_matches(shape: SubjectShape, subject: &str, folder: &str) -> bool {
     match shape {
-        SubjectShape::FolderName => subject == folder,
+        // A tap formula is named `user/tap/foo` by Homebrew and lives in
+        // the Cellar as `foo`.
+        SubjectShape::FolderName => subject.rsplit('/').next().unwrap_or(subject) == folder,
         SubjectShape::NameBeforeAt => {
-            subject.split_once('@').map_or(subject, |(name, _)| name) == folder
+            // `tool@version`, or a backend tool whose own name holds a
+            // `@` (`npm:@scope/pkg`): try the whole subject and each cut.
+            let mut names = vec![subject];
+            if let Some((n, _)) = subject.split_once('@') {
+                names.push(n);
+            }
+            if let Some((n, _)) = subject.rsplit_once('@') {
+                names.push(n);
+            }
+            names
+                .into_iter()
+                .any(|n| n == folder || mise_folder_name(n) == folder)
         }
         SubjectShape::ChannelWithHostTriple => {
-            folder == subject || folder.split_once('-').map(|(channel, _)| channel) == Some(subject)
+            if folder == subject {
+                return true;
+            }
+            match (parse_toolchain(subject), parse_toolchain(folder)) {
+                (Some(s), Some(f)) => {
+                    s.channel == f.channel
+                        && s.date == f.date
+                        && s.host.is_none_or(|h| Some(h) == f.host)
+                }
+                _ => false,
+            }
         }
     }
 }
@@ -256,10 +356,15 @@ pub fn parse_brew_autoremove(stdout: &[u8]) -> Result<(String, Vec<String>), Unr
     let mut lines = text.lines();
     let mut header: Option<String> = None;
     for line in lines.by_ref() {
-        let line = line.trim();
+        let cleaned = strip_ansi(line);
+        let line = cleaned.trim();
         if line.is_empty() {
             continue;
         }
+        // Homebrew prints the header through its `oh1` formatter, which
+        // puts an arrow in front (`==> Would autoremove 2 unneeded
+        // formulae:`, cleanup.rb).
+        let line = line.strip_prefix("==>").map_or(line, str::trim_start);
         if line.starts_with("Would autoremove ") && line.contains("unneeded formula") {
             header = Some(line.to_string());
             break;
@@ -291,6 +396,24 @@ pub fn parse_brew_autoremove(stdout: &[u8]) -> Result<(String, Vec<String>), Unr
         ));
     }
     Ok((header, names))
+}
+
+/// `text` without ANSI colour sequences.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The formulae `brew list --formula --installed-on-request` prints, one
@@ -372,8 +495,7 @@ pub fn parse_mise_global(stdout: &[u8]) -> Result<Vec<(String, String, String)>,
 /// How a probe's command is run. The real one is the gate's spawn; a
 /// test hands in a fake that answers, times out, or fails.
 pub trait ProbeRunner {
-    fn run(&self, program: Program, args: &[&str], timeout: Duration)
-    -> std::io::Result<RunOutput>;
+    fn run(&self, command: ManagerCommand, timeout: Duration) -> std::io::Result<RunOutput>;
     /// The text of a settings file, or why it could not be read.
     fn read_settings(&self, path: &std::path::Path) -> Result<String, String>;
 }
@@ -382,13 +504,8 @@ pub trait ProbeRunner {
 pub struct SystemProbeRunner;
 
 impl ProbeRunner for SystemProbeRunner {
-    fn run(
-        &self,
-        program: Program,
-        args: &[&str],
-        timeout: Duration,
-    ) -> std::io::Result<RunOutput> {
-        crate::fs_gate::spawn::run(program, args, timeout)
+    fn run(&self, command: ManagerCommand, timeout: Duration) -> std::io::Result<RunOutput> {
+        crate::fs_gate::spawn::run_manager(command, timeout)
     }
 
     fn read_settings(&self, path: &std::path::Path) -> Result<String, String> {
@@ -421,16 +538,16 @@ fn run_probe(
     runner: &dyn ProbeRunner,
     decl: &ManagerDecl,
     probe: ManagerProbe,
-    program: Program,
-    args: &[&str],
+    command: ManagerCommand,
     timeout: Duration,
     now: u64,
 ) -> Vec<ManagerFact> {
+    let program = command.program();
     let manager = decl.manager;
     let label = probe.label();
     let not_observed =
         |why: String| vec![row(manager, label, FactKind::NotObserved, None, why, now)];
-    let out = match runner.run(program, args, timeout) {
+    let out = match runner.run(command, timeout) {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return not_observed(format!(
@@ -578,6 +695,26 @@ fn settings_probe(
         },
     };
     let mut out = Vec::new();
+    // Toolchains the settings pin for a directory are held out too.
+    if let Ok(table) = toml::from_str::<toml::Table>(&text)
+        && let Some(overrides) = table.get("overrides").and_then(|v| v.as_table())
+    {
+        let mut pins: Vec<(&String, &str)> = overrides
+            .iter()
+            .filter_map(|(dir, v)| Some((dir, v.as_str()?)))
+            .collect();
+        pins.sort();
+        for (dir, name) in pins {
+            out.push(row(
+                manager,
+                label,
+                FactKind::PinnedByOverride,
+                Some(name.to_string()),
+                format!("pinned for {dir} in {} [overrides]", file.file_name),
+                now,
+            ));
+        }
+    }
     if let Some(name) = declared {
         out.push(row(
             manager,
@@ -647,7 +784,7 @@ pub fn collect_within(
     for (decl, probes) in &managers {
         for probe in probes {
             let remaining = budget.saturating_sub(started.elapsed());
-            let Some((program, args)) = probe.invocation() else {
+            let Some(command) = probe.invocation() else {
                 rows.extend(settings_probe(runner, &registry, decl, units, now));
                 continue;
             };
@@ -666,8 +803,7 @@ pub fn collect_within(
                 runner,
                 decl,
                 *probe,
-                program,
-                args,
+                command,
                 remaining.min(probe_timeout),
                 now,
             ));

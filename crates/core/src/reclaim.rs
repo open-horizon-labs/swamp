@@ -111,22 +111,28 @@ pub fn scope_statement(projects: usize, roots: &[DeclaredRoot], explicit: bool) 
             DeclaredState::Present { .. } | DeclaredState::CoveredBy { .. } => {}
         }
     }
-    let mut base = format!(
-        "consumer evidence checked against {projects} {projects_word} in {} declared {}",
-        roots.len(),
-        plural(roots.len(), "root", "roots"),
-    );
     if roots.is_empty() {
-        base.push_str(" (the built-in default roots only; a project elsewhere was not checked)");
+        because.push("no source roots are declared".to_string());
     }
     let complete = because.is_empty();
-    let statement = if complete {
-        base
-    } else {
+    let statement = if roots.is_empty() {
         format!(
-            "{base}; incomplete: {}; a tool used only outside what was checked appears here with none listed",
-            because.join("; ")
+            "consumer evidence covers the built-in default roots only ({projects} {projects_word}); declare your source roots with `swamp config add-root`"
         )
+    } else {
+        let base = format!(
+            "consumer evidence checked against {projects} {projects_word} in {} declared {}",
+            roots.len(),
+            plural(roots.len(), "root", "roots"),
+        );
+        if complete {
+            base
+        } else {
+            format!(
+                "{base}; incomplete: {}; a tool used only outside what was checked appears here with none listed",
+                because.join("; ")
+            )
+        }
     };
     ScopeStatement {
         projects,
@@ -180,19 +186,51 @@ pub struct ManagerQuote {
     pub quote: String,
     /// Who said it: `Homebrew reports unneeded (brew autoremove)`.
     pub attribution: String,
+    /// When the pass that recorded it ran.
+    pub observed_at: u64,
+    /// Whole days between that pass and the observation this listing
+    /// shows (0 when it ran with or after it).
+    pub days_before_listing: u64,
+    /// The pass is older than the observation beside it: a later
+    /// observation did not run one.
+    pub older_than_listing: bool,
+    /// What the statement covers when it names less than the folder it
+    /// sits on (one version of a tool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covers: Option<String>,
 }
 
 impl ManagerQuote {
-    /// The line a row shows: the attribution, then the manager's words.
+    /// The line a row shows: the attribution, the manager's words, and
+    /// when it said them.
     pub fn line(&self) -> String {
-        format!("{}: \"{}\"", self.attribution, self.quote)
+        let age = if self.older_than_listing {
+            format!(
+                "quoted {} day{} before this listing; older than this listing",
+                self.days_before_listing,
+                if self.days_before_listing == 1 { "" } else { "s" }
+            )
+        } else {
+            "quoted from the pass beside this listing".to_string()
+        };
+        let covers = self
+            .covers
+            .as_deref()
+            .map(|c| format!("; {c}"))
+            .unwrap_or_default();
+        format!("{}: \"{}\" ({age}{covers})", self.attribution, self.quote)
     }
 }
+
+/// A pass this much older than the observation is not "beside" it.
+const SAME_PASS_SLACK_SECS: u64 = 3_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldKind {
     ActiveDefault,
+    /// A toolchain the manager's settings pin for a directory.
+    PinnedByOverride,
     InstalledOnRequest,
     /// The manager's own record of what is a default could not be read.
     Unknown,
@@ -216,6 +254,7 @@ impl Hold {
     pub fn short(&self) -> &'static str {
         match self.kind {
             HoldKind::ActiveDefault => "active default",
+            HoldKind::PinnedByOverride => "pinned by override",
             HoldKind::InstalledOnRequest => "installed on request",
             HoldKind::Unknown => "standing unknown",
         }
@@ -503,7 +542,7 @@ fn regeneration_of(
     let (class, default_words) = crate::locations::regeneration_for_category(u.category);
     if let Some((words, adapter)) = tool_consequence(u, interiors) {
         return Regeneration {
-            class,
+            class: class_from_consequence(&words, class),
             words,
             source: format!("tool consequence text ({adapter} build adapter)"),
         };
@@ -530,6 +569,33 @@ fn regeneration_of(
         words: default_words.to_string(),
         source: "category default".to_string(),
     }
+}
+
+/// The class a consequence text supports. The category's class is only a
+/// default: the tool's own words win. Text that says the bytes are gone or
+/// unique is not regenerable; text that says removal breaks something is
+/// not established; text that names a download or a rebuild keeps the
+/// category's class (rebuild wording picks Rebuild); anything else says
+/// nothing about cost, so the class is not established.
+fn class_from_consequence(words: &str, category_class: RegenClass) -> RegenClass {
+    let w = words.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| w.contains(n));
+    if has(&["are gone", "is gone", "cannot", "may be unique", "starts empty", "is lost"]) {
+        return RegenClass::NotRegenerable;
+    }
+    if has(&["breaks"]) {
+        return RegenClass::NotEstablished;
+    }
+    if has(&["rebuild", "recompile", "regenerat"]) && !has(&["download", "reinstall"]) {
+        return RegenClass::Rebuild;
+    }
+    if has(&["download", "reinstall", "fetch", "unpacks", "install again"]) {
+        return match category_class {
+            RegenClass::Rebuild => RegenClass::Rebuild,
+            _ => RegenClass::Download,
+        };
+    }
+    RegenClass::NotEstablished
 }
 
 /// The consequence a build adapter stated for this unit's own interior:
@@ -568,12 +634,35 @@ fn tool_consequence(
     ))
 }
 
-fn quote(decl: &ManagerDecl, probe: ManagerProbe, f: &ManagerFact) -> ManagerQuote {
+fn quote(
+    decl: &ManagerDecl,
+    probe: ManagerProbe,
+    f: &ManagerFact,
+    listing_at: u64,
+) -> ManagerQuote {
+    let older = f.observed_at + SAME_PASS_SLACK_SECS < listing_at;
+    let subject = f.subject.clone().unwrap_or_default();
+    let covers = match (decl.subject, subject.rsplit_once('@')) {
+        (crate::locations::SubjectShape::NameBeforeAt, Some((_, version))) if !version.is_empty() => {
+            Some(format!(
+                "names version {version} only; other versions of this tool are not covered"
+            ))
+        }
+        _ => None,
+    };
     ManagerQuote {
         manager: decl.manager.to_string(),
-        subject: f.subject.clone().unwrap_or_default(),
+        subject,
         quote: f.text.clone(),
-        attribution: manager_facts::attribution(decl.display, probe),
+        attribution: manager_facts::attribution(decl.display, probe, f.kind),
+        observed_at: f.observed_at,
+        days_before_listing: if older {
+            (listing_at - f.observed_at) / 86_400
+        } else {
+            0
+        },
+        older_than_listing: older,
+        covers,
     }
 }
 
@@ -594,6 +683,7 @@ struct ManagerJoin {
 fn hold_kind_of(kind: FactKind) -> HoldKind {
     match kind {
         FactKind::InstalledOnRequest => HoldKind::InstalledOnRequest,
+        FactKind::PinnedByOverride => HoldKind::PinnedByOverride,
         _ => HoldKind::ActiveDefault,
     }
 }
@@ -651,27 +741,21 @@ fn join_manager(
     managed: &HashMap<usize, ManagerDecl>,
     index: usize,
     facts: &ManagerFacts,
+    listing_at: u64,
 ) -> ManagerJoin {
     let u = &units[index];
     let decl = &managed[&index];
     let mut join = ManagerJoin::default();
     let folder = u.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let has_remainder = u
-        .children
-        .iter()
-        .any(|c| c.kind == ChildKind::Remainder && c.entries > 0);
-    let listed_all = u.children.is_empty();
     for probe in decl.probes {
-        let kind = probe.kind();
-        for f in facts
-            .facts
-            .iter()
-            .filter(|f| f.manager == decl.manager && f.probe == probe.label() && f.kind == kind)
-        {
+        for f in facts.facts.iter().filter(|f| {
+            f.manager == decl.manager && f.probe == probe.label() && probe.kinds().contains(&f.kind)
+        }) {
+            let kind = f.kind;
             let Some(subject) = f.subject.as_deref() else {
                 continue;
             };
-            let label = manager_facts::attribution(decl.display, *probe);
+            let label = manager_facts::attribution(decl.display, *probe, kind);
             let to_unit =
                 !folder.is_empty() && manager_facts::subject_matches(decl.subject, subject, folder);
             let matched: Vec<usize> = u
@@ -694,7 +778,7 @@ fn join_manager(
                         true,
                     );
                 } else {
-                    join.unit_quotes.push(quote(decl, *probe, f));
+                    join.unit_quotes.push(quote(decl, *probe, f, listing_at));
                 }
             } else if !matched.is_empty() {
                 for i in matched {
@@ -708,7 +792,7 @@ fn join_manager(
                         join.child_quotes
                             .entry(i)
                             .or_default()
-                            .push(quote(decl, *probe, f));
+                            .push(quote(decl, *probe, f, listing_at));
                     }
                 }
             } else if decl.catch_all
@@ -716,14 +800,14 @@ fn join_manager(
             {
                 if kind.holds() {
                     // It may be inside what this unit lists only in
-                    // aggregate: the remainder row, or a unit with no
-                    // drilldown at all.
-                    if has_remainder || listed_all {
-                        join.unmatched_hold_subjects.push(subject.to_string());
-                        join.unmatched_hold_kind = Some(hold_kind_of(kind));
-                    }
+                    // aggregate (the remainder row, or a unit with no
+                    // drilldown), or under a name swamp cannot map to a
+                    // folder. Either way the standing is unknown, and
+                    // unknown is held out: the whole unit.
+                    join.unmatched_hold_subjects.push(subject.to_string());
+                    join.unmatched_hold_kind = Some(hold_kind_of(kind));
                 } else {
-                    join.unit_quotes.push(quote(decl, *probe, f));
+                    join.unit_quotes.push(quote(decl, *probe, f, listing_at));
                 }
             }
         }
@@ -735,11 +819,11 @@ fn join_manager(
             .probes
             .iter()
             .find(|p| p.kind().holds() && hold_kind_of(p.kind()) == kind)
-            .map(|p| manager_facts::attribution(decl.display, *p))
+            .map(|p| manager_facts::attribution(decl.display, *p, p.kind()))
             .unwrap_or_default();
         join.unit_hold = Some(Hold {
             kind,
-            label: format!("{probe_label}; not separable from this unit"),
+            label: format!("{probe_label}; not separable from this unit (no listed folder matches)"),
             subjects: join.unmatched_hold_subjects.clone(),
             whole_unit: true,
         });
@@ -869,7 +953,15 @@ fn unit_row(
     let regeneration = regeneration_of(u, input.interiors);
     let join = managed
         .contains_key(&index)
-        .then(|| join_manager(input.units, managed, index, input.manager_facts));
+        .then(|| {
+            join_manager(
+                input.units,
+                managed,
+                index,
+                input.manager_facts,
+                input.observed_at,
+            )
+        });
     let (held, unit_quotes, unit_hold) = match &join {
         Some(j) => (
             held_bytes_of(u, j),
@@ -1074,6 +1166,34 @@ fn unjoined_notes(
         }
     }
     decls.sort_by_key(|d| d.manager);
+    // A default or pin the manager names that matches no measured folder
+    // is said, never dropped.
+    for decl in &decls {
+        for f in &input.manager_facts.facts {
+            if f.manager != decl.manager
+                || !matches!(f.kind, FactKind::ActiveDefault | FactKind::PinnedByOverride)
+            {
+                continue;
+            }
+            let Some(subject) = f.subject.as_deref() else {
+                continue;
+            };
+            if !claimed_elsewhere(input.units, managed, usize::MAX, decl.manager, subject) {
+                let what = if f.kind == FactKind::PinnedByOverride {
+                    "pinned by override"
+                } else {
+                    "default"
+                };
+                let note = format!(
+                    "{}: {what}: {subject}, no matching folder found in the measured units",
+                    decl.display
+                );
+                if !out.contains(&note) {
+                    out.push(note);
+                }
+            }
+        }
+    }
     for decl in decls {
         for probe in decl.probes.iter().filter(|p| !p.kind().holds()) {
             let subjects: Vec<&str> = input
@@ -1236,8 +1356,9 @@ pub fn render_text(view: &ReclaimView) -> String {
     let t = &view.totals;
     let _ = writeln!(
         out,
-        "\n{} units, {} allocated. Regenerable kinds: {} ({} more held out as defaults, installed on request, or unknown standing). Not regenerable: {}. Cost not established: {}.",
+        "\n{} unit{}, {} allocated. Regenerable kinds: {} ({} more held out as defaults, installed on request, or unknown standing). Not regenerable: {}. Cost not established: {}.",
         t.count,
+        if t.count == 1 { "" } else { "s" },
         human_bytes_pub(t.bytes),
         human_bytes_pub(t.regenerable_bytes),
         human_bytes_pub(t.held_bytes),

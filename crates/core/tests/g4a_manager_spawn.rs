@@ -82,14 +82,15 @@ fn not_observed(rows: &[swamp_core::manager_facts::ManagerFact]) -> Vec<&str> {
 fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn() {
     let dir = tempfile::tempdir().unwrap();
     // SAFETY: this file has exactly one test, so no other thread reads or
-    // writes the environment while it runs.
-    unsafe { std::env::set_var("PATH", dir.path()) };
+    // writes the environment while it runs. Under the `testing` feature
+    // the program directory is what the resolver reads; PATH is never used.
+    unsafe { std::env::set_var("SWAMP_TEST_PROGRAM_DIR", dir.path()) };
 
     // A binary that is not there: the tempting wrong patch is an error
     // that fails the observation. Each attempt is counted, and each probe
     // says why it has no answer.
     let (rows, spawns, _) = run(Duration::from_secs(2));
-    assert_eq!(spawns, 4, "every attempt is a counted spawn");
+    assert_eq!(spawns, 0, "nothing is started for a program that is not there");
     let notes = not_observed(&rows);
     assert!(notes.len() >= 4, "{notes:?}");
     assert!(
@@ -142,7 +143,7 @@ fn the_real_spawn_layer_turns_every_failure_into_a_note_and_counts_every_spawn()
     shim(
         dir.path(),
         "brew",
-        "case \"$1\" in autoremove) printf 'Would autoremove 2 unneeded formulae:\\nlibevent\\nunbound\\n';; list) printf 'ansible\\natuin\\n';; esac",
+        "case \"$1\" in autoremove) printf '==> Would autoremove 2 unneeded formulae:\\nlibevent\\nunbound\\n';; list) printf 'ansible\\natuin\\n';; esac",
     );
     shim(
         dir.path(),
