@@ -654,11 +654,11 @@ and the consequence "rebuild with `cargo build`".
   use relative paths), so none is named and none is guessed.
 - A project's own `target/` is a build artifact of that project and is
   counted once there, never also as a standalone target.
-- It is plannable through the same reviewed Trash flow as any build output
-  (`swamp propose <path>`, or mark it in the TUI's unowned view). The
-  confirm line says what it is, what a rebuild costs, and shows the in-use
-  reading taken when it was planned. Nothing is removed without the human's
-  Enter.
+- It is plannable through the same reviewed Trash flow as any build output:
+  mark it in the TUI's unowned view (the plan is `actions::propose`'s, the
+  same call every other plan unit goes through). The confirm line says what
+  it is, what a rebuild costs, and shows the in-use reading taken when it
+  was planned. Nothing is removed without the human's Enter.
 - Only roots you declare are scanned; `/private/tmp` is not in the default
   scope.
 

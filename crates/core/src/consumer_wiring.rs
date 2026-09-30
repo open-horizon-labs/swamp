@@ -1246,6 +1246,61 @@ mod tests {
         }
     }
 
+    /// DerivedData's own `LastAccessedDate` goes onto the unit (the newest
+    /// of its projects) and onto each project's own row by folder name,
+    /// and beats a newer key-file access time.
+    #[test]
+    fn xcode_last_accessed_beats_a_newer_access_time_and_lands_on_its_own_folder() {
+        use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
+        let child = |name: &str| UnitChild {
+            kind: ChildKind::Entry,
+            name: name.into(),
+            bytes: Some(10),
+            measure: ChildMeasure::Complete,
+            mtime_max: 5,
+            entries: 0,
+            not_measured: 0,
+            // The folder was read today.
+            last_used: crate::last_used::resolve(None, Some(1_790_000_000)),
+        };
+        let mut unit = external_unit(
+            "xcode",
+            StorageCategory::BuildOutput,
+            Path::new("/fixture/DerivedData"),
+        );
+        unit.last_used = crate::last_used::resolve(None, Some(1_790_000_000));
+        unit.children = vec![
+            child("App-abc"),
+            child("Other-def"),
+            child("Unrecorded-ghi"),
+        ];
+        apply_derived_data_last_used(
+            &mut unit,
+            &[
+                ("App-abc".to_string(), 1_788_652_800),
+                ("Other-def".to_string(), 1_788_000_000),
+            ],
+        );
+        let xcode = crate::last_used::LastUsedSource::ToolNative(
+            crate::last_used::XCODE_DERIVED_DATA.to_string(),
+        );
+        assert_eq!(unit.last_used.at, Some(1_788_652_800), "the newest record");
+        assert_eq!(unit.last_used.source, xcode);
+        assert_eq!(unit.last_used.atime, Some(1_790_000_000), "atime kept");
+        assert_eq!(unit.children[0].last_used.at, Some(1_788_652_800));
+        assert_eq!(unit.children[1].last_used.at, Some(1_788_000_000));
+        // A folder with no record keeps only what it had: its access time,
+        // labelled as such, never the unit's record.
+        assert_eq!(
+            unit.children[2].last_used.source,
+            crate::last_used::LastUsedSource::FileAtime
+        );
+        // Nothing recorded at all leaves the unit untouched.
+        let before = unit.last_used.clone();
+        apply_derived_data_last_used(&mut unit, &[]);
+        assert_eq!(unit.last_used, before);
+    }
+
     fn empty_report(root: &Path, projects: Vec<ProjectRow>) -> Report {
         Report {
             store_dir: None,

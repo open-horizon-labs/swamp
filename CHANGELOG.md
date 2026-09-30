@@ -30,7 +30,9 @@ observations, not general performance guarantees. See the README for current use
   `CARGO_TARGET_DIR` built into (Cargo's `CACHEDIR.TAG` signature and
   `.rustc_info.json`), inside a root you declared, shows as `standalone-cargo-target`
   with its size, age and "rebuild with `cargo build`" instead of unowned residual, and
-  can be planned for the Trash with the usual in-use reading. A directory with only the
+  can be planned for the Trash with the usual in-use reading. Declared over `/private/tmp`
+  here it found the four from the report (6.65, 1.66, 1.25 and 1.11 GB, matching `du`) and
+  every other worker's `CARGO_TARGET_DIR`, 53 GB in 24 directories. A directory with only the
   tag (pytest, uv) is not called Cargo's, and a project's own `target/` is still counted
   once, under the project.
 - **The overlap note is data now.** The bytes a unit holds that are counted under
@@ -38,6 +40,12 @@ observations, not general performance guarantees. See the README for current use
   `--json` and the store; the sentence is rendered from them. This is a store-format
   change: the first `swamp observe` after upgrading rebuilds the derived tables
   (configuration, protection, notes and the ledger are kept).
+- **Upgrading rebuilds the index, and `swamp ui` says so.** The store format moved to
+  3. On a copy of this machine's real store the first `swamp observe` reset the derived
+  tables and rescanned in 39 s (an incremental pass is 12 s, the same as v0.7.5's). Until
+  it lands, `swamp ui` still paints in about 0.06 s and shows "written by an older swamp,
+  rebuilt in the background" instead of "nothing has been scanned". Settings, protections,
+  notes, the ledger and the first-run answer are kept; growth history restarts.
 - **An adapter change under the same catalog version no longer replays old rows.** The
   stored identification of build stores now carries a digest of the adapters' source,
   so developers no longer need `swamp observe --full` after editing an adapter.
