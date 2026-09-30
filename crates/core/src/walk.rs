@@ -1313,9 +1313,14 @@ fn process_size(
     let _entered = crate::beacon::enter("walk", &path);
     // Dataless placeholder: not listed, so not fetched (#190); counted as
     // an unreadable directory (incomplete), never as an empty one.
+    // The directory's own `lstat`, taken before listing so a dataless
+    // placeholder is known before `read_dir` could fetch it; reused below
+    // for the stamp and mtime, so it costs no extra call.
     crate::work_counters::record_files_statted(1);
-    let dataless = crate::fs_gate::symlink_metadata(&path)
-        .is_ok_and(|m| crate::fs_gate::read::is_dataless(&m));
+    let own_meta = crate::fs_gate::symlink_metadata(&path);
+    let dataless = own_meta
+        .as_ref()
+        .is_ok_and(crate::fs_gate::read::is_dataless);
     let listed = if dataless {
         Err(std::io::Error::other("dataless directory"))
     } else {
@@ -1360,8 +1365,6 @@ fn process_size(
     let mut file_count: u32 = 0;
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
-    crate::work_counters::record_files_statted(1);
-    let own_meta = crate::fs_gate::symlink_metadata(&path);
     if shared.stamp_dirs
         && let Ok(m) = own_meta.as_ref()
     {
