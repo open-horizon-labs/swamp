@@ -310,11 +310,6 @@ fn preview_text(p: &Preview) -> String {
     all.join("\n")
 }
 
-/// Tempting wrong patch: "trust `mise uninstall` to refuse a version a
-/// config asks for". mise's own dry run exits 0 for the global node; even
-/// with a fake prune that (wrongly) lists it, swamp refuses and names the
-/// global config.
-
 // ======================= audit attacks =======================
 
 fn review(sb: &Sandbox, t: &Target) -> Result<Preview, Refusal> {
