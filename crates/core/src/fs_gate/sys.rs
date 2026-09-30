@@ -124,6 +124,17 @@ impl RegularFile {
     #[cfg(unix)]
     pub fn open_nofollow(path: &Path) -> io::Result<RegularFile> {
         use std::os::unix::fs::OpenOptionsExt;
+        // Refuse by `lstat` first, never by opening: opening a FIFO's read
+        // end, even non-blocking, releases a writer parked on it, whose
+        // next write then fails with EPIPE once this end closes (#190).
+        // The O_NOFOLLOW|O_NONBLOCK open and `fstat` below stay as the
+        // backstop for a swap between the two calls.
+        if !std::fs::symlink_metadata(path)?.is_file() {
+            return Err(io::Error::other(format!(
+                "not a regular file: {}",
+                path.display()
+            )));
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -256,4 +267,39 @@ pub fn is_enospc(e: &io::Error) -> bool {
 #[cfg(not(unix))]
 pub fn is_enospc(_e: &io::Error) -> bool {
     false
+}
+
+#[cfg(all(test, unix))]
+mod open_nofollow_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Tempting wrong patch (the old code): "O_NONBLOCK makes the open
+    /// safe, then fstat refuses". Safe for swamp; the writer parked on
+    /// the FIFO is released and loses its data.
+    #[test]
+    fn refusing_a_fifo_does_not_wake_a_waiting_writer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("member");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let (tx, rx) = mpsc::channel::<()>();
+        let w = fifo.clone();
+        std::thread::spawn(move || {
+            let _f = std::fs::OpenOptions::new().write(true).open(&w);
+            let _ = tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(RegularFile::open_nofollow(&fifo).is_err());
+        let woke = rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        if !woke {
+            use std::os::unix::fs::OpenOptionsExt;
+            let _r = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        assert!(!woke, "the refusal opened the FIFO and released its writer");
+    }
 }
