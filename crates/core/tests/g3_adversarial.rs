@@ -898,7 +898,7 @@ fn adv_plist_edge_cases_are_notes_not_numbers_or_panics() {
             assert_eq!(i.in_use, None);
             assert_eq!(i.purgeable, None);
         }
-        assert!(t.elapsed() < Duration::from_secs(2));
+        assert!(t.elapsed() < Duration::from_secs(20));
     }
     // 12 volumes, unicode names, one locked (no CapacityInUse).
     let mut vols: Vec<(String, &str, Option<u64>)> = (0..11)

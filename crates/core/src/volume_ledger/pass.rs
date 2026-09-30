@@ -858,7 +858,10 @@ fn measure_dir_shared(
 struct Finished {
     task: Task,
     outcome: Outcome,
-    started: Duration,
+    /// The first task this worker took in the run: it had the whole walk
+    /// to itself, however loaded the machine was (a wall-clock test of
+    /// "started early" is not).
+    first: bool,
 }
 
 /// What the workers left when the pass stopped waiting for them.
@@ -881,7 +884,6 @@ fn run_tasks(
     shared: Arc<WalkShared>,
     deadline: Instant,
     hard_deadline: Instant,
-    t0: Instant,
     workers: usize,
 ) -> Ran {
     let next = Arc::new(AtomicUsize::new(0));
@@ -900,6 +902,7 @@ fn run_tasks(
         std::thread::spawn(move || {
             crate::work_counters::install(counters);
             crate::fs_gate::sys::lower_current_thread_priority();
+            let mut first = true;
             loop {
                 let i = next.fetch_add(1, Ordering::SeqCst);
                 let Some(task) = tasks.get(i) else { break };
@@ -907,7 +910,7 @@ fn run_tasks(
                     break;
                 }
                 slot.0.store(i, Ordering::SeqCst);
-                let started = t0.elapsed();
+                let was_first = std::mem::replace(&mut first, false);
                 let outcome = if task.files_only {
                     measure_files_only(&*fs, &shared, &task.path, deadline, &slot.1)
                 } else {
@@ -919,7 +922,7 @@ fn run_tasks(
                     .push(Finished {
                         task: task.clone(),
                         outcome,
-                        started,
+                        first: was_first,
                     });
             }
             alive.fetch_sub(1, Ordering::SeqCst);
@@ -939,7 +942,7 @@ fn run_tasks(
                 finished.push(Finished {
                     task: task.clone(),
                     outcome: Outcome::Stuck(at),
-                    started: Duration::ZERO,
+                    first: false,
                 });
             }
         }
@@ -967,7 +970,6 @@ fn rows_for(
     mounts: &[MountView],
     prev: &HashMap<String, Row>,
     finished: &Finished,
-    budget: Duration,
     now: u64,
 ) -> Vec<Row> {
     let key = finished.task.key();
@@ -1084,9 +1086,9 @@ fn rows_for(
             });
         }
         Outcome::Aborted => {
-            // A task that was running from the start of the run and still
-            // did not finish took the whole budget by itself.
-            if finished.started <= budget / 10 {
+            // A worker's first task of the run had the whole walk to itself:
+            // if it still did not finish, it took the whole budget by itself.
+            if finished.first {
                 rows.push(if finished.task.files_only {
                     Row {
                         path: key,
@@ -1574,7 +1576,6 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
         shared.clone(),
         deadline,
         hard_deadline,
-        t0,
         inputs.workers,
     );
     let finished = ran.finished;
@@ -1594,7 +1595,7 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
     let mut replaced_keys: HashSet<String> = HashSet::new();
     let mut measured = 0usize;
     for f in &finished {
-        let rows = rows_for(&mounts, &by_key, f, budget, now);
+        let rows = rows_for(&mounts, &by_key, f, now);
         match &f.outcome {
             Outcome::Stuck(_) => {
                 replaced_keys.insert(f.task.key());
