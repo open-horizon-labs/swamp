@@ -820,6 +820,7 @@ fn bound_interior_units(value: &mut serde_json::Value, limit: usize, offset: usi
 
 #[allow(clippy::too_many_arguments)]
 fn report_json_envelope(
+    all_rows: bool,
     r: &Report,
     root: &Path,
     view: Option<View>,
@@ -897,7 +898,7 @@ fn report_json_envelope(
                     "total_bytes": filtered.iter().map(|u| u.bytes).sum::<u64>(),
                 })
             }
-            View::Disk => disk_json_now(&store_dir),
+            View::Disk => disk_json_now(&store_dir, all_rows),
             _ => swamp_core::agent_json::view_payload(&rr, &name, project),
         };
         let page = swamp_core::agent_json::paginate(&mut result, limit, offset);
@@ -942,7 +943,7 @@ fn report_json_envelope(
     value["since"] = serde_json::json!(since_str);
     value["index_refreshed"] = serde_json::json!(index_refreshed);
     // The whole-disk ledger, read from the store (never a walk).
-    value["disk"] = disk_json_now(&store_dir);
+    value["disk"] = disk_json_now(&store_dir, all_rows);
     if !scope_coverage.is_empty() {
         value["scope_coverage"] = serde_json::json!(scope_coverage);
     }
@@ -976,11 +977,13 @@ fn report_json_envelope(
 /// The volume ledger as JSON, read now from the store. A store that
 /// cannot be read is `measured: false` with the reason, never an error
 /// for the report around it.
-fn disk_json_now(store_dir: &Path) -> serde_json::Value {
+fn disk_json_now(store_dir: &Path, all: bool) -> serde_json::Value {
     match swamp_core::volume_ledger::read_account(store_dir) {
-        Ok(account) => {
-            swamp_core::volume_ledger::disk_json(account.as_ref(), swamp_core::entities::now())
-        }
+        Ok(account) => swamp_core::volume_ledger::disk_json(
+            account.as_ref(),
+            swamp_core::entities::now(),
+            (!all).then_some(swamp_core::volume_ledger::DEFAULT_JSON_ROWS),
+        ),
         Err(e) => serde_json::json!({
             "measured": false,
             "note": format!("the volume ledger could not be read: {e}"),
@@ -1179,7 +1182,7 @@ fn main() -> Result<()> {
                     let envelope = serde_json::json!({
                         "view": "disk",
                         "project": serde_json::Value::Null,
-                        "result": disk_json_now(&store_dir),
+                        "result": disk_json_now(&store_dir, all),
                     });
                     safe_println!("{}", serde_json::to_string_pretty(&envelope)?);
                 } else {
@@ -1280,6 +1283,7 @@ fn main() -> Result<()> {
             };
             if json {
                 let mut value = report_json_envelope(
+                    all,
                     &r,
                     &root,
                     view,

@@ -454,7 +454,7 @@ fn accounted_src() -> Vec<Accounted> {
 
 struct Setup {
     store: tempfile::TempDir,
-    fs: FakeFs,
+    fs: std::sync::Arc<FakeFs>,
     layout: Layout,
     probe: FakeProbe,
     space: FakeSpace,
@@ -465,7 +465,7 @@ impl Setup {
     fn new() -> Setup {
         Setup {
             store: tempfile::tempdir().unwrap(),
-            fs: world(),
+            fs: std::sync::Arc::new(world()),
             layout: layout(),
             probe: good_probe(),
             space: FakeSpace(Some((
@@ -490,7 +490,7 @@ impl Setup {
             budget,
             force,
             layout: &self.layout,
-            fs: &self.fs,
+            fs: self.fs.clone(),
             probe: &self.probe,
             space: &self.space,
             accounted: &self.accounted,
@@ -740,7 +740,7 @@ fn adv_a_corrupt_ledger_file_does_not_wedge_every_future_pass() {
         budget: Duration::from_secs(60),
         force: true,
         layout: &s.layout,
-        fs: &s.fs,
+        fs: s.fs.clone(),
         probe: &s.probe,
         space: &s.space,
         accounted: &s.accounted,
@@ -873,7 +873,7 @@ fn adv_reading_a_200k_row_ledger_does_zero_work() {
     let (_, work) = swamp_core::work_counters::measured(|| {
         let a = read_account(s.store.path()).unwrap();
         let _ = render_disk_view(a.as_ref(), NOW);
-        let _ = swamp_core::volume_ledger::disk_json(a.as_ref(), NOW);
+        let _ = swamp_core::volume_ledger::disk_json(a.as_ref(), NOW, None);
     });
     assert_eq!(
         (work.dirs_listed, work.files_statted, work.subprocess_spawns),

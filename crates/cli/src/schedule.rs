@@ -150,8 +150,12 @@ pub fn cmd_observe(
             };
             append_log(&log_file(), &outcome)?;
             write_last_run(&store_dir, &outcome)?;
-            volume_step(&store_dir, &config, &pass_scope, &observation, volume)?;
+            // The observation is over: its lock is released before the volume
+            // pass starts, and the pass takes its own (`volume-pass.lock`), so
+            // a slow or stuck pass never makes a scheduled observe say
+            // "another observation is running".
             drop(lock);
+            volume_step(&store_dir, &config, &pass_scope, &observation, volume)?;
             Ok(())
         }
         Ok(Err(e)) => {
@@ -220,7 +224,15 @@ fn volume_step(
         }
         return Ok(());
     }
-    match run_after_observation(store_dir, config, scope, observation, &home, force) {
+    let mut config = config.clone();
+    if config.volume_pass_budget_secs < 5 {
+        safe_println!(
+            "volume_pass_budget_secs = {} is below the 5 s minimum; using 5",
+            config.volume_pass_budget_secs
+        );
+        config.volume_pass_budget_secs = 5;
+    }
+    match run_after_observation(store_dir, &config, scope, observation, &home, force) {
         Ok(PassOutcome::Ran(summary)) => safe_println!("{}", summary.line()),
         Ok(PassOutcome::Skipped(line)) => safe_println!("{line}"),
         Ok(PassOutcome::NotDue(_)) => {}

@@ -154,7 +154,7 @@ fn view_disk_reads_the_stored_ledger_with_ages_and_the_named_residual() {
         "Not measured: 1 folders could not be read",
         "/Users/x/Pictures",
         "Full Disk Access",
-        "Unattributed: APFS accounting, TCC-blocked, clones",
+        "Unattributed: allocation not explained by any measured part",
     ] {
         assert!(text.contains(needle), "missing {needle:?} in\n{text}");
     }

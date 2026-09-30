@@ -3271,6 +3271,23 @@ pub fn store_marker_is_foreign(swamp_dir: &Path) -> Result<bool> {
     Ok(dir.has_incompatible_marker()? || dir.is_newer_generation()?)
 }
 
+/// The volume pass's own lock (`volume-pass.lock`): `Ok(None)` when
+/// another pass holds it.
+pub fn try_lock_volume_pass(
+    swamp_dir: &Path,
+) -> Result<Option<crate::fs_gate::continuity::FileLock>> {
+    Ok(store::StoreDir::at(swamp_dir)?.try_lock_volume_pass()?)
+}
+
+/// Moves an unreadable ledger (and its meta) aside so the next pass can
+/// start fresh.
+pub fn quarantine_volume_ledger(swamp_dir: &Path, stamp: u64) -> Result<()> {
+    let dir = store::StoreDir::at(swamp_dir)?;
+    dir.quarantine_file("volume_ledger.parquet", stamp)?;
+    dir.quarantine_file("volume_ledger_meta.parquet", stamp)?;
+    Ok(())
+}
+
 /// `(rows, meta)`; an absent ledger is `(empty, None)`, not an error.
 pub fn read_volume_ledger(
     swamp_dir: &Path,

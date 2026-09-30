@@ -117,20 +117,43 @@ pub fn render_text(a: &Account, now: u64) -> String {
             super::MAX_NAMED_ROWS
         ));
     }
+    if a.not_measured.not_yet_measured > 0 {
+        out.push_str(&format!(
+            "Not measured yet this pass: {} locations (the pass continues at the next observe)\n",
+            a.not_measured.not_yet_measured
+        ));
+        for name in a.not_measured.not_yet_measured_names.iter().take(10) {
+            out.push_str(&format!("  {name}\n"));
+        }
+    }
     if let Some(est) = a.not_measured.estimate_bytes {
         out.push_str(&format!(
-            "{}: {} (the Data volume's own size minus everything measured above; an estimate)\n",
+            "{}: {} (the Data volume's own size minus everything measured above; an estimate, not a measurement)\n",
             capitalize(a.not_measured.estimate_name),
             human(est)
         ));
     }
     match (a.residual.bytes, a.residual.percent_of_used) {
-        (Some(b), Some(p)) => out.push_str(&format!(
-            "{}: {} ({p:+.2}% of used)\n",
-            capitalize(a.residual.name),
-            signed(b)
-        )),
+        (Some(b), Some(p)) => {
+            out.push_str(&format!(
+                "{}: {} ({p:+.2}% of used)\n",
+                capitalize(a.residual.name),
+                signed(b)
+            ));
+            if a.residual.residual_flag {
+                out.push_str(
+                    "FLAG: the parts do not add up to the container's used bytes (unattributed is outside the 1% tolerance); a measurement above may be missing or wrong\n",
+                );
+            }
+        }
         _ => out.push_str(&format!("{}: not computed\n", capitalize(a.residual.name))),
+    }
+    if !a.external_volumes.is_empty() {
+        out.push_str("On other volumes (not part of this container, not added):\n");
+        for r in &a.external_volumes {
+            out.push_str(&row_line(r, now));
+            out.push('\n');
+        }
     }
     if !a.mounted_views.is_empty() {
         out.push_str("Mounted disk images (not added: their bytes are the image files counted where they are stored):\n");
@@ -171,13 +194,20 @@ fn row_json(r: &Row, now: u64) -> serde_json::Value {
 
 /// The `disk` object of `report --json` and the result of `--view disk
 /// --json`.
-pub fn to_json(a: &Account, now: u64) -> serde_json::Value {
-    let rows: Vec<serde_json::Value> = a
+pub fn to_json(a: &Account, now: u64, limit: Option<usize>) -> serde_json::Value {
+    let mut listed: Vec<&Row> = a
         .rows
         .iter()
         .filter(|r| r.method != super::METHOD_EXPANDED)
-        .map(|r| row_json(r, now))
         .collect();
+    let rows_total = listed.len();
+    if let Some(n) = limit {
+        // The largest rows first; the totals above cover every row.
+        listed.sort_by(|x, y| y.bytes.cmp(&x.bytes).then(x.path.cmp(&y.path)));
+        listed.truncate(n);
+    }
+    let rows_truncated = listed.len() < rows_total;
+    let rows: Vec<serde_json::Value> = listed.iter().map(|r| row_json(r, now)).collect();
     json!({
         "measured_at": a.measured_at,
         "age_secs": now.saturating_sub(a.measured_at),
@@ -207,6 +237,8 @@ pub fn to_json(a: &Account, now: u64) -> serde_json::Value {
         "not_measured": {
             "count": a.not_measured.count,
             "names": a.not_measured.names,
+            "not_yet_measured": a.not_measured.not_yet_measured,
+            "not_yet_measured_names": a.not_measured.not_yet_measured_names,
             "estimate_bytes": a.not_measured.estimate_bytes,
             "estimate_name": a.not_measured.estimate_name,
         },
@@ -215,10 +247,14 @@ pub fn to_json(a: &Account, now: u64) -> serde_json::Value {
             "bytes": a.residual.bytes,
             "percent_of_used": a.residual.percent_of_used,
             "within_one_percent": a.residual.within_one_percent,
+            "residual_flag": a.residual.residual_flag,
         },
+        "external_volumes": a.external_volumes.iter().map(|r| row_json(r, now)).collect::<Vec<_>>(),
         "mounted_views": a.mounted_views.iter().map(|r| row_json(r, now)).collect::<Vec<_>>(),
         "notes": a.notes,
         "rows": rows,
+        "rows_total": rows_total,
+        "rows_truncated": rows_truncated,
     })
 }
 
@@ -233,12 +269,16 @@ pub fn render_disk_view(a: Option<&Account>, now: u64) -> String {
     }
 }
 
+/// Rows `report --json` carries by default; `--all` carries every row.
+pub const DEFAULT_JSON_ROWS: usize = 50;
+
 /// The JSON of `report --view disk` and the `disk` object of
-/// `report --json`: the reading, or `{"measured": false, ...}`.
-pub fn disk_json(a: Option<&Account>, now: u64) -> serde_json::Value {
+/// `report --json`: the reading (`limit` bounds the `rows` list, never
+/// the totals), or `{"measured": false, ...}`.
+pub fn disk_json(a: Option<&Account>, now: u64, limit: Option<usize>) -> serde_json::Value {
     match a {
         Some(a) => {
-            let mut v = to_json(a, now);
+            let mut v = to_json(a, now, limit);
             v["measured"] = json!(true);
             v
         }

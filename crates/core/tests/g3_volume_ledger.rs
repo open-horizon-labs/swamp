@@ -59,6 +59,9 @@ struct FakeFs {
     hooks: Mutex<Vec<Hook>>,
     lists: AtomicU64,
     stats: AtomicU64,
+    /// Listing this real path blocks until `release` is set: a hung mount.
+    block_on: Mutex<Option<PathBuf>>,
+    release: std::sync::atomic::AtomicBool,
 }
 
 fn name_of(path: &Path) -> OsString {
@@ -209,6 +212,20 @@ impl FakeFs {
         *self.slow.lock().unwrap() = Some((PathBuf::from(self.lp(logical_prefix)), delay));
     }
 
+    fn block_forever_on(&self, logical: &str) {
+        *self.block_on.lock().unwrap() = Some(PathBuf::from(self.lp(logical)));
+    }
+
+    fn touched_exactly(&self, logical: &str) -> usize {
+        let real = PathBuf::from(self.lp(logical));
+        self.touched
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| **p == real)
+            .count()
+    }
+
     fn touched_under(&self, logical_prefix: &str) -> usize {
         self.touched_real_under(&self.lp(logical_prefix))
     }
@@ -233,6 +250,10 @@ impl VolumeFs for FakeFs {
                 .starts_with(prefix.to_string_lossy().as_ref())
         {
             std::thread::sleep(d);
+        }
+        let blocked = self.block_on.lock().unwrap().as_deref() == Some(dir);
+        while blocked && !self.release.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
         }
         if self.denied.lock().unwrap().contains(dir) {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
@@ -461,7 +482,7 @@ fn accounted_src() -> Vec<Accounted> {
 
 struct Setup {
     store: tempfile::TempDir,
-    fs: FakeFs,
+    fs: std::sync::Arc<FakeFs>,
     layout: Layout,
     probe: FakeProbe,
     space: FakeSpace,
@@ -472,7 +493,7 @@ impl Setup {
     fn new() -> Setup {
         Setup {
             store: tempfile::tempdir().unwrap(),
-            fs: world(),
+            fs: std::sync::Arc::new(world()),
             layout: layout(),
             probe: good_probe(),
             space: FakeSpace(Some((
@@ -497,7 +518,7 @@ impl Setup {
             budget,
             force,
             layout: &self.layout,
-            fs: &self.fs,
+            fs: self.fs.clone(),
             probe: &self.probe,
             space: &self.space,
             accounted: &self.accounted,
@@ -775,11 +796,11 @@ fn parts_add_up_to_the_container_with_a_named_residual_for_clones_sparse_and_har
     assert_eq!(parts as i64 + residual, container_used as i64);
     assert_eq!(a.residual.within_one_percent, Some(true));
     let text = render_disk_view(Some(&a), NOW);
-    assert!(text.contains("Unattributed: APFS accounting, TCC-blocked, clones"));
+    assert!(text.contains("Unattributed: allocation not explained by any measured part"));
 }
 
 impl Setup {
-    fn new_with_world(fs: FakeFs) -> Setup {
+    fn new_with_world(fs: std::sync::Arc<FakeFs>) -> Setup {
         Setup { fs, ..Setup::new() }
     }
 }
@@ -809,7 +830,7 @@ fn what_could_not_be_read_is_an_estimate_by_elimination_and_the_parts_sum_within
     assert_eq!(a.residual.bytes, Some(0));
     assert_eq!(a.residual.within_one_percent, Some(true));
     let text = render_disk_view(Some(&a), NOW);
-    assert!(text.contains("Not measured, estimated by elimination"));
+    assert!(text.contains("Not measured (unreadable folders or not yet measured), estimated"));
     assert!(text.contains("an estimate"));
     // System volumes are separate volumes; the mounted image container
     // (disk9) is never one of them.
@@ -1219,7 +1240,7 @@ fn reading_the_ledger_lists_nothing_stats_nothing_and_spawns_nothing() {
     let (text, work) = swamp_core::work_counters::measured(|| {
         let a = read_account(s.store.path()).unwrap();
         let text = render_disk_view(a.as_ref(), NOW + 3 * 3_600);
-        let json = swamp_core::volume_ledger::disk_json(a.as_ref(), NOW + 3 * 3_600);
+        let json = swamp_core::volume_ledger::disk_json(a.as_ref(), NOW + 3 * 3_600, None);
         assert_eq!(json["measured"], true);
         text
     });
@@ -1248,7 +1269,7 @@ fn the_report_reads_the_top_five_of_everything_else_largest_first() {
         .collect();
     assert!(sizes.windows(2).all(|w| w[0] >= w[1]), "{sizes:?}");
     assert_eq!(a.everything_else.top[0].path, "/Users/me/zz7");
-    let json = swamp_core::volume_ledger::disk_json(Some(&a), NOW);
+    let json = swamp_core::volume_ledger::disk_json(Some(&a), NOW, None);
     assert_eq!(json["everything_else"]["top"].as_array().unwrap().len(), 5);
     for key in [
         "container",
@@ -1573,7 +1594,7 @@ fn units_nested_in_units_add_up_but_a_view_of_a_unit_is_added_once() {
     let added: u64 = rows.iter().map(Row::additive).sum();
     assert_eq!(
         added,
-        5_000 + 1_000 + 1_000 + 700,
+        5_000 + 1_000 + 1_000,
         "agent views inside a unit add nothing"
     );
     let view = rows
@@ -1584,8 +1605,8 @@ fn units_nested_in_units_add_up_but_a_view_of_a_unit_is_added_once() {
     assert!(view.note.as_deref().unwrap().contains("counted there"));
     let alone = rows.iter().find(|r| r.path == "/h/.codex").unwrap();
     assert_eq!(
-        alone.overlap_bytes, 0,
-        "an agent home no unit encloses is added"
+        alone.overlap_bytes, 700,
+        "an agent view is never added: the walk measures the whole folder it lives in"
     );
 }
 
@@ -1681,7 +1702,7 @@ fn no_verdict_word_appears_in_the_rendered_reading() {
     ran(&s.pass());
     let a = read_account(s.store.path()).unwrap().unwrap();
     let text = render_disk_view(Some(&a), NOW).to_lowercase();
-    let json = swamp_core::volume_ledger::disk_json(Some(&a), NOW)
+    let json = swamp_core::volume_ledger::disk_json(Some(&a), NOW, None)
         .to_string()
         .to_lowercase();
     for word in [
@@ -1695,4 +1716,257 @@ fn no_verdict_word_appears_in_the_rendered_reading() {
         assert!(!json.contains(&word), "{word} in json");
     }
     assert!(!text.contains('\u{2014}'), "no em dashes");
+}
+
+// ---- review round: hard deadline, locks, mounts, external volumes ---------
+
+#[test]
+fn a_path_that_blocks_forever_ends_the_pass_at_the_hard_deadline_and_the_next_run_continues() {
+    // Tempting wrong patch: joining the workers (a scoped thread pool), so
+    // one `lstat` on a wedged mount hangs the pass, holds its lock and
+    // starves every later run. The pass stops waiting at twice the budget,
+    // says where it was stuck, releases its lock and moves the cursor on.
+    let s = Setup::new();
+    s.fs.block_forever_on("/Users/me/Downloads");
+    let t = Instant::now();
+    let outcome = s.run_at(NOW, true, Duration::from_millis(400), Some(0));
+    assert!(
+        t.elapsed() < Duration::from_secs(8),
+        "the pass hung: {:?}",
+        t.elapsed()
+    );
+    let summary = ran(&outcome).clone();
+    assert!(!summary.complete);
+    assert!(
+        summary
+            .notes
+            .iter()
+            .any(|n| n.contains("stuck at") && n.contains("Downloads")),
+        "{:?}",
+        summary.notes
+    );
+    assert!(summary.line().contains("stuck at"), "logged with the path");
+    // Its lock is free again.
+    assert!(
+        swamp_core::growth::try_lock_volume_pass(s.store.path())
+            .unwrap()
+            .is_some(),
+        "the pass kept its lock"
+    );
+    let stuck = s
+        .row("/Users/me/Downloads")
+        .expect("the stuck folder is a row");
+    assert_eq!(stuck.bytes, None);
+    assert_eq!(stuck.exactness, Exactness::NotMeasured);
+    // The hang clears; the next run resumes from the cursor and finishes.
+    s.fs.release.store(true, Ordering::SeqCst);
+    let next = s.run_at(NOW + 1, true, Duration::from_secs(30), Some(0));
+    assert!(ran(&next).complete);
+}
+
+#[test]
+fn the_pass_lock_is_its_own_and_a_second_pass_says_so() {
+    // Tempting wrong patch: the pass sharing the observation lock, so a
+    // stuck pass makes every scheduled observe say "another observation
+    // is running".
+    let s = Setup::new();
+    let held = swamp_core::growth::try_lock_volume_pass(s.store.path())
+        .unwrap()
+        .expect("free at first");
+    match s.pass() {
+        PassOutcome::Skipped(line) => assert!(line.contains("another volume pass"), "{line}"),
+        other => panic!("{other:?}"),
+    }
+    // The observation writer lock is not the pass's.
+    let dir = swamp_core::fs_gate::StoreDir::at(s.store.path()).unwrap();
+    let _obs = dir.lock_observation_writes().unwrap();
+    drop(held);
+    assert!(
+        swamp_core::growth::try_lock_volume_pass(s.store.path())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn a_mount_point_is_never_statted_and_nothing_behind_a_remote_one_is_touched() {
+    // Tempting wrong patch: `lstat` on every child to compare devices,
+    // which is the call that hangs on a stalled network mount, before the
+    // mount table is consulted.
+    let s = Setup::new();
+    s.fs.mkdir("/Users/me/Remote", 5);
+    s.fs.file("/Users/me/Remote/deep", 5, 9_991, 1);
+    let mut mounts = s.fs.mounts();
+    mounts.push(MountView {
+        path: PathBuf::from("/Users/me/Remote"),
+        kind: MountKind::Remote,
+        used: None,
+    });
+    s.fs.set_mounts(mounts);
+    ran(&s.pass());
+    for p in [
+        "/Users/me/Remote",
+        "/Volumes/Share",
+        "/Volumes/Recovery",
+        "/Library/Developer/CoreSimulator/Volumes/iOS_1",
+    ] {
+        assert_eq!(s.fs.touched_exactly(p), 0, "{p} was statted or listed");
+        assert_eq!(s.fs.touched_under(p), 0, "{p} was entered");
+    }
+    let row = s.row("/Users/me/Remote").expect("listed, not dropped");
+    assert_eq!(row.category, Category::Mount);
+    assert_eq!(row.bytes, None);
+}
+
+#[test]
+fn a_remote_filesystem_type_is_decided_from_the_mount_table_alone() {
+    use swamp_core::volume_ledger::pass::is_remote_fs;
+    for t in [
+        "smbfs",
+        "nfs",
+        "afpfs",
+        "webdav",
+        "macfuse",
+        "fuse.sshfs",
+        "fuse",
+        "cifs",
+        "9p",
+        "autofs",
+    ] {
+        assert!(is_remote_fs(t), "{t}");
+    }
+    for t in ["apfs", "hfs", "ext4", "btrfs", "xfs"] {
+        assert!(!is_remote_fs(t), "{t}");
+    }
+}
+
+#[test]
+fn a_declared_root_on_another_volume_is_listed_apart_and_never_added() {
+    // Tempting wrong patch: adding every accounted root to the internal
+    // container's accounted bytes, so a root on an external disk makes the
+    // identity fail (or hides a gap) on the internal one.
+    let mut s = Setup::new();
+    s.accounted.push(Accounted {
+        path: PathBuf::from("/Volumes/Backup/src"),
+        bytes: 9_000_000,
+        category: Category::Declared,
+        subset_of_enclosing: false,
+        measured_at: NOW,
+        incomplete: false,
+        note: None,
+    });
+    let mut mounts = s.fs.mounts();
+    mounts.push(MountView {
+        path: PathBuf::from("/Volumes/Backup"),
+        kind: MountKind::OwnStorage,
+        used: Some(5),
+    });
+    s.fs.set_mounts(mounts);
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    assert_eq!(
+        a.accounted.bytes,
+        7_777 * 512,
+        "the external root is not added"
+    );
+    assert_eq!(a.external_volumes.len(), 1);
+    assert_eq!(a.external_volumes[0].bytes, Some(9_000_000));
+    let text = render_disk_view(Some(&a), NOW);
+    assert!(
+        text.contains("On other volumes (not part of this container"),
+        "{text}"
+    );
+    assert!(text.contains("/Volumes/Backup/src"));
+}
+
+#[test]
+fn the_json_rows_are_bounded_by_default_and_the_totals_are_not() {
+    // Tempting wrong patch: every ledger row in every `report --json`.
+    let s = Setup::new();
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    let all = swamp_core::volume_ledger::disk_json(Some(&a), NOW, None);
+    let few = swamp_core::volume_ledger::disk_json(Some(&a), NOW, Some(3));
+    assert_eq!(few["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(few["rows_truncated"], true);
+    assert_eq!(few["rows_total"], all["rows_total"]);
+    assert_eq!(
+        all["rows"].as_array().unwrap().len() as u64,
+        all["rows_total"].as_u64().unwrap()
+    );
+    assert_eq!(few["accounted"], all["accounted"]);
+    assert_eq!(
+        few["everything_else"]["bytes"],
+        all["everything_else"]["bytes"]
+    );
+    let largest = few["rows"][0]["allocated_bytes"].as_u64().unwrap();
+    assert!(
+        all["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["allocated_bytes"].as_u64().unwrap_or(0) <= largest)
+    );
+}
+
+#[test]
+fn an_agent_home_no_unit_encloses_is_measured_by_the_walk_and_never_added_twice() {
+    // Tempting wrong patch: pruning the agent home from the walk and adding
+    // only the agent sessions' bytes, so everything else in that folder is
+    // never measured (or the home is added on top of the walk).
+    let mut s = Setup::new();
+    s.fs.file("/Users/me/.codex/sessions/a", 700, 9_100, 1);
+    s.fs.file("/Users/me/.codex/logs/b", 300, 9_101, 1);
+    s.accounted.push(Accounted {
+        path: PathBuf::from("/Users/me/.codex"),
+        bytes: 700 * 512,
+        category: Category::Catalog,
+        subset_of_enclosing: true,
+        measured_at: NOW,
+        incomplete: false,
+        note: None,
+    });
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    assert_eq!(
+        a.accounted.bytes,
+        7_777 * 512,
+        "the agent view adds nothing"
+    );
+    let home = s
+        .rows()
+        .into_iter()
+        .find(|r| r.path == "/Users/me/.codex" && r.category == Category::Other)
+        .expect("measured by the walk");
+    assert_eq!(
+        home.bytes,
+        Some(1_000 * 512),
+        "the whole folder, sessions and logs"
+    );
+}
+
+#[test]
+fn a_pass_that_measured_nothing_says_which_locations_are_not_measured_yet() {
+    // Tempting wrong patch: an incomplete pass whose gap is silently filed
+    // as an estimate. The cursor knows exactly which locations are pending.
+    let s = Setup::new();
+    many_small_folders(&s.fs, 40);
+    s.fs.slow_under("/Users/me/d", Duration::from_millis(30));
+    let first = s.run_at(NOW, true, Duration::from_millis(300), Some(0));
+    assert!(!ran(&first).complete);
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    assert!(a.not_measured.not_yet_measured > 0);
+    assert_eq!(
+        a.not_measured.not_yet_measured,
+        a.not_measured.not_yet_measured_names.len()
+    );
+    let text = render_disk_view(Some(&a), NOW);
+    assert!(text.contains("Not measured yet this pass"));
+    // A pending row is never a size.
+    assert!(
+        a.rows
+            .iter()
+            .filter(|r| r.method == "pending")
+            .all(|r| r.bytes.is_none())
+    );
 }

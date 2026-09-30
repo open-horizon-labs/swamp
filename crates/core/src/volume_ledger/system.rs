@@ -269,6 +269,9 @@ pub fn parse_apfs_list(xml: &str, prefer: Option<&str>) -> Result<ApfsContainer,
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DataVolumeInfo {
     pub container_reference: Option<String>,
+    /// The volume's own device (`disk3s5`): how this machine's Data volume
+    /// is told from another Data-role volume in the same container.
+    pub device: Option<String>,
     pub in_use: Option<u64>,
     /// The first integer whose key names purgeable space
     /// (`...Purgeable...`); `None` when the answer has no such key.
@@ -304,6 +307,10 @@ pub fn parse_data_volume_info(xml: &str) -> Result<DataVolumeInfo, String> {
     Ok(DataVolumeInfo {
         container_reference: plist
             .get("APFSContainerReference")
+            .and_then(Plist::as_str)
+            .map(str::to_string),
+        device: plist
+            .get("DeviceIdentifier")
             .and_then(Plist::as_str)
             .map(str::to_string),
         in_use: plist.get("CapacityInUse").and_then(Plist::as_u64),
@@ -373,8 +380,36 @@ pub fn collect(probe: &dyn SystemProbe, now: u64) -> SystemFacts {
     match probe.apfs_list() {
         Ok(xml) => match parse_apfs_list(&xml, prefer.as_deref()) {
             Ok(container) => {
+                // This machine's Data volume is the one `diskutil info` says
+                // is mounted at /System/Volumes/Data; without that answer, a
+                // container with exactly one Data-role volume has it.
+                let own_device: Option<String> = info_parsed
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|i| i.device.clone());
+                let data_roles = container
+                    .volumes
+                    .iter()
+                    .filter(|v| v.roles.iter().any(|r| r == "Data"))
+                    .count();
+                let is_own = |v: &ApfsVolume| {
+                    v.roles.iter().any(|r| r == "Data")
+                        && match &own_device {
+                            Some(d) => v.device == *d,
+                            None => data_roles == 1,
+                        }
+                };
+                if data_roles > 1 && own_device.is_none() {
+                    facts.rows.push(not_measured(
+                        "APFS Data volume",
+                        Category::System,
+                        M_APFS,
+                        now,
+                        "this container has more than one Data volume and diskutil did not say which is mounted here".to_string(),
+                    ));
+                }
                 for v in &container.volumes {
-                    if v.roles.iter().any(|r| r == "Data") {
+                    if is_own(v) {
                         facts.data_volume_used = v.in_use;
                         continue;
                     }

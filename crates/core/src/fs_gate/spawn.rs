@@ -123,6 +123,18 @@ impl Program {
         }
     }
 
+    /// What is executed. `diskutil` and `tmutil` are fixed absolute paths:
+    /// an earlier directory on `PATH` (a shim, a hostile directory) is
+    /// never the program a volume pass runs. Everything else resolves
+    /// through `PATH` as before.
+    pub fn executable(self) -> &'static str {
+        match self {
+            Program::Diskutil => "/usr/sbin/diskutil",
+            Program::Tmutil => "/usr/bin/tmutil",
+            other => other.binary(),
+        }
+    }
+
     /// The program named `name`, if swamp may run it.
     pub fn named(name: &str) -> Option<Program> {
         Program::ALL.iter().copied().find(|p| p.binary() == name)
@@ -496,7 +508,7 @@ pub(super) fn run_unchecked(
     args: &[OsString],
     timeout: Duration,
 ) -> io::Result<RunOutput> {
-    run_command(program.binary(), args, timeout)
+    run_command(program.executable(), args, timeout)
 }
 
 // ---- child lifetime (#156) ------------------------------------------

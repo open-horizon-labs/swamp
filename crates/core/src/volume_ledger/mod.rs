@@ -20,7 +20,7 @@ pub mod pass;
 pub mod system;
 mod view;
 
-pub use view::{NOT_MEASURED_YET, disk_json, render_disk_view};
+pub use view::{DEFAULT_JSON_ROWS, NOT_MEASURED_YET, disk_json, render_disk_view};
 
 use crate::growth::{VolumeLedgerRow, VolumeMetaRow};
 use std::path::PathBuf;
@@ -37,11 +37,34 @@ pub const TOP_ELSEWHERE: usize = 5;
 pub const FDA_NOTE: &str = "macOS keeps some folders (Photos, Mail, Messages, Safari, Group Containers, Containers) unreadable without Full Disk Access; swamp does not ask for it, so their size is not measured";
 
 /// The named residual: what the parts do not explain.
-pub const RESIDUAL_NAME: &str = "unattributed: APFS accounting, TCC-blocked, clones";
+pub const RESIDUAL_NAME: &str = "unattributed: allocation not explained by any measured part";
 
 /// The estimate for what could not be read, from the Data volume's own
 /// consumed bytes minus everything measured.
-pub const NOT_MEASURED_ESTIMATE_NAME: &str = "not measured, estimated by elimination";
+pub const NOT_MEASURED_ESTIMATE_NAME: &str =
+    "not measured (unreadable folders or not yet measured), estimated";
+
+/// A row that says a location has not been measured yet this cycle.
+pub const METHOD_PENDING: &str = "pending";
+
+/// A lossless `path` for a row: the path as text when it is UTF-8, and
+/// otherwise its lossy text plus the exact bytes in hex, so two names that
+/// differ only in invalid UTF-8 are two rows, not one.
+pub fn key_of(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    match path.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let hex: String = path
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            format!("{}#bytes-{hex}", path.to_string_lossy())
+        }
+    }
+}
 
 /// Row method of an accounted location: taken from the observation, not
 /// walked again.
@@ -75,6 +98,9 @@ pub enum Category {
     Unreadable,
     /// A mounted disk image: a view of bytes stored elsewhere.
     Mount,
+    /// A location on another volume (a declared root on an external
+    /// disk): real bytes, but not on this container.
+    External,
 }
 
 impl Category {
@@ -88,6 +114,7 @@ impl Category {
             Category::Snapshot => "snapshot",
             Category::Unreadable => "unreadable",
             Category::Mount => "mount",
+            Category::External => "external",
         }
     }
 
@@ -101,6 +128,7 @@ impl Category {
             "snapshot" => Category::Snapshot,
             "unreadable" => Category::Unreadable,
             "mount" => Category::Mount,
+            "external" => Category::External,
             _ => return None,
         })
     }
@@ -276,7 +304,7 @@ pub fn mount_row(m: &MountView, measured_at: u64) -> Row {
         ),
     };
     Row {
-        path: m.path.display().to_string(),
+        path: key_of(&m.path),
         category: Category::Mount,
         bytes,
         overlap_bytes: 0,
@@ -291,11 +319,15 @@ pub fn mount_row(m: &MountView, measured_at: u64) -> Row {
 
 /// Rows for the accounted locations, with double counting removed:
 ///
-/// * a `subset_of_enclosing` location inside (or equal to) another
-///   accounted location is shown, and added zero times;
+/// * a `subset_of_enclosing` location (an agent tool's sessions and
+///   caches) is a view of a folder the walk or a catalog location already
+///   measures whole: shown, never added, never pruned from the walk;
 /// * mounted disk images inside a location (an observation that walked a
 ///   unit through its mount points counted their bytes) are taken back
-///   out as overlap: the image files are counted where they are stored.
+///   out as overlap: the image files are counted where they are stored;
+/// * a location on another volume (under a mount that is not this
+///   container's own storage) is real, but not part of this container:
+///   listed apart, never added.
 pub fn accounted_rows(list: &[Accounted], mounts: &[MountView]) -> Vec<Row> {
     let mut order: Vec<&Accounted> = list.iter().collect();
     order.sort_by(|a, b| {
@@ -307,31 +339,42 @@ pub fn accounted_rows(list: &[Accounted], mounts: &[MountView]) -> Vec<Row> {
     let mut rows = Vec::new();
     for a in &order {
         let mut overlap = 0u64;
+        let mut category = a.category;
         let mut notes: Vec<String> = a.note.iter().cloned().collect();
-        if a.subset_of_enclosing
-            && list.iter().any(|o| {
-                !o.subset_of_enclosing && !std::ptr::eq(o, *a) && a.path.starts_with(&o.path)
-            })
-        {
-            overlap = a.bytes;
-            notes.push("inside another location and counted there".to_string());
-        }
-        let views: u64 = mounts
+        let other_volume = mounts
             .iter()
-            .filter(|m| m.kind == MountKind::OwnStorage && m.path.starts_with(&a.path))
-            .filter_map(|m| m.used)
-            .sum();
-        let views = views.min(a.bytes - overlap);
-        if views > 0 {
-            overlap += views;
+            .filter(|m| a.path.starts_with(&m.path) && m.kind != MountKind::SameContainer)
+            .max_by_key(|m| m.path.components().count());
+        if let Some(m) = other_volume {
+            category = Category::External;
             notes.push(format!(
-                "{} of it is mounted disk images, views of image files counted where they are stored",
-                crate::render::human_bytes_pub(views)
+                "on {}: not part of this container",
+                m.path.display()
             ));
+        } else if a.subset_of_enclosing {
+            overlap = a.bytes;
+            notes.push(
+                "a finer view of a folder measured as a whole elsewhere in this ledger; counted there, not added"
+                    .to_string(),
+            );
+        } else {
+            let views = mounts
+                .iter()
+                .filter(|m| m.kind == MountKind::OwnStorage && m.path.starts_with(&a.path))
+                .filter_map(|m| m.used)
+                .fold(0u64, u64::saturating_add)
+                .min(a.bytes);
+            if views > 0 {
+                overlap = views;
+                notes.push(format!(
+                    "{} of it is mounted disk images, views of image files counted where they are stored",
+                    crate::render::human_bytes_pub(views)
+                ));
+            }
         }
         rows.push(Row {
-            path: a.path.display().to_string(),
-            category: a.category,
+            path: key_of(&a.path),
+            category,
             bytes: Some(a.bytes),
             overlap_bytes: overlap,
             entries: None,
@@ -350,7 +393,9 @@ pub fn accounted_rows(list: &[Accounted], mounts: &[MountView]) -> Vec<Row> {
 }
 
 /// The accounting identity, from stored rows. Every figure names what it
-/// is; the residual is the one place that can be negative.
+/// is. The residual is NOT absorbed by anything: it is what no measured
+/// part explains, it is signed, and it is flagged when it exceeds 1% of
+/// the container's used bytes.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Account {
     pub measured_at: u64,
@@ -372,6 +417,8 @@ pub struct Account {
     /// Mounted disk images: their bytes live in the image files counted
     /// where they are stored, so these are never added.
     pub mounted_views: Vec<Row>,
+    /// Locations on other volumes: not part of this container.
+    pub external_volumes: Vec<Row>,
     pub notes: Vec<String>,
     pub rows: Vec<Row>,
 }
@@ -410,8 +457,14 @@ pub struct NotMeasured {
     pub count: usize,
     /// The first [`MAX_NAMED_ROWS`] of them.
     pub names: Vec<String>,
-    /// Data volume consumed bytes minus everything measured, when the
-    /// Data volume's figure is known. An estimate by elimination.
+    /// Locations no run of the current cycle has measured yet (exact
+    /// list, from the cursor).
+    pub not_yet_measured: usize,
+    pub not_yet_measured_names: Vec<String>,
+    /// Data volume consumed bytes minus everything measured, counted only
+    /// while something is unreadable or not yet measured. An ESTIMATE,
+    /// shown apart from the measured parts; `None` when nothing is
+    /// unreadable or pending (then the gap is the residual).
     pub estimate_bytes: Option<u64>,
     pub estimate_name: &'static str,
 }
@@ -427,18 +480,35 @@ pub struct Residual {
     pub percent_of_used: Option<f64>,
     /// `|residual|` is within 1% of the container's used bytes.
     pub within_one_percent: Option<bool>,
+    /// The parts do not reconcile: `|residual|` is more than 1% of used.
+    pub residual_flag: bool,
 }
 
-/// Rows and meta into the reading. Pure: no disk, no clock.
+fn sum_u64(values: impl Iterator<Item = u64>) -> u64 {
+    values.fold(0u64, u64::saturating_add)
+}
+
+fn clamp_i64(v: i128) -> i64 {
+    v.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Rows and meta into the reading. Pure: no disk, no clock. Every sum
+/// saturates, so a corrupt or foreign ledger with huge values cannot
+/// panic or wrap.
 pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
     let live: Vec<&Row> = rows.iter().filter(|r| !r.is_structure()).collect();
+    let pending: Vec<&Row> = live
+        .iter()
+        .copied()
+        .filter(|r| r.method == METHOD_PENDING)
+        .collect();
     let accounted_rows: Vec<&Row> = live
         .iter()
         .copied()
         .filter(|r| matches!(r.category, Category::Catalog | Category::Declared))
         .collect();
     let accounted = Part {
-        bytes: accounted_rows.iter().map(|r| r.additive()).sum(),
+        bytes: sum_u64(accounted_rows.iter().map(|r| r.additive())),
         locations: accounted_rows.len(),
     };
     let mut elsewhere_rows: Vec<&Row> = live
@@ -446,7 +516,7 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
         .copied()
         .filter(|r| r.category == Category::Other && r.bytes.is_some())
         .collect();
-    let else_bytes: u64 = elsewhere_rows.iter().map(|r| r.additive()).sum();
+    let else_bytes = sum_u64(elsewhere_rows.iter().map(|r| r.additive()));
     elsewhere_rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.path.cmp(&b.path)));
     let top: Vec<Row> = elsewhere_rows
         .iter()
@@ -459,7 +529,7 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
         .filter(|r| r.category == Category::System && r.bytes.is_some())
         .cloned()
         .collect();
-    let system_bytes: u64 = volumes.iter().map(|r| r.additive()).sum();
+    let system_bytes = sum_u64(volumes.iter().map(|r| r.additive()));
     let purgeable = live
         .iter()
         .copied()
@@ -476,28 +546,53 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
         .copied()
         .filter(|r| r.category == Category::Unreadable)
         .collect();
+    let unreadable_count = sum_u64(unreadable.iter().map(|r| r.unreadable.max(1)));
     let mounted_views: Vec<Row> = live
         .iter()
         .copied()
         .filter(|r| r.category == Category::Mount)
         .cloned()
         .collect();
+    let external_volumes: Vec<Row> = live
+        .iter()
+        .copied()
+        .filter(|r| r.category == Category::External)
+        .cloned()
+        .collect();
 
-    let measured_data_side = accounted.bytes + else_bytes;
-    let estimate = meta
-        .data_volume_used
-        .map(|used| used.saturating_sub(measured_data_side));
-    let parts_sum =
-        accounted.bytes + else_bytes + system_bytes + snapshot_bytes + estimate.unwrap_or(0);
+    // The estimate exists only while something is unreadable or not yet
+    // measured. With nothing to blame, the gap stays in the residual,
+    // where it is checked.
+    let measured_data_side = accounted.bytes.saturating_add(else_bytes);
+    let estimate = match meta.data_volume_used {
+        Some(used) if unreadable_count > 0 || !pending.is_empty() => {
+            Some(used.saturating_sub(measured_data_side))
+        }
+        _ => None,
+    };
+    let parts_sum: u128 = [
+        accounted.bytes,
+        else_bytes,
+        system_bytes,
+        snapshot_bytes,
+        estimate.unwrap_or(0),
+    ]
+    .iter()
+    .map(|v| *v as u128)
+    .sum();
     let (residual_bytes, percent, within) = match meta.container_used {
         Some(used) => {
-            let r = used as i64 - parts_sum as i64;
+            let r: i128 = used as i128 - parts_sum as i128;
             let pct = if used == 0 {
                 0.0
             } else {
                 r as f64 * 100.0 / used as f64
             };
-            (Some(r), Some(pct), Some(r.unsigned_abs() * 100 <= used))
+            (
+                Some(clamp_i64(r)),
+                Some(pct),
+                Some(r.unsigned_abs().saturating_mul(100) <= used as u128),
+            )
         }
         None => (None, None, None),
     };
@@ -513,7 +608,7 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
             notes.push(format!("{}: {n}", r.path));
         }
     }
-    if !unreadable.is_empty() {
+    if unreadable_count > 0 {
         notes.push(FDA_NOTE.to_string());
     }
     if meta.container_used.is_none() {
@@ -523,7 +618,7 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
     }
     if meta.data_volume_used.is_none() {
         notes.push(
-            "the Data volume's own size is not known (diskutil), so what could not be read is not estimated; it is inside the unattributed line".to_string(),
+            "the Data volume's own size is not known (diskutil), so what could not be read is not estimated; any gap is in the unattributed line".to_string(),
         );
     }
     if !meta.complete {
@@ -560,11 +655,14 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
         not_measured: NotMeasured {
             // One row can stand for many folders (the tail past the named
             // ones): the count is theirs, the names are the first ones.
-            count: unreadable
-                .iter()
-                .map(|r| r.unreadable.max(1) as usize)
-                .sum(),
+            count: unreadable_count.min(usize::MAX as u64) as usize,
             names: unreadable
+                .iter()
+                .take(MAX_NAMED_ROWS)
+                .map(|r| r.path.clone())
+                .collect(),
+            not_yet_measured: pending.len(),
+            not_yet_measured_names: pending
                 .iter()
                 .take(MAX_NAMED_ROWS)
                 .map(|r| r.path.clone())
@@ -577,8 +675,10 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
             bytes: residual_bytes,
             percent_of_used: percent,
             within_one_percent: within,
+            residual_flag: within == Some(false),
         },
         mounted_views,
+        external_volumes,
         notes,
         rows: rows.to_vec(),
     }
