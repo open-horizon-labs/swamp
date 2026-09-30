@@ -705,7 +705,7 @@ fn adv_untrusted_developer_dir_never_reaches_xcrun() {
         .host()
         .with_parent_env(&[("DEVELOPER_DIR", evil.to_str().unwrap())]);
     let bin = ToolResolver::sandboxed(&sb.root)
-        .with_parent_env(vec![("DEVELOPER_DIR".into(), evil.clone().into())])
+        .with_parent_env(vec![("DEVELOPER_DIR".into(), evil.display().to_string())])
         .resolve(Program::Xcrun)
         .unwrap();
     let _ = host;
