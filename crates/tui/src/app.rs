@@ -374,6 +374,11 @@ pub struct App {
     pub observed_label: String,
     /// False only while the very first observation has not landed.
     pub has_index: bool,
+    /// The store on disk was written by an older swamp, so its derived
+    /// tables are being rebuilt by the background observation. Only ever
+    /// set together with `has_index == false`; it changes what the empty
+    /// list says, never what is drawn or how fast.
+    pub store_rebuild: bool,
     /// Header age and stale warning come from the report's own
     /// `observed_at` against the clock (real sessions); off, the header
     /// shows `observed_label` verbatim (fixtures with made-up times).
@@ -653,6 +658,7 @@ impl App {
             last_result: None,
             observed_label: "just now".to_string(),
             has_index: true,
+            store_rebuild: false,
             live_age: false,
             disk_banner: None,
             actor: "human".to_string(),

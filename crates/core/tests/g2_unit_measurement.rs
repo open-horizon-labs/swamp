@@ -591,6 +591,10 @@ fn a_store_from_the_previous_format_rebuilds_without_losing_other_tables_or_cras
     fs::write(fx.store.join("config.toml"), b"# keep me\n").unwrap();
     let ledger = fx.store.join("ledger.parquet");
     fs::write(&ledger, b"ledger state").unwrap();
+    // The record that the first-run question was answered is human intent,
+    // not a derived table: a format reset must not ask it again.
+    let asked = fx.store.join("first-run-asked");
+    fs::write(&asked, b"asked\n").unwrap();
 
     // A report is a pure read: it refuses the old generation and changes
     // nothing.
@@ -607,6 +611,11 @@ fn a_store_from_the_previous_format_rebuilds_without_losing_other_tables_or_cras
         b"# keep me\n"
     );
     assert_eq!(fs::read(&ledger).unwrap(), b"ledger state");
+    assert_eq!(
+        fs::read(&asked).unwrap(),
+        b"asked\n",
+        "the first-run marker survives a store-format reset"
+    );
     let snapshot = report_scope_from_store(&fx.scope, &fx.store).expect("readable after rebuild");
     let got = unit_ending(&snapshot.external_units, "toolchains");
     assert_eq!(got.last_used.at, Some(OLD as u64));

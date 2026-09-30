@@ -388,6 +388,9 @@ const TUI_REPORT_API: &[&str] = &[
     // Whether the store holds an observation of any scope (two small
     // tables): the "is there an index" question before deciding to scan.
     "@core::report::store_has_observation",
+    // Whether that store is an older generation being rebuilt (one small
+    // marker file): only what the empty list says while it rebuilds.
+    "@core::report::store_is_older_generation",
 ];
 
 fn allowed(m: &Module, list: &[(Krate, &[&str])]) -> bool {

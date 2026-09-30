@@ -3844,6 +3844,17 @@ fn stored_choice(scope: &crate::scope::EffectiveScope, store_dir: &Path) -> Opti
         })
 }
 
+/// Whether the store carries an explicit marker from an older swamp: its
+/// derived tables cannot be read, and the observer resets and rebuilds
+/// them (`docs/architecture.md`). A store with no marker at all is simply
+/// new, and an unreadable marker is not called older. What lets the TUI
+/// say "being rebuilt" instead of "nothing has been scanned".
+pub fn store_is_older_generation(store_dir: &Path) -> bool {
+    crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_incompatible_marker())
+        .unwrap_or(false)
+}
+
 /// Whether the store holds any observation at all, of any scope: the
 /// "is there an index" question the TUI asks before deciding to scan.
 pub fn store_has_observation(store_dir: &Path) -> bool {

@@ -375,6 +375,29 @@ fn capture(app: &App, w: u16, h: u16) -> String {
     terminal.backend().to_string()
 }
 
+/// A store written by an older swamp cannot be read, so the list is empty
+/// until the background rebuild lands. It says why, instead of claiming
+/// nothing was ever scanned.
+#[test]
+fn an_older_generation_store_says_it_is_being_rebuilt_not_that_nothing_was_scanned() {
+    let mut app = App::new(
+        swamp_core::report::Report::empty("/Users/dev/src".into()),
+        "/Users/dev/src".into(),
+    );
+    app.has_index = false;
+    app.filter_text = "0".into();
+    let plain = capture(&app, 120, 24);
+    assert!(plain.contains("Nothing has been scanned yet"), "{plain}");
+    app.store_rebuild = true;
+    let rebuild = capture(&app, 120, 24);
+    assert!(rebuild.contains("older"), "{rebuild}");
+    assert!(rebuild.contains("rebuilt in the background"), "{rebuild}");
+    assert!(
+        !rebuild.contains("Nothing has been scanned yet"),
+        "{rebuild}"
+    );
+}
+
 #[test]
 fn scope_unique_estimate_is_labeled_even_in_a_narrow_header() {
     let mut report = fixture_report();

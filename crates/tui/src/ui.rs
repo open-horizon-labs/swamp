@@ -1048,6 +1048,10 @@ fn empty_state(app: &App) -> String {
         );
     }
     match app.view {
+        V::Projects if !app.has_index && app.store_rebuild => "This store was written by an older \
+             swamp, so its index is being rebuilt in the background. Your settings, protections \
+             and notes are kept; growth history starts again. R rescans."
+            .to_string(),
         V::Projects if !app.has_index => {
             "Nothing has been scanned yet. Press R to scan; it runs in the background.".to_string()
         }
