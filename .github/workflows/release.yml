@@ -118,7 +118,7 @@ jobs:
     # The selected validation baseline. The binary built here links the
     # glibc of this image; the smoke step records the newest glibc symbol
     # version it requires, which is the documented minimum.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -128,6 +128,7 @@ jobs:
           targets: x86_64-unknown-linux-gnu
 
       - name: Cargo cache
+        if: vars.LOCAL_LINUX_CI_ENABLED != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-linux-x86_64
@@ -210,7 +211,7 @@ jobs:
   # job in every active run has failed. With no run it dispatches one.
   gates:
     name: CI and the full tier passed for this commit
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
     timeout-minutes: 100
     permissions:
       actions: write
@@ -231,7 +232,7 @@ jobs:
         linux-x86_64-newer,
         gates,
       ]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
 
