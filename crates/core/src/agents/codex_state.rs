@@ -211,6 +211,16 @@ fn read_session_rows(
     if signature.as_bytes() != b"SQLite format 3\0" {
         return None;
     }
+    // SQLite opens its `-wal`/`-shm`/`-journal` sidecars itself with a
+    // blocking open; one that is not a regular file (a FIFO) would park
+    // this read (#190), so any such sidecar declines the database.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = db_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        if ctx.stat(Path::new(&sidecar)).is_ok_and(|m| !m.is_file()) {
+            return None;
+        }
+    }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let connection = Connection::open_with_flags(db_path, flags).ok()?;
     connection.busy_timeout(Duration::from_millis(25)).ok()?;

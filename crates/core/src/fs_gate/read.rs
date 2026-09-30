@@ -104,12 +104,18 @@ pub(crate) fn is_dataless(meta: &std::fs::Metadata) -> bool {
 }
 
 /// True when `path` exists but opening it for reading could block: it is
-/// not a regular file (a FIFO, socket, device) or it is a dataless
+/// a FIFO or a device, or it is a dataless
 /// placeholder. For callers that hand a path to a library which opens it
 /// itself (gix), so they can decline before that open (#190).
 pub(crate) fn would_block_on_open(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    // A socket is not listed: `open(2)` on one fails at once (`ENXIO`),
+    // and git's own fsmonitor daemon keeps one inside `.git`.
     match std::fs::metadata(path) {
-        Ok(m) => (!m.is_file() && !m.is_dir()) || is_dataless(&m),
+        Ok(m) => {
+            let ft = m.file_type();
+            ft.is_fifo() || ft.is_block_device() || ft.is_char_device() || is_dataless(&m)
+        }
         Err(_) => false,
     }
 }
