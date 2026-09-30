@@ -76,6 +76,7 @@ pub mod sharing;
 pub mod signals;
 pub mod store;
 pub mod systemd_user;
+pub mod tool_removal;
 pub mod toolchain_declarations;
 pub mod tree;
 pub mod walk;

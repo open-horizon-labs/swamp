@@ -316,6 +316,21 @@ pub fn docker_remove(removal: &crate::docker::Removal) -> std::result::Result<()
     })
 }
 
+/// Runs one tool-managed removal (#177): `mise -C / uninstall <t@v>`,
+/// `mise -C / prune --tools` or `xcrun simctl runtime delete <UUID>`,
+/// with `bin` exactly as the review resolved it and `argv` exactly as the
+/// confirm showed it. Permanent: a manager has no Trash. Only
+/// `crate::tool_removal::execute` calls this (the gate audit), after its
+/// own re-review at Enter. Anything that is not one of those shapes is
+/// refused before anything starts.
+pub fn tool_remove(
+    bin: &super::spawn::ToolBin,
+    argv: &[std::ffi::OsString],
+    timeout: Duration,
+) -> std::io::Result<super::spawn::RunOutput> {
+    super::spawn::run_tool_exec(bin, argv, timeout)
+}
+
 /// `git -C <repo> worktree prune`, after the linked worktree at `common`'s
 /// owning checkout went to the Trash. `common` is the `.git` common dir
 /// the caller read from the worktree before moving it. Best-effort; the

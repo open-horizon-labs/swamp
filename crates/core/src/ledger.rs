@@ -8,6 +8,10 @@ pub enum Verb {
     Delete,
     Archive,
     RemoveWorktree,
+    /// Removed through the manager's own command (mise, simctl), with no
+    /// Trash (#177). Additive: a binary that predates it reads the label
+    /// as `Delete`, an ordinary removal, and keeps the row's text as is.
+    ToolRemove,
 }
 
 impl Verb {
@@ -16,12 +20,14 @@ impl Verb {
             Verb::Delete => "delete",
             Verb::Archive => "archive",
             Verb::RemoveWorktree => "remove-worktree",
+            Verb::ToolRemove => "tool-remove",
         }
     }
     fn from_label(s: &str) -> Self {
         match s {
             "archive" => Verb::Archive,
             "remove-worktree" => Verb::RemoveWorktree,
+            "tool-remove" => Verb::ToolRemove,
             _ => Verb::Delete,
         }
     }

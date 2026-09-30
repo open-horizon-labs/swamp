@@ -999,6 +999,39 @@ pub fn remainder_of(detector_id: &str) -> Option<Remainder> {
         .and_then(|d| d.remainder_of())
 }
 
+/// A manager that removes the installs under one of a detector's
+/// locations itself, permanently (#177): moving them to Trash would break
+/// the manager's own bookkeeping, so swamp removes them only through the
+/// manager's command after its own dry run (`crate::tool_removal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolManager {
+    /// `mise uninstall` / `mise prune --tools`.
+    Mise,
+    /// `xcrun simctl runtime delete`.
+    Simulator,
+}
+
+/// One of a detector's locations whose installs [`ToolManager`] removes:
+/// the location's path ends with `suffix` (component-wise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolManagedLocation {
+    pub suffix: &'static str,
+    pub manager: ToolManager,
+}
+
+/// The manager that removes installs under `path`, a location detector
+/// `detector_id` reported (see [`Detector::tool_managed`]).
+pub fn tool_manager_of(detector_id: &str, path: &Path) -> Option<ToolManager> {
+    Registry::with_builtins()
+        .detectors()
+        .iter()
+        .find(|d| d.id() == detector_id)?
+        .tool_managed()
+        .iter()
+        .find(|t| path.ends_with(t.suffix))
+        .map(|t| t.manager)
+}
+
 /// What a human can do to re-obtain a detector's store if it is removed.
 /// Facts, never a verdict: this says what re-obtaining costs, not
 /// whether removing it is a good idea.
@@ -1043,6 +1076,11 @@ pub trait Detector: Send + Sync {
     /// none rather than picking one to stand for the rest.
     fn recovery_hint(&self) -> Option<RecoveryHint> {
         None
+    }
+    /// Which of this detector's locations hold installs their own manager
+    /// removes (#177). Empty for almost every detector.
+    fn tool_managed(&self) -> &'static [ToolManagedLocation] {
+        &[]
     }
     /// Which of this detector's locations are machine-wide build stores,
     /// and of which kind. The external observation hands each such

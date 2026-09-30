@@ -146,6 +146,10 @@ pub struct Row {
     /// for a structural row with no single unit backing it (a project
     /// header, a worktree row, an aggregated kind/type bucket).
     pub evidence: Vec<swamp_core::evidence::Evidence>,
+    /// Set on an external row whose installs their own manager removes
+    /// (mise installs, simulator runtimes; #177): Backspace opens that
+    /// manager's sheet instead of a Trash confirm.
+    pub tool: Option<swamp_core::tool_removal::Manager>,
 }
 
 impl Row {
@@ -172,6 +176,7 @@ impl Row {
             allocated: false,
             project: None,
             evidence: Vec::new(),
+            tool: None,
         }
     }
 }
@@ -546,6 +551,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             // worktree/artifact below it); drill into the tree/worktree
             // rows for evidence, same as every other per-project fact.
             evidence: Vec::new(),
+            tool: None,
         });
     }
     out
@@ -675,6 +681,7 @@ pub fn tree_rows_with_agents(
                 .find(|a| a.kind == ArtifactKind::Source)
                 .map(|a| a.evidence.clone())
                 .unwrap_or_default(),
+            tool: None,
         });
         if is_collapsed {
             continue;
@@ -1650,6 +1657,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             allocated: false,
             project: None,
             evidence: Vec::new(),
+            tool: None,
         })
         .collect()
 }
@@ -2155,6 +2163,11 @@ pub fn external_rows_with(
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        row.tool = swamp_core::tool_removal::manager_for_unit(&u.detector_id, &u.path);
+        if let Some(m) = row.tool {
+            row.signals
+                .push(format!("removed by {} itself · Backspace", m.name()));
+        }
         let has_interior = interiors
             .iter()
             .any(|i| i.path != u.path && i.path.starts_with(&u.path));
@@ -2167,7 +2180,8 @@ pub fn external_rows_with(
             row.expansion_key = Some(key);
             row.rail = if open { "▾ ".into() } else { "▸ ".into() };
             row.collapsed_children = (!open).then_some(children.len());
-            row.signals = vec!["store interior below · inspection only".into()];
+            row.signals
+                .insert(0, "store interior below · inspection only".into());
             rows.push(row);
             if open {
                 rows.extend(children);

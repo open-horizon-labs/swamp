@@ -13,7 +13,7 @@
 use super::{
     ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
     LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
-    RecoveryHint, StorageCategory,
+    RecoveryHint, StorageCategory, ToolManagedLocation, ToolManager,
 };
 
 pub const MISE_DETECTOR_ID: &str = "mise";
@@ -66,6 +66,13 @@ impl Detector for MiseDetector {
             command: "mise install",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn tool_managed(&self) -> &'static [ToolManagedLocation] {
+        &[ToolManagedLocation {
+            suffix: "installs",
+            manager: ToolManager::Mise,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

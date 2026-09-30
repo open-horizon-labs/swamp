@@ -246,6 +246,14 @@ pub struct App {
     /// Ephemeral on-demand details; never persisted in the observation store.
     pub cargo_inspection: Option<Vec<String>>,
     pub cargo_inspection_scroll: u16,
+    /// The tool-managed removal sheet (#177), when open.
+    pub tool_sheet: Option<crate::tool_sheet::ToolSheet>,
+    /// The one tool worker in flight (listing, review or removal): one at
+    /// a time, never on this thread.
+    tool_rx: Option<std::sync::mpsc::Receiver<crate::tool_sheet::ToolEvent>>,
+    /// How tool removal reaches the machine: the real managers, or a
+    /// test's sandbox of fakes.
+    pub tool_host: swamp_core::tool_removal::Host,
     pub operation: Option<Operation>,
     operation_rx: Option<std::sync::mpsc::Receiver<OperationEvent>>,
     review_progress: Option<std::sync::mpsc::Sender<OperationEvent>>,
@@ -605,6 +613,9 @@ impl App {
         App {
             cargo_inspection: None,
             cargo_inspection_scroll: 0,
+            tool_sheet: None,
+            tool_rx: None,
+            tool_host: swamp_core::tool_removal::Host::system(),
             operation: None,
             operation_rx: None,
             review_progress: None,
@@ -2080,6 +2091,27 @@ impl App {
         if self.operation.is_some() {
             return;
         }
+        // A row whose installs its own manager removes (#177) never goes
+        // to Trash: Backspace with nothing marked opens its sheet, Space
+        // says why it cannot be marked.
+        if !all && let Some(manager) = self.selected_row().and_then(|r| r.tool) {
+            if confirm && self.marked.is_empty() {
+                self.open_tool_sheet(manager);
+            } else if confirm {
+                self.set_refusal(&format!(
+                    "{} removes these installs itself, one at a time: confirm or clear the \
+                     marked items first.",
+                    manager.name()
+                ));
+            } else {
+                self.set_refusal(&format!(
+                    "Removed by {} itself, never moved to Trash: press Backspace on this row to \
+                     see its own list.",
+                    manager.name()
+                ));
+            }
+            return;
+        }
         if confirm && !self.marked.is_empty() {
             self.note_confirm_base();
             self.open_confirm();
@@ -2946,10 +2978,192 @@ impl App {
         changed
     }
 
+    /// Opens the tool-managed removal sheet and reads the manager's own
+    /// list on a worker (never on open of the TUI: only this key press).
+    pub fn open_tool_sheet(&mut self, manager: swamp_core::tool_removal::Manager) {
+        if self.tool_rx.is_some() {
+            return;
+        }
+        self.tool_sheet = Some(crate::tool_sheet::ToolSheet::new(manager));
+        let host = self.tool_host.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tool_rx = Some(rx);
+        crate::worker::spawn(move || {
+            let listed = swamp_core::tool_removal::read_candidates(&host, manager);
+            let _ = tx.send(crate::tool_sheet::ToolEvent::Listed(listed));
+        });
+    }
+
+    /// swamp's stored sizes of directories, for the confirm's size line.
+    fn tool_sizes(&self) -> Vec<(PathBuf, u64)> {
+        self.external_units
+            .iter()
+            .map(|u| (u.path.clone(), u.bytes))
+            .chain(
+                self.store_interiors
+                    .iter()
+                    .map(|u| (u.path.clone(), u.bytes)),
+            )
+            .collect()
+    }
+
+    /// ↑/↓ in the sheet's list.
+    pub fn tool_move(&mut self, delta: i32) {
+        if let Some(sheet) = self.tool_sheet.as_mut()
+            && matches!(sheet.stage, crate::tool_sheet::Stage::Choose)
+        {
+            let n = sheet.listing.as_ref().map_or(0, |l| l.candidates.len());
+            if n > 0 {
+                let at = (sheet.cursor as i64 + i64::from(delta)).clamp(0, n as i64 - 1);
+                sheet.cursor = at as usize;
+            }
+        }
+    }
+
+    /// Enter in the sheet: review the chosen item, or, on the confirm, run
+    /// exactly its command (after the re-review `execute` does).
+    pub fn tool_enter(&mut self) {
+        use crate::tool_sheet::{Stage, ToolEvent};
+        let store = swamp_core::fs_gate::StoreDir::resolved();
+        if self.tool_rx.is_some() {
+            return;
+        }
+        let (w, h) = (self.width, self.height);
+        let sizes = self.tool_sizes();
+        let host = self.tool_host.clone();
+        let Some(sheet) = self.tool_sheet.as_mut() else {
+            return;
+        };
+        match &sheet.stage {
+            Stage::Choose => {
+                let Some(c) = sheet
+                    .listing
+                    .as_ref()
+                    .and_then(|l| l.candidates.get(sheet.cursor))
+                    .cloned()
+                else {
+                    return;
+                };
+                sheet.stage = Stage::Reviewing(c.label.clone());
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.tool_rx = Some(rx);
+                crate::worker::spawn(move || {
+                    let r = swamp_core::tool_removal::review_target(&host, &c.target, &sizes)
+                        .map(Box::new);
+                    let _ = tx.send(ToolEvent::Reviewed(r));
+                });
+            }
+            Stage::Confirm(preview) => {
+                // Enter runs only what the human can see in full.
+                if h != 0 && !crate::tool_sheet::confirm_fits(preview, w, h) {
+                    return;
+                }
+                let preview = preview.clone();
+                sheet.stage = Stage::Running(preview.title().to_string());
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.tool_rx = Some(rx);
+                crate::worker::spawn(move || {
+                    let out = crate::actions::run_tool_removal(&host, &preview, &sizes, &store);
+                    let _ = tx.send(ToolEvent::Ran(Box::new(out)));
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Esc in the sheet: back one step, or close. A running removal is
+    /// never interrupted from here.
+    pub fn tool_back(&mut self) {
+        use crate::tool_sheet::Stage;
+        let Some(sheet) = self.tool_sheet.as_mut() else {
+            return;
+        };
+        let has_list = sheet.listing.is_some();
+        match sheet.stage {
+            Stage::Running(_) => {}
+            Stage::Listing | Stage::Reviewing(_) => {
+                // Only a read-only listing or dry run is running: stop it.
+                let back_to_list = has_list && matches!(sheet.stage, Stage::Reviewing(_));
+                if back_to_list {
+                    sheet.stage = Stage::Choose;
+                }
+                self.tool_rx = None;
+                crate::worker::spawn(swamp_core::fs_gate::spawn::kill_all_children);
+                if !back_to_list {
+                    self.tool_sheet = None;
+                }
+            }
+            Stage::Confirm(_) | Stage::Refused { .. } if has_list => sheet.stage = Stage::Choose,
+            _ => self.tool_sheet = None,
+        }
+    }
+
+    /// Lands a tool worker's report. True when the screen changed.
+    pub fn poll_tool(&mut self) -> bool {
+        use crate::tool_sheet::{Stage, ToolEvent};
+        let event = match self.tool_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(e)) => e,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.tool_rx = None;
+                if let Some(sheet) = self.tool_sheet.as_mut() {
+                    let running = matches!(sheet.stage, Stage::Running(_));
+                    sheet.stage = Stage::Refused {
+                        what: "worker stopped".into(),
+                        refusal: swamp_core::tool_removal::Refusal {
+                            reason: if running {
+                                "The removal's worker stopped unexpectedly; what the manager did \
+                                 was not read back."
+                                    .into()
+                            } else {
+                                "The worker stopped unexpectedly.".into()
+                            },
+                            next: "Open the sheet again to see the manager's list now.".into(),
+                            output: Vec::new(),
+                        },
+                    };
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.tool_rx = None;
+        let Some(sheet) = self.tool_sheet.as_mut() else {
+            return true;
+        };
+        match event {
+            ToolEvent::Listed(Ok(listing)) => {
+                sheet.cursor = 0;
+                sheet.listing = Some(listing);
+                sheet.stage = Stage::Choose;
+            }
+            ToolEvent::Listed(Err(refusal)) => {
+                sheet.stage = Stage::Refused {
+                    what: format!("{}'s list", sheet.manager.name()),
+                    refusal,
+                };
+            }
+            ToolEvent::Reviewed(Ok(preview)) => sheet.stage = Stage::Confirm(preview),
+            ToolEvent::Reviewed(Err(refusal)) => {
+                let what = sheet
+                    .listing
+                    .as_ref()
+                    .and_then(|l| l.candidates.get(sheet.cursor))
+                    .map_or_else(String::new, |c| c.label.clone());
+                sheet.stage = Stage::Refused { what, refusal };
+            }
+            ToolEvent::Ran(outcome) => {
+                sheet.listing = None;
+                sheet.stage = Stage::Done(outcome);
+            }
+        }
+        true
+    }
+
     /// Something on screen moves by itself: a check or a move, our own
     /// scan, or another process's. Only then does the UI paint on a timer.
     pub fn is_busy(&self) -> bool {
-        self.operation.is_some()
+        self.tool_rx.is_some()
+            || self.operation.is_some()
             || self.observing.is_some()
             || self.pending.is_some()
             || self.external_observer.is_some()

@@ -1,4 +1,4 @@
-"/Users/dev/src · observed just now · since 1w · 2 pr┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-54 of 54 ───────────────────────────────┐                                                    "
+"/Users/dev/src · observed just now · since 1w · 2 pr┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-56 of 56 ───────────────────────────────┐                                                    "
 "view: projects (1 of 10 · v next) · filter: growth >│Keys                                                                                          │                                                    "
 "Name                                                │  ↑ ↓        move the cursor                                                                  │nup / facts                                         "
 "mole  🔨                                            │  PgUp PgDn  move a screenful · Home and End jump to the first and last row                   │                                                    " Hidden by multi-width symbols: [(7, " ")]
@@ -10,6 +10,8 @@
 "                                                    │             On a project row that is its rebuildable items; only if it has none, the         │                                                    "
 "                                                    │             checkout itself (named 'checkout' on the plan), with .git and source, into Trash.│                                                    "
 "                                                    │             Docker images and volumes are removed by docker for good: no Trash.              │                                                    "
+"                                                    │             mise installs and simulator runtimes: the manager's own list and dry run, then   │                                                    "
+"                                                    │             its command, permanently: no Trash.                                              │                                                    "
 "                                                    │  b  d       list what the last check could not include, with the reason and the next step (d │                                                    "
 "                                                    │             on the plan)                                                                     │                                                    "
 "                                                    │  ✗  ~n/m    a project row is all marked, or n of its m items are                             │                                                    "
@@ -53,8 +55,6 @@
 "                                                    │    mtime_max; no tool reports a distinct use timestamp                                       │                                                    "
 "                                                    │  external location detectors (version managers, package caches, SDKs): modification age of   │                                                    "
 "                                                    │    the measured directory only; no per-tool invocation history is read                       │                                                    "
-"                                                    │                                                                                              │                                                    "
-"                                                    │                                                                                              │                                                    "
 "                                                    │                                                                                              │                                                    "
 "                                                    │                                                                                              │                                                    "
 "/ filter  v view  R refresh  ⌫ delete  Space mark  A└──────────────────────────────────────────────────────────────────────────────────────────────┘                                                    "

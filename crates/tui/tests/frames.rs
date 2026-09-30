@@ -1192,6 +1192,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         allocated: false,
         project: None,
         evidence: Vec::new(),
+        tool: None,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [

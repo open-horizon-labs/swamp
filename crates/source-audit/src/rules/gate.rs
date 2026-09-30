@@ -189,9 +189,27 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["cargo_cleanup"]),
             (Krate::Core, &["preserve"]),
             (Krate::Core, &["docker"]),
+            (Krate::Core, &["tool_removal"]),
             (Krate::Tui, &["actions"]),
         ],
         why: "destructive operations belong to the execution sinks",
+    },
+    Group {
+        path: "@core::fs_gate::destroy::tool_remove",
+        allowed: &[(Krate::Core, &["tool_removal"])],
+        why: "a tool-managed removal runs only after tool_removal::execute's re-review at Enter \
+              (tool-removal-refuses-on-manager-facts)",
+    },
+    Group {
+        path: "@core::tool_removal::execute",
+        allowed: &[(Krate::Tui, &["actions"]), (Krate::Core, &["tool_removal"])],
+        why: "a tool-managed removal has no Trash: only the human's Enter on the TUI confirm \
+              runs one, never a CLI, JSON or agent path (tool-removal-refuses-on-manager-facts)",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::run_tool_read",
+        allowed: &[(Krate::Core, &["tool_removal"])],
+        why: "a resolved manager binary runs only for tool-managed removal's listings and dry runs",
     },
     Group {
         path: "@core::fs_gate::sys",
@@ -275,10 +293,15 @@ const GROUPS: &[Group] = &[
         why: "liveness of the observation lock holder",
     },
     Group {
+        path: "@core::fs_gate::spawn::Program::Mise",
+        allowed: &[(Krate::Core, &["tool_removal"])],
+        why: "mise runs only as a resolved ToolBin for tool-managed removal",
+    },
+    Group {
         path: "@core::fs_gate::spawn::Program::Xcrun",
-        allowed: &[],
+        allowed: &[(Krate::Core, &["tool_removal"])],
         why: "xcrun runs only as an allow-listed detector command (`Program::named` in \
-              `locations`)",
+              `locations`), or as a resolved ToolBin for tool-managed removal",
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Brew",
@@ -304,9 +327,13 @@ const GROUPS: &[Group] = &[
     },
     Group {
         path: "@core::occupancy::OccupancyState",
-        allowed: &[(Krate::Core, &["occupancy"])],
+        allowed: &[
+            (Krate::Core, &["occupancy"]),
+            (Krate::Core, &["tool_removal"]),
+        ],
         why: "an occupancy answer is shown as a fact (evidence, or a refusal string); nothing \
-              gates a Trash move on it any more (2026-09-23)",
+              gates a Trash move on it any more (2026-09-23). Tool-managed removal, which has no \
+              Trash, refuses on Occupied and Unknown (tool-removal-refuses-on-manager-facts)",
     },
     Group {
         path: "@core::growth::ObservationOwnership::new",

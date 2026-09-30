@@ -138,8 +138,10 @@ const SNAPSHOT_ARGS: [&str; 4] = ["-n", "-P", "-F", "n"];
 /// listing it could not fully read.
 #[derive(Debug)]
 pub struct OccupancySnapshot {
-    /// Absolute paths reported open (files, cwd, txt, ...).
-    open: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Absolute paths reported open (files, cwd, txt, ...), with the
+    /// command names holding each when the listing asked for them
+    /// (`-F cn`, tool-managed removal); empty otherwise.
+    open: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>>,
     /// Why the listing is not trustworthy for a negative answer.
     gap: Option<String>,
 }
@@ -147,9 +149,13 @@ pub struct OccupancySnapshot {
 impl OccupancySnapshot {
     /// Run the one `lsof -n -P -F n`.
     pub fn capture() -> Self {
+        Self::capture_args(&SNAPSHOT_ARGS)
+    }
+
+    fn capture_args(args: &[&str]) -> Self {
         match crate::fs_gate::spawn::run(
             crate::fs_gate::spawn::Program::Lsof,
-            SNAPSHOT_ARGS,
+            args,
             SNAPSHOT_TIMEOUT,
         ) {
             Ok(out) => Self::from_lsof_run(
@@ -187,8 +193,12 @@ impl OccupancySnapshot {
         if !matches!(code, Some(0) | Some(1)) {
             return Self::failed(format!("lsof exited with {code:?}"));
         }
-        let mut open = std::collections::BTreeSet::new();
+        let mut open: std::collections::BTreeMap<
+            std::path::PathBuf,
+            std::collections::BTreeSet<String>,
+        > = Default::default();
         let mut saw_process = false;
+        let mut command: Option<String> = None;
         for line in stdout.lines().filter(|l| !l.is_empty()) {
             let mut chars = line.chars();
             let id = chars.next().unwrap_or(' ');
@@ -196,11 +206,18 @@ impl OccupancySnapshot {
                 return Self::failed(format!("unparseable lsof output line: {line:.40}"));
             }
             match id {
-                'p' => saw_process = true,
+                'p' => {
+                    saw_process = true;
+                    command = None;
+                }
+                'c' => command = Some(chars.as_str().to_string()),
                 'n' => {
                     let name = chars.as_str();
                     if name.starts_with('/') {
-                        open.insert(std::path::PathBuf::from(name));
+                        let holders = open.entry(std::path::PathBuf::from(name)).or_default();
+                        if let Some(c) = &command {
+                            holders.insert(c.clone());
+                        }
                     }
                 }
                 _ => {}
@@ -233,7 +250,7 @@ impl OccupancySnapshot {
         for anchor in std::iter::once(path).chain(canonical.as_deref()) {
             // Path ordering is component-wise, so everything under
             // `anchor` sorts contiguously right after it.
-            if let Some(hit) = self.open.range(anchor.to_path_buf()..).next()
+            if let Some((hit, _)) = self.open.range(anchor.to_path_buf()..).next()
                 && hit.starts_with(anchor)
             {
                 return OccupancyState::Occupied(hit.clone());
@@ -288,7 +305,68 @@ impl OccupancySnapshot {
         let _restore_hook = RestoreHook(prev_hook);
         f()
     }
+    /// Tool-managed removal's open-file answer (#177): every path the
+    /// manager's dry run named, from one `lsof -n -P -F cn` listing that
+    /// also names each holder's command. A holder whose command is one of
+    /// `manager_own` (the manager's own host process, which the manager
+    /// stops before it removes: CoreSimulator's `SimLaunchHost` keeps a
+    /// library open in every mounted runtime) does not count; any other
+    /// is `Occupied`, and a listing that could not be fully read is
+    /// `Unknown`, never `Free`. The holder's command name comes back with
+    /// an `Occupied` answer.
+    pub fn tool_removal_state(
+        paths: &[std::path::PathBuf],
+        manager_own: &[&str],
+    ) -> (OccupancyState, Option<String>) {
+        let snapshot = match crate::platform::OccupancyProbe::for_os(crate::platform::Os::current())
+        {
+            crate::platform::OccupancyProbe::Lsof => Self::capture_args(&TOOL_SNAPSHOT_ARGS),
+            crate::platform::OccupancyProbe::Procfs => {
+                let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+                return (probe_paths(&refs), None);
+            }
+        };
+        snapshot.holders_of(paths, manager_own)
+    }
+
+    /// [`Self::tool_removal_state`] over an already-taken listing.
+    pub(crate) fn holders_of(
+        &self,
+        paths: &[std::path::PathBuf],
+        manager_own: &[&str],
+    ) -> (OccupancyState, Option<String>) {
+        for path in paths {
+            let canonical = crate::fs_gate::canonicalize(path).ok();
+            for anchor in std::iter::once(path.as_path()).chain(canonical.as_deref()) {
+                for (hit, holders) in self
+                    .open
+                    .range(anchor.to_path_buf()..)
+                    .take_while(|(hit, _)| hit.starts_with(anchor))
+                {
+                    let own = !holders.is_empty()
+                        && holders
+                            .iter()
+                            .all(|h| manager_own.iter().any(|m| h.starts_with(m)));
+                    if !own {
+                        let who = holders.iter().next().cloned();
+                        return (OccupancyState::Occupied(hit.clone()), who);
+                    }
+                }
+            }
+        }
+        match &self.gap {
+            None => (OccupancyState::Free, None),
+            Some(why) => (
+                OccupancyState::Unknown(format!("open-file listing incomplete ({why})")),
+                None,
+            ),
+        }
+    }
 }
+
+/// The tool-removal listing's `lsof` argv: the snapshot's, with each
+/// process's command name.
+const TOOL_SNAPSHOT_ARGS: [&str; 4] = ["-n", "-P", "-F", "cn"];
 
 /// Where a scoped open-file snapshot is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1283,5 +1361,30 @@ mod tests {
             }
         });
         assert_eq!(counted.subprocess_spawns, 3);
+    }
+    /// Tool removal counts every holder but the manager's own host
+    /// process, and an incomplete listing is `Unknown`, never `Free`.
+    #[test]
+    fn tool_removal_holders_skip_only_the_managers_own_process() {
+        let listing =
+            "p1\ncSimLaunchHost.arm64\nn/vol/iOS/lib.dylib\np2\ncnode\nn/m/node/24/bin/node\n";
+        let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
+        let (s, who) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+        assert_eq!((s, who), (OccupancyState::Free, None));
+        let (s, who) = snap.holders_of(&[PathBuf::from("/m/node/24")], &["SimLaunchHost"]);
+        assert_eq!(
+            s,
+            OccupancyState::Occupied(PathBuf::from("/m/node/24/bin/node"))
+        );
+        assert_eq!(who.as_deref(), Some("node"));
+        let partial =
+            OccupancySnapshot::from_lsof_run(Some(1), false, listing, "lsof: Permission denied");
+        let (s, _) = partial.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+        assert!(matches!(s, OccupancyState::Unknown(_)), "{s:?}");
+        let failed = OccupancySnapshot::from_lsof_run(None, true, "", "");
+        assert!(matches!(
+            failed.holders_of(&[PathBuf::from("/x")], &[]).0,
+            OccupancyState::Unknown(_)
+        ));
     }
 }
