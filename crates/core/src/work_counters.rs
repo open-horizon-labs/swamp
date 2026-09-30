@@ -143,12 +143,12 @@ pub struct WorkCounters {
     /// [`measured`] installs, with no process-wide state at all.
     pub subprocess_spawns: u64,
     /// Recent files whose blocks were not yet assigned by the filesystem
-    /// (delayed allocation, #197): each was counted at its estimated
-    /// eventual allocation, not at what `st_blocks` said.
+    /// (delayed allocation, #197). Each is counted at exactly what
+    /// `st_blocks` said, so the total can still rise.
     #[serde(default)]
     pub pending_allocation_files: u64,
-    /// The estimated part of those bytes: what was added on top of
-    /// `st_blocks * 512` for the files counted above.
+    /// The most those files can still add at writeback: their length
+    /// rounded up to 4 KiB minus what `st_blocks` reported.
     #[serde(default)]
     pub pending_allocation_bytes: u64,
 }
@@ -189,11 +189,11 @@ pub fn record_spawn() {
     add(|c| &c.spawns, 1);
 }
 
-/// One recent file counted at its estimated eventual allocation:
-/// `estimated_extra` is the bytes added on top of what `st_blocks` said.
-pub fn record_pending_allocation(estimated_extra: u64) {
+/// One recent file whose allocation may still rise:
+/// `may_still_grow_by` is the upper bound of that rise.
+pub fn record_pending_allocation(may_still_grow_by: u64) {
     add(|c| &c.pending_files, 1);
-    add(|c| &c.pending_bytes, estimated_extra);
+    add(|c| &c.pending_bytes, may_still_grow_by);
 }
 
 /// The process-global counters. Sees every thread; a caller that wants
