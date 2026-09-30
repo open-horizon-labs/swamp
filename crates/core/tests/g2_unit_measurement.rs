@@ -54,7 +54,7 @@ fn atime_of(path: &Path) -> i64 {
 
 fn write(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 fn scope_for(detector: &str, vars: &[(&str, &Path)], home: &Path) -> EffectiveScope {
@@ -75,6 +75,7 @@ fn scope_for(detector: &str, vars: &[(&str, &Path)], home: &Path) -> EffectiveSc
 }
 
 fn measure(scope: &EffectiveScope, store: &Path) -> Vec<ExternalUnit> {
+    swamp_core::fs_gate::settle::settle();
     discover_and_measure(
         scope,
         Some(store),
@@ -476,6 +477,7 @@ fn store_scope(vars: &[(&str, &Path)], root: &Path, home: &Path) -> EffectiveSco
 }
 
 fn observe(scope: &EffectiveScope, store: &Path) -> swamp_core::report::ScopeObservation {
+    swamp_core::fs_gate::settle::settle();
     observe_scope(
         scope,
         ObservationParts::ALL,

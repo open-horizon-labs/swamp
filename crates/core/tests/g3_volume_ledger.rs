@@ -1552,10 +1552,14 @@ fn the_real_walker_never_opens_special_files_never_follows_links_and_counts_hard
     let outside = tmp.path().join("outside");
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    std::fs::write(outside.join("huge"), vec![1u8; 4 << 20]).unwrap();
-    std::fs::write(root.join("a"), vec![2u8; 8192]).unwrap();
+    std::fs::write(
+        outside.join("huge"),
+        swamp_core::fs_gate::settle::noise(4 << 20),
+    )
+    .unwrap();
+    std::fs::write(root.join("a"), swamp_core::fs_gate::settle::noise(8192)).unwrap();
     std::fs::hard_link(root.join("a"), root.join("sub/a-link")).unwrap();
-    std::fs::write(root.join("sub/b"), vec![3u8; 4096]).unwrap();
+    std::fs::write(root.join("sub/b"), swamp_core::fs_gate::settle::noise(4096)).unwrap();
     let sparse = std::fs::File::create(root.join("sparse")).unwrap();
     sparse.set_len(64 << 20).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
@@ -1563,6 +1567,7 @@ fn the_real_walker_never_opens_special_files_never_follows_links_and_counts_hard
     swamp_core::fs_gate::sys::make_fifo_for_test(&root.join("pipe")).unwrap();
     let _socket = std::os::unix::net::UnixListener::bind(root.join("s")).unwrap();
 
+    swamp_core::fs_gate::settle::settle();
     let expected: u64 = ["a", "sub/b", "sparse"]
         .iter()
         .map(|p| std::fs::symlink_metadata(root.join(p)).unwrap().blocks() * 512)
@@ -1608,7 +1613,11 @@ fn a_real_unreadable_directory_is_not_measured() {
     let root = tmp.path().join("t");
     let denied = root.join("protected");
     std::fs::create_dir_all(&denied).unwrap();
-    std::fs::write(denied.join("secret"), vec![9u8; 100_000]).unwrap();
+    std::fs::write(
+        denied.join("secret"),
+        swamp_core::fs_gate::settle::noise(100_000),
+    )
+    .unwrap();
     std::fs::write(root.join("ok"), b"x").unwrap();
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
     let readable_anyway = std::fs::read_dir(&denied).is_ok(); // running as root

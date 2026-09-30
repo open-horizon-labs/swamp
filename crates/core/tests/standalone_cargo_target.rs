@@ -26,7 +26,7 @@ impl FsEventsSource for Quiet {
 
 fn write(path: &Path, bytes: usize) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, vec![7u8; bytes]).unwrap();
+    fs::write(path, swamp_core::fs_gate::settle::noise(bytes)).unwrap();
 }
 
 fn cargo_target(dir: &Path) {
@@ -38,6 +38,7 @@ fn cargo_target(dir: &Path) {
 }
 
 fn report(root: &Path, store: &Path) -> swamp_core::Report {
+    swamp_core::fs_gate::settle::settle();
     swamp_core::report::report_full_mode_scoped(
         root,
         None,
