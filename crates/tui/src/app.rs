@@ -3027,6 +3027,9 @@ impl App {
 
     pub fn open_confirm(&mut self) {
         if !self.marked.is_empty() {
+            // A confirm opened by a key press has not been seen: input
+            // already queued is dropped, as for the review path.
+            self.confirm_drain |= !self.confirm_open;
             self.confirm_open = true;
         }
     }
