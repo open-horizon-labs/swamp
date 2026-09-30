@@ -27,7 +27,7 @@ implementation can support repeated observations without an exhaustive file inde
 | Codex linkage uses its state database, not transcript scanning | Verified | [Codex state reader](../crates/core/src/agents/codex_state.rs). Read-only external metadata; no Swamp-owned SQLite store and no JSONL attribution fallback. |
 | macOS and Linux have native validation | Verified for the integration head | [Full check run](https://github.com/open-horizon-labs/swamp/actions/runs/36269708229), [release workflow](../.github/workflows/release.yml). This does not certify every Linux distribution or filesystem. |
 | The CLI is entirely read-only | Incorrect; removed | Observation, scheduling, configuration, and protection change state. Reporting is read-only; there is no CLI deletion command. |
-| Every recognized ecosystem has complete cleanup support | Incorrect; not claimed | Build and agent matrices distinguish capability and format coverage. Shared/unsupported units can be inspection-only. |
+| Every recognized ecosystem has complete cleanup support | Incorrect; not claimed | Build and agent matrices distinguish capability and format coverage. Where swamp has no cleanup rule the row is still a real path: Space marks it on its own and the confirm says what swamp did not establish. |
 | Old means obsolete, or allocated bytes equal freed space | Unsupported; not claimed | Age is review evidence. Hardlinks, Trash, shared extents, and Docker accounting affect reclamation. |
 | Every refresh takes a fixed fraction of a second | Unsupported; removed | Individual installed trials are workload measurements, not a general benchmark. |
 

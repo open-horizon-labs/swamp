@@ -206,9 +206,10 @@ model only where a tool genuinely needs a new concept" clause:
   a newer version's unified session/message/state store (Codex's seven
   `*.sqlite` files, OpenCode's `opencode.db`, Oh My Pi's `agent.db`).
   Always folded into one unit with its sidecars as members; never split,
-  never actionable (`is_sqlite_like` in
-  `crate::actions` refuses any selective action on a path with this
-  kind unconditionally). Codex's state index alone is opened read-only
+  never split; the agent-facing plan (`actions::propose_agents`) refuses
+  any selective action on a path with this kind (`is_sqlite_like`), while
+  the TUI's plan for a person marks it with a warning that moving one of
+  the files alone can lose writes. Codex's state index alone is opened read-only
   for exact `rollout_path`/`cwd` linkage; no other columns or SQLite
   stores are queried.
 - **`SessionData`** -- a session-keyed companion directory that is
@@ -378,9 +379,9 @@ scratchpad directories, `cache-break-state-*.json`) to
 detector proposes that one exact path (macOS only) as a `cache` unit with
 the consequence *session scratch; removing it during a session breaks that
 session*. That sentence is swamp's own statement, not something Claude Code
-documents. It is inspection only: no action is offered, so the open-file
-occupancy check the agent units use is never run for it, and **no
-active-session evidence is shown for this unit**. #172's acceptance line about
+documents. The TUI marks it like any real folder (the open-file reading is taken
+when it is marked, and the confirm says a running session breaks if it
+goes); no active-session evidence beyond that reading is shown for this unit. #172's acceptance line about
 active-session evidence is therefore still open.
 
 - **Why a separate detector.** The agent layer identifies a tool's units
@@ -719,7 +720,7 @@ if any, are outside this action.
 - **Protected config:** authentication, settings, instructions, extensions,
   hooks and secrets remain protected.
 - **Sessions:** immediate directories with `events.jsonl` support removal.
-  Unrecognized files/directories remain inspection-only.
+  Unrecognized files/directories have no swamp rule and mark one at a time.
 - **Project linkage:** one bounded, cached read of `workspace.yaml` extracts
   its top-level absolute `cwd` in supported single-line scalar forms.
   Missing or unfamiliar metadata remains unresolved. No transcript search
@@ -905,7 +906,7 @@ tools this chunk added.
 | CLI text | `swamp report --view agents [--project NAME] [--all]` |
 | CLI JSON | `swamp report --view agents --json` (`{units, total_bytes}`) |
 | TUI (read) | `2` opens the Tools section, `v` cycles to the Agents view |
-| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every markable row in the Agents view the same way, skipping protected/unmarkable ones and naming the skip in the footer; `Enter` moves it to the Trash through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A protected row, or one whose category has no Trash move, cannot be marked; the footer names `propose_agents`'s own refusal reason. |
+| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every row in the Agents view that swamp has a rule for, leaving out what it keeps by default or has no rule for and naming how many in the footer (Space marks those one at a time); `Enter` moves it to the Trash through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A row swamp keeps by default (credentials, settings) or has no rule for marks with a warning (`actions::propose_agents_for_human`); only your own `swamp protect` mark refuses. The agent-facing `propose_agents` keeps every refusal. |
 | Protect | `swamp protect add\|remove\|list [--json] <path>` |
 | Removal | TUI only (2026-09-23: there is no `propose`/`propose-agents`/`approve`/`execute` command any more). |
 | Skill | `skills/swamp/references/agent-storage.md` |

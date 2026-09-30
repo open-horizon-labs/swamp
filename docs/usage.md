@@ -522,11 +522,13 @@ never collapsed into "cache", and a unit is measured whether or not any
 project currently references it (removing the last consumer never
 deletes the unit or its history).
 
-External units are shown for review only, never markable in the TUI and
-never actionable through any command: registry/detector output
+No command removes an external unit: registry/detector output
 identifies shared storage (a package manager's cache, a toolchain
-install), it never deletes it. Removing one means the manager that owns
-it fetches or rebuilds it again the next time it is needed. The
+install), it never deletes it. In the TUI each unit and each listed
+folder is a real path and can be marked for the reviewed Trash move
+(see "Cleanup and recovery"); removing one means the manager that owns
+it fetches or rebuilds it again the next time it is needed, and the
+confirm says so. The
 `--view external` total is deliberately kept separate from
 `reconciliation` above it: external units are never folded into
 `walked_total`/`attributed`/`unowned`, so there is nothing to
@@ -542,9 +544,9 @@ flushed; such files are counted as reported and listed as
 right after a big write is explained rather than surprising. A file that
 cannot be read mid-walk is not measured; the rest of its directory still is.
 
-The TUI has a dedicated, read-only External view (Tools section: `2`, then `v`): the same
-one-row-per-unit facts as `--view external`, never markable -- act on
-what it shows with the manager's own tools, not swamp.
+The TUI has a dedicated External view (Tools section: `2`, then `v`): the same
+one-row-per-unit facts as `--view external`; each unit and each listed
+folder can be marked for the reviewed Trash move.
 
 ### Last run or opened
 
@@ -685,9 +687,11 @@ path. Each row says, as facts with their sources:
   formulae:"`, `mise reports prunable (mise prune --tools --dry-run): "mise
   poetry@2.1.3 is prunable: ..."`. Swamp never says a unit is unused, obsolete or
   safe; these are the manager's sentences.
-- **The removal path that exists.** A standalone Cargo target: Trash after
-  review, marked in the TUI's unowned view. An installation: `tool command, not
-  available yet`. Everything else: `view only`.
+- **The removal path that exists.** Every unit and every listed folder: Trash
+  after review (Space, then Backspace in the TUI; see "Cleanup and recovery").
+  A unit whose manager swamp runs removal for (mise installs, simulator
+  runtimes) also names that manager's own command (Backspace on an unmarked
+  row). JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
 
 | Storage category | Class | Words when nothing more specific exists | Source |
 |---|---|---|---|
@@ -853,18 +857,21 @@ today vs. named-and-planned). In short:
   removing them costs nothing and nothing comes back. Removing a session
   means losing its resume/rewind/checkpoint history -- the linked
   project's own files are never touched. Credentials, settings, skills, commands and
-  similar automation definitions are protected by default and cannot be
-  marked at all.
-- **A tool whose layout is not confirmed against its own source gets
-  identification and nothing else.** `swamp report --view agents` still
-  measures Cursor's and Windsurf's storage, but the TUI offers no mark
-  affordance and reports linkage as unresolved, because acting on a
-  layout nobody has verified is not a size question. The same now
-  applies, narrowly, to GitHub Copilot CLI's `session-state/`: the
-  *directory names* are documented by GitHub, what is inside them is
-  not, so those units are measured and never markable.
-  `docs/agent-storage.md`'s matrix says which is which, and every row's
-  citation is pinned to an upstream commit and checked by CI.
+  similar automation definitions are kept by default: `A` leaves them out,
+  Space marks one, and its confirm says what the tool loses (it may stop
+  signing in or lose settings until restored from Trash). A category swamp
+  has no rule for, and a database file (SQLite, WAL, SHM), mark the same
+  way with their consequence named. Only your own `swamp protect` mark
+  refuses.
+- **A tool whose layout is not confirmed against its own source is
+  identified, and its paths can still be moved.** `swamp report --view
+  agents` measures Cursor's and Windsurf's storage and reports linkage as
+  unresolved; the TUI marks each path individually, and the confirm says
+  the layout is not verified against upstream. The same holds for GitHub
+  Copilot CLI's `session-state/`: the *directory names* are documented by
+  GitHub, what is inside them is not. `docs/agent-storage.md`'s matrix
+  says which is which, and every row's citation is pinned to an upstream
+  commit and checked by CI.
 - **Human keep/protect intent survives refresh:**
   `swamp protect add <path>` / `swamp protect list [--json]` /
   `swamp protect remove <path>` -- independent of, and never overridden
@@ -1251,7 +1258,7 @@ and `--view deps --json` carry the same summary and every unit under an
 `interior` key on each identified row. In the TUI, Space marks supported
 project-local outputs, test output and intermediates, individually or by
 family. The selection uses the same non-overlapping members as the displayed
-family. Shared stores, installations and unknown layouts stay inspection-only. See
+family. A shared store, an installation or an unknown layout has no cleanup rule: Space on its own row still moves that exact path to Trash, and the confirm lists what the adapter could not establish. See
 [docs/build-artifacts.md](build-artifacts.md) for the capability matrix,
 the per-ecosystem layouts that are covered, and the attribution limits.
 
@@ -1269,7 +1276,7 @@ does not promise it can be downloaded again. Machine-wide stores (npm
 cache, pnpm store, Gradle user home, `~/.m2/repository`) are reported
 as whole external units for now; their per-entry identification exists
 but is not yet joined into the report (see
-[docs/build-artifacts.md](build-artifacts.md)). The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs are inspection-only.
+[docs/build-artifacts.md](build-artifacts.md)). The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs have no selective cleanup rule: each can be marked on its own row.
 
 Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. Opening a project in the TUI shows cleanup groups under each build profile: **Compiler caches**, **Compiled tests & examples**, and **Build-script output**, when supported members exist. Space marks a group's exact members for review; Backspace opens confirmation. Expand with → to choose Tests, Examples, or individual age-ranked members instead. Unrelated dependencies are not part of these groups. **Inspect directories** retains the physical layout as another view of the same bytes. No switch to Builds is required. The selected-row details explain cleanup recommendations and rebuilding consequences. Incremental compiler caches are suggested as a starting point if slower subsequent builds are an acceptable trade-off—not because Swamp has proved them obsolete. Compiled dependencies remain a folded aggregate without selective dependency cleanup.
 
@@ -1322,7 +1329,7 @@ Its sizes and ages are one observation of Swamp's own build directory, not expec
 
 **Do not add all the displayed sizes.** A `*` marks allocated bytes, which can count shared hardlinks more than once. That is why debug can show 34.5 GB while the containing build target shows 30.1 GB on a different accounting basis. Parent rows include their children, and Inspect directories repeats the same storage by path. A dash in a purpose group's Change column means no aggregate growth value is supplied, not zero growth.
 
-**Candidates are not guaranteed free space.** The debug profile's 20.7 GB candidate total covers supported cleanup members, not all debug output. Missing groups or “Selective cleanup unsupported” describe Swamp's action support, not a requirement to retain those files. Final outputs and the remaining compiled dependencies are inspection-only for selective cleanup. Space or Backspace on a profile reviews all supported cleanup groups beneath it, not the entire profile directory. Use the candidate total, not the profile's full size, to understand that selection.
+**Candidates are not guaranteed free space.** The debug profile's 20.7 GB candidate total covers supported cleanup members, not all debug output. Missing groups or “Selective cleanup unsupported” describe Swamp's action support, not a requirement to retain those files. Final outputs and the remaining compiled dependencies have no selective cleanup rule; each is marked on its own row. Space or Backspace on a profile reviews all supported cleanup groups beneath it, not the entire profile directory. Use the candidate total, not the profile's full size, to understand that selection.
 
 Cleanup moves supported filesystem groups to Trash; those bytes are not immediately freed. Emptying Trash later may reclaim space, but surviving hardlinks and filesystem snapshots can limit the result. Source files and unrelated dependency artifacts are outside these purpose-based selections. Protection is checked when marking, and Cargo's advisory lock is held during removal. There is no post-mark occupancy veto or separate approval grant.
 
@@ -1403,7 +1410,18 @@ Images, volumes, and build-cache records join to projects using Compose metadata
 
 A project action expands to its actionable artifact rows. If it has none, a direct project action can offer the checkout. Bulk marking with `A` skips that fallback. The `ignored` and `untracked` remainder totals cover scattered files, so those summary buckets are not themselves deletion units.
 
-There is no re-check between marking and pressing Enter: no "this changed since you looked" refusal, and no veto based on whether something has a file open (that fact is shown, not enforced). The only way Enter refuses is an ordinary OS-level error -- the path is already gone, permission is denied, or the Trash is on a different filesystem with no permanent-delete fallback. Tool-managed removal (below) is the one exception, because it has no Trash.
+**What you see and own, you may move to Trash.** Every row with a real folder or file behind it can be marked: a Reclaim unit and each folder listed under it, an External unit and its folders, a store-interior folder, a measured folder in the Disk views, a build folder no cleanup rule covers, a config or credentials file an AI tool keeps. The category, the location and what swamp does not know are **lines on the confirm, never a refusal**: local state and models say they cannot be regenerated, an installation says its tool will still list it (and, where swamp runs the tool's own removal, names that command), the whole `~/Library/Caches` says it is the folder every app keeps its cache in, Claude session scratch says a running session breaks, a size with a coverage gap says it is a lower bound, a path outside your home says the system may refuse, "last used: no record" and "regeneration cost not established" say what swamp could not find, and a process holding a file open is named (or "could not be checked"). The confirm lists every exact path and size, then these lines, then "Trash is the way back"; it fits the whole plan on screen or Enter is not offered.
+
+The only reasons swamp refuses, each stated on screen:
+
+1. **Not a real deletable folder or file**: gone, a socket or device, not an absolute path, a `.` or `..` in it, a daemon's record rather than a path (a Docker build-cache record, an `ignored`/`untracked` aggregate, a category total, a remainder row), or a folder the walk could not read.
+2. **The OS refuses**: permission denied, a protected system path, a different filesystem. The OS error is the reason.
+3. **The plan changed**: the target changed since you marked it (a symlink swapped in for the folder, a different folder renamed into place, a path that now resolves elsewhere). Nothing moves and the mark stays.
+4. **The ledger cannot be written**: a `started` row is written before a Reclaim/External move, so a store swamp cannot write means nothing moves.
+5. **Overlapping marks**: a folder and one inside it cannot both be marked.
+6. **Your own `swamp protect` mark**: `protected by you (...); swamp protect remove <path> takes the mark off`. A protect list that cannot be read is not an empty list and does not block you: the confirm says `could not read your protect list ... your keep marks were not checked`.
+
+A symlink itself can be moved (the link, never its target). The Reclaim, External and Disk rows use the same review: Space marks (and says why if not), Backspace opens the confirm (it never acts directly), Enter confirms, Esc cancels; no other key acts while the confirm is open. `A` marks each top-level unit once; a folder listed under a unit, a path no cleanup rule covers, and what swamp keeps by default are marked one at a time with Space. Moving a folder out of a unit takes its bytes off the unit on screen at once; the next observation remeasures. The result line says "Sizes are from the last observation" and that space is freed when the Trash is emptied. Other Trash moves (artifact rows, worktrees, Cargo groups, agent units) are not re-derived between marking and Enter, and Enter refuses only for an ordinary OS error. Tool-managed removal (below) has no Trash and keeps its review-to-`Y` recheck of the facts you were shown.
 
 ### Tool-managed removal: mise versions and simulator runtimes
 
@@ -1415,19 +1433,29 @@ Installs that Trash would break are removed by their own manager, permanently, a
 
 The confirm shows what is removed, "No Trash recovery: this cannot be undone", the exact command and the program path, the size (simctl's `sizeBytes`, swamp's stored measurement, or "not measured"), what reinstalling costs ("Reinstall is a download ..."), the open-file answer, mise's own reasons quoted (`mise says: "... is prunable: ..."`), which devices use a simulator runtime, warnings (always, for mise: "Versions pinned by environment variables in your shell are not visible to swamp."), and the dry run verbatim (control, bidi and zero-width characters stripped, bounded). **Enter never runs a removal.** `Y` does, and only after the confirm has been on screen, in full, for 1 second; input already queued when the confirm appears is dropped, and a paste is never read as keys. `Y` runs the whole review again and refuses if anything changed, including the dry run's text and mise's reasons; otherwise it runs exactly the command shown, reads the manager's list back and says plainly what it observed. Esc goes back and nothing runs.
 
+Facts swamp shows as **warnings on the confirm** (you decide; `Y` re-reviews and refuses if any of them changed):
+
+| Warning | Why it is a warning |
+|---|---|
+| A config requests the version (`mise ls` names a source); the global config is named as such; mise reports it active | `mise uninstall` does not check this itself, and after it goes mise in that directory reinstalls it or fails |
+| mise's prune does not list the version | mise does not report it as unneeded; only prune knows the configs mise tracks, and `source: null` from one directory is not "nothing requests it" |
+| A simulator on the runtime is anything but exactly `Shutdown` (Booted, Booting, Shutting Down, no state), or the device list could not be read; the runtime has no identifier, is not Ready/Unusable | `simctl` shuts running simulators down and deletes anyway; the warning names them |
+| Files are held open, the open-file check could not finish, or simctl reports no mount path | there is no Trash to recover from; the warning names the process or says the check did not finish |
+
+Refusals (a removal that would not be the removal you reviewed, or a manager that will not do it):
+
 | Refusal | Why |
 |---|---|
-| A config requests the version (`mise ls` names a source); the global config is named as such | `mise uninstall` does not check this itself |
-| mise's prune does not list the version | only prune knows the configs mise tracks; `source: null` from one directory is not "nothing requests it" |
-| mise's list has a field swamp cannot read, or lists the version twice and any entry is requested or active | an unreadable fact is not an absent one |
-| mise reports it active, it is a symlink install, its install dir (or a directory above it, up to `installs`) is a symlink, or it is not at `<data dir>/installs/<tool folder>/<version>` | removing it would go through a link or a directory nobody reviewed |
+| mise's list has a field swamp cannot read, or lists the version twice and one entry cannot be read | an unreadable fact is not an absent one |
+| It is a symlink install, its install dir (or a directory above it, up to `installs`) is a symlink, or it is not at `<data dir>/installs/<tool folder>/<version>` | removing it would go through a link or a directory nobody reviewed |
 | The dry run exited non-zero, timed out, printed over 1 MiB, printed an error, a line swamp does not recognize, no dry-run marker, a configuration-links line, a path with `..`, or a path that is not exactly this version's install or cache directory | a text swamp cannot read is not a preview |
-| A simulator on the runtime is anything but exactly `Shutdown` (Booted, Booting, Shutting Down, no state), in the default device set or the Xcode Previews set; the runtime has no identifier, no mount path, is not deletable, or is not Ready/Unusable | `simctl` shuts running simulators down and deletes anyway |
-| Files are held open, or the open-file check could not finish | there is no Trash to recover from; only CoreSimulator's own `SimLaunchHost.arm64`/`SimLaunchHost.x86_64`/`SimLaunchHost`, running from CoreSimulator's or Xcode's own folder, does not count |
-| Anything changed between the confirm and `Y` (swamp reviews everything again when you press `Y`) | swamp runs only what that re-review still shows; a change in the milliseconds between that re-review and the command starting is not seen |
+| simctl reports the runtime is not deletable | the tool itself refuses |
+| Anything changed between the confirm and `Y`, including any warning that appeared, disappeared or changed (swamp reviews everything again when you press `Y`) | swamp runs only what that re-review still shows; a change in the milliseconds between that re-review and the command starting is not seen |
 | The confirm does not fit the terminal, or was never drawn | `Y` runs nothing it has not shown in full |
 
-Unbooted simulator devices do not refuse: the confirm names how many and which, and they stop working until you create them again. When simctl shows no Xcode Previews device set the confirm says other device sets are not visible to swamp. A manager version other than the one swamp was tested against (mise 2026.9.15, xcrun 72) is a warning on the confirm. The manager is resolved from a fixed list of directories (never `PATH`); a candidate that exists but is not owned by you or root, or is writable by others, refuses rather than falling through to another. A directory swamp runs a program from must be owned by you or root and not writable by everyone; it may be group-writable only for the macOS `admin` group, because admin members can already use sudo, so this grants no power they lack (standard Homebrew on Apple Silicon keeps `/opt/homebrew/bin` that way). Any other group, any other owner, or any group-write on Linux refuses, and the refusal names the group ("/opt/homebrew/bin is writable by group staff"). The program file itself must still be owned by you or root and not group- or world-writable. Its environment is built from nothing (`HOME`, a fixed `PATH`, `NO_COLOR=1`, `LC_ALL=C`, pagers off), from `/`. mise gets only its own directory settings (`MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`, `MISE_STATE_DIR`, `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`), the same ones its detector and swamp's manager probe honor; xcrun gets `DEVELOPER_DIR` only when it is a real directory owned by you or root, not writable by others, holding a trusted `simctl` (otherwise the confirm says "DEVELOPER_DIR ignored"). Two swamp instances are not locked against each other: if both confirm the same removal, the second run finds nothing to remove (the manager does nothing, or errors), and because the ledger is read and then rewritten, one of the two ledger rows can be lost. Within one swamp, removals run one at a time. A removal still running is not stopped by Esc or Ctrl-C: a manager killed halfway can leave a half-removed install; after 10 minutes it is killed and reported as not finished, and never retried.
+A mise install folder or simulator runtime can also be marked with Space and moved to Trash like any other folder; the confirm says the manager will not know it is gone. Backspace on a row that is not marked opens the manager's own list.
+
+The confirm names how many simulator devices use a runtime and which, and they stop working until you create them again. When simctl shows no Xcode Previews device set the confirm says other device sets are not visible to swamp. A manager version other than the one swamp was tested against (mise 2026.9.15, xcrun 72) is a warning on the confirm. The manager is resolved from a fixed list of directories (never `PATH`); a candidate that exists but is not owned by you or root, or is writable by others, refuses rather than falling through to another. A directory swamp runs a program from must be owned by you or root and not writable by everyone; it may be group-writable only for the macOS `admin` group, because admin members can already use sudo, so this grants no power they lack (standard Homebrew on Apple Silicon keeps `/opt/homebrew/bin` that way). Any other group, any other owner, or any group-write on Linux refuses, and the refusal names the group ("/opt/homebrew/bin is writable by group staff"). The program file itself must still be owned by you or root and not group- or world-writable. Its environment is built from nothing (`HOME`, a fixed `PATH`, `NO_COLOR=1`, `LC_ALL=C`, pagers off), from `/`. mise gets only its own directory settings (`MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`, `MISE_STATE_DIR`, `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`), the same ones its detector and swamp's manager probe honor; xcrun gets `DEVELOPER_DIR` only when it is a real directory owned by you or root, not writable by others, holding a trusted `simctl` (otherwise the confirm says "DEVELOPER_DIR ignored"). Two swamp instances are not locked against each other: if both confirm the same removal, the second run finds nothing to remove (the manager does nothing, or errors), and because the ledger is read and then rewritten, one of the two ledger rows can be lost. Within one swamp, removals run one at a time. A removal still running is not stopped by Esc or Ctrl-C: a manager killed halfway can leave a half-removed install; after 10 minutes it is killed and reported as not finished, and never retried.
 
 Not in this release: `brew uninstall` and `rustup toolchain uninstall` have no dry run, so swamp does not run them; `brew autoremove` waits for a captured real non-empty dry run; a bulk `mise prune --tools` removal is left out (its set is decided when it runs, and its whole path list cannot always be shown): remove the versions mise reports prunable one at a time.
 

@@ -6,7 +6,7 @@ outcome: disk-growth-by-project
 ---
 
 
-**Exception (2026-09-30, #177):** tool-managed removal (a mise version, a simulator runtime), which has no Trash, keeps automated refusals, a review-to-confirm recheck and a TUI-only, human-only confirm: `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`.
+**Exception (2026-09-30, #177):** tool-managed removal (a mise version, a simulator runtime), which has no Trash, keeps a review-to-confirm recheck and a TUI-only, human-only confirm: `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`. Its advisory facts are warnings the person decides on (amended the same day).
 
 ## Why this was retired
 

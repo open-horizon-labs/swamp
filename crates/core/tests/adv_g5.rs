@@ -407,7 +407,14 @@ fn adv_ls_duplicate_entries_are_not_resolved_by_first_match() {
         "",
         0,
     );
-    assert!(review(&sb, &go()).is_err());
+    // The second entry's request is not hidden behind the first: it is on
+    // the confirm as a warning (advice, not a refusal, 2026-09-30).
+    let p = review(&sb, &go()).expect("a config request is a warning");
+    let w = p.warnings().join("\n");
+    assert!(
+        w.contains("requested by") && w.contains("global config"),
+        "{w}"
+    );
 }
 
 fn sim_runtimes(sb: &Sandbox, body: &str) {
@@ -425,7 +432,7 @@ fn sim() -> Target {
 
 /// Tempting wrong patch: "`unwrap_or_default()` on runtimeIdentifier".
 /// Without it the booted-device lookup keys on "" and finds nobody: the
-/// booted iPhone on this runtime is never seen. Must refuse.
+/// booted iPhone on this runtime is never seen. Must say it could not match.
 #[test]
 fn adv_runtime_without_identifier_does_not_skip_the_booted_check() {
     let sb = Sandbox::new();
@@ -434,16 +441,17 @@ fn adv_runtime_without_identifier_does_not_skip_the_booted_check() {
         &sb,
         r#""build":"23C54","deletable":true,"sizeBytes":1,"state":"Ready","version":"26.2""#,
     );
-    let r = review(&sb, &sim());
+    let p = review(&sb, &sim()).expect("a warning, not a refusal");
+    let w = p.warnings().join("\n");
     assert!(
-        r.is_err(),
-        "previewed a runtime whose devices swamp could not match"
+        w.contains("without a runtime identifier") && w.contains("cannot tell which simulators"),
+        "a runtime whose devices swamp could not match says so: {w}"
     );
 }
 
 /// Tempting wrong patch: "`state == \"Booted\"` means nothing is running".
 /// A device Booting or Shutting Down, or with no state, is not known to
-/// be shut down; simctl would shut it down and delete anyway.
+/// be shut down; simctl would shut it down and delete anyway: named.
 #[test]
 fn adv_device_booting_or_without_state_refuses() {
     for dev in [
@@ -460,7 +468,12 @@ fn adv_device_booting_or_without_state_refuses() {
             "",
             0,
         );
-        assert!(review(&sb, &sim()).is_err(), "previewed with device {dev}");
+        let p = review(&sb, &sim()).unwrap_or_else(|_| panic!("a warning with device {dev}"));
+        let w = p.warnings().join("\n");
+        assert!(
+            w.contains("is not shut down on this runtime"),
+            "a device not known to be shut down is named: {dev}: {w}"
+        );
     }
 }
 

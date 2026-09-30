@@ -10,7 +10,7 @@ BuildKit's cache) -- and what removing a piece of it would cost.
 **Report and Cargo inspection do not delete data.** Observation writes
 the report store. The TUI supports exact-path Trash for identified
 project-local outputs, test output and intermediates. Shared stores,
-installations and unknown layouts remain inspection-only. Cargo's
+installations and unknown layouts have no cleanup rule (a person can still mark that exact path; the confirm lists what the adapter could not establish). Cargo's
 fingerprint-aware purpose groups use their separate membership plan
 (`references/cleanup-and-recovery.md`). Describe the row's actual capability;
 do not imply a CLI deletion command exists.
@@ -58,7 +58,7 @@ column.
 | `bytes` + `basis` | a size on one stated basis | not reclaimable space, and never addable across bases |
 | `role` / family | what kind of thing this is | not that it is obsolete or removable |
 | `consequence` | what happens if the bytes go | not a recommendation to remove them |
-| `action` | exact-path TUI Trash, inspection only, or unavailable-with-a-reason | not permission to delete or evidence of disuse |
+| `action` | what swamp's own cleanup rule covers: exact-path TUI Trash, or no rule (inspection only / unsupported, with the reason) | not permission to delete, not a lock, and not evidence of disuse |
 | `coverage.limits` | exactly what swamp could not establish | |
 | `variant.unknowns` | fields with no evidence behind them | |
 

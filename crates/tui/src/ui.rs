@@ -2121,7 +2121,11 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "Space",
         "mark or unmark the row. On a project row: everything in it that can be rebuilt",
     );
-    entry(&mut out, "A", "mark every row here that can be cleaned up");
+    entry(
+        &mut out,
+        "A",
+        "mark every row here that swamp has a cleanup rule for. Rows it keeps by default or has no rule for are marked one at a time with Space; in Reclaim and External each unit is marked once",
+    );
     entry(
         &mut out,
         "Backspace",
@@ -2140,7 +2144,12 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "",
-        "mise installs and simulator runtimes: the manager's own list and dry run, then its command, permanently: no Trash.",
+        "Reclaim, External and Disk rows, and the folders listed under them: Space marks the real folder, Backspace opens a confirm with its exact path, size and what swamp does not know (last used, regeneration cost, who has it open), and Trash is the way back. Refused only for a path that is not a real folder or file, an OS refusal, a mark that changed since you made it, an unwritable ledger, an overlap, or your own protect mark.",
+    );
+    entry(
+        &mut out,
+        "",
+        "mise installs and simulator runtimes: Backspace on an unmarked row opens the manager's own list and dry run, then its command, permanently: no Trash. Space marks the folder for Trash instead.",
     );
     entry(
         &mut out,

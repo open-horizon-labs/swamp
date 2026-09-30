@@ -97,9 +97,9 @@ Git status, unpushed commits, cached PR information, modification age, and remov
 
 Space marks supported rows in the TUI and changes nothing; a check says `ready` or `blocked` for each item, and `b` lists what is blocked with the reason and the next step. Backspace opens the plan (count, size, destination, and what is removed for good); Enter confirms. The result stays on screen until your next key. A build profile selects its supported cleanup groups, not the entire profile directory. Other views can select whole checkouts or worktrees: read the actual paths and warnings.
 
-Filesystem removals move paths to Trash. **Space is not reclaimed until Trash is emptied.** Docker image and volume removals use the daemon and are not recoverable through Trash. Shared stores and unsupported units remain inspection-only. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery).
+Filesystem removals move paths to Trash. **Space is not reclaimed until Trash is emptied.** Docker image and volume removals use the daemon and are not recoverable through Trash. Anything you can see as a real folder or file can be marked, including shared stores and paths swamp has no cleanup rule for: the confirm lists what swamp does not know, and only a path that is not a real deletable folder or file, an OS refusal, a plan that changed since you marked it, an unwritable ledger or your own `swamp protect` mark refuses. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery).
 
-There is no CLI deletion command or MCP server. Cleanup is a human-confirmed TUI action; it does not re-check every fact between marking and confirmation.
+There is no CLI deletion command or MCP server. Cleanup is a human-confirmed TUI action; Reclaim, External and Disk moves re-check that the marked entry is unchanged at Enter, other moves do not re-derive facts between marking and confirmation.
 
 ## Use it from an agent
 

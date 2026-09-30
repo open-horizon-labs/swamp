@@ -1,7 +1,10 @@
-//! Markability: which report rows are a "folded unit" that Backspace can
-//! mark for deletion. Per DESIGN.md / PRODUCT.md: folded artifacts only
-//! (dependency trees, build outputs, caches, Docker objects) — never a
-//! checkout, worktree, `.git`, Source tree, or unowned path.
+//! Markability for **bulk** marking (`A`, a project mark): which report
+//! rows are a "folded unit" that one gesture may sweep up (dependency
+//! trees, build outputs, caches, Docker objects). Space on a single row is
+//! never limited by this: a checkout, a worktree, `.git` or a Source
+//! directory marks on its own row with its warnings on the confirm
+//! (`App::mark_row`); this list only keeps them out of a gesture that
+//! would mark many at once.
 
 use swamp_core::report::ArtifactKind;
 
@@ -35,14 +38,14 @@ pub fn markable(kind: &ArtifactKind) -> Result<(), &'static str> {
         ArtifactKind::DockerBuildCache => {
             Err("docker has no per-entry build-cache removal; `docker builder prune` acts on all of it")
         }
-        ArtifactKind::Git => Err("git metadata is never a delete target"),
-        ArtifactKind::Source => Err("source trees are never a delete target"),
+        ArtifactKind::Git => Err("git metadata is left out of mark-all; Space on its own row marks it, and the confirm says its history goes with it"),
+        ArtifactKind::Source => Err("source trees are left out of mark-all; Space on its own row marks one"),
         // Bytes scattered across the checkout, reported under the
         // worktree's own path: there is no single directory to act on.
         ArtifactKind::Ignored | ArtifactKind::Untracked => Err(
             "an aggregate of every such path under the checkout, not one directory; open the worktree and act on what is inside it",
         ),
-        ArtifactKind::Unknown => Err("kind is unclassified; not a folded unit"),
+        ArtifactKind::Unknown => Err("kind is unclassified, so it is left out of mark-all; Space on its own row marks it"),
     }
 }
 

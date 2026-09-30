@@ -36,8 +36,8 @@ The effective scope combines defaults, enabled tool-location detectors, and conf
 - Keep current measurements and reverse-delta history in the existing Parquet store. Fold artifacts; request deeper inspection on demand instead of persisting an exhaustive file index.
 - Keep incremental observation local to changes. Label stale unique-byte estimates until explicit reconciliation.
 - Record history coverage honestly. History begins with observation and contains sizes and metadata, not recoverable contents or writer identity.
-- Offer cleanup only for supported units. Filesystem actions use Trash; Docker image/volume deletion has no Trash recovery. External shared stores may be inspection-only.
-- Keep removal human-confirmed in the TUI. There is no CLI deletion or approval command. Facts are not all re-checked between marking and confirmation.
+- What you see and own, you may move to Trash: cleanup is offered for every real folder or file, and what swamp does not know about it (no rule, no record of use, regeneration cost not established) is stated on the confirm. Filesystem actions use Trash; Docker image/volume deletion has no Trash recovery.
+- Keep removal human-confirmed in the TUI. There is no CLI deletion or approval command. Refusals are only: not a real deletable path, the OS, a plan that changed since you marked it, an unwritable ledger, an overlap, your own protect mark.
 - Distinguish rebuilding a cache from losing a conversation, checkpoint, local source change, or other unique data.
 
 See [usage](docs/usage.md), the [trust model](skills/swamp/references/trust-model.md), and [implementation limits](docs/architecture.md#limits-of-the-current-implementation).

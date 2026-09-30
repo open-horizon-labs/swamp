@@ -151,9 +151,10 @@ detector-resolved location (mise's `installs`/`downloads` inside its
 own data dir, Hugging Face's `hub` cache inside `HF_HOME`) is excluded
 from that outer location's own measurement, so summing every unit in
 `--view external` never double-counts a nested one.
-They are shown for review only: never markable in the TUI, and no
-command deletes one. Never treat an external unit as deletable through
-any path this tool exposes -- act on it with the manager's own tools.
+No command deletes one. In the TUI a person can mark a unit or a listed
+folder for the reviewed Trash move (the confirm says what swamp does not
+know); an agent must never act on one itself -- relay the facts, and the
+manager's own command where it has one.
 
 ## Filesystem vs. Docker accounting
 

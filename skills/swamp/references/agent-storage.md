@@ -45,9 +45,10 @@ category directory, recoverable Trash move -- regenerated automatically
 by the tool) and **sessions** (the exact transcript + its linked
 recovery material, moved together -- this discards unique
 resume/rewind/checkpoint history, never the linked project's own
-files). Everything else -- protected config, plugins outside their own
-`.trash` staging area, attachments, unclassified -- has no Trash move
-at all; the TUI refuses to mark it and names why.
+files). Everything else -- config swamp keeps by default, plugins
+outside their own `.trash` staging area, attachments, unclassified --
+has no swamp rule; a person can still mark it one row at a time, and the
+confirm says what the tool loses.
 
 A project's linked agent storage is also visible from the project tree
 itself, not only `--view agents`: `swamp report --project <name>` (text
@@ -74,9 +75,10 @@ later one could not be) leaves a `restore.json` manifest inside its
 Trash envelope naming exactly which member moved where.
 
 If a unit cannot be marked, the TUI's footer names the exact reason
-(`protected: ...`, `swamp has no Trash move for this category`,
-`touches a database-like (SQLite/WAL/SHM) file`) -- relay it verbatim,
-never as "unsafe" or "can't be deleted".
+(`protected by you: ...` for the person's own `swamp protect` mark, or a
+path that is gone) -- relay it verbatim, never as "unsafe" or "can't be
+deleted". The other facts (kept by default, no rule for the category, a
+database-like file) are warnings on the confirm, not refusals.
 
 ## Full reference
 

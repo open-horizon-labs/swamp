@@ -6,7 +6,7 @@ outcome: decision-relevant-storage-evidence
 ---
 
 
-**Exception (2026-09-30, #177):** tool-managed removal (a mise version, a simulator runtime), which has no Trash, keeps automated refusals, a review-to-confirm recheck and a TUI-only, human-only confirm: `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`.
+**Exception (2026-09-30, #177):** tool-managed removal (a mise version, a simulator runtime), which has no Trash, keeps a review-to-confirm recheck and a TUI-only, human-only confirm: `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`. **Amended the same day:** an occupied or unanswered open-file reading is a *warning* there too (said as held, or as not checked), not a refusal; `Y` refuses only if the reading changed since the confirm. A Trash move (Reclaim, External, Disk, artifacts, agents) names the same tri-state reading on its confirm and is never gated on it.
 
 ## Why this was retired
 

@@ -33,15 +33,16 @@ commands. Filesystem selections use the Trash flow:
   (`~/.Trash` on macOS, the freedesktop home trash on Linux) and appends
   one ledger line per unit: path, recovery location, bytes, time.
 
-Docker image/volume removal uses Docker and has no Trash recovery. A mise tool version or a simulator runtime is removed by mise or simctl itself, permanently, from the TUI only (Backspace on its row, then `Y` on a confirm that shows the manager's own dry run); swamp refuses it when a config requests the version, a simulator is not shut down, files are held open or cannot be checked, or anything changed since the confirm (`.oh/guardrails/tool-removal-refuses-on-manager-facts.md`). No CLI, JSON or agent path runs it.
+Docker image/volume removal uses Docker and has no Trash recovery. A mise tool version or a simulator runtime is removed by mise or simctl itself, permanently, from the TUI only (Backspace on its row, then `Y` on a confirm that shows the manager's own dry run); its confirm warns when a config requests the version, a simulator is not shut down, or files are held open or cannot be checked, and `Y` refuses if any fact changed since the confirm (`.oh/guardrails/tool-removal-refuses-on-manager-facts.md`). No CLI, JSON or agent path runs it.
 Moving filesystem data to Trash does not itself free disk space.
 
-There is no re-derivation between marking
-and moving, no "changed since you looked" refusal, and no occupancy
-veto -- the open-file fact is shown, never enforced. The only way Enter
-refuses is an ordinary OS-level error: permission denied, the path is
-already gone, or the Trash is on a different device with no
-permanent-delete fallback.
+There is no occupancy veto -- the open-file
+fact is shown, never enforced. Reclaim, External and Disk moves recheck
+that the marked entry is the same entry in the same place (a plan that
+changed refuses) and write a ledger row first; other moves are not re-derived.
+Otherwise Enter refuses only for an ordinary OS-level error: permission
+denied, the path is already gone, or the Trash is on a different device
+with no permanent-delete fallback.
 
 ## What this means for you as an agent
 

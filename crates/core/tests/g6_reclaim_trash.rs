@@ -421,14 +421,30 @@ fn protect_marks_that_cannot_be_read_are_a_warning_not_an_empty_list() {
     let v = view(&[unit(StorageCategory::Cache, &p, 5)]);
     let t = target_of(&v, &p);
     let r = review(&t, None, Some(&f.home)).unwrap();
-    assert!(r.warnings[0].contains("could not read your protect list"), "{:?}", r.warnings);
-    std::fs::write(swamp_core::protection::protect_path(&f.store), b"not parquet").unwrap();
+    assert!(
+        r.warnings[0].contains("could not read your protect list"),
+        "{:?}",
+        r.warnings
+    );
+    std::fs::write(
+        swamp_core::protection::protect_path(&f.store),
+        b"not parquet",
+    )
+    .unwrap();
     let r = review(&t, Some(&f.store), Some(&f.home)).unwrap();
-    assert!(r.warnings[0].contains("keep marks were not checked"), "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains("keep marks were not checked"),
+        "{:?}",
+        r.warnings
+    );
     // And a readable list still wins over the warning path.
     std::fs::remove_file(swamp_core::protection::protect_path(&f.store)).unwrap();
     swamp_core::protection::protect_add(&f.store, &p).unwrap();
-    assert!(review(&t, Some(&f.store), Some(&f.home)).unwrap_err().contains("protected by you"));
+    assert!(
+        review(&t, Some(&f.store), Some(&f.home))
+            .unwrap_err()
+            .contains("protected by you")
+    );
 }
 
 /// Tempting wrong patch: a path with `..` or a relative path is

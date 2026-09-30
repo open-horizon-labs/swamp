@@ -1,7 +1,7 @@
 ---
 id: protection-fails-closed
 severity: hard
-statement: "Human keep/protect intent is loaded through one function that returns a Result; unreadable or malformed protection state is unknown, never an empty keep list, and every action refuses until it can be read. There is exactly ONE protection predicate (agents::protection_conflict), it tests both directions -- a unit beneath a protected path and a unit containing one -- and no other function answers the question except by delegating to it. The list is written atomically."
+statement: "Human keep/protect intent is loaded through one function that returns a Result; unreadable or malformed protection state is unknown, never an empty keep list: the confirm says `could not read your protect list ... your keep marks were not checked` and the person's single confirm decides (maintainer decision, 2026-09-30; it used to refuse every action). A readable mark the person made themselves still refuses, with the command that removes it (`swamp protect remove <path>`). There is exactly ONE protection predicate (agents::protection_conflict), it tests both directions -- a unit beneath a protected path and a unit containing one -- and no other function answers the question except by delegating to it. The list is written atomically."
 outcome: decision-relevant-storage-evidence
 audit: sinks_have_no_path_predicates
 compile_fail:
@@ -9,11 +9,16 @@ compile_fail:
   - protect_list_has_no_default
   - protect_listing_is_display_only
 runtime_tests:
-  - crates/tui/src/app.rs::tests::agents_view_mark_row_refuses_a_protected_unit_with_the_reason_not_a_generic_message
+  - crates/tui/src/app.rs::tests::agents_view_mark_row_marks_a_default_kept_unit_with_a_warning_and_respects_the_persons_mark
+  - crates/tui/tests/g6_reclaim_trash.rs::a_protected_folder_is_refused_with_the_persons_own_mark_named
+  - crates/core/tests/g6_reclaim_trash.rs::protect_marks_that_cannot_be_read_are_a_warning_not_an_empty_list
+  - crates/core/tests/g6_reclaim_trash.rs::the_persons_protect_mark_is_respected_at_review_and_at_the_move
   - crates/tui/tests/scope_preserving_refresh.rs::marking_an_ordinary_row_that_contains_a_protected_file_is_refused_with_the_reason
 ---
 
 ## Rationale
+
+**Amended 2026-09-30.** Fail-closed meant "refuse every mark in the app while the list cannot be read". The maintainer ruled that what they see and own is theirs to remove, so an unreadable list is now *unknown, shown*: a warning on every confirm (Reclaim/External/Disk review, the standalone and nested-unit plans, the generic mark). The type-level rule is unchanged: `ProtectList` has no `Default`, `load_protect` returns a `Result`, and no caller turns an error into an empty list silently. A list that loads and covers the path (either direction) still refuses.
 
 Two findings from the 2026-09-21 review:
 

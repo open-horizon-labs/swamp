@@ -360,35 +360,33 @@ fn linked_component(install: &Path, d: &Dirs) -> Option<PathBuf> {
         .find(|p| crate::fs_gate::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
 }
 
-/// swamp's own refusals for one installed version (mise checks none of
-/// them).
-fn guard(inst: &Install, home: &Path, bin: &ToolBin) -> Result<(), Refusal> {
+/// What swamp says about one installed version that mise's own dry run
+/// does not check: a config that requests it, mise's own "active". Advice
+/// on the confirm, not a refusal: the person decides, and a fresh review
+/// at `Y` must show the same facts. The refusals that follow are about
+/// the removal being the removal that was reviewed (a link in the path,
+/// an install mise does not keep where it keeps them).
+fn guard(inst: &Install, home: &Path, bin: &ToolBin) -> Result<Vec<String>, Refusal> {
     let tv = inst.tv();
     let d = dirs(bin, home);
+    let mut advice: Vec<String> = Vec::new();
     if let Some(src) = &inst.source {
-        return Err(if is_global_config(src, &d, bin) {
-            Refusal::new(
-                format!(
-                    "{tv} is requested by {} (mise's global config). mise's own dry run does not \
-                     check this.",
-                    tilde(src, home)
-                ),
-                format!(
-                    "Edit that file or run `mise unuse -g {}` yourself, then review again.",
-                    inst.tool
-                ),
+        advice.push(if is_global_config(src, &d, bin) {
+            format!(
+                "{tv} is requested by {} (mise's global config); mise's own dry run does not check this. After it goes, mise in a directory that uses it reinstalls it or fails. `mise unuse -g {}` changes the request.",
+                tilde(src, home),
+                inst.tool
             )
         } else {
-            Refusal::new(
-                format!("{tv} is requested by {}.", tilde(src, home)),
-                "Change that config first, then review again.",
+            format!(
+                "{tv} is requested by {}; after it goes, mise in that directory reinstalls it or fails.",
+                tilde(src, home)
             )
         });
     }
     if inst.active {
-        return Err(Refusal::new(
-            format!("mise reports {tv} as active."),
-            "Change the config that selects it first, then review again.",
+        advice.push(format!(
+            "mise reports {tv} as active: the config that selects it still points at it."
         ));
     }
     if let Some(to) = &inst.symlinked_to {
@@ -419,7 +417,7 @@ fn guard(inst: &Install, home: &Path, bin: &ToolBin) -> Result<(), Refusal> {
             "Remove it with mise yourself if you mean to.",
         ));
     }
-    Ok(())
+    Ok(advice)
 }
 
 /// `mise prune --tools --dry-run`, parsed. Its exit code must be 0.
@@ -518,7 +516,7 @@ pub(super) fn review(
 ) -> Result<Preview, Refusal> {
     let home = host.home();
     let installs = list_installs(bin)?;
-    let (prune, prune_shown) = prune_dry(bin, &home)?;
+    let (prune, _) = prune_dry(bin, &home)?;
     let find = |tv: &str| installs.iter().find(|i| i.tv() == tv);
     let mut state: Vec<(String, String)> = Vec::new();
     let prune_set: Vec<String> = prune.versions.keys().cloned().collect();
@@ -545,19 +543,18 @@ pub(super) fn review(
             // Every entry mise lists for this version: a duplicate that is
             // requested, active or unreadable refuses, whatever the first
             // one says.
+            let mut advice: Vec<String> = Vec::new();
             for dup in installs.iter().filter(|i| i.tv() == tv) {
-                guard(dup, &home, bin)?;
+                for line in guard(dup, &home, bin)? {
+                    if !advice.contains(&line) {
+                        advice.push(line);
+                    }
+                }
             }
             if !prune.versions.contains_key(&tv) {
-                return Err(Refusal::new(
-                    format!(
-                        "mise's prune does not list {tv}, so a config mise tracks may still \
-                         request it."
-                    ),
-                    "Run `mise prune --tools --dry-run` yourself to see why, or remove it with \
-                     mise yourself.",
-                )
-                .with_output(prune_shown));
+                advice.push(format!(
+                    "mise's prune does not list {tv}: mise does not report it as unneeded, so a config mise tracks may still request it. `mise prune --tools --dry-run` shows why."
+                ));
             }
             state.push((format!("mise's entry for {tv}"), inst.fact(&home)));
             let exec: Vec<OsString> = ["-C", "/", "uninstall", tv.as_str()]
@@ -603,7 +600,12 @@ pub(super) fn review(
                 )
                 .with_output(shown.clone())
             })?;
-            let open_files = super::open_files_fact(host, &removes, &[], Manager::Mise)?;
+            let (open_files, open_warning) =
+                super::open_files_fact(host, &removes, &[], Manager::Mise);
+            state.push(("open files".to_string(), open_files.clone()));
+            let mut warnings = vec![PINNED_BY_ENV.to_string()];
+            warnings.extend(advice);
+            warnings.extend(open_warning);
             let mut evidence: Vec<String> = prune
                 .reasons
                 .iter()
@@ -625,7 +627,7 @@ pub(super) fn review(
                 size: size_of(&[inst.install_path.as_path()], sizes),
                 regen: regen(inst),
                 evidence,
-                warnings: vec![PINNED_BY_ENV.to_string()],
+                warnings,
                 open_files,
                 manager_version: String::new(),
                 title: tv,

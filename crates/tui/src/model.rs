@@ -2883,7 +2883,11 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
             };
             // Kept by default, not forbidden: Space marks it, and the confirm says
             // what the tool loses. `A` leaves it out.
-            let protect = if u.protected { " [kept by default]" } else { "" };
+            let protect = if u.protected {
+                " [kept by default]"
+            } else {
+                ""
+            };
             let mut row = Row::leaf(
                 0,
                 format!(
