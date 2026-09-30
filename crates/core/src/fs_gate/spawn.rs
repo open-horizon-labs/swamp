@@ -886,6 +886,8 @@ pub struct ToolResolver {
     home: Option<PathBuf>,
     sandbox: Option<PathBuf>,
     parent_env: Option<Vec<(String, String)>>,
+    /// Why nothing resolves (a test sandbox that failed its checks).
+    refused: Option<String>,
 }
 
 /// Directories a test sandbox may never be, or contain.
@@ -921,41 +923,47 @@ impl ToolResolver {
                 .filter(|h| h.is_absolute()),
             sandbox: None,
             parent_env: None,
+            refused: None,
         }
     }
 
     /// Fake managers under `dir/bin/<name>`, with `dir/home` as the
-    /// child's `HOME`. Test builds only. Panics unless `dir` is a real
-    /// directory (not a link) inside the system temp dir and is not, and
-    /// holds none of, the system directories: a sandbox at `/usr` or
-    /// `/opt/homebrew` would resolve a real manager.
+    /// child's `HOME`. Test builds only. Unless `dir` is a real directory
+    /// (not a link) inside the system temp dir that is not, and holds
+    /// none of, the system directories, nothing resolves: a sandbox at
+    /// `/usr` or `/opt/homebrew` would name a real manager.
     #[cfg(any(test, feature = "testing"))]
     pub fn sandboxed(dir: &Path) -> Self {
-        let bad = |why: &str| -> ! {
-            panic!(
-                "test build: {} is not a test sandbox ({why})",
-                dir.display()
-            )
-        };
-        if std::fs::symlink_metadata(dir).map_or(true, |m| !m.is_dir()) {
-            bad("not a real directory");
-        }
-        let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| bad("cannot be resolved"));
-        let tmp = std::fs::canonicalize(std::env::temp_dir())
-            .unwrap_or_else(|_| bad("no system temp dir"));
-        if canon == tmp || !canon.starts_with(&tmp) {
-            bad("not inside the system temp dir");
-        }
-        if SYSTEM_DIRS
-            .iter()
-            .any(|s| canon == Path::new(s) || Path::new(s).starts_with(&canon))
-        {
-            bad("a system directory");
-        }
-        ToolResolver {
-            home: Some(canon.join("home")),
-            sandbox: Some(canon),
-            parent_env: None,
+        let checked = (|| -> Result<PathBuf, String> {
+            if std::fs::symlink_metadata(dir).map_or(true, |m| !m.is_dir()) {
+                return Err("not a real directory".into());
+            }
+            let canon = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+            let tmp = std::fs::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?;
+            if canon == tmp || !canon.starts_with(&tmp) {
+                return Err("not inside the system temp dir".into());
+            }
+            if SYSTEM_DIRS
+                .iter()
+                .any(|s| canon == Path::new(s) || Path::new(s).starts_with(&canon))
+            {
+                return Err("a system directory".into());
+            }
+            Ok(canon)
+        })();
+        match checked {
+            Ok(canon) => ToolResolver {
+                home: Some(canon.join("home")),
+                sandbox: Some(canon),
+                parent_env: None,
+                refused: None,
+            },
+            Err(why) => ToolResolver {
+                home: None,
+                sandbox: Some(PathBuf::from("/nonexistent-test-sandbox")),
+                parent_env: None,
+                refused: Some(format!("{} is not a test sandbox ({why})", dir.display())),
+            },
         }
     }
 
@@ -992,6 +1000,9 @@ impl ToolResolver {
     /// The first candidate that exists, if it and its directories pass
     /// the ownership and permission checks (`program_paths::resolve_strict`).
     pub fn resolve(&self, program: Program) -> Result<ToolBin, String> {
+        if let Some(why) = &self.refused {
+            return Err(why.clone());
+        }
         let r = super::program_paths::resolve_strict(&self.candidates(program))
             .map_err(|why| format!("{}: {why}", program.binary()))?;
         let parent: Vec<(String, String)> = match &self.parent_env {

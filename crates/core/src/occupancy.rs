@@ -198,7 +198,9 @@ impl OccupancySnapshot {
             std::collections::BTreeSet<String>,
         > = Default::default();
         let mut saw_process = false;
-        let mut command: Option<String> = None;
+        // One process at a time: its command name and every path it has
+        // open (its own executable among them, the `txt` entry).
+        let mut procs: Vec<(Option<String>, Vec<std::path::PathBuf>)> = Vec::new();
         for line in stdout.lines().filter(|l| !l.is_empty()) {
             let mut chars = line.chars();
             let id = chars.next().unwrap_or(' ');
@@ -208,19 +210,44 @@ impl OccupancySnapshot {
             match id {
                 'p' => {
                     saw_process = true;
-                    command = None;
+                    procs.push((None, Vec::new()));
                 }
-                'c' => command = Some(chars.as_str().to_string()),
+                'c' => {
+                    if let Some(p) = procs.last_mut() {
+                        p.0 = Some(chars.as_str().to_string());
+                    }
+                }
                 'n' => {
                     let name = chars.as_str();
                     if name.starts_with('/') {
-                        let holders = open.entry(std::path::PathBuf::from(name)).or_default();
-                        if let Some(c) = &command {
-                            holders.insert(c.clone());
+                        if procs.is_empty() {
+                            procs.push((None, Vec::new()));
+                        }
+                        if let Some(p) = procs.last_mut() {
+                            p.1.push(std::path::PathBuf::from(name));
                         }
                     }
                 }
                 _ => {}
+            }
+        }
+        for (command, paths) in procs {
+            // A command name counts as itself only when the process's own
+            // executable is where CoreSimulator or Xcode keeps it; any
+            // other process with that name is just its name.
+            let label = command.map(|c| {
+                let verified = paths.iter().any(|p| {
+                    p.file_name().and_then(|n| n.to_str()) == Some(c.as_str())
+                        && TRUSTED_HOST_ROOTS.iter().any(|r| p.starts_with(r))
+                        && !p.components().any(|x| x.as_os_str() == "..")
+                });
+                if verified { format!("{VERIFIED}{c}") } else { c }
+            });
+            for path in paths {
+                let holders = open.entry(path).or_default();
+                if let Some(l) = &label {
+                    holders.insert(l.clone());
+                }
             }
         }
         // A machine always has at least this process's own descriptors
@@ -344,11 +371,15 @@ impl OccupancySnapshot {
                     .take_while(|(hit, _)| hit.starts_with(anchor))
                 {
                     let own = !holders.is_empty()
-                        && holders
-                            .iter()
-                            .all(|h| manager_own.iter().any(|m| h.starts_with(m)));
+                        && holders.iter().all(|h| {
+                            h.strip_prefix(VERIFIED)
+                                .is_some_and(|c| manager_own.contains(&c))
+                        });
                     if !own {
-                        let who = holders.iter().next().cloned();
+                        let who = holders
+                            .iter()
+                            .next()
+                            .map(|h| h.trim_start_matches(VERIFIED).to_string());
                         return (OccupancyState::Occupied(hit.clone()), who);
                     }
                 }
@@ -363,6 +394,17 @@ impl OccupancySnapshot {
         }
     }
 }
+
+/// Marks a holder whose executable was found under [`TRUSTED_HOST_ROOTS`].
+const VERIFIED: &str = "verified-executable:";
+
+/// Where a manager's own host process may live for its name to count
+/// (`SimLaunchHost.arm64` is CoreSimulator's XPC service).
+const TRUSTED_HOST_ROOTS: &[&str] = &[
+    "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/",
+    "/Library/Developer/CoreSimulator/",
+    "/Applications/Xcode.app/",
+];
 
 /// The tool-removal listing's `lsof` argv: the snapshot's, with each
 /// process's command name.
@@ -1363,14 +1405,21 @@ mod tests {
         assert_eq!(counted.subprocess_spawns, 3);
     }
     /// Tool removal counts every holder but the manager's own host
-    /// process, and an incomplete listing is `Unknown`, never `Free`.
+    /// process (exact name, executable where CoreSimulator keeps it; the
+    /// same name elsewhere blocks), and an incomplete listing is `Unknown`, never `Free`.
     #[test]
     fn tool_removal_holders_skip_only_the_managers_own_process() {
         let listing =
-            "p1\ncSimLaunchHost.arm64\nn/vol/iOS/lib.dylib\np2\ncnode\nn/m/node/24/bin/node\n";
+            "p1\ncSimLaunchHost.arm64\nn/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/SimLaunchHost.arm64.xpc/Contents/MacOS/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\np2\ncnode\nn/m/node/24/bin/node\n";
         let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
-        let (s, who) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+        let (s, who) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
         assert_eq!((s, who), (OccupancyState::Free, None));
+        let impostor = "p3\ncSimLaunchHost.arm64\nn/tmp/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\n";
+        let fake = OccupancySnapshot::from_lsof_run(Some(0), false, impostor, "");
+        assert!(matches!(
+            fake.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]).0,
+            OccupancyState::Occupied(_)
+        ));
         let (s, who) = snap.holders_of(&[PathBuf::from("/m/node/24")], &["SimLaunchHost"]);
         assert_eq!(
             s,
@@ -1379,7 +1428,7 @@ mod tests {
         assert_eq!(who.as_deref(), Some("node"));
         let partial =
             OccupancySnapshot::from_lsof_run(Some(1), false, listing, "lsof: Permission denied");
-        let (s, _) = partial.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+        let (s, _) = partial.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
         assert!(matches!(s, OccupancyState::Unknown(_)), "{s:?}");
         let failed = OccupancySnapshot::from_lsof_run(None, true, "", "");
         assert!(matches!(

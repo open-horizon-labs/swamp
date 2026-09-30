@@ -21,7 +21,7 @@ pub(super) const VERIFIED_VERSION: &str = "72";
 /// CoreSimulator's own host process keeps a library open in every
 /// mounted runtime; simctl stops it and unmounts before it deletes, so
 /// it is not a holder that refuses.
-const MANAGER_OWN: &[&str] = &["SimLaunchHost"];
+const MANAGER_OWN: &[&str] = &["SimLaunchHost.arm64", "SimLaunchHost.x86_64", "SimLaunchHost"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Runtime {
