@@ -39,7 +39,7 @@ use std::path::PathBuf;
 
 use super::{
     BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
-    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor, ToolManagedLocation, ToolManager,
 };
 
 pub const CORE_SIMULATOR_DETECTOR_ID: &str = "core-simulator";
@@ -57,6 +57,21 @@ impl Detector for CoreSimulatorDetector {
 
     fn platforms(&self) -> &'static [Platform] {
         &[Platform::MacOS]
+    }
+
+    /// Runtime images are removed by `simctl runtime delete` (#177):
+    /// the system-wide mounted volumes and the per-user runtime bundles.
+    fn tool_managed(&self) -> &'static [ToolManagedLocation] {
+        &[
+            ToolManagedLocation {
+                suffix: "CoreSimulator/Volumes",
+                manager: ToolManager::Simulator,
+            },
+            ToolManagedLocation {
+                suffix: "CoreSimulator/Profiles/Runtimes",
+                manager: ToolManager::Simulator,
+            },
+        ]
     }
 
     fn version_note(&self) -> &'static str {

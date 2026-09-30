@@ -146,6 +146,10 @@ pub struct Row {
     /// for a structural row with no single unit backing it (a project
     /// header, a worktree row, an aggregated kind/type bucket).
     pub evidence: Vec<swamp_core::evidence::Evidence>,
+    /// Set on an external row whose installs their own manager removes
+    /// (mise installs, simulator runtimes; #177): Backspace opens that
+    /// manager's sheet instead of a Trash confirm.
+    pub tool: Option<swamp_core::tool_removal::Manager>,
     /// Already-worded last-used fact with its source
     /// (`Last run or opened: Jul 8 (file access time)`), for a row whose
     /// unit has one. Shown in the detail pane, never as a table column.
@@ -184,6 +188,7 @@ impl Row {
             allocated: false,
             project: None,
             evidence: Vec::new(),
+            tool: None,
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
@@ -561,6 +566,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             // worktree/artifact below it); drill into the tree/worktree
             // rows for evidence, same as every other per-project fact.
             evidence: Vec::new(),
+            tool: None,
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
@@ -693,6 +699,7 @@ pub fn tree_rows_with_agents(
                 .find(|a| a.kind == ArtifactKind::Source)
                 .map(|a| a.evidence.clone())
                 .unwrap_or_default(),
+            tool: None,
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
@@ -1671,6 +1678,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             allocated: false,
             project: None,
             evidence: Vec::new(),
+            tool: None,
             last_used: None,
             size_text: None,
             detail_lines: Vec::new(),
@@ -2206,6 +2214,11 @@ pub fn external_rows_with(
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        row.tool = swamp_core::tool_removal::manager_for_unit(&u.detector_id, &u.path);
+        if let Some(m) = row.tool {
+            row.signals
+                .push(format!("removed by {} itself · Backspace", m.name()));
+        }
         row.last_used = Some(u.last_used.describe(observed_at));
         // The interior this unit itself owns: not the interior of another
         // unit that happens to sit under its path (`go-build` under
@@ -2263,6 +2276,8 @@ pub fn external_rows_with(
             row.expansion_key = Some(key);
             row.rail = if open { "▾ ".into() } else { "▸ ".into() };
             row.collapsed_children = (!open).then_some(children.len());
+            row.signals
+                .insert(0, "store interior below · inspection only".into());
             row.signals = vec![if has_interior {
                 "store interior below · inspection only".into()
             } else {

@@ -1,4 +1,4 @@
-"/Users/dev/src · observed just now · since 1w · 2 pr┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-58 of 78 ───────────────────────────────┐                                                    "
+"/Users/dev/src · observed just now · since 1w · 2 pr┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-58 of 80 ───────────────────────────────┐                                                    "
 "Developer storage: 10.9GB across 2 projects         │Keys                                                                                          │                                                    "
 "projects 10.9GB                                     │  ↑ ↓        move the cursor                                                                  │                                                    "
 "disk ledger: not measured yet; run swamp observe --v│  PgUp PgDn  move a screenful · Home and End jump to the first and last row                   │                                                    "
@@ -10,6 +10,8 @@
 "swamp  🐳 🔨                                        │             On a project row that is its rebuildable items; only if it has none, the         │                                                    " Hidden by multi-width symbols: [(8, " "), (11, " ")]
 "                                                    │             checkout itself (named 'checkout' on the plan), with .git and source, into Trash.│                                                    "
 "                                                    │             Docker images and volumes are removed by docker for good: no Trash.              │                                                    "
+"                                                    │             mise installs and simulator runtimes: the manager's own list and dry run, then   │                                                    "
+"                                                    │             its command, permanently: no Trash.                                              │                                                    "
 "                                                    │  b  d       list what the last check could not include, with the reason and the next step (d │                                                    "
 "                                                    │             on the plan)                                                                     │                                                    "
 "                                                    │  ✗  ~n/m    a project row is all marked, or n of its m items are                             │                                                    "
@@ -55,6 +57,4 @@
 "                                                    │  [tracked] [ignored] [untracked] is git status; untracked has no copy anywhere.              │                                                    "
 "                                                    │                                                                                              │                                                    "
 "                                                    │Filter grammar                                                                                │                                                    "
-"                                                    │  growth [><] <size> in <duration>   (window capped at stored history)                        │                                                    "
-"                                                    │  kind:<k>   project:<name|glob*>   type:rs|js|py|go|…   pr:open|merged|closed|none           │                                                    "
 "Tab section  v view  / filter  R refresh  ⌫ delete  └──────────────────────────────────────────────────────────────────────────────────────────────┘                                                    "

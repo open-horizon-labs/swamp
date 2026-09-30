@@ -354,6 +354,20 @@ fn remove_worktree(
     Ok(outcome)
 }
 
+/// Enter on the tool-managed removal confirm (#177): the one caller of
+/// `tool_removal::execute`, which re-reviews, refuses anything that
+/// changed, runs exactly `preview`'s command and records a `tool-remove`
+/// ledger line. Runs on a worker, never on the event thread.
+pub fn run_tool_removal(
+    host: &swamp_core::tool_removal::Host,
+    preview: &swamp_core::tool_removal::Preview,
+    sizes: &[(PathBuf, u64)],
+    store: &swamp_core::fs_gate::StoreDir,
+) -> swamp_core::tool_removal::Outcome {
+    let ledger = host.ledger_in(store);
+    swamp_core::tool_removal::execute(host, preview, sizes, &ledger)
+}
+
 /// Executes every unit in order. A failure on one unit does not stop the
 /// rest -- the footer reports refusals per unit, not as a single aborted
 /// batch.

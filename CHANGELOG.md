@@ -60,6 +60,22 @@ observations, not general performance guarantees. See the README for current use
   and a store that has never opened Tools or Disk shows one line saying so until it does
   (`ui_state.json` `views_seen`). The block is four rows plus the strip, so on a 24-row
   screen the table area (its heading included) is 14 rows where it was 19.
+- **mise versions and simulator runtimes can be removed through their own manager, from
+  the TUI.** Trash would break these installs, so they had no removal at all. In the
+  external view, Backspace on the mise installs row or a simulator runtimes row shows the
+  manager's own list; Enter on one runs the manager's own dry run and shows a confirm with
+  the exact command, the dry run verbatim, the size (simctl's `sizeBytes`, 8.4 GB for
+  iOS 26.2 here, or "not measured"), what reinstalling costs, and "No Trash recovery: this
+  cannot be undone". `Y` on the confirm (never Enter, and only after it has been on screen
+  for a second) checks everything again and runs exactly that command:
+  `mise -C / uninstall <tool>@<version>` or `xcrun simctl runtime delete <UUID>`. swamp refuses, with the reason and the next step,
+  a version a config requests (mise's own dry run does not check this for the global
+  config), a version mise's prune does not list, a simulator that is not shut down (simctl would
+  shut it down and delete anyway), files held open or an open-file check that could not finish,
+  a dry run it cannot read, and anything that changed since the confirm. Devices on a
+  runtime are named on the confirm. Each removal is one `tool-remove` ledger row with the
+  command, the manager's version and what the re-read showed; there is no CLI for it.
+  `brew uninstall` and `rustup toolchain uninstall` have no dry run and stay facts only.
 - **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
   unit of developer storage, largest first, with what getting it back costs in the
   tool's own words, when it was last used and from what record, who is known to

@@ -14,7 +14,7 @@ use super::{
     ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
     LastUseDecl, LastUseSource, LocationStatus, ManagerConvention, ManagerDecl, ManagerProbe,
     Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
-    StoreAnchor, SubjectShape,
+    StoreAnchor, SubjectShape, ToolManagedLocation, ToolManager,
 };
 
 pub const MISE_DETECTOR_ID: &str = "mise";
@@ -67,6 +67,13 @@ impl Detector for MiseDetector {
             command: "mise install",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn tool_managed(&self) -> &'static [ToolManagedLocation] {
+        &[ToolManagedLocation {
+            suffix: "installs",
+            manager: ToolManager::Mise,
+        }]
     }
 
     /// mise's `installs/<tool>/<version>`: its prune report names

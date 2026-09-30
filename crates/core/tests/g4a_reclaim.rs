@@ -779,6 +779,7 @@ fn out(code: Option<i32>, stdout: &[u8], stderr: &[u8], timed_out: bool) -> RunO
         stdout: stdout.to_vec(),
         stderr: stderr.to_vec(),
         timed_out,
+        truncated: false,
     }
 }
 

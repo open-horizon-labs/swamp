@@ -30,9 +30,10 @@ const OCCUPANCY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The answer to "does anything outside this process hold this path (or
 /// anything under it) open right now". Deliberately three-valued: a
 /// failed, timed-out or permission-denied probe is **not** "nothing is
-/// open" (`.oh/guardrails/occupancy-is-tristate-at-sinks.md`). Every
-/// destructive sink matches on this and refuses on `Unknown`; nothing
-/// that moves user data may consume the boolean [`occupied`] instead.
+/// open" (`.oh/guardrails/occupancy-gaps-are-unknown-never-free.md`).
+/// A Trash move shows it as a fact and is never gated on it (2026-09-23);
+/// tool-managed removal, which has no Trash, refuses on `Occupied` and
+/// `Unknown` (`.oh/guardrails/tool-removal-refuses-on-manager-facts.md`).
 #[must_use = "an occupancy answer that is not matched on is a recheck that did not happen"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OccupancyState {
@@ -44,24 +45,6 @@ pub enum OccupancyState {
     /// The probe could not answer (binary missing, timed out, permission
     /// denied, unreadable directory). Treated as a refusal at every sink.
     Unknown(String),
-}
-
-impl OccupancyState {
-    /// A one-line refusal cause for a sink's outcome/ledger record.
-    pub fn refusal(&self) -> Option<String> {
-        match self {
-            Self::Free => None,
-            Self::Occupied(p) => Some(format!(
-                "refused: an open file handle was found on {} just now, so an active process is \
-                 using it — propose again once it is closed (for a directory this answer covers \
-                 everything under it)",
-                p.display()
-            )),
-            Self::Unknown(why) => Some(format!(
-                "refused: occupancy could not be determined ({why}); refusing rather than guessing that nothing is open"
-            )),
-        }
-    }
 }
 
 /// The one bounded `lsof` probe every occupancy question in this crate
@@ -138,8 +121,10 @@ const SNAPSHOT_ARGS: [&str; 4] = ["-n", "-P", "-F", "n"];
 /// listing it could not fully read.
 #[derive(Debug)]
 pub struct OccupancySnapshot {
-    /// Absolute paths reported open (files, cwd, txt, ...).
-    open: std::collections::BTreeSet<std::path::PathBuf>,
+    /// Absolute paths reported open (files, cwd, txt, ...), with the
+    /// command names holding each when the listing asked for them
+    /// (`-F cn`, tool-managed removal); empty otherwise.
+    open: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>>,
     /// Why the listing is not trustworthy for a negative answer.
     gap: Option<String>,
 }
@@ -147,9 +132,13 @@ pub struct OccupancySnapshot {
 impl OccupancySnapshot {
     /// Run the one `lsof -n -P -F n`.
     pub fn capture() -> Self {
+        Self::capture_args(&SNAPSHOT_ARGS)
+    }
+
+    fn capture_args(args: &[&str]) -> Self {
         match crate::fs_gate::spawn::run(
             crate::fs_gate::spawn::Program::Lsof,
-            SNAPSHOT_ARGS,
+            args,
             SNAPSHOT_TIMEOUT,
         ) {
             Ok(out) => Self::from_lsof_run(
@@ -187,8 +176,14 @@ impl OccupancySnapshot {
         if !matches!(code, Some(0) | Some(1)) {
             return Self::failed(format!("lsof exited with {code:?}"));
         }
-        let mut open = std::collections::BTreeSet::new();
+        let mut open: std::collections::BTreeMap<
+            std::path::PathBuf,
+            std::collections::BTreeSet<String>,
+        > = Default::default();
         let mut saw_process = false;
+        // One process at a time: its command name and every path it has
+        // open (its own executable among them, the `txt` entry).
+        let mut procs: Vec<(Option<String>, Vec<std::path::PathBuf>)> = Vec::new();
         for line in stdout.lines().filter(|l| !l.is_empty()) {
             let mut chars = line.chars();
             let id = chars.next().unwrap_or(' ');
@@ -196,14 +191,50 @@ impl OccupancySnapshot {
                 return Self::failed(format!("unparseable lsof output line: {line:.40}"));
             }
             match id {
-                'p' => saw_process = true,
+                'p' => {
+                    saw_process = true;
+                    procs.push((None, Vec::new()));
+                }
+                'c' => {
+                    if let Some(p) = procs.last_mut() {
+                        p.0 = Some(chars.as_str().to_string());
+                    }
+                }
                 'n' => {
                     let name = chars.as_str();
                     if name.starts_with('/') {
-                        open.insert(std::path::PathBuf::from(name));
+                        if procs.is_empty() {
+                            procs.push((None, Vec::new()));
+                        }
+                        if let Some(p) = procs.last_mut() {
+                            p.1.push(std::path::PathBuf::from(name));
+                        }
                     }
                 }
                 _ => {}
+            }
+        }
+        for (command, paths) in procs {
+            // A command name counts as itself only when the process's own
+            // executable is where CoreSimulator or Xcode keeps it; any
+            // other process with that name is just its name.
+            let label = command.map(|c| {
+                let verified = paths.iter().any(|p| {
+                    p.file_name().and_then(|n| n.to_str()) == Some(c.as_str())
+                        && TRUSTED_HOST_ROOTS.iter().any(|r| p.starts_with(r))
+                        && !p.components().any(|x| x.as_os_str() == "..")
+                });
+                if verified {
+                    format!("{VERIFIED}{c}")
+                } else {
+                    c
+                }
+            });
+            for path in paths {
+                let holders = open.entry(path).or_default();
+                if let Some(l) = &label {
+                    holders.insert(l.clone());
+                }
             }
         }
         // A machine always has at least this process's own descriptors
@@ -233,7 +264,7 @@ impl OccupancySnapshot {
         for anchor in std::iter::once(path).chain(canonical.as_deref()) {
             // Path ordering is component-wise, so everything under
             // `anchor` sorts contiguously right after it.
-            if let Some(hit) = self.open.range(anchor.to_path_buf()..).next()
+            if let Some((hit, _)) = self.open.range(anchor.to_path_buf()..).next()
                 && hit.starts_with(anchor)
             {
                 return OccupancyState::Occupied(hit.clone());
@@ -288,7 +319,83 @@ impl OccupancySnapshot {
         let _restore_hook = RestoreHook(prev_hook);
         f()
     }
+    /// Tool-managed removal's open-file answer (#177): every path the
+    /// manager's dry run named, from one `lsof -n -P -F cn` listing that
+    /// also names each holder's command. A holder whose command is one of
+    /// `manager_own` (the manager's own host process, which the manager
+    /// stops before it removes: CoreSimulator's `SimLaunchHost` keeps a
+    /// library open in every mounted runtime) does not count; any other
+    /// is `Occupied`, and a listing that could not be fully read is
+    /// `Unknown`, never `Free`. The holder's command name comes back with
+    /// an `Occupied` answer.
+    pub fn tool_removal_state(
+        paths: &[std::path::PathBuf],
+        manager_own: &[&str],
+    ) -> (OccupancyState, Option<String>) {
+        let snapshot = match crate::platform::OccupancyProbe::for_os(crate::platform::Os::current())
+        {
+            crate::platform::OccupancyProbe::Lsof => Self::capture_args(&TOOL_SNAPSHOT_ARGS),
+            crate::platform::OccupancyProbe::Procfs => {
+                let refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+                return (probe_paths(&refs), None);
+            }
+        };
+        snapshot.holders_of(paths, manager_own)
+    }
+
+    /// [`Self::tool_removal_state`] over an already-taken listing.
+    pub(crate) fn holders_of(
+        &self,
+        paths: &[std::path::PathBuf],
+        manager_own: &[&str],
+    ) -> (OccupancyState, Option<String>) {
+        for path in paths {
+            let canonical = crate::fs_gate::canonicalize(path).ok();
+            for anchor in std::iter::once(path.as_path()).chain(canonical.as_deref()) {
+                for (hit, holders) in self
+                    .open
+                    .range(anchor.to_path_buf()..)
+                    .take_while(|(hit, _)| hit.starts_with(anchor))
+                {
+                    let own = !holders.is_empty()
+                        && holders.iter().all(|h| {
+                            h.strip_prefix(VERIFIED)
+                                .is_some_and(|c| manager_own.contains(&c))
+                        });
+                    if !own {
+                        let who = holders
+                            .iter()
+                            .next()
+                            .map(|h| h.trim_start_matches(VERIFIED).to_string());
+                        return (OccupancyState::Occupied(hit.clone()), who);
+                    }
+                }
+            }
+        }
+        match &self.gap {
+            None => (OccupancyState::Free, None),
+            Some(why) => (
+                OccupancyState::Unknown(format!("open-file listing incomplete ({why})")),
+                None,
+            ),
+        }
+    }
 }
+
+/// Marks a holder whose executable was found under [`TRUSTED_HOST_ROOTS`].
+const VERIFIED: &str = "verified-executable:";
+
+/// Where a manager's own host process may live for its name to count
+/// (`SimLaunchHost.arm64` is CoreSimulator's XPC service).
+const TRUSTED_HOST_ROOTS: &[&str] = &[
+    "/Library/Developer/PrivateFrameworks/CoreSimulator.framework/",
+    "/Library/Developer/CoreSimulator/",
+    "/Applications/Xcode.app/",
+];
+
+/// The tool-removal listing's `lsof` argv: the snapshot's, with each
+/// process's command name.
+const TOOL_SNAPSHOT_ARGS: [&str; 4] = ["-n", "-P", "-F", "cn"];
 
 /// Where a scoped open-file snapshot is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,7 +823,6 @@ mod tests {
         let state = probe(Some(1), "", "lsof: WARNING: Permission denied");
         assert!(matches!(state, OccupancyState::Unknown(_)), "{state:?}");
         assert!(!matches!(state, OccupancyState::Free));
-        assert!(state.refusal().is_some());
     }
 
     #[test]
@@ -728,7 +834,6 @@ mod tests {
     #[test]
     fn a_free_probe_is_the_only_state_that_permits_an_action() {
         assert!(matches!(OccupancyState::Free, OccupancyState::Free));
-        assert!(OccupancyState::Free.refusal().is_none());
         assert!(!matches!(
             OccupancyState::Occupied(PathBuf::from("/x")),
             OccupancyState::Free
@@ -1283,5 +1388,100 @@ mod tests {
             }
         });
         assert_eq!(counted.subprocess_spawns, 3);
+    }
+    /// Tool removal counts every holder but the manager's own host
+    /// process (exact name, executable where CoreSimulator keeps it; the
+    /// same name elsewhere blocks), and an incomplete listing is `Unknown`, never `Free`.
+    #[test]
+    fn tool_removal_holders_skip_only_the_managers_own_process() {
+        let listing = "p1\ncSimLaunchHost.arm64\nn/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/SimLaunchHost.arm64.xpc/Contents/MacOS/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\np2\ncnode\nn/m/node/24/bin/node\n";
+        let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
+        let (s, who) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
+        assert_eq!((s, who), (OccupancyState::Free, None));
+        let impostor = "p3\ncSimLaunchHost.arm64\nn/tmp/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\n";
+        let fake = OccupancySnapshot::from_lsof_run(Some(0), false, impostor, "");
+        assert!(matches!(
+            fake.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"])
+                .0,
+            OccupancyState::Occupied(_)
+        ));
+        let (s, who) = snap.holders_of(&[PathBuf::from("/m/node/24")], &["SimLaunchHost"]);
+        assert_eq!(
+            s,
+            OccupancyState::Occupied(PathBuf::from("/m/node/24/bin/node"))
+        );
+        assert_eq!(who.as_deref(), Some("node"));
+        let partial =
+            OccupancySnapshot::from_lsof_run(Some(1), false, listing, "lsof: Permission denied");
+        let (s, _) = partial.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
+        assert!(matches!(s, OccupancyState::Unknown(_)), "{s:?}");
+        let failed = OccupancySnapshot::from_lsof_run(None, true, "", "");
+        assert!(matches!(
+            failed.holders_of(&[PathBuf::from("/x")], &[]).0,
+            OccupancyState::Unknown(_)
+        ));
+    }
+}
+
+/// Adversarial audit G5 (#177): the manager's-own exemption is exact.
+#[cfg(test)]
+mod adv_g5_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Tempting wrong patch: "`starts_with` because lsof prints
+    /// `SimLaunchHost.arm64`". A process merely named like it
+    /// (`SimLaunchHostX`, `SimLaunchHost-evil`) must still block.
+    #[test]
+    fn adv_simlaunchhost_exemption_is_not_a_prefix_match() {
+        for name in ["SimLaunchHostX", "SimLaunchHost-evil", "SimLaunchHostile"] {
+            let listing = format!("p1\nc{name}\nn/vol/iOS/lib.dylib\n");
+            let snap = OccupancySnapshot::from_lsof_run(Some(0), false, &listing, "");
+            let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+            assert!(
+                matches!(s, OccupancyState::Occupied(_)),
+                "{name} was treated as simctl's own host process: {s:?}"
+            );
+        }
+    }
+
+    /// A holder with no `c` line (command unknown) must block.
+    #[test]
+    fn adv_holder_without_command_name_blocks() {
+        let snap =
+            OccupancySnapshot::from_lsof_run(Some(0), false, "p1\nn/vol/iOS/lib.dylib\n", "");
+        let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+        assert!(matches!(s, OccupancyState::Occupied(_)), "{s:?}");
+    }
+}
+
+/// Independent verification of #177 round 2: the exemption is the exact
+/// name AND a verified executable; a prefix match is wrong even when the
+/// look-alike's executable sits under a trusted root.
+#[cfg(test)]
+mod adv_g5b_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Tempting wrong patch: "`starts_with` is fine now that the
+    /// executable is verified". `SimLaunchHostX` living under
+    /// CoreSimulator's tree is still not `SimLaunchHost.arm64`.
+    #[test]
+    fn g5b_verified_lookalike_name_still_blocks() {
+        let listing = "p1\ncSimLaunchHost.arm64X\nn/Library/Developer/CoreSimulator/x/SimLaunchHost.arm64X\nn/vol/iOS/lib.dylib\n";
+        let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
+        let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
+        assert!(matches!(s, OccupancyState::Occupied(_)), "{s:?}");
+    }
+
+    /// Tempting wrong patch: "any path of the process named like the
+    /// command counts as its executable". A `..` escape out of the trusted
+    /// root does not verify.
+    #[test]
+    fn g5b_dotdot_out_of_trusted_root_does_not_verify() {
+        let listing = "p1\ncSimLaunchHost.arm64\nn/Library/Developer/CoreSimulator/../../../tmp/SimLaunchHost.arm64\nn/vol/iOS/lib.dylib\n";
+        let snap = OccupancySnapshot::from_lsof_run(Some(0), false, listing, "");
+        let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost.arm64"]);
+        assert!(matches!(s, OccupancyState::Occupied(_)), "{s:?}");
     }
 }

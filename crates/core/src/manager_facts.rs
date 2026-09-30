@@ -280,7 +280,7 @@ pub fn parse_toolchain(name: &str) -> Option<Toolchain<'_>> {
 /// other character that is not a letter or digit (`:`, `/`, `@`, `_`, `.`)
 /// is one dash. `npm:@scope/pkg` is `npm-scope-pkg`, `ubi:BurntSushi/ripgrep`
 /// is `ubi-burnt-sushi-ripgrep`, `cargo:foo_bar` is `cargo-foo-bar`.
-fn mise_folder_name(tool: &str) -> String {
+pub(crate) fn mise_folder_name(tool: &str) -> String {
     let mut tool = tool;
     let stripped;
     if let Some(open) = tool.find('[') {

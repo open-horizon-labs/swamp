@@ -16,6 +16,7 @@ pub mod model;
 pub mod names;
 pub mod picker;
 pub mod term;
+pub mod tool_sheet;
 pub mod ui;
 pub mod units;
 pub mod worker;
@@ -43,6 +44,13 @@ pub fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
     {
         if app.operation.is_some() {
             app.cancel_operation();
+        } else if app
+            .tool_sheet
+            .as_ref()
+            .is_some_and(|s| matches!(s.stage, tool_sheet::Stage::Running(_)))
+        {
+            // A manager stopped halfway can leave a half-removed install:
+            // Ctrl-C waits for it like every other key.
         } else {
             app.quit = true;
         }
@@ -83,6 +91,21 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
             app.cancel_operation();
         } else if code == KeyCode::Char('R') {
             app.say_refresh_waits();
+        }
+        return;
+    }
+    if app.tool_sheet.is_some() {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => app.tool_back(),
+            KeyCode::Up => app.tool_move(-1),
+            KeyCode::Down => app.tool_move(1),
+            KeyCode::Enter => app.tool_enter(),
+            KeyCode::Char('Y') => app.tool_remove_key(),
+            KeyCode::Char('R') if !app.tool_sheet.as_ref().is_some_and(|s| s.waiting()) => {
+                app.tool_sheet = None;
+                app.refresh_now();
+            }
+            _ => {}
         }
         return;
     }
@@ -658,6 +681,9 @@ fn advance(app: &mut App, gate: &mut RedrawGate, size: Option<(u16, u16)>) {
     if app.poll_operation() {
         gate.touch();
     }
+    if app.poll_tool() {
+        gate.touch();
+    }
     if app.apply_held_reload() {
         gate.touch();
     }
@@ -702,8 +728,17 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         if app.quit {
             return Ok(());
         }
+        // A confirm just appeared: whatever was already queued (key
+        // repeat, typeahead, a paste) was typed before it was seen.
+        if app.take_confirm_drain() {
+            while event::poll(Duration::ZERO)? {
+                let _ = event::read()?;
+            }
+        }
         if event::poll(RedrawGate::wait(app))? {
             match event::read()? {
+                // A paste is never keys: nothing on screen acts on it.
+                Event::Paste(_) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     gate.touch();
                     handle_terminal_key(app, key);

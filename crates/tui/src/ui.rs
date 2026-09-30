@@ -871,6 +871,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(p) = &app.picker {
         draw_picker(frame, app, p, size);
     }
+    if let Some(sheet) = &app.tool_sheet {
+        draw_tool_sheet(frame, sheet, size);
+    }
     if let Some(lines) = &app.cargo_inspection {
         let popup = Rect {
             x: size.x + 1,
@@ -1209,6 +1212,39 @@ fn draw_headline(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), area);
+}
+
+/// The tool-managed removal sheet (#177): a fixed-layout popup whose
+/// last inner row is always its keys.
+fn draw_tool_sheet(frame: &mut Frame, sheet: &crate::tool_sheet::ToolSheet, size: Rect) {
+    let popup = Rect {
+        x: size.x + 1,
+        y: size.y + 1,
+        width: size.width.saturating_sub(2),
+        height: size.height.saturating_sub(2),
+    };
+    if popup.width < 4 || popup.height < 3 {
+        return;
+    }
+    frame.render_widget(Clear, popup);
+    sheet.note_drawn(size.width, size.height);
+    let (width, rows) = crate::tool_sheet::body_size(size.width, size.height);
+    let mut lines: Vec<Line> = sheet
+        .body(width, rows)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    while lines.len() < rows {
+        lines.push(Line::from(""));
+    }
+    let keys = crate::model::truncate_middle(sheet.keys(), width);
+    lines.push(
+        Line::from(keys).style(Style::default().add_modifier(ratatui::style::Modifier::REVERSED)),
+    );
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(sheet.title())),
+        popup,
+    );
 }
 
 fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
@@ -2037,6 +2073,11 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         &mut out,
         "",
         "Docker images and volumes are removed by docker for good: no Trash.",
+    );
+    entry(
+        &mut out,
+        "",
+        "mise installs and simulator runtimes: the manager's own list and dry run, then its command, permanently: no Trash.",
     );
     entry(
         &mut out,

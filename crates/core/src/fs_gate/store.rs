@@ -1138,3 +1138,23 @@ pub(super) fn remove_owned_file(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     }
 }
+
+/// Keeps a store file swamp could not read beside itself as
+/// `<name>.corrupt-<unix seconds>` (one rename in the same directory,
+/// never a delete), so a later write cannot overwrite history. Returns
+/// where it went.
+pub fn keep_aside(path: &Path, at: u64) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let mut dest = path.with_file_name(format!("{name}.corrupt-{at}"));
+    let mut n = 1;
+    while std::fs::symlink_metadata(&dest).is_ok() {
+        dest = path.with_file_name(format!("{name}.corrupt-{at}-{n}"));
+        n += 1;
+    }
+    std::fs::rename(path, &dest)?;
+    Ok(dest)
+}

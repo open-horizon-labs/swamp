@@ -1263,6 +1263,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         allocated: false,
         project: None,
         evidence: Vec::new(),
+        tool: None,
         last_used: None,
         size_text: None,
         detail_lines: Vec::new(),

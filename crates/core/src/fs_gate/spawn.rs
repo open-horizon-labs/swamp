@@ -24,6 +24,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -60,7 +61,9 @@ pub enum Program {
     /// `list --formula --installed-on-request`).
     Brew,
     /// mise's two read-only reports, in a scheduled `observe` only:
-    /// `prune --dry-run` and `ls --global --json`.
+    /// `prune --dry-run` and `ls --global --json` ([`ManagerCommand`]);
+    /// and tool-managed removal's listings, dry runs and removals as a
+    /// [`ToolBin`] (#177). Never a `PATH` name through [`run`].
     Mise,
     /// `defaults read com.apple.dt.Xcode …` (detector query).
     Defaults,
@@ -156,6 +159,9 @@ pub struct RunOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+    /// A stream held more than the run's cap; what is kept is the first
+    /// part. Tool-managed removal refuses on it.
+    pub truncated: bool,
 }
 
 impl RunOutput {
@@ -225,6 +231,9 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             // and no DNS or port-name resolution (`-n -P`; without them the
             // same listing took 16 s instead of 0.2 s).
             &[Lit("-n"), Lit("-P"), Lit("-F"), Lit("n")],
+            // The same listing with each process's command name, for
+            // tool-managed removal's open-file check (#177).
+            &[Lit("-n"), Lit("-P"), Lit("-F"), Lit("cn")],
         ],
         Program::Plutil => &[&[Lit("-convert"), Lit("xml1"), Lit("-o"), Lit("-"), AbsPath]],
         Program::Xcrun => &[&[Lit("simctl"), Lit("list"), Lit("devices"), Lit("-j")]],
@@ -752,6 +761,15 @@ fn run_command_with(
     timeout: Duration,
     plan: &super::program_paths::Plan,
 ) -> io::Result<RunOutput> {
+    run_command_capped(args, timeout, plan, CAPTURE_CAP)
+}
+
+fn run_command_capped(
+    args: &[OsString],
+    timeout: Duration,
+    plan: &super::program_paths::Plan,
+    cap: u64,
+) -> io::Result<RunOutput> {
     let mut out_file = capture_file()?;
     let mut err_file = capture_file()?;
     let mut child = Running::start(args, out_file.try_clone()?, err_file.try_clone()?, plan)?;
@@ -772,10 +790,15 @@ fn run_command_with(
     // A program that floods its output cannot fill memory: only the
     // first `CAPTURE_CAP` bytes come back, and a caller that needs the
     // whole answer treats a full buffer as too large.
-    let read_back = |f: &mut std::fs::File| -> Vec<u8> {
+    let mut truncated = false;
+    let mut read_back = |f: &mut std::fs::File| -> Vec<u8> {
         let mut buf = Vec::new();
         let _ = f.seek(SeekFrom::Start(0));
-        let _ = f.take(CAPTURE_CAP).read_to_end(&mut buf);
+        let _ = Read::by_ref(f).take(cap + 1).read_to_end(&mut buf);
+        if buf.len() as u64 > cap {
+            buf.truncate(cap as usize);
+            truncated = true;
+        }
         buf
     };
     let stdout = read_back(&mut out_file);
@@ -785,7 +808,427 @@ fn run_command_with(
         stdout,
         stderr,
         timed_out,
+        truncated,
     })
+}
+
+// ---- tool-managed removal's managers (#177) -------------------------
+//
+// A removal verb (`mise uninstall`, `simctl runtime delete`) runs only as
+// a [`ToolBin`]: resolved by `program_paths` (the one resolver and
+// child-environment builder, shared with the manager probe), with the
+// stricter rules there: a candidate that exists but is not trusted
+// refuses, and the directory chain is checked.
+// `.oh/guardrails/tool-removal-refuses-on-manager-facts.md`.
+
+/// The most either stream of a tool-removal run keeps. A manager that
+/// prints more than this is not printing a dry run swamp can read.
+pub const TOOL_OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+/// Version of the child environment policy, recorded in the ledger
+/// beside every removal.
+pub const TOOL_ENV_POLICY: &str = "tool-env-2";
+
+/// A manager binary resolved for tool-managed removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolBin {
+    program: Program,
+    /// The canonical executable, the child's whole environment and its
+    /// working directory: the dry run and the removal use this one.
+    plan: super::program_paths::Scrubbed,
+    /// Notes from building the environment (`DEVELOPER_DIR ignored: ...`).
+    notes: Vec<String>,
+    developer_dir: Option<String>,
+    /// Set only by a test sandbox resolver: every spawn in a test build
+    /// panics unless the executable is inside it.
+    sandbox: Option<PathBuf>,
+}
+
+impl ToolBin {
+    pub fn program(&self) -> Program {
+        self.program
+    }
+
+    /// The canonical executable that runs.
+    pub fn path(&self) -> &Path {
+        &self.plan.exe
+    }
+
+    /// The child's value of `name`, if it gets one.
+    pub fn env_value(&self, name: &str) -> Option<&str> {
+        self.plan
+            .env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The names of the variables the child gets.
+    pub fn env_names(&self) -> Vec<String> {
+        self.plan.env.iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    /// What swamp noted while building the child's environment.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+
+    /// The Xcode developer dir the child got, when it got one.
+    pub fn developer_dir(&self) -> Option<&str> {
+        self.developer_dir.as_deref()
+    }
+}
+
+/// Finds manager binaries for tool-managed removal: `program_paths`'s
+/// fixed candidates in production, only `<sandbox>/bin` in a test build.
+#[derive(Debug, Clone)]
+pub struct ToolResolver {
+    home: Option<PathBuf>,
+    sandbox: Option<PathBuf>,
+    parent_env: Option<Vec<(String, String)>>,
+    /// Why nothing resolves (a test sandbox that failed its checks).
+    refused: Option<String>,
+}
+
+/// Directories a test sandbox may never be, or contain.
+#[cfg(any(test, feature = "testing"))]
+const SYSTEM_DIRS: &[&str] = &[
+    "/",
+    "/usr",
+    "/opt",
+    "/Users",
+    "/Library",
+    "/Applications",
+    "/bin",
+    "/System",
+    "/private",
+    "/var",
+    "/tmp",
+    "/home",
+];
+
+impl ToolResolver {
+    /// The production resolver. In a test build (`cfg(test)` or the
+    /// `testing` feature, never a shipped binary) the variable
+    /// `SWAMP_TEST_TOOL_SANDBOX` names a sandbox of fake managers
+    /// instead; without it every spawn from this resolver panics.
+    pub fn system() -> Self {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(dir) = std::env::var_os("SWAMP_TEST_TOOL_SANDBOX") {
+            return Self::sandboxed(Path::new(&dir));
+        }
+        ToolResolver {
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|h| h.is_absolute()),
+            sandbox: None,
+            parent_env: None,
+            refused: None,
+        }
+    }
+
+    /// Fake managers under `dir/bin/<name>`, with `dir/home` as the
+    /// child's `HOME`. Test builds only. Unless `dir` is a real directory
+    /// (not a link) inside the system temp dir that is not, and holds
+    /// none of, the system directories, nothing resolves: a sandbox at
+    /// `/usr` or `/opt/homebrew` would name a real manager.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn sandboxed(dir: &Path) -> Self {
+        let checked = (|| -> Result<PathBuf, String> {
+            if std::fs::symlink_metadata(dir).map_or(true, |m| !m.is_dir()) {
+                return Err("not a real directory".into());
+            }
+            let canon = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+            let tmp = std::fs::canonicalize(std::env::temp_dir()).map_err(|e| e.to_string())?;
+            if canon == tmp || !canon.starts_with(&tmp) {
+                return Err("not inside the system temp dir".into());
+            }
+            if SYSTEM_DIRS
+                .iter()
+                .any(|s| canon == Path::new(s) || Path::new(s).starts_with(&canon))
+            {
+                return Err("a system directory".into());
+            }
+            Ok(canon)
+        })();
+        match checked {
+            Ok(canon) => ToolResolver {
+                home: Some(canon.join("home")),
+                sandbox: Some(canon),
+                parent_env: None,
+                refused: None,
+            },
+            Err(why) => ToolResolver {
+                home: None,
+                sandbox: Some(PathBuf::from("/nonexistent-test-sandbox")),
+                parent_env: None,
+                refused: Some(format!("{} is not a test sandbox ({why})", dir.display())),
+            },
+        }
+    }
+
+    /// Replaces the environment the child's is built from (a test's
+    /// poisoned parent). Test builds only.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_parent_env(mut self, vars: Vec<(String, String)>) -> Self {
+        self.parent_env = Some(vars);
+        self
+    }
+
+    /// The home directory the children run with.
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
+    /// The test sandbox, when this resolver is one.
+    pub(crate) fn sandbox(&self) -> Option<&Path> {
+        self.sandbox.as_deref()
+    }
+
+    /// Where `program` is looked for, in order. Never the inherited
+    /// `PATH`.
+    pub fn candidates(&self, program: Program) -> Vec<PathBuf> {
+        match &self.sandbox {
+            Some(s) => vec![s.join("bin").join(program.binary())],
+            None => super::program_paths::candidates(
+                program,
+                self.home.as_deref().unwrap_or(Path::new("")),
+            ),
+        }
+    }
+
+    /// The first candidate that exists, if it and its directories pass
+    /// the ownership and permission checks (`program_paths::resolve_strict`).
+    pub fn resolve(&self, program: Program) -> Result<ToolBin, String> {
+        if let Some(why) = &self.refused {
+            return Err(why.clone());
+        }
+        let r = super::program_paths::resolve_strict(&self.candidates(program))
+            .map_err(|why| format!("{}: {why}", program.binary()))?;
+        let parent: Vec<(String, String)> = match &self.parent_env {
+            Some(v) => v.clone(),
+            None => std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect(),
+        };
+        let home = self
+            .home
+            .as_deref()
+            .unwrap_or(Path::new("/"))
+            .display()
+            .to_string();
+        let built = super::program_paths::child_env(program, &r.path_head, &home, &parent);
+        Ok(ToolBin {
+            program,
+            plan: super::program_paths::Scrubbed {
+                exe: r.exe,
+                env: built.env,
+                cwd: PathBuf::from("/"),
+            },
+            notes: built.notes,
+            developer_dir: built.developer_dir,
+            sandbox: self.sandbox.clone(),
+        })
+    }
+}
+
+/// Whether `a` can be a mise `<tool>@<version>` operand, in every form
+/// mise itself prints: plain (`node`), a backend (`cargo:ripgrep`,
+/// `aqua:BurntSushi/ripgrep`, `github:owner/repo`, `go:github.com/x/y`)
+/// or an npm scope (`npm:@antfu/ni`). No leading `-`, no whitespace, no
+/// `..`, no control characters; the version is after the last `@`.
+pub fn is_mise_tool_version(a: &str) -> bool {
+    let Some((tool, version)) = a.rsplit_once('@') else {
+        return false;
+    };
+    let tool_ok = tool
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '/' | '.' | '-' | '@'))
+        && !tool.contains("..")
+        && !tool.contains("//");
+    let version_ok = version
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    tool_ok && version_ok
+}
+
+/// Whether `a` is an uppercase 8-4-4-4-12 hex UUID.
+pub fn is_sim_runtime_uuid(a: &str) -> bool {
+    let groups: Vec<&str> = a.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8usize, 4, 4, 4, 12]).all(|(g, n)| {
+            g.len() == n
+                && g.chars()
+                    .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c))
+        })
+}
+
+/// One argument slot of a tool-removal invocation.
+#[derive(Debug, Clone, Copy)]
+enum ToolSlot {
+    Lit(&'static str),
+    MiseToolVersion,
+    SimRuntimeUuid,
+}
+
+/// The read-only invocations a [`ToolBin`] may run: listings, versions
+/// and the managers' own dry runs. A removal shape (a dry run without
+/// its flag) is not here.
+fn tool_read_shapes(program: Program) -> &'static [&'static [ToolSlot]] {
+    use ToolSlot::*;
+    match program {
+        Program::Mise => &[
+            &[Lit("--version")],
+            &[
+                Lit("-C"),
+                Lit("/"),
+                Lit("ls"),
+                Lit("--json"),
+                Lit("--installed"),
+            ],
+            &[
+                Lit("-C"),
+                Lit("/"),
+                Lit("prune"),
+                Lit("--tools"),
+                Lit("--dry-run"),
+            ],
+            &[
+                Lit("-C"),
+                Lit("/"),
+                Lit("uninstall"),
+                Lit("--dry-run"),
+                MiseToolVersion,
+            ],
+        ],
+        Program::Xcrun => &[
+            &[Lit("--version")],
+            &[Lit("simctl"), Lit("runtime"), Lit("list"), Lit("-j")],
+            &[Lit("simctl"), Lit("list"), Lit("devices"), Lit("-j")],
+            &[
+                Lit("simctl"),
+                Lit("--set"),
+                Lit("previews"),
+                Lit("list"),
+                Lit("devices"),
+                Lit("-j"),
+            ],
+            &[
+                Lit("simctl"),
+                Lit("runtime"),
+                Lit("delete"),
+                SimRuntimeUuid,
+                Lit("--dry-run"),
+            ],
+        ],
+        _ => &[],
+    }
+}
+
+/// The removal invocations (`destroy::tool_remove` only): one version, one
+/// runtime. No set form (`mise prune`, `simctl runtime delete all`).
+fn tool_exec_shapes(program: Program) -> &'static [&'static [ToolSlot]] {
+    use ToolSlot::*;
+    match program {
+        Program::Mise => &[&[Lit("-C"), Lit("/"), Lit("uninstall"), MiseToolVersion]],
+        Program::Xcrun => &[&[Lit("simctl"), Lit("runtime"), Lit("delete"), SimRuntimeUuid]],
+        _ => &[],
+    }
+}
+
+fn tool_shape_matches(shapes: &[&[ToolSlot]], args: &[OsString]) -> bool {
+    let Some(words) = args
+        .iter()
+        .map(|a| a.to_str())
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return false;
+    };
+    shapes.iter().any(|shape| {
+        shape.len() == words.len()
+            && shape.iter().zip(&words).all(|(slot, w)| match slot {
+                ToolSlot::Lit(l) => l == w,
+                ToolSlot::MiseToolVersion => is_mise_tool_version(w),
+                ToolSlot::SimRuntimeUuid => is_sim_runtime_uuid(w),
+            })
+    })
+}
+
+/// Whether `args` is a read-only tool invocation.
+pub fn is_tool_read(program: Program, args: &[OsString]) -> bool {
+    tool_shape_matches(tool_read_shapes(program), args)
+}
+
+/// Whether `args` is a removal invocation.
+pub fn is_tool_exec(program: Program, args: &[OsString]) -> bool {
+    tool_shape_matches(tool_exec_shapes(program), args)
+}
+
+/// In any test build, a tool spawn whose canonical binary is not inside
+/// the canonical sandbox panics before anything starts.
+fn guard_test_sandbox(bin: &ToolBin) {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let inside = bin
+            .sandbox
+            .as_ref()
+            .is_some_and(|s| std::fs::canonicalize(&bin.plan.exe).is_ok_and(|e| e.starts_with(s)));
+        if !inside {
+            panic!(
+                "test build: {} is not inside a test sandbox; tests never run a real manager",
+                bin.plan.exe.display()
+            );
+        }
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = bin;
+}
+
+fn run_tool(bin: &ToolBin, args: &[OsString], timeout: Duration) -> io::Result<RunOutput> {
+    guard_test_sandbox(bin);
+    run_command_capped(
+        args,
+        timeout,
+        &super::program_paths::Plan::Scrubbed(bin.plan.clone()),
+        TOOL_OUTPUT_LIMIT,
+    )
+}
+
+/// Runs one read-only tool invocation with the [`ToolBin`]'s scrubbed
+/// environment. Anything that is not a read shape is refused before
+/// anything starts.
+pub fn run_tool_read(bin: &ToolBin, args: &[OsString], timeout: Duration) -> io::Result<RunOutput> {
+    if !is_tool_read(bin.program, args) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not a read-only invocation swamp runs for a tool removal",
+        ));
+    }
+    run_tool(bin, args, timeout)
+}
+
+/// Runs one removal invocation: only `fs_gate::destroy::tool_remove`
+/// calls this.
+pub(super) fn run_tool_exec(
+    bin: &ToolBin,
+    args: &[OsString],
+    timeout: Duration,
+) -> io::Result<RunOutput> {
+    if !is_tool_exec(bin.program, args) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not a removal invocation swamp runs",
+        ));
+    }
+    run_tool(bin, args, timeout)
 }
 
 #[cfg(test)]

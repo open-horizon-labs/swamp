@@ -83,6 +83,7 @@ pub mod signals;
 pub(crate) mod sqlite_ro;
 pub mod store;
 pub mod systemd_user;
+pub mod tool_removal;
 pub mod toolchain_declarations;
 pub mod tree;
 pub mod volume_ledger;

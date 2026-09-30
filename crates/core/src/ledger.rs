@@ -8,6 +8,10 @@ pub enum Verb {
     Delete,
     Archive,
     RemoveWorktree,
+    /// Removed through the manager's own command (mise, simctl), with no
+    /// Trash (#177). Additive: a binary that predates it reads the label
+    /// as `Delete`, an ordinary removal, and keeps the row's text as is.
+    ToolRemove,
 }
 
 impl Verb {
@@ -16,18 +20,24 @@ impl Verb {
             Verb::Delete => "delete",
             Verb::Archive => "archive",
             Verb::RemoveWorktree => "remove-worktree",
+            Verb::ToolRemove => "tool-remove",
         }
     }
     fn from_label(s: &str) -> Self {
         match s {
             "archive" => Verb::Archive,
             "remove-worktree" => Verb::RemoveWorktree,
+            "tool-remove" => Verb::ToolRemove,
             _ => Verb::Delete,
         }
     }
 }
 
 pub const NO_GRANT: &str = "human-marked";
+
+/// How an append that did write its record, but only into a new ledger
+/// (the old one could not be read and was kept aside), begins its error.
+pub const KEPT_ASIDE: &str = "the previous ledger could not be read";
 
 /// One fact the human saw before the action ran, as a key and its
 /// rendered value (`bytes`, `label`, `observed_at`, ...). Typed rows in
@@ -106,12 +116,60 @@ impl Ledger {
     fn facts_path(&self) -> PathBuf {
         self.path().with_file_name("ledger_facts.parquet")
     }
+    /// Adds one record. A ledger that exists but cannot be read (a
+    /// truncated or corrupt file) is never overwritten: it is kept beside
+    /// itself as `ledger.parquet.corrupt-<ts>` (and its facts table the
+    /// same way), the record starts a new ledger, and the call returns an
+    /// error that says where the old one went.
     pub fn append(&self, r: &ActionRecord) -> Result<()> {
+        self.write_record(r, false)
+    }
+
+    /// Replaces the record with `r.id` (a `started` row's final outcome),
+    /// or adds it when there is none.
+    pub fn replace(&self, r: &ActionRecord) -> Result<()> {
+        self.write_record(r, true)
+    }
+
+    fn write_record(&self, r: &ActionRecord, replace: bool) -> Result<()> {
         use crate::growth::columns as c;
         let path = self.path();
+        let facts_path = self.facts_path();
         self.store.create()?;
-        let mut rows = c::read_ledger_rows(&path).unwrap_or_default();
-        let mut facts = c::read_ledger_fact_rows(&self.facts_path()).unwrap_or_default();
+        let mut kept: Vec<String> = Vec::new();
+        let mut rows = if crate::fs_gate::exists(&path) {
+            match c::read_ledger_rows(&path) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    let aside = crate::fs_gate::store::keep_aside(&path, crate::entities::now())
+                        .with_context(|| format!("keep {} aside", path.display()))?;
+                    kept.push(format!("{} ({e})", aside.display()));
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let mut facts = if crate::fs_gate::exists(&facts_path) {
+            match c::read_ledger_fact_rows(&facts_path) {
+                Ok(f) if kept.is_empty() => f,
+                other => {
+                    let aside =
+                        crate::fs_gate::store::keep_aside(&facts_path, crate::entities::now())
+                            .with_context(|| format!("keep {} aside", facts_path.display()))?;
+                    if let Err(e) = other {
+                        kept.push(format!("{} ({e})", aside.display()));
+                    }
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if replace {
+            rows.retain(|row| row.id != r.id);
+            facts.retain(|f| f.record_id != r.id);
+        }
         rows.push(c::StoredLedgerRow {
             id: r.id.clone(),
             verb: r.verb.label().to_string(),
@@ -136,8 +194,14 @@ impl Ledger {
             });
         }
         c::write_ledger_rows(&path, &rows).with_context(|| format!("write {}", path.display()))?;
-        c::write_ledger_fact_rows(&self.facts_path(), &facts)
-            .with_context(|| format!("write {}", self.facts_path().display()))?;
+        c::write_ledger_fact_rows(&facts_path, &facts)
+            .with_context(|| format!("write {}", facts_path.display()))?;
+        if !kept.is_empty() {
+            anyhow::bail!(
+                "{KEPT_ASIDE}; it was kept as {}, and this record starts a new ledger",
+                kept.join(", ")
+            );
+        }
         Ok(())
     }
     pub fn all(&self) -> Result<Vec<ActionRecord>> {
