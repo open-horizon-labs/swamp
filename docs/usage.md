@@ -547,10 +547,10 @@ project); `Enter` moves it to the Trash through the same
 background-worker path every other TUI deletion uses -- never blocking
 the event/render thread. A protected row, or one whose category has no
 Trash move at all (credentials, settings, an unconfirmed layout), cannot
-be marked; the footer names the exact reason. Bulk marking (`Shift+A`)
+be marked; the status rows name the exact reason. Bulk marking (`Shift+A`)
 reaches the Agents view too: it marks every markable row on screen the
 same way, skipping protected/unmarkable ones and naming the skip in the
-footer. The project tree's own Tree view also shows the collapsed
+status rows. The project tree's own Tree view also shows the collapsed
 "Agent storage (linked)" summary row (informational; marking a specific
 unit still happens in the Agents view).
 
@@ -570,18 +570,21 @@ build cleanup candidate. Old is a reason to look, never a verdict -- the human s
 swamp ui ~/src
 ```
 
-With no subcommand, `swamp` opens the UI at the current directory. It starts from a cached report when possible and refreshes in the background. The first observation can take longer.
+With no subcommand, `swamp` opens the UI at the current directory. It paints the last stored report at once, at any age, and scans only when there is none (in the background, with progress in the header). `R` refreshes on demand; if another process is already observing, `R` says so instead of starting a second walk. The UI opens no filesystem watch and, when nothing changes, draws nothing.
 
 | Key | Action |
 |---|---|
 | Up / Down | Move selection |
+| PgUp / PgDn | Move one screenful; in help, the blocked list and the picker they scroll or jump the same way |
+| Home / End | First / last row (or first / last help line, blocked item, picker field) |
 | Right / Left | Open or expand / collapse or return |
 | Enter | Open a project or confirm the pending action |
 | Esc | Cancel the current interaction or return to projects |
 | Space | Mark or unmark a row |
 | Backspace | Request removal of the selected row or marked set |
 | `A` | Mark actionable rows in the current view, excluding the checkout fallback |
-| `k` | Toggle keeping supported compiled outputs before removal |
+| `k` | Toggle keeping supported compiled outputs before removal. The result line says whether it is now on or off; the choice is remembered |
+| `b` / `d` | List what the last check or delete could not include, with the reason and next step (`d` on the plan). Inside the list, `r` checks again |
 | `/` | Open the filter form |
 | `:` | Edit the filter expression; Tab completes terms |
 | `0` | Clear the filter |
@@ -589,7 +592,7 @@ With no subcommand, `swamp` opens the UI at the current directory. It starts fro
 | `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age |
 | `r` | Reverse the sort |
 | `?` | Show help |
-| `q` | Quit |
+| `q` | Quit (closes help, the list or the picker first; while a check or a move runs, it stops it after the current item) |
 
 The initial filter is `growth > 100MB in 7d`. Filter, sort, reverse, and keep-executables choices are saved in `ui_state.json`. Clear the filter if the first observation shows no matching rows.
 
@@ -1028,7 +1031,7 @@ is taken, so an aborted run changes no store file and no coverage fact
 run logs that one line and exits; there is no retry loop. `swamp ui` does
 not wait on it: it shows the last stored report at once with a
 `disk nearly full: refresh skipped (X free)` banner, and starts no
-refresh or live watch. With no stored report yet, it exits with the same
+refresh. With no stored report yet, it exits with the same
 message instead.
 
 `config init`'s `[scan]` table is not a frozen copy of the built-in

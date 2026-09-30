@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed · 209.7MB unowned · docker 0B unowned                                                                                    "
-"view: projects · filter: growth > 100MB in 7d                                                                                                                                                           "
+"view: projects (1 of 10 · v next) · filter: growth > 100MB in 7d                                                                                                                                        "
 "Name                                                                                                              Size     Change Change bar    Cleanup / facts                                         "
 "mole  🔨                                                                                                         2.6GB     +1.3GB       │█████▌                                                         " Hidden by multi-width symbols: [(7, " ")]
 "swamp  🐳 🔨                                                                                                     8.1GB     +2.6GB       │██████                                                         " Hidden by multi-width symbols: [(8, " "), (11, " ")]
@@ -32,8 +32,8 @@
 "                                                             │  age            any                                                        │                                                             "
 "                                                             │                                                                            │                                                             "
 "                                                             │  filter: growth > 100MB in 7d kind:BuildOutput    → 2 rows                 │                                                             "
-"                                                             │  ↑↓ field · ←→ value · type to narrow project                              │                                                             "
-"                                                             │  Enter apply · Esc cancel · e edit as text · 0 clear                       │                                                             "
+"                                                             │                                                                            │                                                             "
+"                                                             │                                                                            │                                                             "
 "                                                             │                                                                            │                                                             "
 "                                                             │                                                                            │                                                             "
 "                                                             └────────────────────────────────────────────────────────────────────────────┘                                                             "
@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"↑↓ field · ←→ value · Space grew/shrank · type to narrow project · Enter apply · Esc cancel · e edit as text · 0 clear                                                                                  "
+"↑↓ field · ←→ value · Enter apply · Esc cancel · e edit as text · 0 clear                                                                                                                               "

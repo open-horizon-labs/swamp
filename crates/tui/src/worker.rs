@@ -22,3 +22,13 @@ where
     // whatever channel it captured.
     drop(std::thread::spawn(job));
 }
+
+/// A number that names the calling thread for the life of the process
+/// (never 0), so a panic hook can ask "is this the thread that draws?"
+/// without the rest of the crate naming `std::thread`.
+pub fn current_thread_token() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    h.finish() | 1
+}

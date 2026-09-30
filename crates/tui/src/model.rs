@@ -149,7 +149,7 @@ pub struct Row {
 }
 
 impl Row {
-    fn leaf(depth: usize, label: String, bytes: u64, growth: Option<i64>) -> Self {
+    pub(crate) fn leaf(depth: usize, label: String, bytes: u64, growth: Option<i64>) -> Self {
         Row {
             depth,
             rail: String::new(),
@@ -809,7 +809,8 @@ pub fn tree_rows_with_agents(
                     if closed { "▸" } else { "▾" }
                 );
                 out_row.collapsed_children = closed.then_some(cargo_children.len());
-                out_row.signals = vec!["build groups below · allocated, not freeable bytes".into()];
+                out_row.signals =
+                    vec!["build folders below · disk use, not what deleting frees".into()];
                 out.push(out_row);
                 if !closed {
                     out.extend(cargo_children);
@@ -1221,8 +1222,8 @@ fn cargo_children_from_index(
             swamp_core::artifact::ArtifactRole::BuildScriptOutput => {
                 "Lower priority: reruns scripts"
             }
-            swamp_core::artifact::ArtifactRole::Profile => "Review supported groups only",
-            _ => "Expand to choose cleanup groups",
+            swamp_core::artifact::ArtifactRole::Profile => "Open it and pick items",
+            _ => "Expand to choose what to clean",
         };
         row.cleanup_summary = Some(if unit.bytes == 0 {
             "Empty".into()
@@ -1235,7 +1236,7 @@ fn cargo_children_from_index(
                 ))
             )
         } else if candidates > 0 {
-            row.signals.push(format!("{candidates} reviewable groups · {} allocated · oldest modification {}. Expand to select groups; not guaranteed freed space.", human_bytes(bytes), age_label(oldest)));
+            row.signals.push(format!("{candidates} items you can clean · {} · oldest changed {} ago. Expand to pick; freed space may be less.", human_bytes(bytes), age_label(oldest)));
             format!(
                 "{advice} · {candidates} {} · {} · oldest {}",
                 if candidates == 1 {
@@ -1472,14 +1473,14 @@ fn append_cleanup_group(
     row.expansion_key = Some(key.clone());
     row.allocated = true;
     row.cleanup_summary = Some(format!(
-        "{effect} · {} groups · oldest {}",
+        "{effect} · {} items · oldest {}",
         members.len(),
         age_label(oldest)
     ));
     row.signals = vec![
         effect.into(),
         format!(
-            "Space marks {} exact groups for review; → inspects members. Source and unrelated dependencies are not selected. Allocated size is not guaranteed freed space.",
+            "Space marks all {} items; → lists them. Source and unrelated dependencies are never picked. Freed space may be less than the size.",
             members.len()
         ),
     ];

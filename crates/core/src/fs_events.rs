@@ -808,11 +808,6 @@ pub fn watch_pending(root: &Path, tx: std::sync::mpsc::Sender<WatchBatch>) -> Op
     }
 }
 
-/// The seam `tui::app::start_watch` opens its streams through, so a test
-/// can assert "one stream per root" without depending on `fseventsd`
-/// answering within any particular time.
-pub type WatchFactory = fn(&Path, std::sync::mpsc::Sender<WatchBatch>) -> Option<PendingWatch>;
-
 /// The non-macOS fallback: always refuses, naming the platform as the
 /// cause, never a bug in the replay itself.
 ///
@@ -870,43 +865,13 @@ fn add_with_parent(changes: &mut std::collections::HashSet<PathBuf>, root: &Path
 // bindings crates is out of scope for this change.
 mod macos;
 
-/// A source that answers with a plan the caller already has: the TUI's
-/// live refresh, which turns what its own FSEvents watcher reported into
-/// a replay plan for one root (`tui::app::observe_live`).
-///
-/// A production type, not a test double. It used to be
-/// `testing::CannedSource`, whose documentation called it "test-only
-/// support … inert in a release binary" while the live refresh ran
-/// through it; and the doc comment's own words hid it from the old
-/// program-model audit (re-review 4, C3/U1).
-///
-/// It cannot manufacture an incremental walk on its own: the plan comes
-/// from [`FsEventsPlan::from_live`], and `growth::stage_tracked_with_source`
-/// refuses an incremental plan for a root whose stored state has no
-/// anchor or carries an older rules version (re-review 4, C2).
-pub struct LivePlanSource(FsEventsPlan);
-
-impl LivePlanSource {
-    pub fn new(plan: FsEventsPlan) -> Self {
-        Self(plan)
-    }
-}
-
-impl FsEventsSource for LivePlanSource {
-    fn replay(&self, _request: &FsEventsRequest) -> FsEventsPlan {
-        self.0.clone()
-    }
-}
-
-/// Test fixtures: a canned source and an inert watch factory, for this
-/// crate's integration tests and the TUI's tests. Compiled only with the
+/// Test fixtures: a canned source, for this crate's integration tests. Compiled only with the
 /// `testing` feature, which only `[dev-dependencies]` enable (and which
 /// `lib.rs` refuses to build in a release profile), so no production
 /// build contains it.
 #[cfg(feature = "testing")]
 pub mod testing {
-    use super::{FsEventsPlan, FsEventsRequest, FsEventsSource, PendingWatch, WatchBatch};
-    use std::path::Path;
+    use super::{FsEventsPlan, FsEventsRequest, FsEventsSource};
 
     /// A canned source: returns whatever plan it was built with,
     /// regardless of the request. Lets every refusal reason and the
@@ -918,27 +883,6 @@ pub mod testing {
         fn replay(&self, _request: &FsEventsRequest) -> FsEventsPlan {
             self.0.clone()
         }
-    }
-
-    /// A [`super::WatchFactory`] that opens no FSEvents stream and
-    /// reports ready immediately.
-    ///
-    /// It exists so "one stream per root" can be asserted as a property
-    /// of the caller's loop rather than of how quickly `fseventsd`
-    /// answers. Starting a real stream is a multi-second, per-process
-    /// serialized call (see [`super::PendingWatch`]), which makes any
-    /// test that opens two real streams a race against its own budget.
-    pub fn inert_watch_factory(
-        _root: &Path,
-        _tx: std::sync::mpsc::Sender<WatchBatch>,
-    ) -> Option<PendingWatch> {
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let _ = ready_tx.send(true);
-        Some(PendingWatch {
-            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            thread: None,
-            ready: ready_rx,
-        })
     }
 }
 

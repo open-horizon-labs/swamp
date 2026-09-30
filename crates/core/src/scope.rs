@@ -547,23 +547,6 @@ impl EffectiveScope {
         ))
     }
 
-    /// The same scope narrowed to exactly one of its roots, keeping that
-    /// root's exclusions and external pruning.
-    ///
-    /// A live TUI refresh re-observes the one root whose files changed.
-    /// Doing that through a single-root report function is what dropped
-    /// the scope contract on refresh -- excluded subtrees and pruned
-    /// external locations reappeared. Narrowing the *scope* instead
-    /// keeps every exclusion and prune note attached to the root being
-    /// re-walked (`.oh/guardrails/tui-refresh-preserves-scope.md`).
-    pub fn restricted_to(&self, root: &Path) -> EffectiveScope {
-        let mut narrowed = self.clone();
-        narrowed.roots.retain(|r| r.path == root);
-        narrowed.pruned_subtrees.retain(|p| p.root == root);
-        narrowed.external_pruned_subtrees.retain(|p| p.root == root);
-        narrowed
-    }
-
     /// Why `path` is excluded from this scope, or `None`.
     ///
     /// **The only** exclusion predicate. Every caller -- the default

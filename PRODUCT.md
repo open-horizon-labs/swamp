@@ -24,7 +24,7 @@ A larger detector catalog is useful only when it improves that decision. Swamp i
 
 ## Operating Context
 
-`observe`, the TUI, and optional scheduled observations measure storage and record facts. `report` reads the last stored observation; it does not refresh it. The TUI watches for changes while open. Linux can also use an opt-in collector; macOS can replay persisted FSEvents.
+`observe`, the TUI, and optional scheduled observations measure storage and record facts. `report` reads the last stored observation; it does not refresh it. The TUI opens on the last stored report at once and scans only when no report exists yet; the schedule keeps the report current and `R` refreshes on demand. It never watches the filesystem while open. Linux can also use an opt-in collector; macOS can replay persisted FSEvents for `observe`.
 
 The effective scope combines defaults, enabled tool-location detectors, and configured additions/exclusions. Explicit roots replace that root selection, while configured exclusions still apply. Scope and coverage must remain visible.
 

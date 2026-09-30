@@ -262,6 +262,14 @@ impl Picker {
     pub fn down(&mut self) {
         self.field = (self.field + 1).min(FIELDS.len() - 1);
     }
+    /// Home / PgUp: the first field.
+    pub fn first(&mut self) {
+        self.field = 0;
+    }
+    /// End / PgDn: the last field.
+    pub fn last(&mut self) {
+        self.field = FIELDS.len() - 1;
+    }
 
     /// The project choices narrowed by the type-to-narrow buffer; index 0
     /// is always "any".
@@ -404,10 +412,15 @@ impl Picker {
         };
         let choices = self.project_choices();
         let project = if self.project_query.is_empty() {
-            choices
+            let name = choices
                 .get(self.project_ix)
                 .cloned()
-                .unwrap_or_else(|| "any".into())
+                .unwrap_or_else(|| "any".into());
+            if self.field == 3 {
+                format!("{name}   (type to narrow)")
+            } else {
+                name
+            }
         } else {
             format!(
                 "{}   (typing: {}▏ {} match{})",

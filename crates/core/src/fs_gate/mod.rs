@@ -56,6 +56,7 @@ pub mod spawn;
 pub mod store;
 pub mod sys;
 pub mod systemd;
+pub mod terminal;
 
 /// A swamp state directory (see [`store::StoreDir`]). Named here so any
 /// module can hold or pass one; building one from a caller's path

@@ -16,8 +16,8 @@
 //!   --target-dir <scratch>/target-audit -- --test-threads=1 --nocapture
 //! ```
 //!
-//! The TUI counterexample (CE3) needs `swamp-tui` and so lives in
-//! `crates/tui/tests/reviewer_counterexamples_stack2_tui.rs`.
+//! The TUI counterexample (CE3) lived in `swamp-tui`; it went with the
+//! TUI's live refresh, which no longer exists.
 //!
 //! stack/27 (2026-09-23, "swamp reports; the human removes"): CE2 and
 //! the original CE3 (`reviewed_snapshot_must_see_a_same_second_same_size_rewrite`)

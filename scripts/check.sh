@@ -88,7 +88,6 @@ for t in \
   core/tests/build_adapter_history \
   core/tests/build_store_join \
   tui/tests/scope_preserving_refresh \
-  tui/tests/reviewer_counterexamples_stack2_tui \
   source-audit/tests/compile_fail \
   source-audit/tests/mutation_sweep; do
   test -f "crates/$t.rs" || { echo "named test target crates/$t.rs is gone" >&2; exit 1; }

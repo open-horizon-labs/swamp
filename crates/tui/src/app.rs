@@ -5,15 +5,59 @@
 use crate::actions::{self, MarkedUnit};
 use crate::filter::{self, Filter};
 use crate::model::{self, Row, Sort};
+use crate::names;
 use crate::units::UnitId;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use swamp_core::report::Report;
 
+/// What pressing a mark key on a projects-view row did.
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectMark {
+    /// The project has nothing that can be marked.
+    Nothing,
+    /// Everything markable was already marked; the press unmarked it.
+    Cleared,
+    /// This many units were newly marked.
+    Marked(usize),
+}
+
+/// Every distinct refusal with how many rows it covered, so a bulk mark
+/// that skipped rows says how many and why, not only the first reason.
+fn summarize_refusals(reasons: &[String]) -> Option<String> {
+    if reasons.is_empty() {
+        return None;
+    }
+    let mut distinct: Vec<(&str, usize)> = Vec::new();
+    for r in reasons {
+        match distinct.iter_mut().find(|(t, _)| *t == r.as_str()) {
+            Some((_, n)) => *n += 1,
+            None => distinct.push((r.as_str(), 1)),
+        }
+    }
+    if distinct.len() == 1 && distinct[0].1 == 1 {
+        return Some(distinct[0].0.to_string());
+    }
+    let shown: Vec<String> = distinct
+        .iter()
+        .take(3)
+        .map(|(t, n)| format!("{t} (x{n})"))
+        .collect();
+    let extra = distinct.len().saturating_sub(3);
+    let extra = if extra > 0 {
+        format!("; +{extra} more reasons")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} rows skipped: {}{extra}",
+        reasons.len(),
+        shown.join("; ")
+    ))
+}
+
 pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
-/// How long a finished operation's result line stays on screen.
-pub const RESULT_DISPLAY: Duration = Duration::from_secs(20);
 /// An index older than this is called stale in the header (a warning,
 /// not an error): the schedule is meant to keep it younger.
 pub const STALE_AFTER_SECS: u64 = 15 * 60;
@@ -61,6 +105,25 @@ impl ViewKind {
             _ => return None,
         })
     }
+    /// Every view, in the order `v` walks them.
+    pub const ALL: [ViewKind; 10] = [
+        ViewKind::Projects,
+        ViewKind::Tree,
+        ViewKind::Builds,
+        ViewKind::Deps,
+        ViewKind::Docker,
+        ViewKind::Kinds,
+        ViewKind::Unowned,
+        ViewKind::Types,
+        ViewKind::External,
+        ViewKind::Agents,
+    ];
+
+    /// 1-based place in [`ViewKind::ALL`], for "3 of 10".
+    pub fn position(self) -> usize {
+        Self::ALL.iter().position(|v| *v == self).unwrap_or(0) + 1
+    }
+
     pub fn next(self) -> Self {
         match self {
             ViewKind::Projects => ViewKind::Tree,
@@ -126,6 +189,18 @@ enum LockPollMsg {
     Reloaded(Box<swamp_core::report::ReportSnapshot>),
 }
 
+/// A reload waiting for the confirm or check to end.
+enum HeldReload {
+    Fresh(Box<RefreshedObservation>),
+    Snapshot(Box<swamp_core::report::ReportSnapshot>),
+}
+
+const REFRESH_WAITS: &str = "A check is running; press R after it finishes";
+
+/// The smallest terminal that shows the permanent-removal line of a plan.
+pub const CONFIRM_MIN_ROWS: u16 = 8;
+pub const CONFIRM_MIN_COLS: u16 = 40;
+
 type PendingObservation = anyhow::Result<RefreshedObservation>;
 
 /// A merged multi-root report and the per-root cache it came from.
@@ -175,8 +250,42 @@ pub struct App {
     operation_rx: Option<std::sync::mpsc::Receiver<OperationEvent>>,
     review_progress: Option<std::sync::mpsc::Sender<OperationEvent>>,
     review_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    reviewed: usize,
-    review_total: usize,
+    /// Worker side: what this check could not include.
+    blocked_log: Vec<BlockedItem>,
+    /// Worker side: the row being marked, for naming a refusal.
+    refusal_ctx: Option<String>,
+    /// What the last check could not include (`b` lists it).
+    pub blocked: Vec<BlockedItem>,
+    /// What the last check looked at: every row in the view, or one row.
+    /// `r` in the blocked list runs it again.
+    last_check: Option<(bool, Option<Row>)>,
+    /// The marks that check added, so a re-check replaces exactly those and
+    /// keeps marks made any other way.
+    last_check_marks: Vec<String>,
+    pub blocked_open: bool,
+    /// First blocked item shown in the blocked list.
+    pub blocked_scroll: usize,
+    /// First body row shown; moves only when the selection leaves the
+    /// window, so one keypress moves the selection one row.
+    pub scroll_offset: std::cell::Cell<usize>,
+    /// Redraws so far; drives the busy glyph.
+    pub frame: u64,
+    /// The one writer of `ui_state.json`, started on first use: a slow or
+    /// full disk stalls it, never a keypress.
+    ui_state_tx: Option<std::sync::mpsc::Sender<UiStateMsg>>,
+    /// Rows a page key moves in whatever is on top (the list, the blocked
+    /// sheet, help, the cargo popup); each drawer sets it to its own
+    /// viewport so PgUp/PgDn always mean "one screenful".
+    pub page: std::cell::Cell<usize>,
+    /// First help line shown. The drawer clamps it to the real end, so
+    /// `End` may set it as far as it likes.
+    pub help_scroll: std::cell::Cell<usize>,
+    /// Where the cursor was in each view when it was last left, so coming
+    /// back (Esc, `v`) lands on the same row instead of the top.
+    view_cursor: std::collections::HashMap<ViewKind, usize>,
+    /// Per-project mark counts for the projects view, kept until the marks
+    /// or the report change (computing one is a tree build per project).
+    mark_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<MarkStates>)>>,
     pub report: Report,
     /// Primary root: the first entry of `roots`, kept for every call
     /// site that only ever needed one representative path (a "resize
@@ -234,6 +343,18 @@ pub struct App {
     /// Marked units, keyed by path string for stable identity.
     pub marked: BTreeMap<String, MarkedUnit>,
     pub confirm_open: bool,
+    /// Unit ids the press that opened the current confirm marked (Backspace
+    /// or `A` on an unmarked selection). Esc on that confirm unmarks exactly
+    /// these, so cancelling never leaves marks the screen did not show
+    /// before; marks made earlier with Space stay, and stay visible.
+    /// The marks that existed when the open confirm was first opened; Esc
+    /// undoes whatever was marked beyond them, however many rechecks or
+    /// repeated presses happened since.
+    confirm_base: Option<std::collections::BTreeSet<String>>,
+    /// A newer index that arrived while a check or a confirm was open. It
+    /// is installed when they end, so what Enter would move never changes
+    /// under the human's eyes.
+    held_reload: Option<HeldReload>,
     pub help_open: bool,
     /// The filter picker form, when open.
     pub picker: Option<crate::picker::Picker>,
@@ -250,8 +371,6 @@ pub struct App {
     lock_poll_rx: Option<std::sync::mpsc::Receiver<LockPollMsg>>,
     /// Last operation outcome or refusal worth one header clause.
     pub last_result: Option<String>,
-    /// When `last_result` was set; it stops showing `RESULT_DISPLAY` later.
-    pub last_result_at: Option<Instant>,
     pub observed_label: String,
     /// False only while the very first observation has not landed.
     pub has_index: bool,
@@ -273,6 +392,8 @@ pub struct App {
     pub quit: bool,
     /// Terminal width at the last draw; the header fits its clauses to it.
     pub width: u16,
+    /// Terminal height at the last draw; 0 until the first one.
+    pub height: u16,
     /// Seconds of observation history the store holds; bounds the growth
     /// windows a human may pick (the store cannot answer beyond it).
     pub history_secs: Option<u64>,
@@ -282,32 +403,6 @@ pub struct App {
     /// Store dir, when known: the applied filter is persisted there so it
     /// survives relaunch (`ui_filter.txt`).
     pub store_dir: Option<PathBuf>,
-    /// The live FSEvents streams covering every root in `roots` (#51):
-    /// one `Watcher` per root, all feeding the single `watch_rx` below
-    /// through cloned senders, so a change under *any* included root,
-    /// including our own deletes, arrives here -- nothing "asks" for a
-    /// refresh. Kept as a `Vec` (not one merged stream) because
-    /// `fs_events::watch` is a per-path platform call; two roots on
-    /// different volumes are two independent FSEvents streams no matter
-    /// how this struct stores their handles.
-    pub watches: Vec<swamp_core::fs_events::Watcher>,
-    pub watch_rx: Option<std::sync::mpsc::Receiver<swamp_core::fs_events::WatchBatch>>,
-    /// Changed directories received and not yet observed.
-    pub live_changes: std::collections::HashSet<PathBuf>,
-    pub live_last_event_id: u64,
-    /// When the last batch arrived; observation starts once the stream has
-    /// been quiet for `LIVE_QUIET`.
-    pub live_last_batch: Option<Instant>,
-    /// Roots whose next live refresh must walk fully, and why: the
-    /// watch lost coverage (Linux: overflow, watch limit, permissions),
-    /// or its epoch opened after the root's last observation, leaving a
-    /// gap nothing covers. Empty on macOS, whose stream reports neither.
-    pub live_full_walk:
-        std::collections::HashMap<PathBuf, (swamp_core::fs_events::RefreshRefusal, String)>,
-    /// Roots whose watch cannot vouch for anything any more (a watch
-    /// limit, a permission gap): live refresh is off for them and the
-    /// status line says why. The background refresh still covers them.
-    pub live_off: std::collections::HashMap<PathBuf, String>,
     /// External/shared storage units (#43), for `ViewKind::External`.
     /// Empty until `set_external_units` is called (once, at startup --
     /// detector resolution is disk I/O and never runs on this struct's
@@ -332,30 +427,84 @@ pub struct App {
     /// once at startup, same contract as `external_units`/`agent_units`.
     pub scope_note: Option<String>,
     /// The authorized scope this TUI is showing. Every refresh --
-    /// background, live watch, post-action re-observe -- goes through it,
+    /// background, post-action re-observe -- goes through it,
     /// so exclusions and external pruning survive an update rather than
     /// applying only to the first render
     /// (`.oh/guardrails/tui-refresh-preserves-scope.md`).
     pub scope: Option<swamp_core::scope::EffectiveScope>,
 }
 
+/// One thing a check could not include, and what to do about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockedItem {
+    pub name: String,
+    pub reason: String,
+    pub next: String,
+}
+
+/// The next step for a reason a check gave. Unknown reasons still get a
+/// safe one: refresh and check again.
+pub fn blocked_next_step(reason: &str) -> &'static str {
+    let r = reason.to_lowercase();
+    if r.contains("human-protected") {
+        "remove the protection (swamp protect), then check again"
+    } else if r.contains("protection state could not be read") {
+        "fix the protect file in the swamp store, then check again"
+    } else if r.contains("nothing reclaimable") {
+        "open the project with Enter and mark what you want inside it"
+    } else if r.contains("category total") {
+        "open the category and mark one of its items"
+    } else if r.contains("inspection-only") {
+        "nothing to do here: swamp only shows this, it cannot clean it"
+    } else if r.contains("agent-storage") || r.contains("active") {
+        "close the agent session that uses it, then check again"
+    } else {
+        "press R to refresh, then check again"
+    }
+}
+
+/// Marked and total units per project (report project name).
+pub type MarkStates = std::collections::HashMap<String, (usize, usize)>;
+
 pub struct Operation {
     pub label: &'static str,
+    /// Items checked (review) or moved (delete) so far.
     pub completed: usize,
     pub total: usize,
+    /// Review: ready. Delete: moved.
     pub succeeded: usize,
+    /// Review: blocked. Delete: not moved.
     pub failed: usize,
-    pub current: PathBuf,
+    /// Plain name of the item being worked on.
+    pub current: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
     pub started: Instant,
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// A review's one open-file snapshot (`lsof`, ~15 s) is being taken;
+    /// A review's one open-file snapshot (`lsof`) is being taken;
     /// no group can finish until it returns. When it began.
     pub checking_open_files: Option<Instant>,
+}
+
+/// What the `ui_state.json` writer is told.
+enum UiStateMsg {
+    /// The state to keep; a newer one that has already arrived wins.
+    Save(UiState),
+    /// Everything before this has been written; tell the sender.
+    Flush(std::sync::mpsc::Sender<()>),
 }
 
 enum OperationEvent {
     /// The review's open-file snapshot started (`true`) or finished.
     OpenFileCheck(bool),
+    /// How many items this check will look at.
+    ReviewTotal(usize),
+    /// The check is looking at this path now.
+    ReviewStep(PathBuf),
+    /// One item is ready.
+    ReviewReady,
+    /// One item is blocked.
+    ReviewBlocked,
     Inspected(Vec<String>),
     Progress {
         completed: usize,
@@ -365,14 +514,13 @@ enum OperationEvent {
     },
     Reviewed {
         marked: BTreeMap<String, MarkedUnit>,
+        blocked: Vec<BlockedItem>,
         refusal: Option<String>,
         confirm: bool,
         cancelled: bool,
     },
     Deleted {
         results: Vec<actions::UnitResult>,
-        planned: u64,
-        measured: Option<i64>,
         total: usize,
     },
     Failed(String),
@@ -452,8 +600,20 @@ impl App {
             operation_rx: None,
             review_progress: None,
             review_cancel: None,
-            reviewed: 0,
-            review_total: 0,
+            blocked_log: Vec::new(),
+            refusal_ctx: None,
+            blocked: Vec::new(),
+            blocked_open: false,
+            blocked_scroll: 0,
+            scroll_offset: std::cell::Cell::new(0),
+            frame: 0,
+            last_check: None,
+            last_check_marks: Vec::new(),
+            ui_state_tx: None,
+            page: std::cell::Cell::new(10),
+            help_scroll: std::cell::Cell::new(0),
+            view_cursor: std::collections::HashMap::new(),
+            mark_cache: std::sync::Mutex::new(None),
             report,
             root,
             roots,
@@ -471,6 +631,8 @@ impl App {
             collapsed: HashSet::new(),
             marked: BTreeMap::new(),
             confirm_open: false,
+            confirm_base: None,
+            held_reload: None,
             help_open: false,
             picker: None,
             completions: Vec::new(),
@@ -480,7 +642,6 @@ impl App {
             external_observer: None,
             lock_poll_rx: None,
             last_result: None,
-            last_result_at: None,
             observed_label: "just now".to_string(),
             has_index: true,
             live_age: false,
@@ -491,14 +652,8 @@ impl App {
             keep_executables: false,
             quit: false,
             width: 0,
+            height: 0,
             store_dir: None,
-            watches: Vec::new(),
-            watch_rx: None,
-            live_changes: std::collections::HashSet::new(),
-            live_last_event_id: 0,
-            live_last_batch: None,
-            live_full_walk: std::collections::HashMap::new(),
-            live_off: std::collections::HashMap::new(),
             track: std::collections::HashMap::new(),
             history_secs: None,
             external_units: Vec::new(),
@@ -671,6 +826,116 @@ impl App {
         }
     }
 
+    /// True while a check or a confirm is open: a new index must wait.
+    fn reload_must_wait(&self) -> bool {
+        self.confirm_open || self.operation.is_some()
+    }
+
+    /// Whether a newer index is waiting for the confirm or check to end.
+    pub fn new_data_waiting(&self) -> bool {
+        self.held_reload.is_some()
+    }
+
+    /// Lands the result of our own observation: now, or after the confirm
+    /// or check that is open ends.
+    pub fn land_observation(&mut self, fresh: RefreshedObservation) {
+        if self.reload_must_wait() {
+            self.held_reload = Some(HeldReload::Fresh(Box::new(fresh)));
+            return;
+        }
+        self.install_refreshed(fresh);
+        self.observed_label = "just now".into();
+        self.drop_marks_missing_from_report();
+    }
+
+    fn install_snapshot(&mut self, snap: swamp_core::report::ReportSnapshot) {
+        self.has_index = true;
+        self.replace_report(snap.report);
+        self.set_external_units(snap.external_units);
+        self.set_store_interiors(snap.store_interiors);
+        self.set_agent_units(snap.agent_units);
+        self.observed_label = "just now".into();
+        self.status = None;
+        self.drop_marks_missing_from_report();
+    }
+
+    /// Installs a held reload once no confirm or check is open. True when
+    /// the screen's inputs changed.
+    pub fn apply_held_reload(&mut self) -> bool {
+        if self.reload_must_wait() {
+            return false;
+        }
+        match self.held_reload.take() {
+            Some(HeldReload::Fresh(f)) => {
+                self.install_refreshed(*f);
+                self.observed_label = "just now".into();
+                self.drop_marks_missing_from_report();
+                true
+            }
+            Some(HeldReload::Snapshot(snap)) => {
+                self.install_snapshot(*snap);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Every path the current report and unit lists can name.
+    fn known_unit_keys(&self) -> std::collections::HashSet<String> {
+        let mut keys = std::collections::HashSet::new();
+        for wt in self.report.projects.iter().flat_map(|p| &p.worktrees) {
+            keys.insert(wt.path.display().to_string());
+            for a in &wt.artifacts {
+                keys.insert(a.path.display().to_string());
+            }
+        }
+        for u in &self.report.unowned {
+            keys.insert(u.path_or_object.clone());
+        }
+        for n in self
+            .report
+            .nested_artifacts
+            .iter()
+            .chain(&self.store_interiors)
+        {
+            keys.insert(n.path.display().to_string());
+        }
+        for u in &self.external_units {
+            keys.insert(u.path.display().to_string());
+        }
+        for u in &self.agent_units {
+            keys.insert(u.path.display().to_string());
+        }
+        keys
+    }
+
+    /// After a new index lands: a mark for something the index no longer
+    /// lists is dropped, and the result line says how many.
+    fn drop_marks_missing_from_report(&mut self) {
+        if self.marked.is_empty() {
+            return;
+        }
+        let known = self.known_unit_keys();
+        let gone: Vec<String> = self
+            .marked
+            .iter()
+            .filter(|(k, u)| u.observed_at < self.report.observed_at && !known.contains(*k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for k in &gone {
+            self.marked.remove(k);
+        }
+        let n = gone.len();
+        self.set_result(format!(
+            "The new scan no longer lists {n} marked item{}; unmarked. {} still marked.",
+            if n == 1 { "" } else { "s" },
+            self.marked.len()
+        ));
+    }
+
     /// Identity of the selected row: its unit path when it has one
     /// (stable across re-sorts), otherwise its label.
     fn selected_row_key(&self) -> Option<String> {
@@ -750,21 +1015,35 @@ impl App {
     }
 
     /// `k`: whether a delete first copies compiled outputs to `bin/`.
+    /// The setting is remembered between sessions, so the result line
+    /// says which way it went and what that means; a key that changes
+    /// something lasting never answers in silence.
     pub fn toggle_keep_executables(&mut self) {
         self.keep_executables = !self.keep_executables;
         self.persist_ui_state();
+        self.set_result(if self.keep_executables {
+            "Keep executables is now on: release and debug programs are copied to bin/ before their folder goes to Trash. Remembered for next time. k turns it off.".to_string()
+        } else {
+            "Keep executables is now off: build folders go to Trash as they are. Remembered for next time. k turns it on.".to_string()
+        });
     }
 
-    /// Whether the active filter is one that has no data source yet.
-    /// Kept for the UI: every predicate now has a data source, so a
-    /// filter never lands in a "no data yet" state.
-    pub fn filter_has_no_data(&self) -> bool {
-        false
-    }
-
+    /// Switches view. The cursor of the view being left is remembered and
+    /// the one of the view being entered is restored (clamped to its
+    /// rows), so `v` or Esc and back never sends the cursor to the top.
     pub fn set_view(&mut self, v: ViewKind) {
+        if v == self.view {
+            return;
+        }
+        self.view_cursor.insert(self.view, self.selected);
         self.view = v;
-        self.selected = 0;
+        let len = self.rows().len();
+        self.selected = self
+            .view_cursor
+            .get(&v)
+            .copied()
+            .unwrap_or(0)
+            .min(len.saturating_sub(1));
     }
 
     pub fn move_selection(&mut self, delta: i32) {
@@ -775,6 +1054,22 @@ impl App {
         }
         let cur = self.selected as i32 + delta;
         self.selected = cur.clamp(0, len as i32 - 1) as usize;
+    }
+
+    /// PgUp / PgDn: one screenful, keeping one row of overlap.
+    pub fn page_selection(&mut self, direction: i32) {
+        let step = self.page.get().max(1) as i32;
+        self.move_selection(direction * step);
+    }
+
+    /// Home.
+    pub fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    /// End.
+    pub fn select_last(&mut self) {
+        self.selected = self.rows().len().saturating_sub(1);
     }
 
     /// Enter filter editing with the current text kept, so the human edits
@@ -870,6 +1165,7 @@ impl App {
             }
         }
         self.selected = 0;
+        self.view_cursor.clear();
     }
 
     pub fn clear_filter(&mut self) {
@@ -877,27 +1173,72 @@ impl App {
         self.filter = Filter::default();
         self.filter_error = None;
         self.selected = 0;
+        self.view_cursor.clear();
         self.persist_filter();
     }
 
-    fn persist_filter(&self) {
+    fn persist_filter(&mut self) {
         self.persist_ui_state();
     }
 
-    fn persist_ui_state(&self) {
-        if let Some(store) = &self.store_dir
-            && let Ok(store) = swamp_core::fs_gate::StoreDir::at(store)
-        {
-            let state = UiState {
-                filter: self.filter_text.clone(),
-                sort: sort_to_str(self.sort).to_string(),
-                reverse: self.reverse,
-                keep_executables: self.keep_executables,
-            };
-            let _ = swamp_core::fs_gate::store::write_json(
-                swamp_core::fs_gate::store::JsonFile::UiState { store: &store },
-                &state,
-            );
+    /// Hands the current filter, sort and `k` to the writer thread and
+    /// returns at once. Writes never wait on the event thread; when several
+    /// arrive together only the newest is written.
+    fn persist_ui_state(&mut self) {
+        let Some(store) = self.store_dir.clone() else {
+            return;
+        };
+        let state = UiState {
+            filter: self.filter_text.clone(),
+            sort: sort_to_str(self.sort).to_string(),
+            reverse: self.reverse,
+            keep_executables: self.keep_executables,
+        };
+        if self.ui_state_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<UiStateMsg>();
+            crate::worker::spawn(move || {
+                let write = |state: &UiState| {
+                    if let Ok(store) = swamp_core::fs_gate::StoreDir::at(&store) {
+                        let _ = swamp_core::fs_gate::store::write_json(
+                            swamp_core::fs_gate::store::JsonFile::UiState { store: &store },
+                            state,
+                        );
+                    }
+                };
+                let mut waiting: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+                while let Ok(first) = rx.recv() {
+                    let mut latest = None;
+                    let mut msgs = vec![first];
+                    msgs.extend(rx.try_iter());
+                    for m in msgs {
+                        match m {
+                            UiStateMsg::Save(s) => latest = Some(s),
+                            UiStateMsg::Flush(done) => waiting.push(done),
+                        }
+                    }
+                    if let Some(s) = latest {
+                        write(&s);
+                    }
+                    for done in waiting.drain(..) {
+                        let _ = done.send(());
+                    }
+                }
+            });
+            self.ui_state_tx = Some(tx);
+        }
+        if let Some(tx) = &self.ui_state_tx {
+            let _ = tx.send(UiStateMsg::Save(state));
+        }
+    }
+
+    /// Waits (a moment at most) for the writer to finish what it was given,
+    /// so the last choice survives quitting. Called once, on the way out.
+    pub fn flush_ui_state(&self) {
+        if let Some(tx) = &self.ui_state_tx {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            if tx.send(UiStateMsg::Flush(done_tx)).is_ok() {
+                let _ = done_rx.recv_timeout(Duration::from_secs(2));
+            }
         }
     }
 
@@ -958,6 +1299,9 @@ impl App {
     /// Enters a project from the projects view into its tree.
     pub fn drill_into_selected(&mut self) {
         if self.confirm_open {
+            if self.height != 0 && !self.confirm_fits(self.width, self.height) {
+                return;
+            }
             self.confirm_delete();
             return;
         }
@@ -1013,6 +1357,8 @@ impl App {
                 }
             }
             self.selected_project = Some(name);
+            // A different project's tree starts at its top.
+            self.view_cursor.remove(&ViewKind::Tree);
             self.set_view(ViewKind::Tree);
         }
     }
@@ -1025,7 +1371,7 @@ impl App {
     /// names how many and why.
     pub fn mark_all_in_view(&mut self) {
         let rows = self.rows();
-        let mut refused: Option<String> = None;
+        let mut refused: Vec<String> = Vec::new();
         let mut marked = 0usize;
         // Agents view (#91/#100/#101): `model::agent_rows` sets `unit`
         // on every row, protected/unsupported ones included, but never
@@ -1041,11 +1387,16 @@ impl App {
                     // Bulk marking never reaches for a checkout: `A` over
                     // a screen of projects would otherwise queue every
                     // checkout under the root behind one Enter.
-                    let n = self.mark_project(&project, false);
-                    if n == 0 {
-                        refused = refused.or(Some("nothing reclaimable in this project".into()));
+                    match self.mark_project(&project, false) {
+                        ProjectMark::Nothing => {
+                            let why = "nothing reclaimable in this project";
+                            let name = self.row_display_name(&row);
+                            self.note_blocked(name, why);
+                            refused.push(why.into())
+                        }
+                        ProjectMark::Cleared => {}
+                        ProjectMark::Marked(n) => marked += n,
                     }
-                    marked += n;
                 } else if row.unit.is_some() {
                     // `mark_row` already knows how to refuse a
                     // protected/unsupported/active agent-storage row
@@ -1070,28 +1421,30 @@ impl App {
                         marked += 1;
                     }
                 }
-                Err(why) => refused = refused.or(Some(why.into())),
+                Err(why) => {
+                    let name = self.row_display_name(&row);
+                    self.note_blocked(name, why);
+                    refused.push(why.into())
+                }
             }
         }
         if agent_skipped > 0 {
-            refused = refused.or(Some(format!(
+            refused.push(format!(
                 "{agent_skipped} agent-storage row{} protected, unsupported, or active; skipped",
                 if agent_skipped == 1 { " is" } else { "s are" }
-            )));
+            ));
         }
         if marked == 0 {
-            self.set_refusal(
-                refused
-                    .as_deref()
-                    .unwrap_or("nothing in this view can be acted on"),
-            );
+            let why = summarize_refusals(&refused)
+                .unwrap_or_else(|| "nothing in this view can be acted on".into());
+            self.set_refusal(&why);
             return;
         }
         // Some rows were left alone (agent-storage skip, or an empty
         // project) even though at least one row *was* marked: say so,
         // rather than silently proceeding to a confirm that looks like
         // it covers everything the human saw on screen.
-        if let Some(msg) = refused {
+        if let Some(msg) = summarize_refusals(&refused) {
             self.set_refusal(&msg);
         }
         self.confirm_open = true;
@@ -1115,7 +1468,103 @@ impl App {
     /// on the whole project rather than on whatever the current filter
     /// happens to show. Returns how many units it newly marked; a second
     /// press on a fully marked project clears it and returns 0.
-    fn mark_project(&mut self, project: &str, include_checkouts: bool) -> usize {
+    fn mark_project(&mut self, project: &str, include_checkouts: bool) -> ProjectMark {
+        let units = self.project_units(project, include_checkouts);
+        if units.is_empty() {
+            return ProjectMark::Nothing;
+        }
+        let marked_already = |app: &Self, r: &Row| {
+            r.unit
+                .as_ref()
+                .is_some_and(|u| app.marked.contains_key(&u.0))
+        };
+        if units.iter().all(|r| marked_already(self, r)) {
+            for r in &units {
+                if let Some(u) = &r.unit {
+                    self.marked.remove(&u.0);
+                }
+            }
+            return ProjectMark::Cleared;
+        }
+        let mut newly = 0usize;
+        for r in units {
+            if marked_already(self, &r) {
+                continue;
+            }
+            self.mark_row(&r);
+            newly += 1;
+        }
+        ProjectMark::Marked(newly)
+    }
+
+    /// How many of a project's markable units are marked, and how many it
+    /// has: what a projects-view row draws (`✗` all, `~n/m` some). The unit
+    /// set is the one Space/Backspace on the row would mark, checkouts
+    /// included when nothing rebuildable exists.
+    pub fn project_mark_state(&self, project: &str) -> (usize, usize) {
+        if self.marked.is_empty() {
+            return (0, 0);
+        }
+        let mut units = self.project_units(project, false);
+        if units.is_empty() {
+            units = self.project_units(project, true);
+        }
+        let marked = units
+            .iter()
+            .filter(|r| {
+                r.unit
+                    .as_ref()
+                    .is_some_and(|u| self.marked.contains_key(&u.0))
+            })
+            .count();
+        (marked, units.len())
+    }
+
+    /// `project_mark_state` for every project that owns a marked unit,
+    /// cached until the marks or the report change. A drawn frame asks for
+    /// this, so it must cost nothing when nothing changed.
+    pub fn project_mark_states(&self) -> std::sync::Arc<MarkStates> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.marked.keys().for_each(|k| k.hash(&mut h));
+        (self.report.observed_at, self.report.projects.len()).hash(&mut h);
+        let sig = h.finish();
+        if let Ok(cache) = self.mark_cache.lock()
+            && let Some((s, states)) = cache.as_ref()
+            && *s == sig
+        {
+            return states.clone();
+        }
+        let mut owners: Option<HashSet<String>> = Some(HashSet::new());
+        for u in self.marked.values() {
+            match names::project_key_of(&self.report, &u.path) {
+                Some(p) => {
+                    if let Some(o) = owners.as_mut() {
+                        o.insert(p);
+                    }
+                }
+                // Not under any checkout (docker, unowned): any project
+                // may own it, so look at all of them.
+                None => owners = None,
+            }
+        }
+        let mut states = MarkStates::new();
+        if !self.marked.is_empty() {
+            for p in &self.report.projects {
+                if owners.as_ref().is_none_or(|o| o.contains(&p.name)) {
+                    states.insert(p.name.clone(), self.project_mark_state(&p.name));
+                }
+            }
+        }
+        let states = std::sync::Arc::new(states);
+        if let Ok(mut cache) = self.mark_cache.lock() {
+            *cache = Some((sig, states.clone()));
+        }
+        states
+    }
+
+    /// The rows a mark on this project row acts on.
+    fn project_units(&self, project: &str, include_checkouts: bool) -> Vec<Row> {
         let rows = model::tree_rows(
             &self.report,
             project,
@@ -1147,31 +1596,7 @@ impl App {
                 .cloned()
                 .collect();
         }
-        if units.is_empty() {
-            return 0;
-        }
-        let marked_already = |app: &Self, r: &Row| {
-            r.unit
-                .as_ref()
-                .is_some_and(|u| app.marked.contains_key(&u.0))
-        };
-        if units.iter().all(|r| marked_already(self, r)) {
-            for r in &units {
-                if let Some(u) = &r.unit {
-                    self.marked.remove(&u.0);
-                }
-            }
-            return 0;
-        }
-        let mut newly = 0usize;
-        for r in units {
-            if marked_already(self, &r) {
-                continue;
-            }
-            self.mark_row(&r);
-            newly += 1;
-        }
-        newly
+        units
     }
 
     /// The mark decision for one row (testable without a selection).
@@ -1183,6 +1608,39 @@ impl App {
     /// Enter. Docker objects are the one exception: there is no
     /// implementation to remove them yet, so marking one would be a lie.
     pub fn mark_row(&mut self, row: &Row) {
+        let name = self.row_display_name(row);
+        let outer = self.refusal_ctx.replace(name);
+        self.mark_row_inner(row);
+        self.refusal_ctx = outer;
+    }
+
+    /// A row's plain name: a unit by what it is, anything else by its label.
+    fn row_display_name(&self, row: &Row) -> String {
+        match &row.unit {
+            Some(u) => names::friendly_unit_name(&self.report, Path::new(&u.0)),
+            None => row.label.trim().to_string(),
+        }
+    }
+
+    /// A refusal that also counts as blocked in the check in progress.
+    fn refuse(&mut self, msg: &str) {
+        let name = self.refusal_ctx.clone().unwrap_or_default();
+        self.note_blocked(name, msg);
+        self.set_refusal(msg);
+    }
+
+    fn note_blocked(&mut self, name: String, reason: &str) {
+        self.blocked_log.push(BlockedItem {
+            name,
+            reason: reason.to_string(),
+            next: blocked_next_step(reason).to_string(),
+        });
+        if let Some(tx) = &self.review_progress {
+            let _ = tx.send(OperationEvent::ReviewBlocked);
+        }
+    }
+
+    fn mark_row_inner(&mut self, row: &Row) {
         if self
             .review_cancel
             .as_ref()
@@ -1200,7 +1658,7 @@ impl App {
                 .cloned()
                 .collect();
             if members.is_empty() {
-                self.set_refusal("No supported cleanup members remain; refresh the report.");
+                self.refuse("No supported cleanup members remain; refresh the report.");
                 return;
             }
             if members
@@ -1235,13 +1693,11 @@ impl App {
         }
         let Some(unit_id) = row.unit.clone() else {
             if row.signals.iter().any(|s| s == "category") {
-                self.set_refusal(
-                    "Category total: select an unchecked child group. Nothing changed.",
-                );
+                self.refuse("Category total: pick one of the items inside it. Nothing changed.");
                 return;
             }
             if row.signals.iter().any(|s| s == "blocked") {
-                self.set_refusal(
+                self.refuse(
                     "Inspection-only: this output cannot be selected for cleanup. Nothing changed.",
                 );
                 return;
@@ -1250,21 +1706,16 @@ impl App {
             // path. Marking it means marking what that project can give
             // back, so the human does not have to open it first.
             if let Some(project) = row.project.clone() {
-                if self.mark_project(&project, true) == 0 {
-                    self.set_refusal("nothing reclaimable in this project");
+                if self.mark_project(&project, true) == ProjectMark::Nothing {
+                    self.refuse("nothing reclaimable in this project");
                 }
                 return;
             }
-            self.set_refusal("nothing to delete on this row");
+            self.refuse("nothing to delete on this row");
             return;
         };
         if let Some(tx) = &self.review_progress {
-            let _ = tx.send(OperationEvent::Progress {
-                completed: self.reviewed,
-                total: self.review_total,
-                path: PathBuf::from(&unit_id.0),
-                outcome: None,
-            });
+            let _ = tx.send(OperationEvent::ReviewStep(PathBuf::from(&unit_id.0)));
         }
         // The ignored/untracked rows report bytes scattered across a
         // checkout under the worktree's own path. Marking one would
@@ -1277,7 +1728,7 @@ impl App {
             )
             && let Err(why) = crate::units::markable(kind)
         {
-            self.set_refusal(why);
+            self.refuse(why);
             return;
         }
         // A Docker object is removed through the daemon, not moved to
@@ -1320,7 +1771,7 @@ impl App {
             match swamp_core::agents::load_protect(&store) {
                 Ok(protected) => {
                     if let Some(reason) = protected.conflict(&candidate) {
-                        self.set_refusal(&format!(
+                        self.refuse(&format!(
                             "human-protected path (swamp protect): {reason}; remove protection \
                              first if this unit should be actionable"
                         ));
@@ -1328,7 +1779,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.set_refusal(&format!(
+                    self.refuse(&format!(
                         "protection state could not be read, so nothing may be marked: {e}"
                     ));
                     return;
@@ -1431,7 +1882,7 @@ impl App {
                     units.into_iter().next()
                 }
                 Err(e) => {
-                    self.set_refusal(&e.to_string());
+                    self.refuse(&e.to_string());
                     return;
                 }
             }
@@ -1462,7 +1913,7 @@ impl App {
                     units.into_iter().next()
                 }
                 Err(e) => {
-                    self.set_refusal(&e.to_string());
+                    self.refuse(&e.to_string());
                     return;
                 }
             }
@@ -1505,14 +1956,8 @@ impl App {
                 warnings,
             },
         );
-        self.reviewed += 1;
         if let Some(tx) = &self.review_progress {
-            let _ = tx.send(OperationEvent::Progress {
-                completed: self.reviewed,
-                total: self.review_total,
-                path: PathBuf::from(&unit_id.0),
-                outcome: Some(true),
-            });
+            let _ = tx.send(OperationEvent::ReviewReady);
         }
     }
 
@@ -1560,7 +2005,9 @@ impl App {
             total: 1,
             succeeded: 0,
             failed: 0,
-            current: profile.clone(),
+            current: names::friendly_unit_name(&self.report, &profile),
+            bytes_done: 0,
+            bytes_total: 0,
             started: Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
@@ -1611,6 +2058,7 @@ impl App {
             return;
         }
         if confirm && !self.marked.is_empty() {
+            self.note_confirm_base();
             self.open_confirm();
             return;
         }
@@ -1618,33 +2066,61 @@ impl App {
         if !all && row.is_none() {
             return;
         }
-        let total = if all {
-            0
-        } else {
-            row.as_ref()
-                .and_then(|r| r.expansion_key.as_deref())
-                .map(|k| model::cleanup_members(&self.report, k).len())
-                .unwrap_or(0)
+        if confirm {
+            self.note_confirm_base();
+        }
+        let marks = self.marked.clone();
+        self.start_review(all, row, confirm, marks);
+    }
+
+    /// `r` in the blocked list: the same check again, from a fresh look at
+    /// the disk (something that was open may have closed). The marks the
+    /// last check added are replaced by what this one finds; marks made
+    /// any other way stay.
+    pub fn recheck_blocked(&mut self) {
+        if self.operation.is_some() {
+            return;
+        }
+        let Some((all, row)) = self.last_check.clone() else {
+            return;
         };
+        let mut marks = self.marked.clone();
+        for id in &self.last_check_marks {
+            marks.remove(id);
+        }
+        let confirm = self.confirm_open;
+        self.blocked_open = false;
+        self.start_review(all, row, confirm, marks);
+    }
+
+    fn start_review(
+        &mut self,
+        all: bool,
+        row: Option<Row>,
+        confirm: bool,
+        base_marks: BTreeMap<String, MarkedUnit>,
+    ) {
+        self.last_check = Some((all, row.clone()));
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut worker = App::new(self.report.clone(), self.root.clone());
-        worker.marked = self.marked.clone();
+        worker.marked = base_marks;
         worker.view = self.view;
         worker.filter = self.filter.clone();
         worker.selected_project = self.selected_project.clone();
         worker.collapsed = self.collapsed.clone();
         worker.track = self.track.clone();
-        worker.review_total = total;
         worker.review_cancel = Some(cancel.clone());
         worker.review_progress = Some(tx.clone());
         self.operation = Some(Operation {
             label: "Reviewing",
             completed: 0,
-            total,
+            total: 0,
             succeeded: 0,
             failed: 0,
-            current: PathBuf::new(),
+            current: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
             started: Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
@@ -1652,9 +2128,17 @@ impl App {
         self.operation_rx = Some(rx);
         self.refusal = None;
         self.last_result = None;
+        self.blocked.clear();
+        self.blocked_open = false;
         crate::worker::spawn(move || {
-            // One open-file snapshot serves every group in this pass,
-            // instead of one directory-tree walk per group.
+            let total = if all {
+                worker.count_targets(None)
+            } else {
+                row.as_ref().map_or(0, |r| worker.count_targets(Some(r)))
+            };
+            let _ = tx.send(OperationEvent::ReviewTotal(total));
+            // One open-file snapshot serves every item in this pass,
+            // instead of one directory-tree walk per item.
             let phase_tx = tx.clone();
             swamp_core::occupancy::OccupancySnapshot::scoped_observed(
                 move |phase| {
@@ -1672,6 +2156,7 @@ impl App {
             );
             let _ = tx.send(OperationEvent::Reviewed {
                 marked: worker.marked,
+                blocked: worker.blocked_log,
                 refusal: worker.refusal.map(|(msg, _)| msg),
                 confirm: confirm || all,
                 cancelled: cancel.load(std::sync::atomic::Ordering::SeqCst),
@@ -1679,7 +2164,50 @@ impl App {
         });
     }
 
-    pub fn poll_operation(&mut self) {
+    /// How many items a check of `row` (or of every row in the view, for
+    /// `None`) will look at: what "checked N of M" counts against. Items
+    /// are counted once by path (the same directory is listed under more
+    /// than one row), and a row with nothing to check counts as one that
+    /// will be reported blocked.
+    fn count_targets(&self, only: Option<&Row>) -> usize {
+        let mut ids: HashSet<String> = HashSet::new();
+        let mut blocked_rows = 0usize;
+        let mut add = |row: &Row, checkouts: bool| {
+            if let Some(key) = row
+                .expansion_key
+                .as_deref()
+                .filter(|k| model::is_cleanup_selection(&self.report, k))
+            {
+                let members = model::cleanup_members(&self.report, key);
+                if members.is_empty() {
+                    blocked_rows += 1;
+                }
+                ids.extend(members.iter().map(|u| u.path.display().to_string()));
+            } else if let Some(u) = &row.unit {
+                ids.insert(u.0.clone());
+            } else if let Some(p) = row.project.as_deref().filter(|_| row.kind.is_none()) {
+                let units = self.project_units(p, checkouts);
+                if units.is_empty() {
+                    blocked_rows += 1;
+                }
+                ids.extend(
+                    units
+                        .iter()
+                        .filter_map(|r| r.unit.as_ref().map(|u| u.0.clone())),
+                );
+            }
+        };
+        match only {
+            Some(row) => add(row, true),
+            None => self.rows().iter().for_each(|r| add(r, false)),
+        }
+        ids.len() + blocked_rows
+    }
+
+    /// Applies what the worker reported. True when anything arrived, so the
+    /// event loop paints it without waiting for a key.
+    pub fn poll_operation(&mut self) -> bool {
+        let mut changed = false;
         loop {
             let event = match self.operation_rx.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(e)) => e,
@@ -1688,6 +2216,7 @@ impl App {
                 ),
                 _ => break,
             };
+            changed = true;
             match event {
                 OperationEvent::Inspected(lines) => {
                     self.operation = None;
@@ -1701,18 +2230,47 @@ impl App {
                         op.checking_open_files = active.then(Instant::now);
                     }
                 }
+                OperationEvent::ReviewTotal(n) => {
+                    if let Some(op) = &mut self.operation {
+                        op.total = n;
+                    }
+                }
+                OperationEvent::ReviewStep(path) => {
+                    let name = names::friendly_unit_name(&self.report, &path);
+                    if let Some(op) = &mut self.operation {
+                        op.current = name;
+                    }
+                }
+                OperationEvent::ReviewReady => {
+                    if let Some(op) = &mut self.operation {
+                        op.succeeded += 1;
+                        op.completed = op.succeeded + op.failed;
+                    }
+                }
+                OperationEvent::ReviewBlocked => {
+                    if let Some(op) = &mut self.operation {
+                        op.failed += 1;
+                        op.completed = op.succeeded + op.failed;
+                    }
+                }
                 OperationEvent::Progress {
                     completed,
                     total,
                     path,
                     outcome,
                 } => {
+                    let name = names::friendly_unit_name(&self.report, &path);
+                    let bytes = self
+                        .marked
+                        .get(&path.display().to_string())
+                        .map_or(0, |u| u.bytes);
                     if let Some(op) = &mut self.operation {
                         op.completed = completed;
                         op.total = total;
-                        op.current = path;
+                        op.current = name;
                         if outcome == Some(true) {
                             op.succeeded += 1;
+                            op.bytes_done += bytes;
                         }
                         if outcome == Some(false) {
                             op.failed += 1;
@@ -1721,49 +2279,79 @@ impl App {
                 }
                 OperationEvent::Reviewed {
                     marked,
+                    blocked,
                     refusal,
                     confirm,
                     cancelled,
                 } => {
+                    let (done, of) = self
+                        .operation
+                        .as_ref()
+                        .map_or((0, 0), |op| (op.completed, op.total));
                     let cancelled = cancelled
                         || self
                             .operation
                             .as_ref()
                             .is_some_and(|op| op.cancel.load(std::sync::atomic::Ordering::SeqCst));
                     if !cancelled {
+                        let before = std::mem::take(&mut self.marked);
+                        let added: Vec<String> = marked
+                            .keys()
+                            .filter(|k| !before.contains_key(*k))
+                            .cloned()
+                            .collect();
+                        let removed = before.keys().filter(|k| !marked.contains_key(*k)).count();
+                        self.last_check_marks = added.clone();
                         self.marked = marked;
+                        self.blocked = blocked;
                         self.refusal = refusal.map(|msg| (msg, Instant::now()));
                         self.confirm_open = confirm && !self.marked.is_empty();
+                        if !self.confirm_open {
+                            self.confirm_base = None;
+                            // Space: say where the marks stand, the row
+                            // itself may not show a change (a project row
+                            // stands for many units).
+                            let msg = self.mark_state_line(added.len(), removed);
+                            self.set_result(msg);
+                        }
                     } else {
-                        self.set_result(
-                            "Review cancelled; previous selection preserved; nothing deleted"
-                                .into(),
-                        );
+                        let progress = if of > 0 {
+                            format!("at {done} of {of}")
+                        } else {
+                            format!("after {done}")
+                        };
+                        let kept = match self.marked.len() {
+                            0 => String::new(),
+                            k => format!(" {k} still marked."),
+                        };
+                        self.set_result(format!(
+                            "Check stopped {progress}. Nothing was moved.{kept}"
+                        ));
                     }
                     self.operation = None;
                     self.operation_rx = None;
                     break;
                 }
-                OperationEvent::Deleted {
-                    results,
-                    planned,
-                    measured,
-                    total,
-                } => {
+                OperationEvent::Deleted { results, total } => {
                     self.operation = None;
                     self.operation_rx = None;
-                    self.finish_delete(results, planned, measured, total);
+                    self.finish_delete(results, total);
                     break;
                 }
                 OperationEvent::Failed(msg) => {
                     self.operation = None;
                     self.operation_rx = None;
                     self.confirm_open = false;
+                    self.confirm_base = None;
                     self.set_refusal(&msg);
                     break;
                 }
             }
         }
+        if self.operation.is_none() && self.status.as_deref() == Some(REFRESH_WAITS) {
+            self.status = None;
+        }
+        changed
     }
 
     fn set_refusal(&mut self, msg: &str) {
@@ -1772,26 +2360,32 @@ impl App {
 
     pub fn set_result(&mut self, msg: String) {
         self.last_result = Some(msg);
-        self.last_result_at = Some(Instant::now());
     }
 
-    /// The last operation's result while it is still worth showing.
+    /// The last operation's result. It stays until the next key: a timer
+    /// that erased it would repaint the screen while nobody is looking.
     pub fn result_active(&self) -> Option<&str> {
-        let msg = self.last_result.as_deref()?;
-        match self.last_result_at {
-            Some(at) if at.elapsed() >= RESULT_DISPLAY => None,
-            _ => Some(msg),
-        }
+        self.last_result.as_deref()
     }
 
     pub fn refusal_active(&self) -> Option<&str> {
         self.refusal.as_ref().and_then(|(msg, at)| {
-            if at.elapsed() < REFUSAL_DISPLAY {
+            // While a confirm is open the refusals it carries (what `A`
+            // skipped and why) stay until the human answers it.
+            if self.confirm_open || at.elapsed() < REFUSAL_DISPLAY {
                 Some(msg.as_str())
             } else {
                 None
             }
         })
+    }
+
+    /// Lists what the last check could not include, with reasons.
+    pub fn open_blocked(&mut self) {
+        if !self.blocked.is_empty() {
+            self.blocked_open = true;
+            self.blocked_scroll = 0;
+        }
     }
 
     pub fn open_confirm(&mut self) {
@@ -1806,18 +2400,94 @@ impl App {
         if self.marked.is_empty()
             && let Some(row) = self.selected_row()
         {
+            self.note_confirm_base();
             self.mark_row(&row);
+        } else {
+            self.note_confirm_base();
         }
         self.open_confirm();
     }
 
+    /// Records the marks as they stand when a confirm is first opened. A
+    /// press that finds the confirm already open keeps the first record.
+    fn note_confirm_base(&mut self) {
+        if !self.confirm_open {
+            self.confirm_base = Some(self.marked.keys().cloned().collect());
+        }
+    }
+
+    /// Esc on the confirm: nothing is deleted, and the marks the opening
+    /// press made are taken back so a later Backspace on another row asks
+    /// about that row. Marks made earlier (Space) stay, drawn on the rows.
     pub fn cancel_confirm(&mut self) {
+        if !self.confirm_open {
+            return;
+        }
         self.confirm_open = false;
+        self.refusal = None;
+        let base = self.confirm_base.take().unwrap_or_default();
+        let undone: Vec<String> = self
+            .marked
+            .keys()
+            .filter(|k| !base.contains(*k))
+            .cloned()
+            .collect();
+        for id in &undone {
+            self.marked.remove(id);
+        }
+        let kept = self.marked.len();
+        let msg = match (undone.len(), kept) {
+            (0, 0) => "Cancelled. Nothing was deleted.".to_string(),
+            (0, k) => format!(
+                "Cancelled. Nothing was deleted. {k} still marked (Space unmarks, Backspace asks again)."
+            ),
+            (n, 0) => format!("Cancelled. Nothing was deleted. Unmarked the {n} it had marked."),
+            (n, k) => format!(
+                "Cancelled. Nothing was deleted. Unmarked the {n} it had marked; {k} marked earlier remain."
+            ),
+        };
+        self.set_result(msg);
+    }
+
+    /// Where the marks stand after a Space, for the result rows.
+    fn mark_state_line(&self, added: usize, removed: usize) -> String {
+        let total = self.marked.len();
+        let bytes: u64 = self.marked.values().map(|u| u.bytes).sum();
+        let blocked = match self.blocked.len() {
+            0 => String::new(),
+            n => format!(" {n} blocked (b to see why)."),
+        };
+        if total == 0 {
+            return if removed > 0 {
+                format!("Unmarked {removed}. Nothing is marked.{blocked}")
+            } else {
+                format!("Nothing marked.{blocked}")
+            };
+        }
+        let change = if added > 0 {
+            format!("Marked {added} more. ")
+        } else if removed > 0 {
+            format!("Unmarked {removed}. ")
+        } else {
+            String::new()
+        };
+        format!(
+            "{change}{total} marked in all ({}). Nothing has been moved. Backspace moves them to Trash after you confirm.{blocked}",
+            model::human_bytes(bytes)
+        )
+    }
+
+    /// Whether a terminal of this size shows what Enter would do. A plan
+    /// that removes anything for good (docker) needs the sheet that says
+    /// so; below that size Enter is not offered and does nothing.
+    pub fn confirm_fits(&self, width: u16, height: u16) -> bool {
+        let permanent = self.marked.values().any(|u| u.docker.is_some());
+        !permanent || (height >= CONFIRM_MIN_ROWS && width >= CONFIRM_MIN_COLS)
     }
 
     pub fn confirm_summary(&self) -> String {
         let units: Vec<MarkedUnit> = self.marked.values().cloned().collect();
-        actions::confirm_summary(&units, self.keep_executables)
+        actions::confirm_summary(&units)
     }
 
     /// Enter on the confirm banner: this keypress at the keyboard is the
@@ -1856,18 +2526,22 @@ impl App {
             total,
             succeeded: 0,
             failed: 0,
-            current: PathBuf::new(),
+            current: String::new(),
+            bytes_done: 0,
+            bytes_total: planned,
             started: Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
         });
         self.operation_rx = Some(rx);
         self.confirm_open = false;
+        self.confirm_base = None;
         self.last_result = None;
         self.refusal = None;
+        self.blocked.clear();
+        self.blocked_open = false;
         crate::worker::spawn(move || {
             let ledger = swamp_core::ledger::Ledger::resolved(&store);
-            let free_before = actions::free_space_bytes(&trash);
             let results = actions::execute_plan_progress(
                 &units,
                 &ledger,
@@ -1883,36 +2557,47 @@ impl App {
                     !cancel.load(std::sync::atomic::Ordering::SeqCst)
                 },
             );
-            let measured = match (free_before, actions::free_space_bytes(&trash)) {
-                (Some(b), Some(a)) => Some(a as i64 - b as i64),
-                _ => None,
-            };
-            let _ = tx.send(OperationEvent::Deleted {
-                results,
-                planned,
-                measured,
-                total,
-            });
+            let _ = tx.send(OperationEvent::Deleted { results, total });
         });
     }
 
-    fn finish_delete(
-        &mut self,
-        results: Vec<actions::UnitResult>,
-        planned: u64,
-        measured: Option<i64>,
-        total: usize,
-    ) {
-        let ok = results.iter().filter(|r| r.outcome.is_ok()).count();
-        let failed: Vec<String> = results
+    fn finish_delete(&mut self, results: Vec<actions::UnitResult>, total: usize) {
+        // What could not be moved, kept so `b` lists each with its reason
+        // instead of the result line naming only the first.
+        let failed: Vec<BlockedItem> = results
             .iter()
             .filter_map(|r| {
-                r.outcome
-                    .as_ref()
-                    .err()
-                    .map(|e| format!("{}: {e}", r.path.display()))
+                r.outcome.as_ref().err().map(|e| BlockedItem {
+                    name: names::friendly_unit_name(&self.report, &r.path),
+                    reason: e.to_string(),
+                    next: "check that nothing is using it, then try again".to_string(),
+                })
             })
             .collect();
+        let could_not = |n: usize| {
+            if n == 0 {
+                String::new()
+            } else {
+                format!(" {n} could not be moved (b to see why).")
+            }
+        };
+        // What moved to Trash and what was removed for good (docker), with
+        // sizes, read before the marks of finished units are dropped.
+        let (mut trash_n, mut trash_bytes, mut docker_n, mut docker_bytes) =
+            (0usize, 0u64, 0usize, 0u64);
+        for r in results.iter().filter(|r| r.outcome.is_ok()) {
+            match self.marked.get(&r.path.display().to_string()) {
+                Some(u) if u.docker.is_some() => {
+                    docker_n += 1;
+                    docker_bytes += u.bytes;
+                }
+                Some(u) => {
+                    trash_n += 1;
+                    trash_bytes += u.bytes;
+                }
+                None => trash_n += 1,
+            }
+        }
         // Retain refused and unprocessed selections for explicit review/retry.
         for r in &results {
             if r.outcome.is_ok() {
@@ -1920,36 +2605,51 @@ impl App {
             }
         }
         self.confirm_open = false;
-        let measured_txt = measured
-            .map(model::human_signed_bytes)
-            .unwrap_or_else(|| "unmeasured".into());
+        let items = |n: usize| {
+            if n == 1 {
+                "1 item".to_string()
+            } else {
+                format!("{n} items")
+            }
+        };
+        let mut moved = format!(
+            "Moved {} ({}) to Trash.",
+            items(trash_n),
+            model::human_bytes(trash_bytes)
+        );
+        if docker_n > 0 {
+            moved.push_str(&format!(
+                " Removed {} docker {} ({}) for good.",
+                docker_n,
+                if docker_n == 1 { "item" } else { "items" },
+                model::human_bytes(docker_bytes)
+            ));
+        }
+        if trash_n == 0 && docker_n > 0 {
+            moved = moved.replacen("Moved 0 items (0B) to Trash. ", "", 1);
+        }
         self.set_result(if results.len() < total {
             format!(
-                "Cancelled · {ok} completed · {} refused · {} not attempted; completed filesystem moves are in Trash; an in-flight docker/git command was killed and may still have completed",
-                failed.len(),
+                "Stopped. {moved}{} {} not attempted. Items moved to Trash stay there. A docker or git command that was running was stopped and may still have finished.",
+                could_not(failed.len()),
                 total - results.len()
             )
-        } else if failed.is_empty() {
+        } else if trash_n > 0 {
+            // No "freed" figure: on the same volume the move to Trash frees
+            // nothing until Trash is emptied, so a measured change is noise.
             format!(
-                "{ok} deleted · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
-                model::human_bytes(planned)
+                "{moved}{} Space is freed when Trash is emptied.",
+                could_not(failed.len())
             )
         } else {
-            format!(
-                "{ok} deleted, {} refused · moved to Trash: space is freed only when Trash is emptied · planned {} · measured free-space change {measured_txt}",
-                failed.len(),
-                model::human_bytes(planned)
-            )
+            format!("{moved}{}", could_not(failed.len()))
         });
+        self.blocked = failed;
         // What just left the disk leaves the screen now; the store and the
         // header follow from a background incremental observe (FSEvents
         // narrows it to the touched trees), the same path startup uses.
-        // The screen is right now; the store follows through the live
-        // FSEvents stream, which sees the move to Trash like any change.
         self.prune_removed(&results);
-        if self.watches.is_empty() {
-            self.observe_in_background();
-        }
+        self.observe_in_background();
     }
 
     /// Drops every row under a successfully removed path from the
@@ -2036,252 +2736,6 @@ impl App {
         }
     }
 
-    /// How long the stream must be quiet before its changes are observed.
-    /// FSEvents already coalesces at 0.5 s; this only lets a burst (a
-    /// build writing thousands of files) land as one observation.
-    pub const LIVE_QUIET: Duration = Duration::from_millis(400);
-
-    /// Starts one live FSEvents stream per root in `self.roots` (#51),
-    /// all feeding the same `watch_rx`. Not used by `swamp ui` any more
-    /// (the TUI never scans on file events); kept, with its tests, for
-    /// when a watch-driven feature returns.
-    ///
-    /// Every root's thread is spawned **before** any readiness is
-    /// collected. `FSEventStreamStart` is a synchronous, per-process
-    /// serialized request to `fseventsd` that costs seconds (measured on
-    /// two fresh temp directories: 1.4 s and 2.9 s on a quiet machine,
-    /// 4.7 s and 6.6 s on a loaded one), so waiting for each root's
-    /// stream before spawning the next one made the later roots pay the
-    /// sum of those latencies against a fixed per-stream budget. That is
-    /// how this ended up holding one watcher for two roots while both
-    /// streams had in fact started: the second one reported ready 1.6 s
-    /// after the caller had already given up on it. Spawning first
-    /// bounds the wait by the slowest stream rather than by their total,
-    /// and `fs_events::watch_start_budget` is now larger than the cost
-    /// of the call it is bounding.
-    #[cfg(test)]
-    pub(crate) fn start_watch_with(&mut self, factory: swamp_core::fs_events::WatchFactory) {
-        if self.store_dir.is_none() || !self.watches.is_empty() {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let pending: Vec<_> = self
-            .roots
-            .clone()
-            .iter()
-            .filter_map(|root| factory(root, tx.clone()))
-            .collect();
-        let budget = swamp_core::fs_events::watch_start_budget();
-        for p in pending {
-            if let Some(w) = p.ready(budget) {
-                self.watches.push(w);
-            }
-        }
-        if !self.watches.is_empty() {
-            self.watch_rx = Some(rx);
-        }
-    }
-
-    /// The root in `self.roots` that owns `path` (the longest matching
-    /// prefix, so a nested root -- were one ever present -- would not be
-    /// shadowed by a shorter ancestor). `None` for a path outside every
-    /// known root, which a stream should not be able to report but is
-    /// handled as "ignore this change" rather than a panic if it ever
-    /// does (a root removed from scope between watch-start and now, for
-    /// instance).
-    fn root_for_path(&self, path: &std::path::Path) -> Option<PathBuf> {
-        self.roots
-            .iter()
-            .filter(|r| path.starts_with(r))
-            .max_by_key(|r| r.as_os_str().len())
-            .cloned()
-    }
-
-    /// Consumes every batch the stream has delivered so far.
-    pub fn drain_watch(&mut self) {
-        let Some(rx) = &self.watch_rx else {
-            return;
-        };
-        let mut batches = Vec::new();
-        while let Ok(batch) = rx.try_recv() {
-            batches.push(batch);
-        }
-        for batch in batches {
-            self.apply_watch_batch(batch);
-        }
-    }
-
-    /// One batch's effect. Changes accumulate for the next quiet-window
-    /// refresh; a coverage loss or an epoch newer than the root's last
-    /// observation turns that refresh into a full walk with the reason
-    /// named, never an incremental one over an incomplete change list.
-    fn apply_watch_batch(&mut self, batch: swamp_core::fs_events::WatchBatch) {
-        use swamp_core::fs_events::RefreshRefusal;
-        self.live_changes.extend(batch.changed_dirs);
-        self.live_last_event_id = self.live_last_event_id.max(batch.last_event_id);
-        self.live_last_batch = Some(Instant::now());
-        if let Some((reason, detail)) = batch.coverage_lost {
-            let unrecoverable = matches!(
-                reason,
-                RefreshRefusal::WatchLimitReached | RefreshRefusal::WatchPermissionGap
-            );
-            if unrecoverable {
-                self.status = Some(format!(
-                    "live refresh off for {}: {detail} ({})",
-                    batch.root.display(),
-                    reason.as_str()
-                ));
-                self.live_off.insert(batch.root.clone(), detail.clone());
-            }
-            self.live_full_walk
-                .insert(batch.root.clone(), (reason, detail));
-        }
-        if let Some(opened_at) = batch.epoch_opened_at {
-            let observed = self
-                .reports_by_root
-                .get(&batch.root)
-                .map(|r| r.observed_at)
-                .or_else(|| (self.roots.len() == 1).then_some(self.report.observed_at));
-            if observed.is_none_or(|t| t < opened_at) {
-                self.live_full_walk.entry(batch.root.clone()).or_insert((
-                    RefreshRefusal::LiveWatchGap,
-                    "the watch opened after this root's last observation".into(),
-                ));
-            }
-        }
-    }
-
-    /// Changes are waiting, no observation is running, and the stream has
-    /// been quiet long enough.
-    pub fn live_observe_due(&self) -> bool {
-        self.pending.is_none()
-            && (!self.live_changes.is_empty() || !self.live_full_walk.is_empty())
-            && self
-                .live_last_batch
-                .is_some_and(|t| t.elapsed() >= Self::LIVE_QUIET)
-    }
-
-    /// Observes exactly the directories the stream reported, on a worker
-    /// thread, through the same pipeline as everything else: the plan is
-    /// the live batch, so the store re-walks those subtrees and carries
-    /// every other row forward.
-    ///
-    /// A live batch can name changes under more than one root (two
-    /// watchers can both go quiet in the same tick); this call handles
-    /// exactly *one* root per invocation -- the first, in `self.roots`
-    /// order, that has any pending change -- draining only that root's
-    /// changed paths from `live_changes` and leaving any other root's
-    /// changes in place. `live_observe_due` stays true afterward as long
-    /// as changes remain, so `event_loop` simply calls this again on its
-    /// next tick to pick up the next root; no root's changes are ever
-    /// silently dropped, and no two roots are ever re-walked by the same
-    /// worker thread (keeping the existing single-root incremental path
-    /// untouched per root).
-    pub fn observe_live(&mut self) {
-        let Some(store) = self.store_dir.clone() else {
-            return;
-        };
-        if self.pending.is_some()
-            || (self.live_changes.is_empty() && self.live_full_walk.is_empty())
-        {
-            return;
-        }
-        // A root owed a full walk goes first: its changes, if any, are
-        // covered by that walk.
-        let forced = self
-            .roots
-            .iter()
-            .find(|r| self.live_full_walk.contains_key(*r))
-            .cloned();
-        let Some(root) =
-            forced.or_else(|| self.live_changes.iter().find_map(|p| self.root_for_path(p)))
-        else {
-            // Every pending change is outside every known root (a root
-            // was removed from scope since the watcher was started);
-            // drop them rather than looping forever on changes nothing
-            // will ever claim.
-            self.live_changes.clear();
-            return;
-        };
-        let (mine, rest): (HashSet<PathBuf>, HashSet<PathBuf>) = self
-            .live_changes
-            .drain()
-            .partition(|p| p.starts_with(&root));
-        self.live_changes = rest;
-        let changed: Vec<PathBuf> = mine.into_iter().collect();
-        let device = swamp_core::fs_gate::device_of(&root);
-        let plan = swamp_core::fs_events::FsEventsPlan::from_live(
-            changed,
-            self.live_last_event_id,
-            device,
-        );
-        // A live refresh re-walks one root -- through that root's own
-        // slice of the authorized scope, so its exclusions and external
-        // prune notes still apply. Without a scope there is nothing
-        // authorized to observe, and refusing is the honest answer.
-        let Some(scope) = self.scope.as_ref().map(|s| s.restricted_to(&root)) else {
-            self.status = Some(
-                "live refresh skipped: no resolved scope for this session; reopen swamp ui".into(),
-            );
-            return;
-        };
-        let (roots, cache) = (self.roots.clone(), self.reports_by_root.clone());
-        let (tx, rx) = std::sync::mpsc::channel();
-        crate::worker::spawn(move || {
-            // The watcher's own changes, as a replay plan: a production
-            // source (`fs_events::LivePlanSource`), not a test double.
-            let source = swamp_core::fs_events::LivePlanSource::new(plan);
-            // `ObservationParts::WALK_ONLY`, and `None` for both unit
-            // vectors.
-            //
-            // Narrowing the scope to the one root a watcher fired under
-            // is the right fix for the *scope* half of the earlier
-            // finding. It is the wrong thing to derive unit vectors
-            // from: every tool home outside that root is unauthorized
-            // in the narrowed scope, so `ObservationParts::ALL` came
-            // back with `agent_units: Some(vec![])`, the event loop
-            // applied it unconditionally, and the agent view emptied on
-            // the first file save anywhere in the project (the
-            // 2026-09-22 re-review's CE3).
-            //
-            // A part not asked for is also a part not *swept*
-            // (`growth::ObservationOwnership`), so asking for fewer
-            // parts here cannot invent a disappearance either. The
-            // background refresh, which covers the whole scope, is what
-            // refreshes those vectors.
-            let res = swamp_core::report::observe_scope(
-                &scope,
-                swamp_core::report::ObservationParts::WALK_ONLY,
-                None,
-                None,
-                false,
-                Some(&store),
-                None,
-                true,
-                true,
-                false,
-                false,
-                &source,
-                30,
-                24 * 3600,
-            )
-            .map(|o| {
-                RefreshedObservation::merged_on_worker(
-                    &roots,
-                    cache,
-                    o.per_root.into_iter().collect(),
-                    None,
-                    None,
-                    None,
-                )
-            });
-            let _ = tx.send(res);
-        });
-        self.pending = Some(rx);
-        self.observing = Some((0, 0));
-        self.observing_started = Some(Instant::now());
-    }
-
     /// Starts an incremental observation of every root in `self.roots`
     /// on one worker thread (sequentially -- root re-walks already run
     /// each worker pool to saturation on their own, so parallelizing
@@ -2361,8 +2815,26 @@ impl App {
 
     /// The `R` key: observe now, in the background. Never while one is
     /// already running, and never on a nearly full disk.
+    /// `R` while a check or a move runs: it does not start a scan, and the
+    /// header says why. The line goes when the operation ends.
+    pub fn say_refresh_waits(&mut self) {
+        self.status = Some(REFRESH_WAITS.to_string());
+    }
+
     pub fn refresh_now(&mut self) {
         if self.pending.is_some() {
+            return;
+        }
+        // Another process (often the schedule) is already observing: say
+        // so rather than start a second walk that would only be refused,
+        // and promise what will happen (its result loads here).
+        if let Some(h) = self.external_observer {
+            let secs = swamp_core::entities::now().saturating_sub(h.since);
+            self.set_result(format!(
+                "An observation is already running (pid {}, {}). Its result loads here when it finishes.",
+                h.pid,
+                swamp_core::schedule::format_elapsed(secs)
+            ));
             return;
         }
         if let Some(b) = &self.disk_banner {
@@ -2425,11 +2897,12 @@ impl App {
 
     /// Applies whatever the lock poller has reported since last tick.
     /// Never blocks.
-    pub fn drain_lock_poll(&mut self) {
+    pub fn drain_lock_poll(&mut self) -> bool {
         let Some(rx) = &self.lock_poll_rx else {
-            return;
+            return false;
         };
         let msgs: Vec<LockPollMsg> = rx.try_iter().collect();
+        let changed = !msgs.is_empty();
         for m in msgs {
             match m {
                 LockPollMsg::Holder(h) => self.external_observer = h,
@@ -2439,20 +2912,29 @@ impl App {
                     if self.pending.is_some() {
                         continue;
                     }
-                    self.has_index = true;
-                    self.replace_report(snap.report);
-                    self.set_external_units(snap.external_units);
-                    self.set_store_interiors(snap.store_interiors);
-                    self.set_agent_units(snap.agent_units);
-                    self.observed_label = "just now".into();
-                    self.status = None;
+                    if self.reload_must_wait() {
+                        self.held_reload = Some(HeldReload::Snapshot(snap));
+                        continue;
+                    }
+                    self.install_snapshot(*snap);
                 }
             }
         }
+        changed
+    }
+
+    /// Something on screen moves by itself: a check or a move, our own
+    /// scan, or another process's. Only then does the UI paint on a timer.
+    pub fn is_busy(&self) -> bool {
+        self.operation.is_some()
+            || self.observing.is_some()
+            || self.pending.is_some()
+            || self.external_observer.is_some()
     }
 
     pub fn toggle_help(&mut self) {
         self.help_open = !self.help_open;
+        self.help_scroll.set(0);
     }
 }
 
@@ -2499,7 +2981,7 @@ mod tests {
         wait_operation(&mut app);
         assert!(app.marked.is_empty());
         assert!(!app.confirm_open);
-        assert!(app.last_result.as_ref().unwrap().contains("cancelled"));
+        assert!(app.last_result.as_ref().unwrap().contains("Check stopped"));
     }
 
     #[test]
@@ -2541,8 +3023,6 @@ mod tests {
                 },
             ],
             3,
-            None,
-            3,
         );
         assert_eq!(app.marked.len(), 2);
         assert!(!app.marked.contains_key("/fixture/done"));
@@ -2555,6 +3035,25 @@ mod tests {
                 .contains("1 not attempted")
         );
         assert!(!app.confirm_open);
+        // The unit that could not move is recallable with `b`, with its
+        // reason, instead of vanishing after the result line.
+        assert_eq!(app.blocked.len(), 1);
+        assert_eq!(app.blocked[0].reason, "busy");
+        assert!(
+            app.last_result
+                .as_ref()
+                .unwrap()
+                .contains("1 could not be moved (b to see why)")
+        );
+        assert!(
+            !app.last_result
+                .as_ref()
+                .unwrap()
+                .contains("Free space changed"),
+            "no measured free-space figure: a move to Trash frees nothing yet"
+        );
+        app.open_blocked();
+        assert!(app.blocked_open);
     }
 
     #[test]
@@ -2589,7 +3088,7 @@ mod tests {
         wait_operation(&mut app);
         assert!(!path.exists());
         assert!(app.marked.is_empty());
-        assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
+        assert!(app.last_result.as_ref().unwrap().contains("Moved 1 item"));
         assert_eq!(
             swamp_core::ledger::Ledger::open(tmp.path().join("ledger.parquet"))
                 .unwrap()
@@ -2701,7 +3200,7 @@ mod tests {
         wait_operation(&mut app);
         assert!(!cache_path.exists(), "marked cache dir must be trashed");
         assert!(app.marked.is_empty());
-        assert!(app.last_result.as_ref().unwrap().contains("1 deleted"));
+        assert!(app.last_result.as_ref().unwrap().contains("Moved 1 item"));
         // Untouched: the protected settings.json survives the same pass.
         assert!(claude_home.path().join("settings.json").exists());
     }
@@ -2869,6 +3368,35 @@ mod tests {
     }
 
     #[test]
+    fn history_span_reads_the_root_scoped_store_the_picker_needs() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = swamp_core::growth::root_scoped_volume_id(root.path());
+        let now = swamp_core::entities::now();
+        let mut projects = fixture_report().projects;
+        swamp_core::growth::observe_and_annotate(
+            &swamp_core::bus::Stage::for_tests(),
+            store.path(),
+            id,
+            &mut projects,
+            now - 7_200,
+            30,
+            3600,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let span = crate::history_span(store.path(), root.path());
+        assert!(
+            span.is_some_and(|s| (7_100..=7_400).contains(&s)),
+            "the picker must see the 2h of history the header shows: {span:?}"
+        );
+        assert_eq!(
+            crate::history_span_of_roots(store.path(), &[root.path().to_path_buf()]),
+            span
+        );
+    }
+
+    #[test]
     fn a_project_row_marks_the_projects_artifacts_without_entering_it() {
         let mut app = App::new(fixture_report(), "/root".into());
         app.clear_filter();
@@ -2976,6 +3504,43 @@ mod tests {
     }
 
     #[test]
+    fn r_in_the_blocked_list_checks_again_and_replaces_only_what_the_check_added() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        let first: Vec<String> = app.marked.keys().cloned().collect();
+        assert!(!first.is_empty() && app.confirm_open);
+        // A mark made another way, and one blocked item to look at.
+        let mut extra = app.marked.values().next().unwrap().clone();
+        extra.path = "/root/elsewhere/extra".into();
+        app.marked.insert("/root/elsewhere/extra".into(), extra);
+        app.blocked = vec![BlockedItem {
+            name: "x".into(),
+            reason: "in use".into(),
+            next: "close it".into(),
+        }];
+        app.open_blocked();
+        assert!(app.blocked_open);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('r'));
+        assert!(!app.blocked_open, "the sheet closes while it checks");
+        assert!(app.operation.is_some(), "the same check runs again");
+        wait_operation(&mut app);
+        let again: Vec<String> = app
+            .marked
+            .keys()
+            .filter(|k| *k != "/root/elsewhere/extra")
+            .cloned()
+            .collect();
+        assert_eq!(again, first, "same target, same marks: not toggled off");
+        assert!(
+            app.marked.contains_key("/root/elsewhere/extra"),
+            "marks made another way stay"
+        );
+        assert!(app.confirm_open, "the plan comes back");
+    }
+
+    #[test]
     fn right_goes_in_and_left_comes_back_out() {
         let mut app = App::new(fixture_report(), "/root".into());
         assert_eq!(app.view, ViewKind::Projects);
@@ -3003,116 +3568,6 @@ mod tests {
             ViewKind::Projects,
             "the second left comes back out"
         );
-    }
-
-    /// A watch that lost coverage (Linux: an inotify queue overflow)
-    /// never lets its partial change list drive an incremental refresh:
-    /// the next live refresh of that root is a full walk naming the loss.
-    #[test]
-    fn a_coverage_loss_turns_the_next_live_refresh_into_a_named_full_walk() {
-        use swamp_core::fs_events::RefreshRefusal;
-        let mut app = App::new(fixture_report(), "/root".into());
-        app.store_dir = Some(std::env::temp_dir());
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.watch_rx = Some(rx);
-        tx.send(swamp_core::fs_events::WatchBatch {
-            root: PathBuf::from("/root"),
-            changed_dirs: vec![PathBuf::from("/root/mole")],
-            last_event_id: 3,
-            coverage_lost: Some((RefreshRefusal::WatchQueueOverflow, "overflowed".into())),
-            epoch_opened_at: None,
-        })
-        .unwrap();
-        app.drain_watch();
-        assert_eq!(
-            app.live_full_walk
-                .get(&PathBuf::from("/root"))
-                .map(|(r, _)| *r),
-            Some(RefreshRefusal::WatchQueueOverflow)
-        );
-        app.live_last_batch = Some(Instant::now() - Duration::from_secs(1));
-        assert!(app.live_observe_due());
-        assert!(
-            app.live_off.is_empty(),
-            "an overflow is recoverable: live refresh stays on"
-        );
-
-        // A watch limit is not recoverable: live refresh goes off for the
-        // root, and the status line says why.
-        tx.send(swamp_core::fs_events::WatchBatch {
-            root: PathBuf::from("/root"),
-            coverage_lost: Some((RefreshRefusal::WatchLimitReached, "no watches left".into())),
-            ..Default::default()
-        })
-        .unwrap();
-        app.drain_watch();
-        assert!(app.live_off.contains_key(&PathBuf::from("/root")));
-        assert!(
-            app.status
-                .as_deref()
-                .unwrap_or("")
-                .contains("watch_limit_reached")
-        );
-    }
-
-    /// A watch whose epoch opened after the root's last observation
-    /// cannot vouch for the gap in between: one full walk first.
-    #[test]
-    fn an_epoch_newer_than_the_last_observation_owes_a_full_walk() {
-        use swamp_core::fs_events::RefreshRefusal;
-        let mut report = fixture_report();
-        report.observed_at = 1_000;
-        let mut app = App::new(report, "/root".into());
-        app.store_dir = Some(std::env::temp_dir());
-        app.apply_watch_batch(swamp_core::fs_events::WatchBatch {
-            root: PathBuf::from("/root"),
-            epoch_opened_at: Some(2_000),
-            ..Default::default()
-        });
-        assert_eq!(
-            app.live_full_walk
-                .get(&PathBuf::from("/root"))
-                .map(|(r, _)| *r),
-            Some(RefreshRefusal::LiveWatchGap)
-        );
-
-        let mut report = fixture_report();
-        report.observed_at = 3_000;
-        let mut app = App::new(report, "/root".into());
-        app.apply_watch_batch(swamp_core::fs_events::WatchBatch {
-            root: PathBuf::from("/root"),
-            epoch_opened_at: Some(2_000),
-            ..Default::default()
-        });
-        assert!(
-            app.live_full_walk.is_empty(),
-            "an observation inside the epoch is covered"
-        );
-    }
-
-    #[test]
-    fn live_changes_are_observed_after_the_stream_goes_quiet() {
-        let mut app = App::new(fixture_report(), "/root".into());
-        app.store_dir = Some(std::env::temp_dir());
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.watch_rx = Some(rx);
-        tx.send(swamp_core::fs_events::WatchBatch {
-            root: PathBuf::from("/root"),
-            changed_dirs: vec![PathBuf::from("/root/mole/node_modules")],
-            last_event_id: 42,
-            ..Default::default()
-        })
-        .unwrap();
-        app.drain_watch();
-        assert_eq!(app.live_changes.len(), 1);
-        assert_eq!(app.live_last_event_id, 42);
-        assert!(!app.live_observe_due(), "not before the quiet window");
-        app.live_last_batch = Some(Instant::now() - Duration::from_secs(1));
-        assert!(app.live_observe_due());
-        // While an observation runs, more changes just accumulate.
-        let (_ptx, prx) = std::sync::mpsc::channel();
-        app.pending = Some(prx);
-        assert!(!app.live_observe_due());
     }
 
     #[test]
@@ -3289,7 +3744,7 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         assert!(app.confirm_open, "one 'are you sure', with the facts on it");
         assert!(app.confirm_summary().contains("node_modules"));
-        assert!(app.confirm_summary().contains("Enter yes"));
+        assert!(app.confirm_summary().contains("→ Trash"));
     }
 
     #[test]
@@ -3301,7 +3756,21 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         app.open_confirm();
         assert!(app.confirm_open);
-        assert!(app.confirm_summary().contains("delete node_modules"));
+        assert!(app.confirm_summary().contains("Move 1 item"));
+    }
+
+    #[test]
+    fn bulk_refusals_are_counted_not_first_only() {
+        let a = "nothing reclaimable in this project".to_string();
+        let b = "protected".to_string();
+        assert_eq!(summarize_refusals(&[]), None);
+        assert_eq!(
+            summarize_refusals(std::slice::from_ref(&a)),
+            Some(a.clone())
+        );
+        let m = summarize_refusals(&[a.clone(), a.clone(), b.clone()]).unwrap();
+        assert!(m.starts_with("3 rows skipped:"), "{m}");
+        assert!(m.contains("(x2)") && m.contains("protected (x1)"), "{m}");
     }
 
     #[test]
@@ -3693,122 +4162,311 @@ mod tests {
         }
     }
 
-    /// `start_watch` opens one FSEvents stream per root in `self.roots`
-    /// (#51), not just the primary one -- the concrete "multiple
-    /// watchers" acceptance case.
-    ///
-    /// Driven through the injected stream factory rather than real
-    /// FSEvents. The previous version opened two real streams and could
-    /// only skip itself when it got *zero*; it got one often enough to
-    /// be recorded as a flake, and the cause was not the assertion but
-    /// `start_watch` itself (`fs_events::PendingWatch` documents the
-    /// measurement). With the factory the assertion is about the loop --
-    /// every root gets its own stream, none is shared, none is dropped
-    /// -- and nothing in it depends on how fast `fseventsd` answers, so
-    /// there is no sleep and no bound to lose a race against.
+    // ---- adversarial review (audit/v0.7.5-adversarial) ----
+
+    /// Backspace with nothing marked, then `r` (check again) from the
+    /// blocked list, then Esc: every mark the Backspace made must go.
     #[test]
-    fn start_watch_opens_one_stream_per_root() {
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let store = tempfile::tempdir().unwrap();
-        let report = minimal_report(
-            dir_a.path().to_str().unwrap(),
-            "proj-a",
-            dir_a.path().join("proj-a").to_str().unwrap(),
+    fn adv_esc_after_check_again_undoes_every_mark_the_opening_press_made() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open && !app.marked.is_empty());
+        app.blocked = vec![BlockedItem {
+            name: "x".into(),
+            reason: "in use".into(),
+            next: "close it".into(),
+        }];
+        app.open_blocked();
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('r'));
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(
+            app.marked.is_empty(),
+            "nothing was marked before the press; Esc left {} marked: {:?}",
+            app.marked.len(),
+            app.marked.keys().collect::<Vec<_>>()
         );
-        let mut app = App::new_multi_root(
-            report,
-            vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
-        );
-        app.store_dir = Some(store.path().to_path_buf());
-        app.start_watch_with(swamp_core::fs_events::testing::inert_watch_factory);
-        assert_eq!(
-            app.watches.len(),
-            2,
-            "one watcher per root, not one shared watcher for the whole App"
-        );
-        assert!(app.watch_rx.is_some());
-        // Already running: a second call must not double the streams.
-        app.start_watch_with(swamp_core::fs_events::testing::inert_watch_factory);
-        assert_eq!(app.watches.len(), 2, "start_watch is idempotent");
     }
 
-    /// A root whose stream never reports ready contributes no watcher,
-    /// and the roots whose streams did start still do -- the partial
-    /// case `start_watch`'s own doc comment promises. Asserted through a
-    /// factory that fails for exactly one root, so "the other roots
-    /// still run" is a property of the loop rather than of which stream
-    /// `fseventsd` happened to be slow about.
+    /// `A` pressed again while its own confirm is open, then Esc.
     #[test]
-    fn a_root_whose_stream_fails_does_not_stop_the_others() {
-        fn only_the_first_starts(
-            root: &std::path::Path,
-            tx: std::sync::mpsc::Sender<swamp_core::fs_events::WatchBatch>,
-        ) -> Option<swamp_core::fs_events::PendingWatch> {
-            if root.to_string_lossy().contains("swamp-watch-refuses") {
-                return None;
+    fn adv_esc_after_a_repeated_while_confirm_open_undoes_the_marks() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('A'));
+        wait_operation(&mut app);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(
+            app.marked.is_empty(),
+            "Esc left {} marks made by the confirm's own press",
+            app.marked.len()
+        );
+    }
+
+    /// Evidence: plain Backspace then Esc leaves nothing; an earlier Space
+    /// mark survives.
+    #[test]
+    fn adv_esc_keeps_earlier_space_marks_and_drops_its_own() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(false, false);
+        wait_operation(&mut app);
+        let space: Vec<String> = app.marked.keys().cloned().collect();
+        assert!(!space.is_empty());
+        app.review_in_background(false, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        app.cancel_confirm();
+        assert_eq!(app.marked.keys().cloned().collect::<Vec<_>>(), space);
+    }
+
+    // ---- v0.7.5 adversarial fixes ----
+
+    fn paint(app: &App, w: u16, h: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| crate::ui::draw(f, app)).unwrap();
+        t.backend().to_string()
+    }
+
+    /// The event loop, one iteration at a time and without a key: what
+    /// arrives is applied, and the frame is painted whenever the gate says
+    /// so. Returns the last painted frame once `done` holds.
+    fn drive_without_keys(app: &mut App, done: impl Fn(&App) -> bool) -> String {
+        let mut gate = crate::RedrawGate::default();
+        // The size is already known, as it is after the first frame.
+        app.width = 100;
+        app.height = 30;
+        let mut frame = paint(app, 100, 30);
+        assert!(gate.due(app));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "never finished");
+            crate::advance(app, &mut gate, Some((100, 30)));
+            if gate.due(app) {
+                frame = paint(app, 100, 30);
             }
-            swamp_core::fs_events::testing::inert_watch_factory(root, tx)
+            if done(app) {
+                return frame;
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
-        let store = tempfile::tempdir().unwrap();
-        let report = minimal_report("/roots/a", "proj-a", "/roots/a/proj-a");
-        let mut app = App::new_multi_root(
-            report,
-            vec![
-                PathBuf::from("/roots/a"),
-                PathBuf::from("/roots/swamp-watch-refuses"),
-                PathBuf::from("/roots/c"),
-            ],
-        );
-        app.store_dir = Some(store.path().to_path_buf());
-        app.start_watch_with(only_the_first_starts);
-        assert_eq!(app.watches.len(), 2, "two of three roots opened a stream");
-        assert!(app.watch_rx.is_some());
     }
 
-    /// A live batch naming changes under two different roots is handled
-    /// one root at a time: `observe_live` drains only the changed paths
-    /// under the root it picks, leaving the other root's changes intact
-    /// for the next call -- never silently dropped, never merged into
-    /// the wrong root's re-walk.
     #[test]
-    fn observe_live_handles_one_roots_changes_at_a_time() {
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let store = tempfile::tempdir().unwrap();
-        let report = minimal_report(
-            dir_a.path().to_str().unwrap(),
-            "proj-a",
-            dir_a.path().join("proj-a").to_str().unwrap(),
-        );
-        let mut app = App::new_multi_root(
-            report,
-            vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
-        );
-        app.store_dir = Some(store.path().to_path_buf());
-        // A refresh without an authorized scope is refused by design
-        // (`.oh/guardrails/tui-refresh-preserves-scope.md`), so the
-        // fixture supplies the one this App is showing -- exactly what
-        // `tui::run`/`run_scope` do at startup.
-        app.scope = Some(swamp_core::scope::resolve_effective_scope(
-            &swamp_core::locations::Environment::fixture(
-                dir_a.path().to_path_buf(),
-                std::collections::HashMap::new(),
-                swamp_core::locations::Platform::MacOS,
+    fn every_async_completion_is_on_the_very_next_frame_without_a_key() {
+        // (name, start the async work, text the finished frame must show,
+        //  text it must no longer show)
+        type Case = (&'static str, fn(&mut App), &'static str, &'static str);
+        fn check_finished(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(false, false);
+        }
+        fn confirm_opens(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(true, true);
+        }
+        fn cancelled(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(true, false);
+            app.cancel_operation();
+        }
+        fn delete_finished(app: &mut App) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.operation = Some(Operation {
+                label: "Deleting",
+                completed: 0,
+                total: 1,
+                succeeded: 0,
+                failed: 0,
+                current: String::new(),
+                bytes_done: 0,
+                bytes_total: 0,
+                started: Instant::now(),
+                cancel: Default::default(),
+                checking_open_files: None,
+            });
+            app.operation_rx = Some(rx);
+            tx.send(OperationEvent::Deleted {
+                results: Vec::new(),
+                total: 1,
+            })
+            .unwrap();
+        }
+        fn refresh_finished(app: &mut App) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.observed_label = "3 hours ago".into();
+            app.observing = Some((0, 0));
+            app.pending = Some(rx);
+            tx.send(Ok(RefreshedObservation {
+                per_root: Vec::new(),
+                merged: None,
+                external_units: None,
+                agent_units: None,
+                store_interiors: None,
+            }))
+            .unwrap();
+        }
+        fn lock_poll_change(app: &mut App) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.lock_poll_rx = Some(rx);
+            tx.send(LockPollMsg::Holder(Some(
+                swamp_core::schedule::LockHolder {
+                    pid: 4242,
+                    since: swamp_core::entities::now(),
+                },
+            )))
+            .unwrap();
+        }
+        fn blocked_check_again(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(true, true);
+            wait_operation(app);
+            app.blocked = vec![BlockedItem {
+                name: "x".into(),
+                reason: "in use".into(),
+                next: "close it".into(),
+            }];
+            app.open_blocked();
+            crate::handle_key(app, crossterm::event::KeyCode::Char('r'));
+        }
+        let cases: [Case; 7] = [
+            ("check finished", check_finished, "marked in all", "Checked"),
+            ("confirm opens", confirm_opens, "Enter confirm", "Checked"),
+            ("cancelled", cancelled, "Check stopped", "Stopping after"),
+            (
+                "delete finished",
+                delete_finished,
+                "Moved",
+                "Moving to Trash",
             ),
-            &swamp_core::scope::ScanConfig::default(),
-            &[dir_a.path().to_path_buf(), dir_b.path().to_path_buf()],
-            &swamp_core::locations::Registry::with_builtins(),
-            1_000,
-        ));
-        app.live_changes.insert(dir_a.path().join("changed-a"));
-        app.live_changes.insert(dir_b.path().join("changed-b"));
-        app.live_last_batch = Some(Instant::now() - App::LIVE_QUIET - Duration::from_millis(10));
-        assert!(app.live_observe_due());
-        app.observe_live();
-        assert!(app.pending.is_some(), "one root's re-walk was started");
-        // Exactly one root's change was drained; the other is still
-        // pending for a subsequent call.
-        assert_eq!(app.live_changes.len(), 1, "{:?}", app.live_changes);
+            (
+                "refresh finished",
+                refresh_finished,
+                "observed just now",
+                "3 hours ago",
+            ),
+            (
+                "lock poll change",
+                lock_poll_change,
+                "another observation running",
+                "Enter confirm",
+            ),
+            (
+                "blocked list check again",
+                blocked_check_again,
+                "Enter confirm",
+                "check again",
+            ),
+        ];
+        for (name, start, shows, gone) in cases {
+            let mut app = App::new(fixture_report(), "/root".into());
+            start(&mut app);
+            let frame = drive_without_keys(&mut app, |a| match name {
+                "refresh finished" => a.pending.is_none(),
+                "lock poll change" => a.external_observer.is_some(),
+                _ => a.operation.is_none(),
+            });
+            assert!(
+                frame.contains(shows),
+                "{name}: expected {shows:?} in\n{frame}"
+            );
+            assert!(
+                !frame.contains(gone),
+                "{name}: {gone:?} still on screen\n{frame}"
+            );
+        }
+    }
+
+    /// After `A`, a refreshed index that no longer lists one of the marked
+    /// rows must not leave Enter able to move it, and a reload that
+    /// arrives while the confirm is open waits for it.
+    #[test]
+    fn a_reload_during_a_confirm_waits_and_stale_marks_are_dropped_with_a_message() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        let marked_before: Vec<String> = app.marked.keys().cloned().collect();
+        assert!(marked_before.iter().any(|k| k.ends_with("node_modules")));
+        let summary_before = app.confirm_summary();
+        let mut newer = fixture_report();
+        newer.observed_at = 2000;
+        for wt in newer.projects.iter_mut().flat_map(|p| &mut p.worktrees) {
+            wt.artifacts.retain(|a| !a.path.ends_with("node_modules"));
+        }
+        let fresh = RefreshedObservation {
+            per_root: Vec::new(),
+            merged: Some(MergedReports {
+                by_root: Default::default(),
+                report: newer,
+            }),
+            external_units: None,
+            agent_units: None,
+            store_interiors: None,
+        };
+        app.land_observation(fresh);
+        assert!(app.new_data_waiting(), "the reload waits for the confirm");
+        assert_eq!(app.report.observed_at, 1000);
+        assert_eq!(
+            app.confirm_summary(),
+            summary_before,
+            "Enter's plan is unchanged"
+        );
+        assert!(paint(&app, 120, 30).contains("new data available"));
+        // Esc closes the confirm; the held index lands and the marks the
+        // press made are gone anyway.
+        app.cancel_confirm();
+        assert!(app.apply_held_reload());
+        assert!(!app.new_data_waiting());
+        assert_eq!(app.report.observed_at, 2000);
+        assert!(app.marked.keys().all(|k| !k.ends_with("node_modules")));
+        // Marks made earlier (Space) that the new index no longer lists are
+        // dropped at once, and the result line says so.
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(false, false);
+        wait_operation(&mut app);
+        assert!(!app.marked.is_empty());
+        let mut newer = fixture_report();
+        newer.observed_at = 2000;
+        for wt in newer.projects.iter_mut().flat_map(|p| &mut p.worktrees) {
+            wt.artifacts.clear();
+        }
+        app.land_observation(RefreshedObservation {
+            per_root: Vec::new(),
+            merged: Some(MergedReports {
+                by_root: Default::default(),
+                report: newer,
+            }),
+            external_units: None,
+            agent_units: None,
+            store_interiors: None,
+        });
+        assert!(app.marked.is_empty(), "{:?}", app.marked.keys());
+        let msg = app.result_active().unwrap_or_default();
+        assert!(msg.contains("no longer lists"), "{msg}");
+    }
+
+    #[test]
+    fn r_during_a_check_says_so() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, false);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('R'));
+        let s = paint(&app, 100, 30);
+        assert!(
+            s.contains("A check is running; press R after it finishes"),
+            "{s}"
+        );
+        app.cancel_operation();
+        wait_operation(&mut app);
     }
 }

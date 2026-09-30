@@ -10,9 +10,12 @@
 
 pub mod actions;
 pub mod app;
+pub mod detail;
 pub mod filter;
 pub mod model;
+pub mod names;
 pub mod picker;
+pub mod term;
 pub mod ui;
 pub mod units;
 pub mod worker;
@@ -53,27 +56,46 @@ pub fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
     );
 }
 
+/// Where a scrolled view lands after `code`, or `None` for a key that does
+/// not scroll. `page` is the rows in one screenful, `last` the furthest
+/// first-line index.
+fn scrolled(cur: usize, code: KeyCode, page: usize, last: usize) -> Option<usize> {
+    Some(match code {
+        KeyCode::Down => cur.saturating_add(1).min(last),
+        KeyCode::Up => cur.saturating_sub(1),
+        KeyCode::PageDown => cur.saturating_add(page.max(1)).min(last),
+        KeyCode::PageUp => cur.saturating_sub(page.max(1)),
+        KeyCode::Home => 0,
+        KeyCode::End => last,
+        _ => return None,
+    })
+}
+
 /// `shift` distinguishes Shift-→/Shift-← inside the picker's growth field.
 pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
+    // A result stays until the next key, and only a key removes it: no
+    // timer repaints the screen while nobody is looking.
+    if app.operation.is_none() {
+        app.last_result = None;
+    }
     if app.operation.is_some() {
         if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
             app.cancel_operation();
+        } else if code == KeyCode::Char('R') {
+            app.say_refresh_waits();
         }
         return;
     }
     if let Some(lines) = &app.cargo_inspection {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => app.cargo_inspection = None,
-            KeyCode::Down => {
-                app.cargo_inspection_scroll = app
-                    .cargo_inspection_scroll
-                    .saturating_add(1)
-                    .min(lines.len().saturating_sub(1).min(u16::MAX as usize) as u16)
-            }
-            KeyCode::Up => {
-                app.cargo_inspection_scroll = app.cargo_inspection_scroll.saturating_sub(1)
-            }
-            _ => {}
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.cargo_inspection = None;
+        } else if let Some(at) = scrolled(
+            app.cargo_inspection_scroll as usize,
+            code,
+            app.page.get(),
+            lines.len().saturating_sub(1).min(u16::MAX as usize),
+        ) {
+            app.cargo_inspection_scroll = at as u16;
         }
         return;
     }
@@ -81,6 +103,8 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         match code {
             KeyCode::Up => p.up(),
             KeyCode::Down => p.down(),
+            KeyCode::Home | KeyCode::PageUp => p.first(),
+            KeyCode::End | KeyCode::PageDown => p.last(),
             KeyCode::Char(' ') => p.flip_op(),
             KeyCode::Right => p.cycle(1),
             KeyCode::Left => p.cycle(-1),
@@ -109,15 +133,44 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         return;
     }
     if app.help_open {
-        if matches!(code, KeyCode::Char('?') | KeyCode::Esc) {
+        if matches!(code, KeyCode::Char('?' | 'q') | KeyCode::Esc) {
             app.toggle_help();
+        } else if let Some(at) =
+            scrolled(app.help_scroll.get(), code, app.page.get(), usize::MAX / 2)
+        {
+            // The drawer clamps this to the real end of the text.
+            app.help_scroll.set(at);
+        }
+        return;
+    }
+    if app.blocked_open {
+        // The blocked list is read-only: nothing under it can be marked.
+        match code {
+            KeyCode::Esc | KeyCode::Char('b' | 'd' | 'q') => app.blocked_open = false,
+            KeyCode::Char('r') => app.recheck_blocked(),
+            _ => {
+                if let Some(at) = scrolled(
+                    app.blocked_scroll,
+                    code,
+                    app.page.get(),
+                    app.blocked.len().saturating_sub(1),
+                ) {
+                    app.blocked_scroll = at;
+                }
+            }
         }
         return;
     }
     match code {
         KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('b') => app.open_blocked(),
+        KeyCode::Char('d') if app.confirm_open => app.open_blocked(),
         KeyCode::Up => app.move_selection(-1),
         KeyCode::Down => app.move_selection(1),
+        KeyCode::PageUp => app.page_selection(-1),
+        KeyCode::PageDown => app.page_selection(1),
+        KeyCode::Home => app.select_first(),
+        KeyCode::End => app.select_last(),
         // Traversal, the way every file tree does it: right goes in,
         // left comes back out. Enter and Esc still do the same, so the
         // muscle memory either way works.
@@ -159,17 +212,23 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     }
 }
 
-/// Runs the interactive UI against `root`.
-/// How far back the store can answer for `root`'s volume. Growth windows
-/// are bounded by it: a 7d window over 4h of observations would report a
-/// week of growth that was never observed.
+/// How far back the store can answer for `root`. Growth windows are
+/// bounded by it: a 7d window over 4h of observations would report a
+/// week of growth that was never observed. History is stored under the
+/// root-scoped directory (`growth::history_span_for_root`), the same one
+/// the header's sparkline reads; the bare device directory holds only
+/// side tables, which made the picker say "no observations yet" next to
+/// a header that showed history.
 fn history_span(store: &std::path::Path, root: &std::path::Path) -> Option<u64> {
-    let now = swamp_core::entities::now();
-    let dev = swamp_core::fs_gate::device_of(root)?;
-    let dir = store.join(dev.to_string());
-    swamp_core::growth::history_span_secs(&dir, now)
+    swamp_core::growth::history_span_for_root(store, root, swamp_core::entities::now())
 }
 
+/// The longest history any of `roots` has.
+fn history_span_of_roots(store: &Path, roots: &[PathBuf]) -> Option<u64> {
+    roots.iter().filter_map(|r| history_span(store, r)).max()
+}
+
+/// Runs the interactive UI against `root`.
 /// The authorized scope for this invocation, resolved once from the
 /// stored config plus whatever explicit roots the command named.
 ///
@@ -248,7 +307,20 @@ fn store_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// Takes the screen before the stored index is read (about half a second
+/// on a large store) so the terminal is never blank while it loads.
+fn enter_with_splash() -> Result<term::TerminalGuard> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!("swamp ui needs an interactive terminal; use swamp report for text");
+    }
+    let mut guard = term::TerminalGuard::enter()?;
+    guard.splash("swamp · reading the last observation…");
+    Ok(guard)
+}
+
 pub fn run(root: &Path) -> Result<()> {
+    let guard = enter_with_splash()?;
     let store = store_dir();
     let root = swamp_core::fs_gate::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // The authorized scope for this invocation, resolved once with the
@@ -323,7 +395,7 @@ pub fn run(root: &Path) -> Result<()> {
         });
     finish_startup(&mut app, &store, coverage.as_deref());
     start_background_services(&mut app, has_index);
-    run_terminal_loop(&mut app)
+    run_terminal_loop(guard, &mut app)
 }
 
 /// Runs the interactive UI over every root a resolved `EffectiveScope`
@@ -342,6 +414,7 @@ pub fn run(root: &Path) -> Result<()> {
 /// demand; the schedule keeps the index current. It never blocks on the observation lock: if another
 /// process holds it, the header says who and for how long.
 pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
+    let guard = enter_with_splash()?;
     let store = store_dir();
     let present_roots = scope.scan_paths();
     anyhow::ensure!(
@@ -375,7 +448,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
         }
     };
     start_background_services(&mut app, has_index);
-    run_terminal_loop(&mut app)
+    run_terminal_loop(guard, &mut app)
 }
 
 /// After the first paint is decided: watch the observation lock (so a
@@ -451,12 +524,9 @@ fn finish_startup(
     if let Some(c) = coverage {
         app.set_scope_note(c);
     }
-    // Multi-root history windows are bounded by the *primary* root's own
-    // history for now (`App::root`, `roots[0]`) -- a per-root history
-    // bound is a real, named simplification (see this chunk's session
-    // note), not a silent one: a multi-root picker can currently offer
-    // a window longer than a non-primary root's own store actually has.
-    app.history_secs = history_span(store, &app.root);
+    // The picker may offer a window as long as the longest history of any
+    // root this report covers.
+    app.history_secs = history_span_of_roots(store, &app.roots);
     let saved = app::load_ui_state(store);
     if !saved.filter.is_empty() {
         app.filter_text = saved.filter;
@@ -469,13 +539,8 @@ fn finish_startup(
     app.keep_executables = saved.keep_executables;
 }
 
-fn run_terminal_loop(app: &mut App) -> Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let result = event_loop(&mut terminal, app);
+fn run_terminal_loop(mut guard: term::TerminalGuard, app: &mut App) -> Result<()> {
+    let result = event_loop(&mut guard.terminal, app);
 
     // Terminal failure must not abandon an in-flight filesystem move.
     if app.operation.is_some() {
@@ -486,49 +551,118 @@ fn run_terminal_loop(app: &mut App) -> Result<()> {
         }
     }
 
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(
-        terminal.backend_mut(),
-        crossterm::terminal::LeaveAlternateScreen
-    )?;
+    // The last sort, filter or `k` choice reaches the disk before exit.
+    app.flush_ui_state();
+    // The guard puts the terminal back as it drops, here or on a panic.
+    drop(guard);
     result
 }
 
-fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    loop {
-        app.poll_operation();
-        if app.operation.is_none()
-            && let Some(rx) = &app.pending
-            && let Ok(res) = rx.try_recv()
-        {
-            app.pending = None;
-            app.observing = None;
-            match res {
-                Ok(fresh) => {
-                    // Each re-observed root replaced exactly its own
-                    // entry (#51) on the worker, which also merged: a
-                    // live/background refresh of one or more roots never
-                    // touches any other root's rows, and the event thread
-                    // only installs what the worker prepared.
-                    app.install_refreshed(fresh);
-                    app.observed_label = "just now".into();
-                }
-                Err(e) => app.status = Some(format!("observation failed: {e}")),
+/// Decides whether the screen needs painting. Idle, nothing changes and
+/// nothing is painted: no timer repaints an unchanged screen (it cost a
+/// terminal escape burst five times a second over ssh and tmux). It paints
+/// when something asked (a key, a resize, a worker's result), while
+/// anything is busy (the spinner and the elapsed time move), and when a
+/// clock-driven part of the screen reads differently (the age of the
+/// index, a refusal that ran out).
+#[derive(Default)]
+struct RedrawGate {
+    forced: bool,
+    was_busy: bool,
+    last_clock: Option<String>,
+}
+
+impl RedrawGate {
+    /// Something other than the clock changed the screen's inputs.
+    fn touch(&mut self) {
+        self.forced = true;
+    }
+
+    /// Whether to paint now; records what the clock parts showed.
+    fn due(&mut self, app: &App) -> bool {
+        let clock = ui::clock_signature(app);
+        let busy = app.is_busy();
+        // The frame after the last busy one shows the finished state.
+        let due =
+            self.forced || busy || self.was_busy || self.last_clock.as_deref() != Some(&clock);
+        self.was_busy = busy;
+        self.forced = false;
+        self.last_clock = Some(clock);
+        due
+    }
+
+    /// How long to wait for input: quick while something moves, slow when
+    /// only the clock could change.
+    fn wait(app: &App) -> Duration {
+        if app.is_busy() {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
+}
+
+/// Everything that arrives without a key: worker results, the lock poll,
+/// the terminal size. Each one that changed the screen's inputs touches the
+/// gate, so the very next frame shows it.
+fn advance(app: &mut App, gate: &mut RedrawGate, size: Option<(u16, u16)>) {
+    if app.poll_operation() {
+        gate.touch();
+    }
+    if app.apply_held_reload() {
+        gate.touch();
+    }
+    if app.operation.is_none()
+        && let Some(rx) = &app.pending
+        && let Ok(res) = rx.try_recv()
+    {
+        app.pending = None;
+        app.observing = None;
+        gate.touch();
+        match res {
+            Ok(fresh) => {
+                // Each re-observed root replaced exactly its own entry
+                // (#51) on the worker, which also merged: the event
+                // thread only installs what the worker prepared.
+                app.land_observation(fresh);
             }
+            Err(e) => app.status = Some(format!("observation failed: {e}")),
         }
-        app.drain_lock_poll();
-        if let Ok(sz) = terminal.size() {
-            app.width = sz.width;
+    }
+    if app.drain_lock_poll() {
+        gate.touch();
+    }
+    if let Some((w, h)) = size
+        && (app.width != w || app.height != h)
+    {
+        app.width = w;
+        app.height = h;
+        gate.touch();
+    }
+}
+
+fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    let mut gate = RedrawGate::default();
+    loop {
+        let size = terminal.size().ok().map(|sz| (sz.width, sz.height));
+        advance(app, &mut gate, size);
+        if gate.due(app) {
+            app.frame = app.frame.wrapping_add(1);
+            terminal.draw(|f| ui::draw(f, app))?;
         }
-        terminal.draw(|f| ui::draw(f, app))?;
         if app.quit {
             return Ok(());
         }
-        if event::poll(Duration::from_millis(200))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            handle_terminal_key(app, key);
+        if event::poll(RedrawGate::wait(app))? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    gate.touch();
+                    handle_terminal_key(app, key);
+                }
+                // A resize, a focus change or anything else may have
+                // disturbed the screen: paint it again.
+                _ => gate.touch(),
+            }
         }
     }
 }
@@ -607,6 +741,8 @@ mod tests {
             succeeded: 1,
             failed: 0,
             current: "/tmp/fixture".into(),
+            bytes_done: 0,
+            bytes_total: 0,
             started: std::time::Instant::now(),
             cancel: cancel.clone(),
             checking_open_files: None,
@@ -734,30 +870,31 @@ mod tests {
     fn delete_result_and_key_legend_are_both_visible_at_80_columns() {
         let mut app = App::new(empty_report(), "/root".into());
         app.set_result(
-            "3 deleted · moved to Trash: space is freed only when Trash is emptied · planned 1.3GB · measured free-space change -10.5MB"
-                .into(),
+            "Moved 3 items (1.3GB) to Trash. Space is freed when Trash is emptied.".into(),
         );
         let s = buffer_text(&app, 80, 24);
-        assert!(s.contains("3 deleted"), "{s}");
-        assert!(
-            s.contains("space is freed only when Trash is emptied"),
-            "{s}"
-        );
+        assert!(s.contains("Moved 3 items (1.3GB) to Trash."), "{s}");
+        assert!(s.contains("Space is freed when Trash is emptied"), "{s}");
         assert!(s.contains("? help  q quit"), "{s}");
     }
 
     #[test]
-    fn expired_result_disappears_and_legend_stays() {
+    fn a_result_stays_until_the_next_key_and_time_alone_never_erases_it() {
         let mut app = App::new(empty_report(), "/root".into());
-        app.set_result("2 deleted".into());
-        app.last_result_at = Some(std::time::Instant::now() - app::RESULT_DISPLAY);
+        app.set_result("Moved 2 items (1MB) to Trash.".into());
+        assert!(buffer_text(&app, 80, 24).contains("Moved 2 items"));
+        std::thread::sleep(Duration::from_millis(1100));
         let s = buffer_text(&app, 80, 24);
-        assert!(!s.contains("2 deleted"), "{s}");
+        assert!(s.contains("Moved 2 items"), "{s}");
+        assert!(s.contains("? help  q quit"), "{s}");
+        handle_key(&mut app, KeyCode::Down);
+        let s = buffer_text(&app, 80, 24);
+        assert!(!s.contains("Moved 2 items"), "{s}");
         assert!(s.contains("? help  q quit"), "{s}");
     }
 
     #[test]
-    fn review_overlay_names_the_open_file_check() {
+    fn review_status_names_the_open_file_check_then_the_item_count() {
         let mut app = App::new(empty_report(), "/root".into());
         app.operation = Some(crate::app::Operation {
             label: "Reviewing",
@@ -765,18 +902,24 @@ mod tests {
             total: 284,
             succeeded: 0,
             failed: 0,
-            current: "/tmp/x".into(),
+            current: "swamp · incremental build (target/debug)".into(),
+            bytes_done: 0,
+            bytes_total: 0,
             started: std::time::Instant::now(),
             cancel: Default::default(),
             checking_open_files: Some(std::time::Instant::now()),
         });
         let s = buffer_text(&app, 100, 24);
-        assert!(s.contains("Checking which files are open"), "{s}");
-        assert!(s.contains("Review only; no files are changed."), "{s}");
+        assert!(s.contains("Checking what is in use"), "{s}");
+        assert!(s.contains("Nothing has been changed"), "{s}");
         app.operation.as_mut().unwrap().checking_open_files = None;
         let s = buffer_text(&app, 100, 24);
-        assert!(s.contains("0/284 groups"), "{s}");
-        assert!(!s.contains("Checking which files are open"), "{s}");
+        assert!(s.contains("Checked 0 of 284"), "{s}");
+        assert!(
+            s.contains("swamp · incremental build (target/debug)"),
+            "{s}"
+        );
+        assert!(!s.contains("Checking what is in use"), "{s}");
     }
 
     /// A stored report plus a resolved scope, in a scratch store.
@@ -806,7 +949,7 @@ mod tests {
         assert!(app.scan_if_no_index(false));
         assert!(app.pending.is_some() && app.observing.is_some());
         let s = buffer_text(&app, 120, 24);
-        assert!(s.contains("observing…"), "{s}");
+        assert!(s.contains("observing"), "{s}");
         assert!(!s.contains("press R"), "{s}");
     }
 
@@ -836,31 +979,21 @@ mod tests {
             h.contains("observed 47m ago · older than 15 min, press R to refresh"),
             "{h}"
         );
-        // Yellow, not red.
+        // Bold, not a color: yellow is unreadable on many light themes.
         let mut t = Terminal::new(TestBackend::new(200, 24)).unwrap();
         t.draw(|f| ui::draw(f, &app)).unwrap();
-        let cell = t
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .find(|c| c.symbol() == "S")
-            .map(|c| c.fg);
-        let stale_cell = t
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .take(200)
-            .find(|c| c.fg == ratatui::style::Color::Yellow);
-        assert!(stale_cell.is_some(), "warning is drawn in yellow: {cell:?}");
+        let head: Vec<_> = t.backend().buffer().content().iter().take(200).collect();
         assert!(
-            !t.backend()
-                .buffer()
-                .content()
-                .iter()
-                .take(200)
-                .any(|c| c.fg == ratatui::style::Color::Red)
+            head.iter()
+                .any(|c| c.modifier.contains(ratatui::style::Modifier::BOLD)),
+            "the warning is bold"
+        );
+        assert!(
+            head.iter().all(|c| !matches!(
+                c.fg,
+                ratatui::style::Color::Yellow | ratatui::style::Color::Red
+            )),
+            "no color carries the warning"
         );
     }
 
@@ -871,7 +1004,7 @@ mod tests {
         assert!(header_of(&app).contains("press R to refresh"));
         app.observing = Some((0, 0));
         let h = header_of(&app);
-        assert!(h.contains("observing…") && !h.contains("press R"), "{h}");
+        assert!(h.contains("observing") && !h.contains("press R"), "{h}");
         app.observing = None;
         app.external_observer = Some(swamp_core::schedule::LockHolder {
             pid: 4242,
@@ -879,8 +1012,8 @@ mod tests {
         });
         let h = header_of(&app);
         assert!(
-            h.contains("scheduled observation running (pid 4242, 1m 12s)")
-                && !h.contains("press R"),
+            // The clock may tick between building the holder and drawing it.
+            h.contains("another observation running (pid 4242, 1m 1") && !h.contains("press R"),
             "{h}"
         );
     }
@@ -925,6 +1058,79 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_screen_is_never_repainted_until_something_changes() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 30);
+        let mut gate = RedrawGate::default();
+        assert!(gate.due(&app), "the first frame is always painted");
+        for _ in 0..50 {
+            assert!(!gate.due(&app), "an unchanged idle screen is not repainted");
+        }
+        assert_eq!(RedrawGate::wait(&app), Duration::from_secs(1));
+        // A key, a resize or a worker result asks for exactly one paint.
+        gate.touch();
+        assert!(gate.due(&app));
+        assert!(!gate.due(&app));
+        // Anything busy paints on the 200 ms tick so the glyph and the
+        // elapsed time move.
+        app.observing = Some((0, 0));
+        assert_eq!(RedrawGate::wait(&app), Duration::from_millis(200));
+        assert!(gate.due(&app) && gate.due(&app));
+        app.observing = None;
+        assert!(gate.due(&app), "the busy to idle frame is painted once");
+        assert!(!gate.due(&app));
+        // The index's age is a clock: crossing into the next minute paints.
+        app.report.observed_at = now - 200;
+        assert!(gate.due(&app), "the age label changed");
+        assert!(!gate.due(&app));
+        // A refusal that runs out repaints without a key.
+        app.refusal = Some(("refused: x".into(), std::time::Instant::now()));
+        assert!(gate.due(&app), "the refusal appears");
+        assert!(!gate.due(&app));
+        app.refusal = Some((
+            "refused: x".into(),
+            std::time::Instant::now() - app::REFUSAL_DISPLAY - Duration::from_millis(1),
+        ));
+        assert!(gate.due(&app), "the refusal ran out: one paint clears it");
+        assert!(!gate.due(&app));
+    }
+
+    #[test]
+    fn ui_state_is_written_off_the_event_thread_newest_wins_and_flushes_on_exit() {
+        let (store, _r, mut app) = stored_app(0);
+        app.set_sort(Sort::Size);
+        app.set_sort(Sort::Size); // off again
+        app.set_sort(Sort::Name);
+        app.toggle_reverse();
+        app.flush_ui_state();
+        let saved = app::load_ui_state(store.path());
+        assert_eq!(saved.sort, "name");
+        assert!(saved.reverse);
+    }
+
+    #[test]
+    fn r_while_another_observation_runs_says_so_and_starts_nothing() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 3600);
+        app.external_observer = Some(swamp_core::schedule::LockHolder {
+            pid: 4242,
+            since: now - 32,
+        });
+        handle_key(&mut app, KeyCode::Char('R'));
+        assert!(app.pending.is_none(), "no second walk");
+        let s = buffer_text(&app, 80, 24);
+        assert!(
+            s.contains("An observation is already running (pid 4242, 3"),
+            "{s}"
+        );
+        assert!(s.contains("Its result loads here"), "{s}");
+        assert!(
+            !s.contains("scheduled"),
+            "a manual `swamp observe` is not 'scheduled': {s}"
+        );
+    }
+
+    #[test]
     fn lock_poll_shows_and_clears_an_external_observer() {
         let (s, _r, mut app) = stored_app(0);
         let guard = match swamp_core::schedule::acquire_lock(s.path()).unwrap() {
@@ -941,7 +1147,7 @@ mod tests {
         }
         assert_eq!(app.external_observer.unwrap().pid, std::process::id());
         let s = buffer_text(&app, 200, 24);
-        assert!(s.contains("scheduled observation running"), "{s}");
+        assert!(s.contains("another observation running"), "{s}");
         drop(guard);
         while app.external_observer.is_some() {
             assert!(std::time::Instant::now() < deadline, "holder never cleared");
@@ -958,5 +1164,243 @@ mod tests {
             let app = App::new(empty_report(), "/root".into());
             terminal.draw(|f| ui::draw(f, &app)).unwrap();
         }
+    }
+
+    // ---- adversarial review (audit/v0.7.5-adversarial) ----
+
+    fn test_op() -> crate::app::Operation {
+        crate::app::Operation {
+            label: "Reviewing",
+            completed: 3,
+            total: 3,
+            succeeded: 3,
+            failed: 0,
+            current: "/tmp/x".into(),
+            bytes_done: 0,
+            bytes_total: 0,
+            started: std::time::Instant::now(),
+            cancel: Default::default(),
+            checking_open_files: None,
+        }
+    }
+
+    /// The event loop calls `poll_operation` (which may end the operation
+    /// and open the confirm) and then asks the gate. The iteration where
+    /// the operation ends is not busy and nothing touched the gate, so
+    /// the finished state (confirm, result line) must still be painted.
+    #[test]
+    fn adv_the_frame_after_an_operation_finishes_is_painted() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 30);
+        let mut gate = RedrawGate::default();
+        app.operation = Some(test_op());
+        assert!(gate.due(&app), "busy: painted");
+        // What poll_operation does when `Reviewed` arrives.
+        app.operation = None;
+        app.set_result("Marked 3 more. 3 marked in all (1MB).".into());
+        assert!(
+            gate.due(&app),
+            "operation ended (result/confirm now on screen) but the gate did not paint: stale 'Reviewing' frame stays up"
+        );
+    }
+
+    fn unit(path: &str, bytes: u64, docker: bool) -> crate::actions::MarkedUnit {
+        crate::actions::MarkedUnit {
+            cargo_unit: None,
+            agent_unit: None,
+            path: path.into(),
+            docker: docker.then(|| swamp_core::docker::Removal::Volume {
+                name: "pgdata".into(),
+            }),
+            worktree_path: "/root/p".into(),
+            bytes,
+            observed_at: 0,
+            worktree: None,
+            label: if docker {
+                "pgdata".into()
+            } else {
+                String::new()
+            },
+            warnings: vec![],
+        }
+    }
+
+    /// A plan with a Trash part and a permanent docker part: whatever the
+    /// terminal size, if the confirm keys are on screen the permanent
+    /// removal must be too (Enter removes it for good).
+    #[test]
+    fn adv_permanent_docker_removal_is_visible_whenever_enter_confirm_is() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.marked.insert(
+            "/root/p/node_modules".into(),
+            unit("/root/p/node_modules", 1 << 30, false),
+        );
+        app.marked
+            .insert("docker:pgdata".into(), unit("docker:pgdata", 5 << 30, true));
+        app.confirm_open = true;
+        let mut bad = Vec::new();
+        for (w, h) in [
+            (200u16, 60u16),
+            (80, 24),
+            (80, 12),
+            (60, 10),
+            (40, 10),
+            (40, 8),
+            (20, 5),
+        ] {
+            let s = buffer_text(&app, w, h);
+            let keys = s.contains("Enter");
+            let permanent = s.contains("for good") || s.contains("docker");
+            if keys && !permanent {
+                bad.push(format!("{w}x{h}:\n{s}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "Enter offered without the permanent part:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    #[test]
+    fn adv_tiny_and_degenerate_terminals_never_panic() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, mut app) = stored_app(now - 30);
+        for (w, h) in [
+            (1u16, 1u16),
+            (0, 0),
+            (1, 0),
+            (0, 5),
+            (20, 5),
+            (40, 10),
+            (300, 60),
+            (2, 2),
+        ] {
+            for state in 0..5 {
+                app.help_open = state == 1;
+                app.operation = (state == 2).then(test_op);
+                app.confirm_open = state == 3;
+                app.set_result(if state == 4 {
+                    "x".repeat(500)
+                } else {
+                    String::new()
+                });
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| ui::draw(f, &app)).unwrap();
+            }
+        }
+        app.help_open = false;
+        app.operation = None;
+        app.confirm_open = false;
+        for k in [
+            KeyCode::PageDown,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::Home,
+            KeyCode::Down,
+            KeyCode::Up,
+        ] {
+            handle_key(&mut app, k);
+            let _ = buffer_text(&app, 20, 5);
+        }
+    }
+
+    // ---- v0.7.5 adversarial fixes ----
+
+    #[test]
+    fn plan_sheet_heads_ready_and_blocked_and_names_each_kind_once() {
+        let mut app = App::new(empty_report(), "/root".into());
+        for i in 0..40 {
+            let path = format!("/root/p{i}/node_modules");
+            app.marked.insert(path.clone(), unit(&path, 1 << 20, false));
+        }
+        for i in 0..3 {
+            let path = format!("/root/q{i}/.build");
+            app.marked.insert(path.clone(), unit(&path, 1 << 20, false));
+        }
+        app.blocked = vec![app::BlockedItem {
+            name: "x".into(),
+            reason: "nothing reclaimable in this project".into(),
+            next: "n".into(),
+        }];
+        app.confirm_open = true;
+        let s = buffer_text(&app, 100, 30);
+        assert!(s.contains("Ready: 43 items"), "{s}");
+        assert!(!s.contains("none blocked"), "{s}");
+        assert!(s.contains("Blocked: 1 (d to see why)"), "{s}");
+        assert!(s.contains("Ready, by project:"), "{s}");
+        assert!(s.contains("node_modules (40), .build (3)"), "{s}");
+        assert!(!s.contains("node_modules, node_modules"), "{s}");
+    }
+
+    #[test]
+    fn a_small_plan_sheet_fills_its_rows_with_count_first() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.marked
+            .insert("/root/p/a".into(), unit("/root/p/a", 1 << 20, false));
+        app.confirm_open = true;
+        let s = buffer_text(&app, 40, 10);
+        let rows: Vec<&str> = s.lines().collect();
+        let empty_inside = rows
+            .iter()
+            .filter(|r| r.starts_with('"') && r.trim_matches('"').trim().is_empty())
+            .count();
+        assert!(s.contains("Ready: 1 item"), "{s}");
+        assert_eq!(empty_inside, 0, "no blank row inside the box:\n{s}");
+    }
+
+    #[test]
+    fn a_fresh_index_reads_just_now_so_the_idle_screen_stays_still() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, app) = stored_app(now - 5);
+        let mut gate = RedrawGate::default();
+        assert!(gate.due(&app));
+        assert!(app.live_age);
+        for _ in 0..3 {
+            assert!(!gate.due(&app));
+        }
+        let s = buffer_text(&app, 100, 24);
+        assert!(s.contains("observed just now"), "{s}");
+    }
+
+    #[test]
+    fn without_a_terminal_the_ui_says_what_to_use_instead() {
+        // Test output is captured, so stdout is never a terminal here.
+        let err = enter_with_splash().err().expect("no terminal, no UI");
+        assert_eq!(
+            err.to_string(),
+            "swamp ui needs an interactive terminal; use swamp report for text"
+        );
+    }
+
+    #[test]
+    fn a_plan_with_a_long_blocked_line_leaves_no_blank_row_at_60x10() {
+        let mut app = App::new(empty_report(), "/root".into());
+        for i in 0..5 {
+            let path = format!("/root/p{i}/node_modules");
+            app.marked.insert(path.clone(), unit(&path, 1 << 20, false));
+        }
+        app.blocked = vec![
+            app::BlockedItem {
+                name: "x".into(),
+                reason: "nothing reclaimable in this project".into(),
+                next: "n".into(),
+            },
+            app::BlockedItem {
+                name: "y".into(),
+                reason: "in use".into(),
+                next: "n".into(),
+            },
+        ];
+        app.confirm_open = true;
+        let s = buffer_text(&app, 60, 10);
+        let blank_inside = s
+            .lines()
+            .filter(|r| {
+                r.starts_with("\"│") && r.trim_matches('"').trim_matches('│').trim().is_empty()
+            })
+            .count();
+        assert!(s.contains("Blocked: 2"), "{s}");
+        assert_eq!(blank_inside, 0, "{s}");
     }
 }
