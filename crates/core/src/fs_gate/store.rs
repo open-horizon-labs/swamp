@@ -129,6 +129,31 @@ impl StoreDir {
         }
     }
 
+    /// Serializes the ledger's read-modify-write (every writer: a Trash
+    /// move, a delete, a tool removal) so two swamp processes never lose
+    /// each other's rows. The lock file sits beside the ledger, is advisory
+    /// and held only for the write. Waits up to ten seconds; a ledger that
+    /// stays locked is an error the caller reports (nothing is written).
+    pub fn lock_ledger_writes(ledger: &Path) -> io::Result<super::continuity::FileLock> {
+        let path = ledger.with_file_name("ledger.lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(lock) = super::continuity::try_lock(&path, true)? {
+                return Ok(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "the ledger is locked by another swamp process (waited 10 s): {}",
+                        path.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn marker_state(&self) -> io::Result<MarkerState> {
         let marker = read_housekeeping_marker(&self.0.join("housekeeping.version"))?;
         Ok(match marker {

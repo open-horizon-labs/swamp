@@ -142,6 +142,11 @@ impl Ledger {
         let path = self.path();
         let facts_path = self.facts_path();
         self.store.create()?;
+        // One writer at a time across processes: the table is read, a row
+        // added and the table rewritten, and two writers would lose rows.
+        let _lock = StoreDir::lock_ledger_writes(&path).map_err(|e| {
+            anyhow::anyhow!("swamp's ledger could not be locked ({e}), so nothing was written")
+        })?;
         let mut kept: Vec<String> = Vec::new();
         let mut rows = if crate::fs_gate::exists(&path) {
             match c::read_ledger_rows(&path) {
