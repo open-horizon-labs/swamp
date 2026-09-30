@@ -1840,6 +1840,9 @@ pub struct ReportSnapshot {
     pub external_units: Vec<crate::external::ExternalUnit>,
     pub agent_units: Vec<crate::agents::AgentUnit>,
     pub store_interiors: Vec<crate::artifact::NestedArtifact>,
+    /// What package managers' own tooling said in the last scheduled
+    /// `observe` (`manager_facts`): stored, never asked at read time.
+    pub manager_facts: crate::manager_facts::ManagerFacts,
 }
 
 // ---------------------------------------------------------------------
@@ -3357,6 +3360,65 @@ pub fn write_volume_ledger(
 
 fn unit_children_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_children.parquet")
+}
+
+fn manager_facts_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("manager_facts.parquet")
+}
+
+/// Replaces `manager_facts.parquet` with the rows of one scheduled pass
+/// (`manager_facts::collect`), under the same writer lock every
+/// observation write takes. The table is machine wide, so the whole file
+/// is the last pass.
+pub fn write_manager_fact_table(
+    swamp_dir: &Path,
+    facts: &[crate::manager_facts::ManagerFact],
+) -> Result<()> {
+    let store = store::StoreDir::at(swamp_dir)?;
+    if store.is_newer_generation()? {
+        anyhow::bail!("store written by a newer swamp; not modifying it");
+    }
+    let _writer_lock = store.lock_observation_writes()?;
+    let rows: Vec<columns::StoredManagerFactRow> = facts
+        .iter()
+        .map(|f| columns::StoredManagerFactRow {
+            manager: f.manager.clone(),
+            probe: f.probe.clone(),
+            kind: f.kind.label().to_string(),
+            subject: f.subject.clone(),
+            text: f.text.clone(),
+            observed_at: f.observed_at,
+        })
+        .collect();
+    let file = manager_facts_path(swamp_dir);
+    columns::write_manager_fact_rows(&file, &rows)
+        .with_context(|| format!("write {}", file.display()))
+}
+
+/// The stored manager facts. A store with no such table (never observed
+/// by a swamp that records them, or a table that cannot be read) is
+/// `observed: false`: the view says "not observed yet", never an error
+/// and never "nothing reported". A row of a kind this build does not
+/// know is skipped, so a newer swamp's table reads as far as it can.
+pub(crate) fn read_manager_fact_table(swamp_dir: &Path) -> crate::manager_facts::ManagerFacts {
+    let rows = columns::read_manager_fact_rows(&manager_facts_path(swamp_dir)).unwrap_or_default();
+    let observed = rows
+        .iter()
+        .any(|r| r.kind == crate::manager_facts::FactKind::Pass.label());
+    let facts = rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(crate::manager_facts::ManagerFact {
+                kind: crate::manager_facts::FactKind::from_label(&r.kind)?,
+                manager: r.manager,
+                probe: r.probe,
+                subject: r.subject,
+                text: r.text,
+                observed_at: r.observed_at,
+            })
+        })
+        .collect();
+    crate::manager_facts::ManagerFacts { observed, facts }
 }
 
 /// One `unit_children.parquet` row per drilldown line, in display order.
@@ -7707,6 +7769,39 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     #[allow(unused_imports)]
     use std::fs::{self, File};
+
+    /// The tempting wrong patch: a manager-fact row whose kind this build
+    /// does not know (written by a newer swamp) fails the whole read. It is
+    /// skipped and the rest reads; a table that is absent is "not
+    /// observed", not an empty pass.
+    #[test]
+    fn a_manager_fact_row_of_an_unknown_kind_is_skipped_and_an_absent_table_is_not_observed() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(!read_manager_fact_table(dir).observed);
+        let row = |kind: &str, subject: Option<&str>| columns::StoredManagerFactRow {
+            manager: "brew".into(),
+            probe: "autoremove-dry-run".into(),
+            kind: kind.into(),
+            subject: subject.map(str::to_string),
+            text: "t".into(),
+            observed_at: 1,
+        };
+        columns::write_manager_fact_rows(
+            &manager_facts_path(dir),
+            &[
+                row("pass", None),
+                row("from-the-future", Some("x")),
+                row("reports-unneeded", Some("libevent")),
+            ],
+        )
+        .unwrap();
+        let got = read_manager_fact_table(dir);
+        assert!(got.observed);
+        assert_eq!(got.facts.len(), 2, "{:?}", got.facts);
+        assert!(got.facts.iter().all(|f| f.subject.as_deref() != Some("x")));
+    }
     #[test]
     fn artifact_and_file_compaction_preserve_sources_on_publish_failure() -> anyhow::Result<()> {
         use super::*;

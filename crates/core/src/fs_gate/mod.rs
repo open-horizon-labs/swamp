@@ -51,6 +51,7 @@ pub mod inotify;
 // and are tested on both platforms (`occupancy::tests`'s `FakeProc`);
 // only `occupancy::probe_paths`'s call into it is Linux-only.
 pub mod procfs;
+pub mod program_paths;
 pub mod read;
 #[cfg(any(test, feature = "testing"))]
 pub mod settle;

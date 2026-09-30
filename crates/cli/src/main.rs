@@ -69,6 +69,13 @@ enum View {
     /// history and declared consumers. Read-only: this view never
     /// removes anything, in this command or any other.
     External,
+    /// The Reclaim view (#175): every unit of developer storage, largest
+    /// first, with what getting it back costs, when it was last used and
+    /// from what record, who is known to need it, what a package manager
+    /// itself reports, and which removal path exists. A read of stored
+    /// facts: it starts no process and lists no directory, and it says
+    /// what its consumer evidence was checked against.
+    Reclaim,
     /// Agent-tool storage (#91-#99/#100): sessions, caches, logs,
     /// checkpoints and protected config for every named coding-agent
     /// tool (Claude Code, Codex, Oh My Pi, OpenCode, Gemini CLI, Pi,
@@ -839,6 +846,7 @@ fn report_json_envelope(
     external_units: &[swamp_core::external::ExternalUnit],
     agent_units: &[swamp_core::agents::AgentUnit],
     store_interiors: &[swamp_core::artifact::NestedArtifact],
+    reclaim: Option<&swamp_core::reclaim::ReclaimView>,
 ) -> Result<serde_json::Value> {
     let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
@@ -892,6 +900,10 @@ fn report_json_envelope(
                     })
                     .collect::<serde_json::Map<String, serde_json::Value>>(),
             }),
+            View::Reclaim => match reclaim {
+                Some(view) => serde_json::to_value(view)?,
+                None => serde_json::Value::Null,
+            },
             View::Agents => {
                 let filtered: Vec<&swamp_core::agents::AgentUnit> = agent_units
                     .iter()
@@ -1262,6 +1274,19 @@ fn main() -> Result<()> {
             let external_units = snapshot.external_units;
             let agent_units = snapshot.agent_units;
             let store_interiors = snapshot.store_interiors;
+            // The Reclaim view is a pure function of these stored facts.
+            let reclaim_view = (view == Some(View::Reclaim)).then(|| {
+                swamp_core::reclaim::build(&swamp_core::reclaim::ReclaimInput {
+                    units: &external_units,
+                    interiors: &store_interiors,
+                    unowned: &r.unowned,
+                    manager_facts: &snapshot.manager_facts,
+                    declared_roots: &declared_json_roots,
+                    explicit_scope: scope.explicit,
+                    projects: r.projects.len(),
+                    observed_at: r.observed_at,
+                })
+            });
             let root = r.root.clone();
             if !coverage.is_empty() {
                 print_scope_coverage_note(&coverage);
@@ -1302,6 +1327,7 @@ fn main() -> Result<()> {
                     &external_units,
                     &agent_units,
                     &store_interiors,
+                    reclaim_view.as_ref(),
                 )?;
                 bound_interior_units(&mut value, unit_limit, unit_offset);
                 if let Some(obj) = value.as_object_mut() {
@@ -1384,6 +1410,11 @@ fn main() -> Result<()> {
                             swamp_core::render::render_standalone_targets(&r.unowned)
                         )
                     }
+                    Some(View::Reclaim) => {
+                        if let Some(v) = &reclaim_view {
+                            safe_print!("{}", swamp_core::reclaim::render_text(v));
+                        }
+                    }
                     Some(View::Agents) => {
                         safe_print!(
                             "{}",
@@ -1434,6 +1465,11 @@ fn main() -> Result<()> {
                             ),
                             swamp_core::render::render_standalone_targets(&r.unowned)
                         )
+                    }
+                    Some(View::Reclaim) => {
+                        if let Some(v) = &reclaim_view {
+                            safe_print!("{}", swamp_core::reclaim::render_text(v));
+                        }
                     }
                     Some(View::Agents) => {
                         safe_print!(

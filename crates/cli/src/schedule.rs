@@ -162,6 +162,7 @@ pub fn cmd_observe(
                     swamp_core::work_counters::snapshot()
                 );
             }
+            record_manager_reports(&store_dir, &observation.external_units, now)?;
 
             let outcome = RunOutcome {
                 observed_at: now,
@@ -278,6 +279,36 @@ fn timeout_outcome(stuck: Option<&(&'static str, PathBuf, Duration)>) -> String 
         ),
         None => "timeout".to_string(),
     }
+}
+
+/// The scheduled manager pass: after a successful observation, ask each
+/// package manager that owns a measured unit its own read-only questions
+/// (`manager_facts::collect`) and store the answers. Only `observe` runs
+/// it; `report` and the TUI read what it stored. A manager that is
+/// missing, slow or unreadable is a `not observed` row, never a failure
+/// of the observation.
+fn record_manager_reports(
+    store_dir: &std::path::Path,
+    units: &[swamp_core::external::ExternalUnit],
+    now: u64,
+) -> Result<()> {
+    let facts = swamp_core::manager_facts::collect(
+        units,
+        &swamp_core::manager_facts::SystemProbeRunner,
+        now,
+    );
+    let not_observed = facts
+        .iter()
+        .filter(|f| f.kind == swamp_core::manager_facts::FactKind::NotObserved)
+        .count();
+    match swamp_core::growth::write_manager_fact_table(store_dir, &facts) {
+        Ok(()) => safe_println!(
+            "  manager reports: {} rows recorded, {not_observed} not observed",
+            facts.len()
+        ),
+        Err(e) => eprintln!("manager reports not recorded: {e}"),
+    }
+    Ok(())
 }
 
 /// The volume pass, after a successful observation and still under the

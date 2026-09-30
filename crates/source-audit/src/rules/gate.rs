@@ -288,8 +288,15 @@ const GROUPS: &[Group] = &[
     Group {
         path: "@core::fs_gate::spawn::Program::Brew",
         allowed: &[],
-        why: "brew runs only as an allow-listed detector command (`Program::named` in \
-              `locations`)",
+        why: "brew runs as an allow-listed detector command (`Program::named` in `locations`) \
+              and, in a scheduled observe only, through `spawn::ManagerCommand` \
+              (`manager_facts`), which cannot name a non-dry-run",
+    },
+    Group {
+        path: "@core::fs_gate::spawn::Program::Mise",
+        allowed: &[],
+        why: "mise runs only through `spawn::ManagerCommand` in a scheduled observe \
+              (`manager_facts`), which cannot name a non-dry-run",
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Defaults",

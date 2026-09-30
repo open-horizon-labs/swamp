@@ -3828,6 +3828,7 @@ fn empty_snapshot(observed_at: u64, store_dir: &Path) -> ReportSnapshot {
         external_units: Vec::new(),
         agent_units: Vec::new(),
         store_interiors: Vec::new(),
+        manager_facts: crate::manager_facts::ManagerFacts::default(),
     }
 }
 
@@ -3974,6 +3975,7 @@ pub fn report_scope_from_store(
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
     rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);
+    snapshot.manager_facts = crate::growth::read_manager_fact_table(store_dir);
     // R20: last -- every derived field (summary, series, unowned, the
     // drill-down, an artifact's growth/allocation) is computed from the
     // facts rebuilt above and the volumes' history, never read from a

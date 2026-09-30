@@ -55,8 +55,13 @@ pub enum Program {
     Launchctl,
     /// Liveness of the observation lock holder (`kill -0 <pid>`).
     Kill,
-    /// `brew --prefix` (detector query).
+    /// `brew --prefix` (detector query) and, in a scheduled `observe`
+    /// only, the two read-only manager reports (`autoremove --dry-run`,
+    /// `list --formula --installed-on-request`).
     Brew,
+    /// mise's two read-only reports, in a scheduled `observe` only:
+    /// `prune --dry-run` and `ls --global --json`.
+    Mise,
     /// `defaults read com.apple.dt.Xcode …` (detector query).
     Defaults,
     /// `systemd --user`'s own manager (#83): `crate::systemd_user`'s
@@ -93,6 +98,7 @@ impl Program {
         Program::Launchctl,
         Program::Kill,
         Program::Brew,
+        Program::Mise,
         Program::Defaults,
         Program::Systemctl,
         Program::Loginctl,
@@ -115,6 +121,7 @@ impl Program {
             Program::Launchctl => "launchctl",
             Program::Kill => "kill",
             Program::Brew => "brew",
+            Program::Mise => "mise",
             Program::Defaults => "defaults",
             Program::Systemctl => "systemctl",
             Program::Loginctl => "loginctl",
@@ -272,7 +279,12 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("unload"), Lit("-w"), SwampPlist],
         ],
         Program::Kill => &[&[Lit("-0"), Number]],
+        // `brew --prefix` is the detector's query. The manager reports are
+        // not shapes at all: they run only as a `ManagerCommand`, which
+        // builds its own argv, so no other caller can run `brew
+        // autoremove` (or anything else) through `run`.
         Program::Brew => &[&[Lit("--prefix")]],
+        Program::Mise => &[],
         Program::Defaults => &[&[
             Lit("read"),
             Lit("com.apple.dt.Xcode"),
@@ -508,7 +520,47 @@ pub(super) fn run_unchecked(
     args: &[OsString],
     timeout: Duration,
 ) -> io::Result<RunOutput> {
-    run_command(program.executable(), args, timeout)
+    let plan = super::program_paths::plan(program)?;
+    run_command_with(args, timeout, &plan)
+}
+
+/// The only four questions swamp asks a package manager's own tooling,
+/// each a dry run or a read. The manager pass builds its argv from this
+/// enum and cannot name any other: `brew autoremove` without `--dry-run`,
+/// `mise prune` without `--dry-run` and `brew uninstall` are not values of
+/// it, and the generic [`run`] is not what the pass calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagerCommand {
+    BrewAutoremoveDryRun,
+    BrewListInstalledOnRequest,
+    MisePruneToolsDryRun,
+    MiseListGlobalJson,
+}
+
+impl ManagerCommand {
+    pub fn program(self) -> Program {
+        match self {
+            Self::BrewAutoremoveDryRun | Self::BrewListInstalledOnRequest => Program::Brew,
+            Self::MisePruneToolsDryRun | Self::MiseListGlobalJson => Program::Mise,
+        }
+    }
+
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::BrewAutoremoveDryRun => &["autoremove", "--dry-run"],
+            Self::BrewListInstalledOnRequest => &["list", "--formula", "--installed-on-request"],
+            Self::MisePruneToolsDryRun => &["prune", "--tools", "--dry-run"],
+            Self::MiseListGlobalJson => &["ls", "--global", "--json"],
+        }
+    }
+}
+
+/// Runs one [`ManagerCommand`]: the program resolved from its fixed
+/// locations, a from-scratch environment, a fixed working directory
+/// (`program_paths`), counted and killed on the time-out like any spawn.
+pub fn run_manager(command: ManagerCommand, timeout: Duration) -> io::Result<RunOutput> {
+    let args: Vec<OsString> = command.args().iter().map(OsString::from).collect();
+    run_unchecked(command.program(), &args, timeout)
 }
 
 // ---- child lifetime (#156) ------------------------------------------
@@ -584,15 +636,25 @@ struct Running {
 
 impl Running {
     fn start(
-        binary: &str,
         args: &[OsString],
         out: std::fs::File,
         err: std::fs::File,
+        plan: &super::program_paths::Plan,
     ) -> io::Result<Self> {
         use std::os::unix::process::CommandExt;
         install_cleanup_once();
         crate::work_counters::record_spawn();
-        let child = Command::new(binary)
+        let mut command = match plan {
+            super::program_paths::Plan::Inherit(exe) => Command::new(exe),
+            super::program_paths::Plan::Scrubbed(s) => {
+                let mut c = Command::new(&s.exe);
+                c.env_clear()
+                    .envs(s.env.iter().cloned())
+                    .current_dir(&s.cwd);
+                c
+            }
+        };
+        let child = command
             .args(args)
             .stdin(Stdio::null())
             .stdout(out)
@@ -661,11 +723,38 @@ impl Drop for Running {
     }
 }
 
+/// An anonymous file for one stream of a child's output. The system
+/// temporary directory comes from the parent's `TMPDIR`, which may name a
+/// directory that does not exist; the fixed system locations are the
+/// fallback, so a bad `TMPDIR` cannot make every spawn fail.
+fn capture_file() -> io::Result<std::fs::File> {
+    tempfile::tempfile()
+        .or_else(|_| tempfile::tempfile_in("/tmp"))
+        .or_else(|_| tempfile::tempfile_in("/var/tmp"))
+}
+
+/// The most output one run returns (see `run_command`). Far above any
+/// answer swamp parses; a full buffer means "more than this".
+const CAPTURE_CAP: u64 = 8 * 1024 * 1024;
+
 /// Runs `binary args…` under the lifetime rules above.
-fn run_command(binary: &str, args: &[OsString], timeout: Duration) -> io::Result<RunOutput> {
-    let mut out_file = tempfile::tempfile()?;
-    let mut err_file = tempfile::tempfile()?;
-    let mut child = Running::start(binary, args, out_file.try_clone()?, err_file.try_clone()?)?;
+#[cfg(test)]
+fn run_command(
+    binary: &'static str,
+    args: &[OsString],
+    timeout: Duration,
+) -> io::Result<RunOutput> {
+    run_command_with(args, timeout, &super::program_paths::Plan::Inherit(binary))
+}
+
+fn run_command_with(
+    args: &[OsString],
+    timeout: Duration,
+    plan: &super::program_paths::Plan,
+) -> io::Result<RunOutput> {
+    let mut out_file = capture_file()?;
+    let mut err_file = capture_file()?;
+    let mut child = Running::start(args, out_file.try_clone()?, err_file.try_clone()?, plan)?;
     let started = Instant::now();
     let (code, timed_out) = loop {
         match child.try_wait() {
@@ -680,10 +769,13 @@ fn run_command(binary: &str, args: &[OsString], timeout: Duration) -> io::Result
             Err(e) => return Err(e), // `Drop` kills and reaps
         }
     };
+    // A program that floods its output cannot fill memory: only the
+    // first `CAPTURE_CAP` bytes come back, and a caller that needs the
+    // whole answer treats a full buffer as too large.
     let read_back = |f: &mut std::fs::File| -> Vec<u8> {
         let mut buf = Vec::new();
         let _ = f.seek(SeekFrom::Start(0));
-        let _ = f.read_to_end(&mut buf);
+        let _ = f.take(CAPTURE_CAP).read_to_end(&mut buf);
         buf
     };
     let stdout = read_back(&mut out_file);
@@ -734,7 +826,13 @@ mod tests {
     fn dropping_the_guard_kills_the_group() {
         let out = tempfile::tempfile().unwrap();
         let err = tempfile::tempfile().unwrap();
-        let mut r = Running::start("sh", &hung_tree(), out.try_clone().unwrap(), err).unwrap();
+        let mut r = Running::start(
+            &hung_tree(),
+            out.try_clone().unwrap(),
+            err,
+            &crate::fs_gate::program_paths::Plan::Inherit("sh"),
+        )
+        .unwrap();
         let leader = r.child.id() as i32;
         std::thread::sleep(Duration::from_millis(300));
         let mut buf = String::new();
@@ -829,6 +927,25 @@ mod tests {
             (Program::Kill, vec!["1"]),
             (Program::Launchctl, vec!["remove", "com.apple.something"]),
             (Program::Brew, vec!["uninstall", "x"]),
+            // The manager reports are the dry runs only. The tempting wrong
+            // patch is a looser shape that also lets the real run through.
+            (Program::Brew, vec!["autoremove"]),
+            (Program::Brew, vec!["autoremove", "--dry-run"]),
+            (Program::Brew, vec!["autoremove", "--dry-run", "--force"]),
+            (Program::Brew, vec!["list", "--formula"]),
+            (
+                Program::Brew,
+                vec!["list", "--formula", "--installed-on-request"],
+            ),
+            (Program::Brew, vec!["cleanup", "--dry-run"]),
+            (Program::Mise, vec!["prune"]),
+            (Program::Mise, vec!["prune", "--dry-run", "--yes"]),
+            (Program::Mise, vec!["prune", "--dry-run"]),
+            (Program::Mise, vec!["prune", "--tools"]),
+            (Program::Mise, vec!["prune", "--tools", "--dry-run"]),
+            (Program::Mise, vec!["ls", "--global", "--json"]),
+            (Program::Mise, vec!["uninstall", "node@1"]),
+            (Program::Mise, vec!["exec", "--", "true"]),
             (
                 Program::Defaults,
                 vec!["write", "com.apple.dt.Xcode", "x", "y"],
@@ -880,6 +997,35 @@ mod tests {
         }
     }
 
+    /// The tempting wrong patch: manager reports stay generic shapes of
+    /// `run`, so any module (through `Program::named("mise")` too) can run
+    /// them, and #177's removal shapes would sit beside them. They are not
+    /// shapes: only `run_manager` can start them.
+    #[test]
+    fn manager_commands_are_not_reachable_through_the_generic_run() {
+        for command in [
+            ManagerCommand::BrewAutoremoveDryRun,
+            ManagerCommand::BrewListInstalledOnRequest,
+            ManagerCommand::MisePruneToolsDryRun,
+            ManagerCommand::MiseListGlobalJson,
+        ] {
+            let args: Vec<OsString> = command.args().iter().map(OsString::from).collect();
+            assert!(permitted(command.program(), &args).is_err(), "{command:?}");
+            let named = Program::named(command.program().binary()).unwrap();
+            let (r, counted) = crate::work_counters::measured(|| {
+                run(named, command.args(), Duration::from_secs(5))
+            });
+            assert!(r.is_err());
+            assert_eq!(counted.subprocess_spawns, 0);
+            assert!(
+                !command
+                    .args()
+                    .iter()
+                    .any(|a| matches!(*a, "uninstall" | "remove"))
+            );
+        }
+    }
+
     #[test]
     fn swamps_own_invocations_are_shapes() {
         for (program, args) in [
@@ -925,6 +1071,7 @@ mod tests {
                 ],
             ),
             (Program::Kill, vec!["-0", "123"]),
+            (Program::Brew, vec!["--prefix"]),
             (Program::Id, vec!["-u"]),
             (Program::Df, vec!["-k", "/"]),
             (Program::Diskutil, vec!["apfs", "list", "-plist"]),

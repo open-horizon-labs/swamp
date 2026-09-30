@@ -1176,7 +1176,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
     assert!(
-        before.contains("view: projects (1 of 10 · v next) · filter: none"),
+        before.contains("view: projects (1 of 11 · v next) · filter: none"),
         "{before}"
     );
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
@@ -1186,7 +1186,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
         tree.contains("view: tree of "),
         "second line must name the scope:\n{tree}"
     );
-    assert!(tree.contains("2 of 10 · Esc: projects"), "{tree}");
+    assert!(tree.contains("2 of 11 · Esc: projects"), "{tree}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
@@ -1261,6 +1261,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         evidence: Vec::new(),
         last_used: None,
         size_text: None,
+        detail_lines: Vec::new(),
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [
@@ -2321,7 +2322,7 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
     assert_eq!(app.view, ViewKind::Builds);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("builds of mole (3 of 10 · v next"), "{f}");
+    assert!(f.contains("builds of mole (3 of 11 · v next"), "{f}");
     swamp_tui::handle_key(&mut app, KeyCode::Char('2'));
     assert_eq!(app.view, ViewKind::Tree);
     assert_eq!(app.selected, at, "the tree cursor came back");
@@ -2562,4 +2563,420 @@ fn adv_a_not_measured_or_negative_drilldown_row_never_draws_a_zero_size() {
         !zero(&locked) && !zero(&adjustment),
         "a zero size drawn as a fact:\n{locked}\n{adjustment}"
     );
+}
+
+// ---------------------------------------------------------------------
+// v0.8.0 G4a: the Reclaim view (#175).
+// ---------------------------------------------------------------------
+
+fn reclaim_unit(
+    detector: &str,
+    category: swamp_core::locations::StorageCategory,
+    path: &str,
+    bytes: u64,
+    children: Vec<swamp_core::drilldown::UnitChild>,
+) -> swamp_core::external::ExternalUnit {
+    swamp_core::external::ExternalUnit {
+        detector_id: detector.into(),
+        detector_name: detector.into(),
+        category,
+        provenance: swamp_core::locations::Provenance::BuiltinConvention,
+        path: PathBuf::from(path),
+        bytes,
+        mtime_max: 0,
+        hardlinked: false,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at: 1_700_000_000,
+        consumers: Vec::new(),
+        note: None,
+        evidence: Vec::new(),
+        bytes_counted_elsewhere: 0,
+        overlap_count: 0,
+        last_used: Default::default(),
+        children,
+    }
+}
+
+fn reclaim_child(
+    kind: swamp_core::drilldown::ChildKind,
+    name: &str,
+    bytes: Option<i64>,
+) -> swamp_core::drilldown::UnitChild {
+    swamp_core::drilldown::UnitChild {
+        kind,
+        name: name.into(),
+        bytes,
+        measure: if bytes.is_some() {
+            swamp_core::drilldown::ChildMeasure::Complete
+        } else {
+            swamp_core::drilldown::ChildMeasure::NotMeasured
+        },
+        mtime_max: 0,
+        entries: 1,
+        not_measured: 0,
+        last_used: Default::default(),
+    }
+}
+
+fn manager_fact(
+    manager: &str,
+    probe: &str,
+    kind: swamp_core::manager_facts::FactKind,
+    subject: Option<&str>,
+    text: &str,
+) -> swamp_core::manager_facts::ManagerFact {
+    swamp_core::manager_facts::ManagerFact {
+        manager: manager.into(),
+        probe: probe.into(),
+        kind,
+        subject: subject.map(str::to_string),
+        text: text.into(),
+        observed_at: 1_700_000_000,
+    }
+}
+
+fn reclaim_app(declared_missing: bool) -> App {
+    use swamp_core::drilldown::ChildKind::{Entry, Remainder};
+    use swamp_core::locations::StorageCategory as C;
+    use swamp_core::manager_facts::FactKind as K;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.filter_text.clear();
+    app.set_external_units(vec![
+        reclaim_unit(
+            "rustup",
+            C::Installation,
+            "/Users/dev/.rustup/toolchains",
+            3_950_000_000,
+            vec![
+                reclaim_child(Entry, "stable-aarch64-apple-darwin", Some(2_000_000_000)),
+                reclaim_child(Entry, "nightly-aarch64-apple-darwin", Some(1_500_000_000)),
+                reclaim_child(Entry, "locked-toolchain", None),
+                reclaim_child(Remainder, "", Some(450_000_000)),
+            ],
+        ),
+        reclaim_unit(
+            "mise",
+            C::Installation,
+            "/Users/dev/.local/share/mise/installs",
+            1_200_000_000,
+            vec![
+                reclaim_child(Entry, "node", Some(700_000_000)),
+                reclaim_child(Entry, "java", Some(500_000_000)),
+            ],
+        ),
+        reclaim_unit(
+            "codex",
+            C::LocalState,
+            "/Users/dev/.codex",
+            6_800_000_000,
+            Vec::new(),
+        ),
+        reclaim_unit(
+            "uv",
+            C::Cache,
+            "/Users/dev/.cache/uv",
+            3_900_000_000,
+            Vec::new(),
+        ),
+    ]);
+    let listing_at = app.report.observed_at;
+    app.set_manager_facts(swamp_core::manager_facts::ManagerFacts {
+        observed: true,
+        facts: [
+            manager_fact("", "", K::Pass, None, ""),
+            manager_fact(
+                "rustup",
+                "settings-default",
+                K::ActiveDefault,
+                Some("stable"),
+                "default_toolchain \"stable\" in settings.toml",
+            ),
+            manager_fact("rustup", "settings-default", K::Checked, None, ""),
+            manager_fact(
+                "mise",
+                "global-tools",
+                K::ActiveDefault,
+                Some("node"),
+                "listed in the global configuration /Users/dev/.config/mise/config.toml",
+            ),
+            manager_fact("mise", "global-tools", K::Checked, None, ""),
+            manager_fact(
+                "mise",
+                "prune-dry-run",
+                K::ReportsPrunable,
+                Some("java@temurin-17.0.20+101"),
+                "mise java@temurin-17.0.20+101 is prunable: java is required at zulu-8.96.0.19 by ~/src/etl/mise.toml",
+            ),
+            manager_fact("mise", "prune-dry-run", K::Checked, None, ""),
+        ]
+        .into_iter()
+        // Read by the pass that follows the observation the units come from.
+        .map(|f| swamp_core::manager_facts::ManagerFact {
+            observed_at: listing_at,
+            ..f
+        })
+        .collect(),
+    });
+    let mut roots = vec![swamp_core::roots::DeclaredRoot {
+        path: "/Users/dev/src".into(),
+        state: swamp_core::roots::DeclaredState::Present {
+            bytes: Some(1),
+            complete: true,
+        },
+    }];
+    if declared_missing {
+        roots.push(swamp_core::roots::DeclaredRoot {
+            path: "/Volumes/work/src".into(),
+            state: swamp_core::roots::DeclaredState::Missing,
+        });
+    }
+    app.set_declared_roots(&roots);
+    app.set_view(ViewKind::Reclaim);
+    app
+}
+
+#[test]
+fn reclaim_view_frames() {
+    use crossterm::event::KeyCode;
+    for (w, h) in [(80, 24), (120, 30)] {
+        let mut app = reclaim_app(false);
+        app.width = w;
+        check(&format!("reclaim_{w}x{h}"), &capture(&app, w, h));
+        // Open the toolchains row: the folders add up to its size, the
+        // default one is marked and the unreadable one is `unmeasured`.
+        let at = app
+            .rows()
+            .iter()
+            .position(|r| r.label.contains(".rustup/toolchains"))
+            .unwrap();
+        app.selected = at;
+        swamp_tui::handle_key(&mut app, KeyCode::Enter);
+        check(&format!("reclaim_open_{w}x{h}"), &capture(&app, w, h));
+    }
+}
+
+/// The tempting wrong patch: the scope statement is a header nobody sees
+/// at a small width, or is dropped when a declared root is missing.
+#[test]
+fn reclaim_view_says_what_its_consumer_evidence_was_checked_against_on_every_screen() {
+    for w in [80u16, 120, 200] {
+        let app = reclaim_app(false);
+        let f = capture(&app, w, 24);
+        assert!(
+            f.contains("consumer evidence checked against 2 projects in 1 declared root"),
+            "w={w}\n{f}"
+        );
+        let app = reclaim_app(true);
+        let f = capture(&app, w, 24);
+        assert!(f.contains("incomplete"), "w={w}\n{f}");
+        assert!(f.contains("in 2 declared roots"), "w={w}\n{f}");
+    }
+}
+
+/// The tempting wrong patch: entering the view scans, or asks a manager,
+/// to fill itself. It is a function of stored facts: no listing, no stat,
+/// no process.
+#[test]
+fn opening_the_reclaim_view_scans_nothing() {
+    let mut app = reclaim_app(false);
+    app.set_view(ViewKind::External);
+    let (frame, work) = swamp_core::work_counters::measured(|| {
+        app.set_view(ViewKind::Reclaim);
+        capture(&app, 80, 24)
+    });
+    assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+    assert!(frame.contains("codex"), "{frame}");
+}
+
+/// The tempting wrong patch: the new view lays its table out differently
+/// (or moves the footer), so switching views shifts what the eye has. The
+/// heading, the footer and its key hints sit on the same screen rows in
+/// every view; selecting or opening a row moves nothing above it; and the
+/// screen is the same height at 80 and 120 columns.
+#[test]
+fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
+    use crossterm::event::KeyCode;
+    for (w, h) in [(80u16, 24u16), (120, 30)] {
+        let mut app = reclaim_app(false);
+        app.width = w;
+        let footer_of = |app: &App| {
+            let f = capture(app, w, h);
+            assert_eq!(f.lines().count(), h as usize, "w={w}");
+            line_of(&f, h as usize - 1)
+        };
+        let reclaim_footer = footer_of(&app);
+        assert!(reclaim_footer.contains("v view"), "{reclaim_footer}");
+        assert!(reclaim_footer.contains("q quit"), "{reclaim_footer}");
+        assert!(reclaim_footer.contains("? help"), "{reclaim_footer}");
+        // Reclaim shows no key that only refuses: nothing in it is
+        // markable, so no delete or mark keys.
+        for gone in ["⌫ delete", "Space mark", "A mark all"] {
+            assert!(!reclaim_footer.contains(gone), "{reclaim_footer}");
+        }
+        // Every other view keeps its footer, on the same screen row.
+        let external = {
+            app.set_view(ViewKind::External);
+            footer_of(&app)
+        };
+        for v in ViewKind::ALL {
+            if v == ViewKind::Reclaim {
+                continue;
+            }
+            app.set_view(v);
+            assert_eq!(footer_of(&app), external, "w={w} view={v:?}");
+        }
+        app.set_view(ViewKind::Reclaim);
+        // The heading is on the row every flat view puts it on.
+        let heading = |app: &App| {
+            capture(app, w, h)
+                .lines()
+                .position(|l| l.trim_start_matches('"').starts_with("Name"))
+                .unwrap()
+        };
+        let reclaim_heading = heading(&app);
+        app.set_view(ViewKind::External);
+        assert_eq!(heading(&app), reclaim_heading, "w={w}");
+        app.set_view(ViewKind::Reclaim);
+        // Selecting another row moves no table row.
+        let table = |app: &App, n: usize| -> Vec<String> {
+            let f = capture(app, w, h);
+            (0..n).map(|i| line_of(&f, i)).collect()
+        };
+        app.selected = 0;
+        let first = table(&app, 8);
+        app.selected = 1;
+        assert_eq!(table(&app, 8), first, "w={w}: selecting shifted rows");
+        // Opening a row moves only the rows below it.
+        app.selected = 0;
+        let before = capture(&app, w, h);
+        let at = app.selected;
+        swamp_tui::handle_key(&mut app, KeyCode::Enter);
+        let after = capture(&app, w, h);
+        for i in 0..(reclaim_heading + 2 + at) {
+            assert_eq!(line_of(&before, i), line_of(&after, i), "w={w} row {i}");
+        }
+        assert_eq!(after.lines().count(), h as usize);
+    }
+}
+
+/// The tempting wrong patch: an unreadable folder draws `0B`, and the
+/// default toolchain looks like any other row.
+#[test]
+fn reclaim_children_draw_unmeasured_and_mark_the_default() {
+    use crossterm::event::KeyCode;
+    let mut app = reclaim_app(false);
+    let at = app
+        .rows()
+        .iter()
+        .position(|r| r.label.contains(".rustup/toolchains"))
+        .unwrap();
+    app.selected = at;
+    swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    let f = capture(&app, 120, 30);
+    assert!(f.contains("locked-toolchain"), "{f}");
+    let locked = f.lines().find(|l| l.contains("locked-toolchain")).unwrap();
+    assert!(locked.contains("unmeasured"), "{locked}");
+    assert!(!locked.contains("0B"), "{locked}");
+    let stable = f
+        .lines()
+        .find(|l| l.contains("active default") && l.contains("├─"))
+        .unwrap_or_else(|| panic!("the default toolchain's row says so\n{f}"));
+    assert!(stable.contains("stable"), "{stable}");
+    let nightly = f
+        .lines()
+        .find(|l| l.contains("nightly-aarch64-apple-darwin"))
+        .unwrap();
+    assert!(!nightly.contains("active default"), "{nightly}");
+}
+
+/// The tempting wrong patch: a verdict word or an em dash reaches the
+/// screen through a state the frames did not cover. Checked over every
+/// string the view builds (rows, signals, detail lines, the header and
+/// scope line) with every unit opened, and over rendered frames for the
+/// verdict words (the table's own "no change" glyph is an existing cell
+/// mark, not one of this view's strings).
+#[test]
+fn reclaim_strings_carry_no_verdict_words_and_no_em_dashes() {
+    use crossterm::event::KeyCode;
+    let mut app = reclaim_app(true);
+    for i in 0..app.rows().len() {
+        app.selected = i;
+        swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    }
+    let mut strings: Vec<String> = Vec::new();
+    for row in app.rows() {
+        strings.push(row.label.clone());
+        strings.extend(row.signals.iter().cloned());
+        strings.extend(row.detail_lines.iter().cloned());
+        strings.extend(row.last_used.iter().cloned());
+        strings.extend(row.size_text.iter().cloned());
+    }
+    let view = app.reclaim_view();
+    strings.push(view.scope.statement.clone());
+    strings.extend(view.coverage_notes.iter().cloned());
+    let mut blob = strings.join("\n");
+    assert!(!blob.contains('\u{2014}'), "{blob}");
+    for w in [50u16, 80, 120, 200] {
+        for sel in 0..app.rows().len().min(8) {
+            app.selected = sel;
+            blob.push_str(&capture(&app, w, 30));
+        }
+    }
+    let lower = blob.to_lowercase();
+    for word in [
+        "unused", "obsolete", "stale", "orphan", "junk", "garbage", "safe",
+    ] {
+        assert!(
+            !lower
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| w == word),
+            "{word}"
+        );
+    }
+}
+
+/// Adversarial (auditor): the Reclaim view, closed and open, draws at
+/// tiny and narrow sizes without panicking, and at 40/50 columns its
+/// footer keeps a key hint and the heading row matches External's.
+#[test]
+fn adv_reclaim_view_survives_tiny_and_narrow_screens() {
+    use crossterm::event::KeyCode;
+    for (w, h) in [(0u16, 0u16), (1, 1), (2, 2), (10, 3), (40, 12), (50, 16)] {
+        let mut app = reclaim_app(false);
+        app.width = w;
+        draw_only(&app, w, h);
+        if let Some(at) = app
+            .rows()
+            .iter()
+            .position(|r| r.label.contains(".rustup/toolchains"))
+        {
+            app.selected = at;
+            swamp_tui::handle_key(&mut app, KeyCode::Enter);
+            draw_only(&app, w, h);
+            swamp_tui::handle_key(&mut app, KeyCode::Right);
+            draw_only(&app, w, h);
+        }
+    }
+    for (w, h) in [(40u16, 12u16), (50, 16)] {
+        let mut app = reclaim_app(false);
+        app.width = w;
+        let r = capture(&app, w, h);
+        app.set_view(ViewKind::External);
+        let e = capture(&app, w, h);
+        assert!(
+            !line_of(&r, h as usize - 1).is_empty(),
+            "w={w} footer empty\n{r}"
+        );
+        assert_eq!(
+            line_of(&r, 0),
+            line_of(&e, 0),
+            "w={w} heading differs\n{r}\n{e}"
+        );
+    }
+}
+
+fn draw_only(app: &App, w: u16, h: u16) {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| ui::draw(f, app)).unwrap();
 }

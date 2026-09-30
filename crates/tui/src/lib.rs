@@ -293,6 +293,7 @@ fn stored_multi_root_app(
     app.set_external_units(snapshot.external_units);
     app.set_store_interiors(snapshot.store_interiors);
     app.set_agent_units(snapshot.agent_units);
+    app.set_manager_facts(snapshot.manager_facts);
     app.scope = Some(scope.clone());
     app.observed_label = "from last observation".into();
     app.disk_banner = banner;
@@ -353,6 +354,7 @@ pub fn run(root: &Path) -> Result<()> {
             a.set_external_units(snapshot.external_units);
             a.set_store_interiors(snapshot.store_interiors);
             a.set_agent_units(snapshot.agent_units);
+            a.set_manager_facts(snapshot.manager_facts);
             a.disk_banner = banner.clone();
             a
         }

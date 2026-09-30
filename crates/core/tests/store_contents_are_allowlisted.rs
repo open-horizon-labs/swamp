@@ -97,6 +97,7 @@ const TABLES: &[&str] = &[
     "external_units.parquet",
     "unit_children.parquet",
     "unit_meta.parquet",
+    "manager_facts.parquet",
     "overlap_marks.parquet",
     "volume_ledger.parquet",
     "volume_ledger_meta.parquet",

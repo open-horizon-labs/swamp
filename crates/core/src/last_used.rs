@@ -280,11 +280,18 @@ impl LastUsed {
     /// `Last run or opened: Jul 8 (file access time)`, or
     /// `Last run or opened: no record`.
     pub fn describe(&self, now: u64) -> String {
+        format!("{LABEL}: {}", self.fact(now))
+    }
+
+    /// The value with its source, without the label: `Jul 8 (file access
+    /// time)`, or `no record` (with the reason when a consulted source
+    /// was set aside). A missing record is never a date.
+    pub fn fact(&self, now: u64) -> String {
         match (self.at, self.source.describe()) {
-            (Some(at), Some(source)) => format!("{LABEL}: {} ({source})", format_day(at, now)),
+            (Some(at), Some(source)) => format!("{} ({source})", format_day(at, now)),
             _ => match self.why_none {
-                Some(why) => format!("{LABEL}: no record ({})", why.describe()),
-                None => format!("{LABEL}: no record"),
+                Some(why) => format!("no record ({})", why.describe()),
+                None => "no record".to_string(),
             },
         }
     }

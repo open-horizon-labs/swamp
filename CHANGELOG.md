@@ -29,6 +29,18 @@ observations, not general performance guarantees. See the README for current use
   the full 30-minute `observe_timeout_sec`. That path is skipped as
   `not measured (stalled on <date>)` for 24 hours, so one blocking path cannot
   fail every scheduled pass.
+- **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
+  unit of developer storage, largest first, with what getting it back costs in the
+  tool's own words, when it was last used and from what record, who is known to
+  need it (declared, and recorded by the tool), what Homebrew or mise itself
+  reports (quoted and attributed, never swamp's verdict), and which removal path
+  exists. Every listing says what its consumer evidence was checked against and
+  when that is incomplete; a rustup default toolchain, a mise global tool and a
+  formula installed on request are marked and held out of the regenerable total,
+  and `unknown` when the manager's record could not be read. A scheduled `observe`
+  asks the managers two read-only questions each (dry runs only, from fixed program paths, a scrubbed environment and one fixed directory) into a new
+  `manager_facts.parquet` that older versions ignore; `report` and the TUI start
+  no process.
 - **Each unit says when it was last run or opened, and where that comes from.**
   `swamp report --view external` (and `--json`, and the TUI's selected-row detail)
   now shows `Last run or opened: Jul 8 (file access time)`, `... Sep 6 (Xcode

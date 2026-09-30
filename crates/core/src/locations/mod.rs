@@ -1054,6 +1054,159 @@ pub struct RecoveryHint {
     pub cost: RecoveryCost,
 }
 
+/// Whether re-obtaining a unit's contents is possible at all, as the
+/// Reclaim view classifies it. A fact about the kind of storage, never
+/// about whether removing a particular unit is a good idea.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RegenClass {
+    /// The manager fetches it again (an installation, a cache).
+    Download,
+    /// It is built again from sources that stay on disk.
+    Rebuild,
+    /// Local state or models: nothing recorded here can make it again.
+    NotRegenerable,
+    /// The kind of storage does not say.
+    NotEstablished,
+}
+
+/// The one table that classifies a unit kind by its storage category,
+/// used when neither the unit's own consequence text (a build adapter's)
+/// nor its detector's [`RecoveryHint`] says more. Sources, per row:
+///
+/// * `Installation`: every manager that installs into such a location
+///   documents a reinstall command (`brew reinstall`, `rustup toolchain
+///   install`, `mise install`, `sdkmanager`, ESP-IDF's `install.sh`); the
+///   detectors' own hints carry the exact command.
+/// * `Downloads`, `Cache`: a download or derived cache is filled again by
+///   the tool on next use (npm, pip, uv, Cargo and Gradle document this
+///   for their caches).
+/// * `BuildOutput`: rebuilt by the tool's own build command from sources
+///   that stay in place.
+/// * `Environments`: recreating an environment restores what its manifest
+///   names, not the data a person added to it (an emulator's apps, a
+///   virtualenv's hand-installed packages), so the class is not
+///   established.
+/// * `LocalState`, `Models`: state a tool wrote for the user, or model
+///   files that may have been built or pulled from a source that is gone;
+///   nothing in swamp's records can regenerate them.
+/// * `Unclassified`: no detector said what is inside.
+pub fn regeneration_for_category(category: StorageCategory) -> (RegenClass, &'static str) {
+    match category {
+        StorageCategory::Installation => (
+            RegenClass::Download,
+            "reinstall is a download (the manager that installed it fetches it again)",
+        ),
+        StorageCategory::Downloads | StorageCategory::Cache => (
+            RegenClass::Download,
+            "downloaded or derived again by the tool on next use",
+        ),
+        StorageCategory::BuildOutput => {
+            (RegenClass::Rebuild, "rebuilt by the tool's build command")
+        }
+        StorageCategory::Environments => (
+            RegenClass::NotEstablished,
+            "recreating restores what the manifest names, not data added later",
+        ),
+        StorageCategory::LocalState | StorageCategory::Models => (
+            RegenClass::NotRegenerable,
+            "cannot be regenerated (local state or models; no source is recorded)",
+        ),
+        StorageCategory::Unclassified => (
+            RegenClass::NotEstablished,
+            "regeneration cost not established (no detector says what is inside)",
+        ),
+    }
+}
+
+/// A detector's [`RecoveryHint`] as the words a row shows, with the
+/// exact command a human would type.
+pub fn recovery_words(category: StorageCategory, hint: RecoveryHint) -> (RegenClass, String) {
+    match hint.cost {
+        RecoveryCost::NetworkRefetch => {
+            let lead = if category == StorageCategory::Installation {
+                "reinstall is a download"
+            } else {
+                "downloaded again on next use"
+            };
+            (RegenClass::Download, format!("{lead} (`{}`)", hint.command))
+        }
+        RecoveryCost::LocalRematerialization => (
+            RegenClass::Rebuild,
+            format!("rebuilt from what is already on disk (`{}`)", hint.command),
+        ),
+        RecoveryCost::LocalRebuild => (
+            RegenClass::Rebuild,
+            format!("rebuilt locally (`{}`)", hint.command),
+        ),
+    }
+}
+
+/// Detector `detector_id`'s recovery hint, when it declares one.
+pub fn recovery_hint_of(detector_id: &str) -> Option<RecoveryHint> {
+    Registry::with_builtins()
+        .detectors()
+        .iter()
+        .find(|d| d.id() == detector_id)
+        .and_then(|d| d.recovery_hint())
+}
+
+/// How a manager's own report names its subjects, relative to the
+/// folders of the store it manages, so a fact joins to a folder without a
+/// per-tool table anywhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectShape {
+    /// The subject is the folder's name (a Homebrew formula under
+    /// `Cellar`).
+    FolderName,
+    /// `<name>@<version>`: the folder is `<name>` (mise's
+    /// `installs/<tool>`).
+    NameBeforeAt,
+    /// A channel or toolchain as the manager's settings spell it
+    /// (`stable`); a folder carries the host triple after it.
+    ChannelWithHostTriple,
+}
+
+/// One read-only question swamp asks a manager's own tooling during a
+/// scheduled `observe` (never from `report` or the TUI). The commands
+/// themselves are allow-listed argument shapes in `fs_gate::spawn`; this
+/// names which parse applies to the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManagerProbe {
+    /// The names the manager lists as unneeded by its dry-run autoremove.
+    BrewAutoremoveDryRun,
+    /// The formulae the manager records as installed on request.
+    BrewInstalledOnRequest,
+    /// The versions the manager lists as prunable by its dry-run prune.
+    MisePruneDryRun,
+    /// The tools the manager's global configuration lists.
+    MiseGlobalTools,
+    /// The default toolchain in the manager's own settings file, the file
+    /// the detector's `DeclaredVersions` convention names. No command.
+    SettingsDefault,
+}
+
+/// What a detector declares about the manager that owns its store: the
+/// capability the Reclaim view and the observation's manager pass ask
+/// the registry for, so no other module names a manager beside its
+/// detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagerDecl {
+    /// The manager's command name, as fact rows and the attribution
+    /// ("Homebrew reports unneeded (brew autoremove)") spell it.
+    pub manager: &'static str,
+    /// The manager's name as a person writes it.
+    pub display: &'static str,
+    /// Which of this detector's units the manager's report is about.
+    pub anchor: StoreAnchor,
+    pub subject: SubjectShape,
+    /// Whether a report about a subject that matches no folder attaches
+    /// to this detector's unit as a whole: true for a unit that stands
+    /// for everything of the manager's not measured on its own.
+    pub catch_all: bool,
+    pub probes: &'static [ManagerProbe],
+}
+
 /// One fact source under the registry. Copy `builtin.rs` or
 /// `cargo_home.rs` for the pattern; see `docs/architecture.md`.
 pub trait Detector: Send + Sync {
@@ -1103,6 +1256,12 @@ pub trait Detector: Send + Sync {
     /// time.
     fn last_use_sources(&self) -> &'static [LastUseDecl] {
         &[]
+    }
+    /// The manager that owns this detector's Installation store, and the
+    /// read-only questions its own tooling can answer about it. `None`
+    /// (the default) for a detector whose store has no such manager.
+    fn manager(&self) -> Option<ManagerDecl> {
+        None
     }
     /// Whether this detector runs under ordinary `defaults = true` scope
     /// without the config naming it.
