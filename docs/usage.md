@@ -387,8 +387,9 @@ in **both** directions:
   destroy exactly what you asked to keep.
 
 The TUI reloads the protect list from disk fresh every time you mark a row, so a protection added mid-session is honoured immediately. If the protect list cannot be read or parsed,
-protection state is **unknown**, and marking refuses with that
-reason until the file is repaired or removed -- `swamp protect list`
+protection state is **unknown**: marking is not blocked, and the confirm says
+`could not read your protect list ... your keep marks were not checked`
+until the file is repaired or removed -- `swamp protect list`
 reports the same error rather than printing an empty list. The file is
 written atomically (temp file plus rename), so an interrupted write
 cannot turn your keep list into an empty one.
@@ -1419,7 +1420,10 @@ The only reasons swamp refuses, each stated on screen:
 3. **The plan changed**: the target changed since you marked it (a symlink swapped in for the folder, a different folder renamed into place, a path that now resolves elsewhere). Nothing moves and the mark stays.
 4. **The ledger cannot be written**: a `started` row is written before a Reclaim/External move, so a store swamp cannot write means nothing moves.
 5. **Overlapping marks**: a folder and one inside it cannot both be marked.
-6. **Your own `swamp protect` mark**: `protected by you (...); swamp protect remove <path> takes the mark off`. A protect list that cannot be read is not an empty list and does not block you: the confirm says `could not read your protect list ... your keep marks were not checked`.
+6. **Your own `swamp protect` mark**: `protected by you (...); swamp protect remove <entry> takes the mark off`, where `<entry>` is the keep entry that covers the row (it may be a folder above or below it, not the row's own path). `swamp protect remove` on a path that matches no entry now says `nothing matched`.
+7. **Swamp's own ledger or the Trash**: a folder that is, or holds, swamp's store (the one `SWAMP_DIR` names included) or the Trash the move goes into cannot be moved by swamp, because the move is recorded in that ledger: `this holds swamp's own ledger, which records this move; move it yourself in Finder if you want it gone`. A protect list that cannot be read is not an empty list and does not block you: the confirm says `could not read your protect list ... your keep marks were not checked`.
+
+Facts read when you mark a row: what it contains (a folder above known units says how many and which, your whole Library, the system temp folder, Homebrew's whole prefix, a mounted volume's root, the folder swamp was started in), mounted volumes inside it (their bytes live on the disk images, so moving it frees about nothing), a git checkout at it or one level below, a file with other hard links, the Trash on another volume (swamp never copies, so that move is refused), and what holds it open. Enter re-reads the entry and what holds it open, and refuses with "changed since review" if either is different. A failed move leaves a `failed:` ledger row with the OS error, never a `started` row. Two folders with the same name can move in one confirm. Control and invisible characters in a folder name are shown escaped.
 
 A symlink itself can be moved (the link, never its target). The Reclaim, External and Disk rows use the same review: Space marks (and says why if not), Backspace opens the confirm (it never acts directly), Enter confirms, Esc cancels; no other key acts while the confirm is open. `A` marks each top-level unit once; a folder listed under a unit, a path no cleanup rule covers, and what swamp keeps by default are marked one at a time with Space. Moving a folder out of a unit takes its bytes off the unit on screen at once; the next observation remeasures. The result line says "Sizes are from the last observation" and that space is freed when the Trash is emptied. Other Trash moves (artifact rows, worktrees, Cargo groups, agent units) are not re-derived between marking and Enter, and Enter refuses only for an ordinary OS error. Tool-managed removal (below) has no Trash and keeps its review-to-`Y` recheck of the facts you were shown.
 

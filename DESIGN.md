@@ -262,7 +262,7 @@ row is marked, in both directions: a row beneath a protected path, and a
 row that *contains* one. Protecting a single file inside a build
 directory therefore refuses the directory, in the status rows, at the moment
 you press Space -- not silently at execution. Protection state that
-cannot be read is *unknown*, so it refuses too. This used to be reached
+cannot be read is *unknown*: the confirm says the keep marks were not checked. This used to be reached
 only for the two row kinds that happened to propose through core, which
 is how a one-directional protection bug survived every test; see
 `.oh/guardrails/protection-fails-closed.md`.

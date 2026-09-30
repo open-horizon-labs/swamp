@@ -491,11 +491,20 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
         .sum::<u64>()
         - permanent;
     let mut lines: Vec<String> = Vec::new();
+    let inside_extra = if reclaim_units.iter().any(|u| {
+        u.warnings
+            .iter()
+            .any(|w| w.contains("counted under projects"))
+    }) {
+        " plus project worktrees inside, counted under their projects"
+    } else {
+        ""
+    };
     // Two destinations, and the difference is the whole point: a path
     // goes to Trash and comes back, a Docker object does not.
     if trash_units > 0 {
         lines.push(format!(
-            "Move {} ({}) → Trash. Space is freed when Trash is emptied.",
+            "Move {} ({}{inside_extra}) → Trash. Space is freed when Trash is emptied.",
             plural(trash_units, "item", "items"),
             human_bytes(trash_bytes)
         ));
@@ -593,15 +602,16 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
             None => warned.push((w.clone(), 1)),
         }
     }
-    for (text, n) in warned.iter().take(3) {
+    // Every distinct warning is listed: a warning folded into "+N more"
+    // while Enter is offered is a fact the person did not read. A plan
+    // whose lines do not all fit the sheet offers no Enter (`confirm_fits`).
+    for (text, n) in &warned {
+        let text = swamp_core::reclaim_trash::plain(text);
         if *n > 1 {
             lines.push(format!("⚠ {text} ({n} items)"));
         } else {
             lines.push(format!("⚠ {text}"));
         }
-    }
-    if warned.len() > 3 {
-        lines.push(format!("⚠ +{} more warnings", warned.len() - 3));
     }
     lines.extend(reclaim_lines(&reclaim_units));
     lines.join("\n")
@@ -618,20 +628,22 @@ const RECLAIM_PATHS: usize = 8;
 /// review lines), then the way back. Nothing is cut to "N more" until the
 /// list is long, and then the count says how many paths are not shown.
 fn reclaim_lines(units: &[&MarkedUnit]) -> Vec<String> {
+    use swamp_core::reclaim_trash::plain;
     let mut lines: Vec<String> = Vec::new();
     if units.is_empty() {
         return lines;
     }
+    let shown = |u: &MarkedUnit| plain(&u.path.display().to_string());
     if units.len() <= RECLAIM_BLOCKS {
         for u in units {
-            lines.push(format!("{} ({})", u.path.display(), human_bytes(u.bytes)));
+            lines.push(format!("{} ({})", shown(u), human_bytes(u.bytes)));
             for w in &u.warnings {
-                lines.push(format!("⚠ {w}"));
+                lines.push(format!("⚠ {}", plain(w)));
             }
         }
     } else {
         for u in units.iter().take(RECLAIM_PATHS) {
-            lines.push(format!("{} ({})", u.path.display(), human_bytes(u.bytes)));
+            lines.push(format!("{} ({})", shown(u), human_bytes(u.bytes)));
         }
         if units.len() > RECLAIM_PATHS {
             let rest: u64 = units.iter().skip(RECLAIM_PATHS).map(|u| u.bytes).sum();
@@ -641,22 +653,38 @@ fn reclaim_lines(units: &[&MarkedUnit]) -> Vec<String> {
                 human_bytes(rest)
             ));
         }
-        let mut merged: Vec<(String, usize)> = Vec::new();
-        for w in units.iter().flat_map(|u| u.warnings.iter()) {
-            match merged.iter_mut().find(|(t, _)| t == w) {
-                Some((_, n)) => *n += 1,
-                None => merged.push((w.clone(), 1)),
+        // Each distinct warning once, and the folders it is about whenever
+        // it is not about all of them: a warning is never shown without
+        // the path it belongs to.
+        let mut merged: Vec<(String, Vec<String>)> = Vec::new();
+        for u in units {
+            for w in &u.warnings {
+                match merged.iter_mut().find(|(t, _)| t == w) {
+                    Some((_, who)) => who.push(shown(u)),
+                    None => merged.push((w.clone(), vec![shown(u)])),
+                }
             }
         }
-        // The kinds of fact first, each with how many folders carry it.
-        for (text, n) in &merged {
-            if *n > 1 {
-                lines.push(format!("⚠ {text} ({n} folders)"));
+        for (text, who) in &merged {
+            let text = plain(text);
+            if who.len() == units.len() {
+                lines.push(format!("⚠ {text} (all {} folders)", units.len()));
             } else {
-                lines.push(format!("⚠ {text}"));
+                let few: Vec<&str> = who.iter().take(3).map(String::as_str).collect();
+                let more = who.len().saturating_sub(3);
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                lines.push(format!("⚠ {text}: {}{more}", few.join(", ")));
             }
         }
     }
+    lines.push(
+        "Facts above were read when you marked; Enter re-checks that each entry, and what holds it open, is unchanged."
+            .to_string(),
+    );
     lines.push(
         "Trash is the way back: move the folder out of the Trash to restore it. Space is freed when Trash is emptied."
             .to_string(),

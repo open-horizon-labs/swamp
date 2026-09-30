@@ -58,7 +58,7 @@ column.
 | `bytes` + `basis` | a size on one stated basis | not reclaimable space, and never addable across bases |
 | `role` / family | what kind of thing this is | not that it is obsolete or removable |
 | `consequence` | what happens if the bytes go | not a recommendation to remove them |
-| `action` | what swamp's own cleanup rule covers: exact-path TUI Trash, or no rule (inspection only / unsupported, with the reason) | not permission to delete, not a lock, and not evidence of disuse |
+| `action` | what swamp's own cleanup rule covers: exact-path TUI Trash, or no rule (identified only / unsupported, with the reason) | not permission to delete, not a lock, and not evidence of disuse |
 | `coverage.limits` | exactly what swamp could not establish | |
 | `variant.unknowns` | fields with no evidence behind them | |
 

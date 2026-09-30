@@ -411,7 +411,8 @@ pub fn propose(
                 }
                 (Err(why), _, _) => match single(
                     vec![format!(
-                        "swamp's selection rules for this build folder do not cover it ({why}): only this path moves, companions are not included"
+                        "swamp's selection rules for this build folder do not cover it ({}): only this path moves, companions are not included",
+                        why.replace("inspection-only", "no cleanup rule")
                     )],
                     true,
                 ) {
@@ -1565,12 +1566,18 @@ fn reclaim_record(
         verb: crate::ledger::Verb::Delete,
         entity_id: crate::entities::id_for(&r.path.display().to_string()),
         evidence: vec![
-            crate::ledger::LedgerFact::new("label", &facts.label),
+            crate::ledger::LedgerFact::new("label", crate::reclaim_trash::plain(&facts.label)),
             crate::ledger::LedgerFact::new("bytes", facts.bytes),
             crate::ledger::LedgerFact::new("observed_at", facts.observed_at),
-            crate::ledger::LedgerFact::new("warnings_shown", facts.warnings.join("; ")),
+            crate::ledger::LedgerFact::new(
+                "warnings_shown",
+                crate::reclaim_trash::plain(&facts.warnings.join("; ")),
+            ),
             crate::ledger::LedgerFact::new("reclaim_category", &facts.category),
-            crate::ledger::LedgerFact::new("canonical", r.canonical.display()),
+            crate::ledger::LedgerFact::new(
+                "canonical",
+                crate::reclaim_trash::plain(&r.canonical.display().to_string()),
+            ),
         ],
         grant_id: crate::ledger::NO_GRANT.to_string(),
         actor: "human:tui".to_string(),
@@ -1615,8 +1622,35 @@ pub fn trash_reclaim(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("item");
-    let moved = fs_gate::destroy::trash_move(&r.path, trash_root, &format!("{name}-{}", now()))
-        .map_err(|e| format!("the move to Trash failed: {e}"))?;
+    // The record id keeps two folders with the same name, moved in one
+    // confirm, from colliding on `<name>-<second>`.
+    let unique: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let moved = match fs_gate::destroy::trash_move(
+        &r.path,
+        trash_root,
+        &format!("{name}-{}-{unique}", now()),
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            // A move that did not happen must not read as one in progress.
+            // The whole chain, so the OS error (Permission denied, ...) is
+            // the reason, not only the outermost context.
+            let why = format!("the move to Trash failed: {e:#}");
+            let _ = ledger.replace(&reclaim_record(
+                &id,
+                r,
+                facts,
+                &format!("failed:{why}"),
+                None,
+                "not moved",
+            ));
+            return Err(why);
+        }
+    };
     let dest = moved.path().to_path_buf();
     ledger
         .replace(&reclaim_record(

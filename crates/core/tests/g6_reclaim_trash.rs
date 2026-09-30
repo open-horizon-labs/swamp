@@ -542,7 +542,14 @@ fn claude_scratch_warns_about_running_sessions() {
         target_of(&v, &p)
     };
     t.path = scratch.to_path_buf();
-    let w = swamp_core::reclaim_trash::warnings_for(&t, "", Some(&f.home));
+    let w = swamp_core::reclaim_trash::warnings_for(
+        &t,
+        "",
+        &swamp_core::reclaim_trash::Surroundings {
+            home: Some(&f.home),
+            ..Default::default()
+        },
+    );
     assert!(w.iter().any(|l| l.contains("breaks when it goes")), "{w:?}");
 }
 
@@ -853,4 +860,125 @@ fn the_persons_agent_plan_warns_where_the_agent_plan_refuses() {
         .unwrap()
         .0;
     assert!(dest.exists() && !cfg.exists());
+}
+
+// ---------------------------------------------------------------------
+// Review round: store refusal, contained facts, failed moves.
+// ---------------------------------------------------------------------
+
+/// Tempting wrong patch: only the store itself is refused, so `~/.local`
+/// (which holds it) or the Trash's parent moves and the ledger is recreated
+/// elsewhere, losing the record of the move. The Trash and every ancestor
+/// of it are refused too.
+#[test]
+fn the_trash_folder_and_its_ancestors_are_refused_too() {
+    use swamp_core::reclaim_trash::{Surroundings, review_in};
+    let f = fx();
+    let trash = f.home.join(".local/share/Trash");
+    make_dir(&trash);
+    for p in [
+        trash.clone(),
+        f.home.join(".local/share"),
+        f.home.join(".local"),
+    ] {
+        let v = view(&[unit(StorageCategory::Cache, &p, 5)]);
+        let t = target_of(&v, &p);
+        let err = review_in(
+            &t,
+            &Surroundings {
+                home: Some(&f.home),
+                store: Some(&f.trash.join("elsewhere-store")),
+                trash_root: Some(&trash),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("move it yourself in Finder"),
+            "{}: {err}",
+            p.display()
+        );
+    }
+}
+
+/// Tempting wrong patch: a failed move says only the outermost context.
+/// The OS error is the reason, and the started row is replaced by a failed
+/// row that carries it.
+#[test]
+fn a_failed_move_names_the_os_error_and_the_ledger_row_says_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let parent = f.home.join("p");
+    let p = parent.join("cache");
+    make_dir(&p);
+    let (t, r, w) = reviewed(&f, StorageCategory::Cache, &p);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let res = trash(&r, &facts_of(&t, w), Some(&f.store), &ledger(&f), &f.trash);
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let err = res.unwrap_err();
+    assert!(err.to_lowercase().contains("permission denied"), "{err}");
+    let rows = ledger(&f).all().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].outcome.starts_with("failed:"),
+        "{}",
+        rows[0].outcome
+    );
+    assert!(rows[0].outcome.to_lowercase().contains("permission denied"));
+}
+
+/// Tempting wrong patch: only prefixes of the path are checked, so a
+/// folder ABOVE something dangerous says nothing about it. Each of these
+/// says what it is or holds.
+#[test]
+fn a_folder_says_what_it_contains_not_only_what_it_is() {
+    use swamp_core::reclaim_trash::{Known, Surroundings, warnings_for};
+    let f = fx();
+    let lib = f.home.join("Library");
+    let codex = f.home.join(".codex");
+    let mut t = target_of(&view(&[unit(StorageCategory::Unclassified, &lib, 5)]), &lib);
+    let known = vec![
+        Known {
+            path: codex.join("auth.json"),
+            class: "AI-tool unit kept by default",
+        },
+        Known {
+            path: codex.join("config.toml"),
+            class: "AI-tool unit kept by default",
+        },
+        Known {
+            path: codex.join("sessions"),
+            class: "AI-tool unit",
+        },
+    ];
+    let cwd = f.home.join("src/repo");
+    let around = Surroundings {
+        home: Some(&f.home),
+        cwd: Some(&cwd),
+        known: &known,
+        ..Default::default()
+    };
+    let text = |t: &ReclaimTarget| warnings_for(t, "", &around).join("\n");
+    assert!(text(&t).contains("your whole Library"), "{}", text(&t));
+    t.path = codex.clone();
+    let c = text(&t);
+    assert!(
+        c.contains("contains 2 AI-tool unit kept by defaults"),
+        "{c}"
+    );
+    assert!(c.contains("contains 1 AI-tool unit"), "{c}");
+    t.path = f.home.clone();
+    let h = text(&t);
+    assert!(
+        h.contains("your home folder") && h.contains("contains the folder swamp was started in"),
+        "{h}"
+    );
+    for (path, needle) in [
+        ("/private/tmp", "system temp folder"),
+        ("/opt/homebrew", "Homebrew's own prefix"),
+        ("/Volumes/Data1", "root of a mounted volume"),
+    ] {
+        t.path = PathBuf::from(path);
+        assert!(text(&t).contains(needle), "{path}: {}", text(&t));
+    }
 }

@@ -2167,11 +2167,14 @@ pub fn discover_and_measure_in(
         // review's `protected_descendant_must_prevent_parent_cache_proposal`
         // counterexample -- protecting `debug/log.txt` must stop `debug/`
         // being proposed, or the protection means nothing.
-        let human_protected = protected_paths.conflict(cand.path()).or_else(|| {
-            cand.members()
-                .iter()
-                .find_map(|m| protected_paths.conflict(&m.path))
-        });
+        let human_protected = protected_paths
+            .conflict(cand.path())
+            .map(|c| c.to_string())
+            .or_else(|| {
+                cand.members()
+                    .iter()
+                    .find_map(|m| protected_paths.conflict(&m.path).map(|c| c.to_string()))
+            });
         let (protected, protect_reason) = if let Some(why) = &protection_unknown {
             (true, Some(format!("protection state unknown: {why}")))
         } else if cand.protected() {

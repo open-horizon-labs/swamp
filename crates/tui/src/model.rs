@@ -2598,7 +2598,12 @@ pub fn disk_rows(
             format!("measured {}", age(r.measured_at)),
         ];
         // A measured folder is a real path the person may move to Trash.
-        if std::path::Path::new(&r.path).is_absolute() {
+        // A ledger row for "files directly here" is a figure, not a path.
+        if std::path::Path::new(&r.path).is_absolute()
+            && !r
+                .path
+                .ends_with(swamp_core::volume_ledger::pass::FILES_SUFFIX)
+        {
             c.unit = Some(UnitId::for_artifact(std::path::Path::new(&r.path)));
         }
         rows.push(c);
@@ -2843,7 +2848,12 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
         };
         c.allocated = true;
         c.signals = vec![r.exactness.as_str().replace('_', " ")];
-        if r.bytes.is_some() && std::path::Path::new(&r.path).is_absolute() {
+        if r.bytes.is_some()
+            && std::path::Path::new(&r.path).is_absolute()
+            && !r
+                .path
+                .ends_with(swamp_core::volume_ledger::pass::FILES_SUFFIX)
+        {
             c.unit = Some(UnitId::for_artifact(std::path::Path::new(&r.path)));
         }
         rows.push(c);

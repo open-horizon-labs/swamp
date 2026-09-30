@@ -211,6 +211,8 @@ pub struct Reviewed {
     device: u64,
     inode: u64,
     kind: EntryKind,
+    /// The open-file reading the person was shown (None: nothing held it).
+    occupancy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +232,7 @@ impl EntryKind {
     }
 }
 
-fn identify(path: &Path) -> Result<(EntryKind, u64, u64), String> {
+fn identify(path: &Path) -> Result<(EntryKind, u64, u64, u64), String> {
     let meta = crate::fs_gate::symlink_metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!("{} is gone", path.display()),
         _ => format!("{} cannot be read: {e}", path.display()),
@@ -248,7 +250,7 @@ fn identify(path: &Path) -> Result<(EntryKind, u64, u64), String> {
             path.display()
         ));
     };
-    Ok((kind, meta.dev(), meta.ino()))
+    Ok((kind, meta.dev(), meta.ino(), meta.nlink()))
 }
 
 fn canonical_of(path: &Path) -> Result<PathBuf, String> {
@@ -292,9 +294,9 @@ fn read_protect(path: &Path, store: Option<&Path>) -> ProtectReading {
     };
     match crate::protection::load_protect(store) {
         Ok(list) => match list.conflict(path) {
-            Some(why) => ProtectReading::Kept(format!(
-                "protected by you ({why}); `swamp protect remove {}` takes the mark off",
-                path.display()
+            Some(c) => ProtectReading::Kept(format!(
+                "protected by you ({c}); `swamp protect remove {}` takes the mark off",
+                c.entry.display()
             )),
             None => ProtectReading::Clear,
         },
@@ -334,7 +336,8 @@ fn occupancy_line_of(ev: &crate::evidence::Evidence) -> Option<String> {
 
 /// Everything the marked row adds to the confirm, plain facts in the
 /// order a person deciding needs them. No line is a verdict.
-pub fn warnings_for(t: &ReclaimTarget, kind_note: &str, home: Option<&Path>) -> Vec<String> {
+pub fn warnings_for(t: &ReclaimTarget, kind_note: &str, around: &Surroundings<'_>) -> Vec<String> {
+    let home = around.home;
     let mut w: Vec<String> = Vec::new();
     match t.bytes {
         None => w.push(
@@ -355,6 +358,8 @@ pub fn warnings_for(t: &ReclaimTarget, kind_note: &str, home: Option<&Path>) -> 
                     w.push(format!(
                         "project worktrees are inside it and go to Trash too: {part}"
                     ));
+                } else if part.starts_with("bytes are a lower bound") {
+                    w.push(part.to_string());
                 } else {
                     w.push(format!("bytes are a lower bound ({part})"));
                 }
@@ -364,14 +369,25 @@ pub fn warnings_for(t: &ReclaimTarget, kind_note: &str, home: Option<&Path>) -> 
     if !kind_note.is_empty() {
         w.push(kind_note.to_string());
     }
+    // The words often already open with the fact ("cannot be regenerated
+    // (...)"): say it once.
+    let said = |lead: &str, words: &str, source: &str| {
+        if words.starts_with(lead) {
+            format!("{words} (from {source})")
+        } else {
+            format!("{lead}: {words} (from {source})")
+        }
+    };
     match t.regeneration_class {
-        RegenClass::NotRegenerable => w.push(format!(
-            "cannot be regenerated: {} (cost from {})",
-            t.regeneration_words, t.regeneration_source
+        RegenClass::NotRegenerable => w.push(said(
+            "cannot be regenerated",
+            &t.regeneration_words,
+            &t.regeneration_source,
         )),
-        RegenClass::NotEstablished => w.push(format!(
-            "regeneration cost not established: {} (from {})",
-            t.regeneration_words, t.regeneration_source
+        RegenClass::NotEstablished => w.push(said(
+            "regeneration cost not established",
+            &t.regeneration_words,
+            &t.regeneration_source,
         )),
         RegenClass::Download | RegenClass::Rebuild => w.push(format!(
             "getting it back: {} (from {})",
@@ -408,12 +424,139 @@ pub fn warnings_for(t: &ReclaimTarget, kind_note: &str, home: Option<&Path>) -> 
                     .to_string(),
             );
         }
-        if !path.starts_with(home) {
+        if path == home {
+            w.push(format!(
+                "this is your home folder ({}): everything you keep there goes with it",
+                home.display()
+            ));
+        } else if home.starts_with(path) {
+            w.push(format!(
+                "this folder contains your whole home folder ({})",
+                home.display()
+            ));
+        } else if !path.starts_with(home) {
             w.push(format!(
                 "outside your home folder ({}): the system may refuse the move",
                 home.display()
             ));
         }
+    }
+    w.extend(inside_facts(path, around));
+    w
+}
+
+/// Where the review happens: the person's home, swamp's own store and the
+/// Trash the move would go to. Facts about a path are stated against these.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Surroundings<'a> {
+    pub home: Option<&'a Path>,
+    pub store: Option<&'a Path>,
+    pub trash_root: Option<&'a Path>,
+    /// The folder swamp was started in.
+    pub cwd: Option<&'a Path>,
+    /// Units and facts swamp already knows of by path: what a folder that
+    /// contains them takes along.
+    pub known: &'a [Known],
+}
+
+/// A path swamp knows something about, by class (`class` is plain words
+/// for a line on the confirm: "Reclaim unit", "AI-tool unit kept by
+/// default").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Known {
+    pub path: PathBuf,
+    pub class: &'static str,
+}
+
+/// Escapes control and invisible format characters (newline, bidi
+/// overrides, zero-width marks) so a folder name cannot write its own
+/// line into a plan or reorder what is read. Printable text is unchanged.
+pub fn plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let hidden = c.is_control()
+            || matches!(c as u32,
+                0x00AD | 0x061C | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+                | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB);
+        if hidden {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Facts about what the path CONTAINS (a folder above a known unit takes
+/// it along), about what it is (the system temp folder, a whole Library, a
+/// Homebrew prefix, a volume root) and about where swamp is running.
+/// Bounded: each class is one line with a count and at most three names.
+fn inside_facts(path: &Path, around: &Surroundings<'_>) -> Vec<String> {
+    let mut w: Vec<String> = Vec::new();
+    let shown = path.to_string_lossy();
+    if path == Path::new("/private/tmp")
+        || path == Path::new("/tmp")
+        || path == Path::new("/private")
+    {
+        w.push(
+            "this is the system temp folder (or holds it): every running program's temp files are in it, including Claude session scratch that a running session needs"
+                .to_string(),
+        );
+    }
+    if let Some(home) = around.home
+        && path == home.join("Library")
+    {
+        w.push(
+            "this is your whole Library: app data, preferences, Keychains, Mail, containers and every app's cache"
+                .to_string(),
+        );
+    }
+    if path == Path::new("/opt/homebrew") || shown.ends_with("/.linuxbrew") {
+        w.push(
+            "this is Homebrew's own prefix: brew itself and every tool it installed go with it"
+                .to_string(),
+        );
+    }
+    if shown.starts_with("/Volumes/") && path.components().count() == 3 {
+        w.push("this is the root of a mounted volume: everything on that volume".to_string());
+    }
+    if let Some(cwd) = around.cwd
+        && cwd.starts_with(path)
+    {
+        w.push(format!(
+            "this contains the folder swamp was started in ({})",
+            cwd.display()
+        ));
+    }
+    let mut classes: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for k in around.known {
+        if k.path != path && k.path.starts_with(path) {
+            let name = k
+                .path
+                .strip_prefix(path)
+                .unwrap_or(&k.path)
+                .display()
+                .to_string();
+            match classes.iter_mut().find(|(c, _)| *c == k.class) {
+                Some((_, names)) => names.push(name),
+                None => classes.push((k.class, vec![name])),
+            }
+        }
+    }
+    for (class, names) in classes {
+        let few: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
+        let more = names.len().saturating_sub(3);
+        w.push(format!(
+            "this contains {} {class}{}: {}{}",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            few.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ));
     }
     w
 }
@@ -445,8 +588,97 @@ pub fn review(
     store: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<Review, String> {
+    review_in(
+        t,
+        &Surroundings {
+            home,
+            store,
+            ..Default::default()
+        },
+    )
+}
+
+/// Whether the Trash is on another volume than the entry. Moves are one
+/// rename (`fs_gate::destroy`), never a copy, so such a move is refused by
+/// the backend; the confirm says so before Enter.
+pub fn trash_volume_line(entry_device: u64, trash_device: Option<u64>) -> Option<String> {
+    match trash_device {
+        Some(d) if d != entry_device => Some(
+            "the Trash is on another volume than this folder: swamp moves by rename and never copies, so the move will be refused; free space does not help"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// The device of the Trash root, or of the nearest folder above it that
+/// exists (the Trash is created on the first move).
+fn trash_device(root: &Path) -> Option<u64> {
+    let mut at = Some(root);
+    while let Some(p) = at {
+        if let Ok(m) = crate::fs_gate::symlink_metadata(p) {
+            return Some(m.dev());
+        }
+        at = p.parent();
+    }
+    None
+}
+
+/// Folders directly inside `path` (and one level further, bounded) that
+/// sit on another device: mounted volumes. Pure decision in
+/// [`different_device`].
+fn submounts(path: &Path, device: u64) -> Vec<PathBuf> {
+    let mut seen: Vec<(PathBuf, u64)> = Vec::new();
+    // The capped shallow listing (the one listing outside the walker).
+    for e in crate::locations::shallow_list(path)
+        .entries
+        .iter()
+        .filter(|e| e.is_dir)
+    {
+        let p = path.join(&e.name);
+        if let Ok(m) = crate::fs_gate::symlink_metadata(&p) {
+            seen.push((p, m.dev()));
+        }
+    }
+    different_device(device, &seen)
+}
+
+/// Which of the listed entries are on another device than `device`.
+fn different_device(device: u64, entries: &[(PathBuf, u64)]) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter(|(_, d)| *d != device)
+        .map(|(p, _)| p.clone())
+        .collect()
+}
+
+/// A `.git` at the path or one folder below it (bounded listing).
+fn git_checkout_line(path: &Path) -> Option<String> {
+    let has_git = |p: &Path| crate::fs_gate::symlink_metadata(p.join(".git")).is_ok();
+    let found = if has_git(path) {
+        Some(path.to_path_buf())
+    } else {
+        crate::locations::shallow_list(path)
+            .entries
+            .iter()
+            .filter(|e| e.is_dir)
+            .map(|e| path.join(&e.name))
+            .find(|p| has_git(p))
+    };
+    found.map(|p| {
+        format!(
+            "git checkout at {}: commits not pushed anywhere, and uncommitted work, are lost unless saved elsewhere; check `git status` first",
+            p.display()
+        )
+    })
+}
+
+/// [`review`] with the Trash root known, so the confirm can say when the
+/// Trash is on another volume.
+pub fn review_in(t: &ReclaimTarget, around: &Surroundings<'_>) -> Result<Review, String> {
+    let store = around.store;
     let canonical = canonical_of(&t.path)?;
-    let (kind, device, inode) = identify(&t.path)?;
+    let (kind, device, inode, nlink) = identify(&t.path)?;
     let mut unread = None;
     for p in [&t.path, &canonical] {
         match read_protect(p, store) {
@@ -455,7 +687,64 @@ pub fn review(
             ProtectReading::Clear => {}
         }
     }
-    let mut warnings = warnings_for(t, installation_note(&t.category), home);
+    // The one refusal about swamp itself: a move that takes away the
+    // ledger that records it (or the Trash it moves into) cannot be
+    // recorded, and the ledger would be silently recreated elsewhere.
+    let own = |p: &Path| {
+        // A store that does not exist holds no ledger to lose.
+        if crate::fs_gate::symlink_metadata(p).is_err() {
+            return false;
+        }
+        let c = crate::scope::comparable(p);
+        let me = crate::scope::comparable(&t.path);
+        c == me || c.starts_with(&me)
+    };
+    let resolved_store = crate::fs_gate::StoreDir::resolved();
+    if store.is_some_and(own) || own(resolved_store.path()) {
+        return Err("this holds swamp's own ledger, which records this move; move it yourself in Finder if you want it gone".to_string());
+    }
+    if around.trash_root.is_some_and(own) {
+        return Err("this holds the Trash this move goes into, and swamp's ledger records it; move it yourself in Finder if you want it gone".to_string());
+    }
+    let brew = t.path == Path::new("/opt/homebrew");
+    let note = if brew {
+        ""
+    } else {
+        installation_note(&t.category)
+    };
+    let mut warnings = warnings_for(t, note, around);
+    if kind == EntryKind::Directory {
+        let mounted = submounts(&t.path, device);
+        if !mounted.is_empty() {
+            let names: Vec<String> = mounted
+                .iter()
+                .take(3)
+                .filter_map(|p| p.file_name().map(|n| plain(&n.to_string_lossy())))
+                .collect();
+            warnings.push(format!(
+                "contains {} mounted volume{} ({}{}): their bytes live on the disk images, not in this folder, so moving it frees about nothing, and whatever uses them breaks; unmount them first",
+                mounted.len(),
+                if mounted.len() == 1 { "" } else { "s" },
+                names.join(", "),
+                if mounted.len() > 3 { ", ..." } else { "" }
+            ));
+        }
+    }
+    if kind == EntryKind::File && nlink > 1 {
+        warnings.push(format!(
+            "this file has {nlink} hard links: its bytes stay on disk while another link exists"
+        ));
+    }
+    if kind == EntryKind::Directory
+        && let Some(line) = git_checkout_line(&t.path)
+    {
+        warnings.push(line);
+    }
+    if let Some(root) = around.trash_root
+        && let Some(line) = trash_volume_line(device, trash_device(root))
+    {
+        warnings.push(line);
+    }
     if let Some(why) = unread {
         warnings.insert(
             0,
@@ -470,10 +759,13 @@ pub fn review(
             "this is a symlink: only the link goes to Trash, never what it points to".to_string(),
         );
     }
-    if kind != EntryKind::Symlink
-        && let Some(line) = occupancy_line(&t.path)
-    {
-        warnings.insert(0, line);
+    let occupancy = if kind != EntryKind::Symlink {
+        occupancy_line(&t.path)
+    } else {
+        None
+    };
+    if let Some(line) = &occupancy {
+        warnings.insert(0, line.clone());
     }
     Ok(Review {
         reviewed: Reviewed {
@@ -482,9 +774,22 @@ pub fn review(
             device,
             inode,
             kind,
+            occupancy,
         },
         warnings,
     })
+}
+
+/// What the open-file reading says that can make a confirm wrong: held
+/// (and on what), or not held. An unanswered reading (the snapshot timed
+/// out under load) against a free one is not a change: only a folder that
+/// became held, or stopped being held, refuses, so a busy machine does not
+/// turn every Enter into "review again".
+fn occupancy_key(line: Option<&str>) -> String {
+    match line {
+        Some(l) if l.starts_with("in use right now") => format!("held:{l}"),
+        _ => "not held".to_string(),
+    }
 }
 
 /// The recheck at the move: the same entry is at the same place, and the
@@ -492,7 +797,7 @@ pub fn review(
 /// review` and nothing moves.
 pub fn recheck(r: &Reviewed, store: Option<&Path>) -> Result<(), String> {
     let changed = |what: String| format!("changed since review: {what}; nothing moved");
-    let (kind, device, inode) = identify(&r.path).map_err(changed)?;
+    let (kind, device, inode, _) = identify(&r.path).map_err(changed)?;
     if kind != r.kind {
         return Err(changed(format!(
             "{} was {} and is now {}",
@@ -516,6 +821,20 @@ pub fn recheck(r: &Reviewed, store: Option<&Path>) -> Result<(), String> {
             r.canonical.display()
         )));
     }
+    // The warnings the person read are facts: a process that opened the
+    // folder since, or let go of it, is a different confirm (the rule
+    // tool-managed removal keeps at `Y`). A correctness check on what was
+    // shown, not a veto on the category or on use.
+    if kind != EntryKind::Symlink {
+        let now = occupancy_line(&r.path);
+        if occupancy_key(now.as_deref()) != occupancy_key(r.occupancy.as_deref()) {
+            return Err(changed(format!(
+                "what holds it open changed (was: {}; now: {}); review again",
+                r.occupancy.as_deref().unwrap_or("nothing held it"),
+                now.as_deref().unwrap_or("nothing holds it")
+            )));
+        }
+    }
     // A list that could not be read at review was said so on the confirm;
     // a mark that covers the entry now is the person's own decision.
     for p in [&r.path, &canonical] {
@@ -535,6 +854,42 @@ mod tests {
         EvidenceSource::ProcessQuery {
             tool: "lsof".into(),
         }
+    }
+
+    /// Tempting wrong patch: the volume check is left to the move, so the
+    /// confirm never says the Trash is elsewhere (and a refusal arrives
+    /// after Enter). Another device says so; the same device or a Trash
+    /// not yet made says nothing.
+    #[test]
+    fn mounted_volumes_are_the_entries_on_another_device() {
+        let e = vec![
+            (PathBuf::from("/v/a"), 7),
+            (PathBuf::from("/v/img1"), 9),
+            (PathBuf::from("/v/img2"), 10),
+        ];
+        assert_eq!(
+            different_device(7, &e),
+            vec![PathBuf::from("/v/img1"), PathBuf::from("/v/img2")]
+        );
+        assert!(different_device(7, &e[..1]).is_empty());
+    }
+
+    #[test]
+    fn a_trash_on_another_volume_is_said_before_enter() {
+        assert!(
+            trash_volume_line(1, Some(2))
+                .unwrap()
+                .contains("another volume")
+        );
+        assert_eq!(trash_volume_line(1, Some(1)), None);
+        assert_eq!(trash_volume_line(1, None), None);
+    }
+
+    /// Tempting wrong patch: control characters are printed as they are.
+    #[test]
+    fn plain_escapes_controls_and_bidi_and_keeps_text() {
+        assert_eq!(plain("a\nb\u{202e}c"), "a\\u{a}b\\u{202e}c");
+        assert_eq!(plain("Caches/héllo"), "Caches/héllo");
     }
 
     /// Tempting wrong patch: an open-file reading that could not be taken

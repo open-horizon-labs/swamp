@@ -1917,7 +1917,9 @@ fn a_checkout_is_named_as_a_checkout() {
 }
 
 /// On a short screen the confirm drops whole tail lines and says so; it
-/// never cuts a warning mid-sentence, and the numbers stay.
+/// never cuts a warning mid-sentence, and the numbers stay. A plan that
+/// folds a warning offers no Enter (audit G6 item 12): the footer says the
+/// plan does not fit.
 #[test]
 fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
     let mut app = App::new(fixture_report(), "/Users/dev/src".into());
@@ -1932,7 +1934,9 @@ fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
     let f = capture(&app, 40, 14);
     assert!(f.contains("Move 4 items (4.0GB) → Trash"), "{f}");
     assert!(f.contains("more lines"), "{f}");
-    assert!(f.contains("Enter confirm · Esc back"), "{f}");
+    assert!(!app.confirm_fits(40, 14));
+    assert!(!f.contains("Enter confirm · Esc back"), "{f}");
+    assert!(f.contains("Plan does not fit"), "{f}");
 }
 
 // ---- steady layout: nothing moves, nothing goes quiet ----------------

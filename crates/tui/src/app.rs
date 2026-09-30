@@ -649,7 +649,7 @@ pub struct BlockedItem {
 pub fn blocked_next_step(reason: &str) -> &'static str {
     let r = reason.to_lowercase();
     if r.contains("protected by you") {
-        "take the mark off with `swamp protect remove <path>`, then check again"
+        "run the `swamp protect remove ...` command named in the reason (it names the entry that covers this path), then check again"
     } else if r.contains("nothing reclaimable") {
         "open the project with Enter and mark what you want inside it"
     } else if r.contains("category total") {
@@ -2189,11 +2189,11 @@ impl App {
             let candidate = PathBuf::from(&unit_id.0);
             match swamp_core::agents::load_protect(&store) {
                 Ok(protected) => {
-                    if let Some(reason) = protected.conflict(&candidate) {
+                    if let Some(c) = protected.conflict(&candidate) {
                         self.refuse(&format!(
-                            "protected by you ({reason}); `swamp protect remove {}` takes the \
+                            "protected by you ({c}); `swamp protect remove {}` takes the \
                              mark off",
-                            candidate.display()
+                            c.entry.display()
                         ));
                         return;
                     }
@@ -2492,10 +2492,39 @@ impl App {
             return;
         }
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let review = match swamp_core::reclaim_trash::review(
+        let trash = actions::trash_root();
+        // What swamp already knows by path: a folder above it takes it along.
+        let view = self.reclaim_view();
+        let mut known: Vec<swamp_core::reclaim_trash::Known> = view
+            .rows
+            .iter()
+            .map(|r| swamp_core::reclaim_trash::Known {
+                path: PathBuf::from(&r.path),
+                class: "Reclaim unit",
+            })
+            .collect();
+        known.extend(
+            self.agent_units
+                .iter()
+                .map(|u| swamp_core::reclaim_trash::Known {
+                    path: u.path.clone(),
+                    class: if u.protected {
+                        "AI-tool unit kept by default (credentials, settings)"
+                    } else {
+                        "AI-tool unit"
+                    },
+                }),
+        );
+        let cwd = std::env::current_dir().ok();
+        let review = match swamp_core::reclaim_trash::review_in(
             &target,
-            self.store_dir.as_deref(),
-            home.as_deref(),
+            &swamp_core::reclaim_trash::Surroundings {
+                home: home.as_deref(),
+                store: self.store_dir.as_deref(),
+                trash_root: Some(&trash),
+                cwd: cwd.as_deref(),
+                known: &known,
+            },
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3094,6 +3123,12 @@ impl App {
         if self.marked.values().any(|u| u.reclaim.is_some()) {
             return roomy && crate::ui::reclaim_plan_fits(self, width, height);
         }
+        // Any plan that carries warnings must show every one of them: the
+        // sheet has no scroll, so Enter is offered only when they fit.
+        let warned = self.marked.values().any(|u| !u.warnings.is_empty());
+        if warned && height != 0 && !crate::ui::reclaim_plan_fits(self, width, height) {
+            return false;
+        }
         !permanent || roomy
     }
 
@@ -3154,21 +3189,25 @@ impl App {
         self.blocked_open = false;
         crate::worker::spawn(move || {
             let ledger = swamp_core::ledger::Ledger::resolved(&store);
-            let results = actions::execute_plan_progress(
-                &units,
-                &ledger,
-                &trash,
-                keep,
-                |completed, path, outcome| {
-                    let _ = tx.send(OperationEvent::Progress {
-                        completed,
-                        total,
-                        path: path.to_path_buf(),
-                        outcome,
-                    });
-                    !cancel.load(std::sync::atomic::Ordering::SeqCst)
-                },
-            );
+            // One open-file snapshot, taken now (after the confirm), serves
+            // every Reclaim recheck in this run.
+            let results = swamp_core::occupancy::OccupancySnapshot::scoped(|| {
+                actions::execute_plan_progress(
+                    &units,
+                    &ledger,
+                    &trash,
+                    keep,
+                    |completed, path, outcome| {
+                        let _ = tx.send(OperationEvent::Progress {
+                            completed,
+                            total,
+                            path: path.to_path_buf(),
+                            outcome,
+                        });
+                        !cancel.load(std::sync::atomic::Ordering::SeqCst)
+                    },
+                )
+            });
             let _ = tx.send(OperationEvent::Deleted { results, total });
         });
     }

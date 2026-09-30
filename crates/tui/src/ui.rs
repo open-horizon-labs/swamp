@@ -866,27 +866,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
             "↑↓ scroll · r check again · Esc close".to_string()
         }
     } else if app.confirm_open && !app.confirm_fits(size.width, size.height) {
-        let need = format!(
-            "{}x{}",
-            crate::app::CONFIRM_MIN_COLS,
-            crate::app::CONFIRM_MIN_ROWS
-        );
-        let long = format!("Terminal too small to confirm: enlarge to at least {need} · Esc back");
+        // The limit is whether the whole plan (every path and warning)
+        // fits the sheet, not a fixed size.
+        let long =
+            "The whole plan does not fit: enlarge the terminal or mark fewer rows · Esc back"
+                .to_string();
         if crate::model::display_width(&long) <= size.width as usize {
             long
         } else {
-            format!("Too small: need {need}")
+            "Plan does not fit · Esc back".to_string()
         }
     } else if app.confirm_open {
         let mut clauses = vec!["Enter confirm".to_string(), "Esc back".to_string()];
         if !app.blocked.is_empty() {
             clauses.push("d blocked".to_string());
         }
-        clauses.push(if app.keep_executables {
-            "keep executables → bin/ (k)".to_string()
-        } else {
-            "k keep executables".to_string()
-        });
+        // `k` copies executables out of a build folder before a move: it
+        // does nothing for a plan of Reclaim/External folders alone.
+        if !app.marked.values().all(|u| u.reclaim.is_some()) {
+            clauses.push(if app.keep_executables {
+                "keep executables → bin/ (k)".to_string()
+            } else {
+                "k keep executables".to_string()
+            });
+        }
         fit_clauses(&clauses, size.width as usize)
     } else if app.picker.is_some() {
         fit_clauses(

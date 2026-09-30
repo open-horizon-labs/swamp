@@ -161,7 +161,15 @@ fn adv_the_protect_remove_named_in_the_refusal_takes_a_descendant_mark_off() {
 #[test]
 fn adv_the_home_folder_itself_is_named_on_the_confirm() {
     let f = fx();
-    let r = review(&target(&f.home), Some(&f.store), Some(&f.home)).unwrap();
+    // The store sits inside the fixture home, and a folder holding swamp's
+    // ledger is refused (review M3), so the facts are read with a store
+    // elsewhere: this test is about what the confirm says of the home folder.
+    let r = review(
+        &target(&f.home),
+        Some(&f.root.join("store-elsewhere")),
+        Some(&f.home),
+    )
+    .unwrap();
     assert!(
         r.warnings.iter().any(|w| w.contains("home folder")),
         "a mark on the home folder itself says nothing about it: {:#?}",
@@ -193,19 +201,21 @@ fn adv_a_folder_that_contains_home_is_not_called_outside_it() {
 
 /// Tempting wrong patch: the store is just another path. Marking swamp's
 /// own store (or a folder holding it) moves the ledger the move is
-/// recorded in; the plan must say so.
+/// recorded in. Maintainer ruling 2026-09-30 (review M3): this one is a
+/// REFUSAL, an internal-correctness invariant, with the plain reason.
 #[test]
-fn adv_swamps_own_store_is_named_on_the_confirm() {
+fn adv_swamps_own_store_and_its_ancestors_are_refused_with_the_reason() {
     let f = fx();
-    for p in [f.store.clone(), f.home.join(".local/share")] {
-        let r = review(&target(&p), Some(&f.store), Some(&f.home)).unwrap();
+    for p in [
+        f.store.clone(),
+        f.home.join(".local/share"),
+        f.home.join(".local"),
+    ] {
+        let err = review(&target(&p), Some(&f.store), Some(&f.home)).unwrap_err();
         assert!(
-            r.warnings
-                .iter()
-                .any(|w| w.contains("swamp") && (w.contains("store") || w.contains("ledger"))),
-            "{}: marking swamp's own store says nothing about it: {:#?}",
-            p.display(),
-            r.warnings
+            err.contains("swamp's own ledger") && err.contains("move it yourself in Finder"),
+            "{}: {err}",
+            p.display()
         );
     }
 }

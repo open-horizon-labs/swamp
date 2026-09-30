@@ -526,10 +526,7 @@ fn a_plan_that_does_not_fit_the_terminal_offers_no_enter() {
     handle_key(&mut a, KeyCode::Enter);
     assert!(a.operation.is_none() && p.exists());
     let small = frame(&a, 40, 12);
-    assert!(
-        small.contains("too small") || small.contains("Too small"),
-        "{small}"
-    );
+    assert!(small.contains("lan does not fit"), "{small}");
     // A roomy terminal shows the whole plan: the path and every warning.
     a.width = 120;
     a.height = 50;
@@ -864,4 +861,40 @@ fn a_tool_managed_row_marks_for_trash_and_keeps_its_own_command_on_backspace() {
     a.marked.clear();
     handle_key(&mut a, KeyCode::Backspace);
     assert!(a.tool_sheet.is_some() || a.operation.is_some());
+}
+
+/// Tempting wrong patch: the footer blames a fixed terminal size ("enlarge
+/// to at least 40x9") when the real limit is whether the whole plan fits.
+/// At a size above 40x9 the footer says the plan does not fit, and `k keep
+/// executables` is not offered for a plan of Reclaim folders alone.
+#[test]
+fn the_does_not_fit_footer_is_true_and_k_is_not_offered_for_reclaim_plans() {
+    let f = fx();
+    let mut units = Vec::new();
+    for i in 0..6 {
+        let p = f.root.join(format!("u{i}"));
+        dir(&p);
+        units.push(unit(StorageCategory::LocalState, &p, 5, vec![]));
+    }
+    let mut a = app_with(&f, units, ViewKind::Reclaim);
+    handle_key(&mut a, KeyCode::Char('A'));
+    wait(&mut a);
+    assert!(a.confirm_open);
+    a.width = 60;
+    a.height = 14;
+    assert!(!a.confirm_fits(60, 14));
+    let small = frame(&a, 60, 14);
+    let last = small.lines().last().unwrap();
+    assert!(
+        last.contains("plan does not fit") || last.contains("Plan does not fit"),
+        "{last}"
+    );
+    assert!(!small.contains("40x9"), "{small}");
+    a.width = 200;
+    a.height = 80;
+    let big = frame(&a, 200, 80);
+    assert!(
+        !big.lines().last().unwrap().contains("keep executables"),
+        "{big}"
+    );
 }
