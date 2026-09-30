@@ -81,7 +81,7 @@ impl LastUsedSource {
         match self {
             Self::ToolNative(name) => Some(match name.as_str() {
                 XCODE_DERIVED_DATA => "Xcode DerivedData record".to_string(),
-                CARGO_GLOBAL_CACHE => "cargo global cache record".to_string(),
+                CARGO_GLOBAL_CACHE => "last used by cargo, from its global cache".to_string(),
                 other => format!("{other} record"),
             }),
             Self::FileAtime => Some("file access time".to_string()),
@@ -114,41 +114,152 @@ pub struct LastUsed {
     /// shown. Present in JSON so the two can be compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub atime: Option<u64>,
+    /// Why there is no value when something was consulted and set aside:
+    /// a date in the future, or a probe that hit its listing limit.
+    /// `None` for a plain absence of signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_none: Option<NoRecordWhy>,
+}
+
+/// Why a consulted source produced no value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoRecordWhy {
+    /// The record was dated after now (a tracker written in milliseconds,
+    /// a copied plist from a machine with a wrong clock): not a fact.
+    FutureDate,
+    /// The scan of the unit's `bin` directories hit its listing limit, so
+    /// the newest access time seen would be that of a sample.
+    ProbeLimit,
+}
+
+impl NoRecordWhy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FutureDate => "future_date",
+            Self::ProbeLimit => "probe_limit",
+        }
+    }
+    fn from_label(s: &str) -> Option<Self> {
+        Some(match s {
+            "future_date" => Self::FutureDate,
+            "probe_limit" => Self::ProbeLimit,
+            _ => return None,
+        })
+    }
+    fn describe(self) -> &'static str {
+        match self {
+            Self::FutureDate => "ignored: date in the future",
+            Self::ProbeLimit => "probe limit reached",
+        }
+    }
+}
+
+/// A record dated after now (plus a day of clock slack) is not a fact. A
+/// value that only makes sense as milliseconds (a Cargo tracker written
+/// with them) is converted; anything else in the future is refused.
+fn plausible(ts: u64, now: u64) -> Result<u64, NoRecordWhy> {
+    const SLACK: u64 = 86_400;
+    // 2001-09-09 in seconds is 1e9; below the year 2000 in ms is not ms.
+    const MS_FLOOR: u64 = 946_684_800;
+    if ts <= now.saturating_add(SLACK) {
+        Ok(ts)
+    } else if ts / 1000 >= MS_FLOOR && ts / 1000 <= now.saturating_add(SLACK) {
+        Ok(ts / 1000)
+    } else {
+        Err(NoRecordWhy::FutureDate)
+    }
 }
 
 /// The precedence rule, in one place. A zero timestamp is "not
-/// recorded", never the epoch.
+/// recorded", never the epoch; a date in the future is set aside
+/// ([`NoRecordWhy::FutureDate`]), never stated as a fact.
 pub fn resolve(tool_native: Option<(&str, u64)>, atime: Option<u64>) -> LastUsed {
-    let atime = atime.filter(|t| *t > 0);
-    match tool_native.filter(|(_, t)| *t > 0) {
+    resolve_at(tool_native, atime, crate::entities::now())
+}
+
+pub(crate) fn resolve_at(
+    tool_native: Option<(&str, u64)>,
+    atime: Option<u64>,
+    now: u64,
+) -> LastUsed {
+    let mut why = None;
+    let atime = atime.filter(|t| *t > 0).and_then(|t| match plausible(t, now) {
+        Ok(t) => Some(t),
+        Err(w) => {
+            why = Some(w);
+            None
+        }
+    });
+    let native = tool_native
+        .filter(|(_, t)| *t > 0)
+        .and_then(|(name, t)| match plausible(t, now) {
+            Ok(t) => Some((name, t)),
+            Err(w) => {
+                why = Some(w);
+                None
+            }
+        });
+    match native {
         Some((name, at)) => LastUsed {
             at: Some(at),
             source: LastUsedSource::ToolNative(name.to_string()),
             atime,
+            why_none: None,
         },
         None => match atime {
             Some(at) => LastUsed {
                 at: Some(at),
                 source: LastUsedSource::FileAtime,
                 atime,
+                why_none: None,
             },
-            None => LastUsed::default(),
+            None => LastUsed {
+                why_none: why,
+                ..LastUsed::default()
+            },
         },
     }
 }
 
 impl LastUsed {
     /// Rebuilds a stored fact from its columns; an unknown source label
-    /// or a missing value is `no record`.
+    /// or a missing value is `no record`. A `none:<why>` label keeps the
+    /// reason a consulted source was set aside.
     pub fn from_columns(at: Option<u64>, source: Option<&str>, atime: Option<u64>) -> LastUsed {
-        let source = source.map(LastUsedSource::from_label).unwrap_or_default();
+        let label = source.unwrap_or("none");
+        let why_none = label.strip_prefix("none:").and_then(NoRecordWhy::from_label);
+        let source = LastUsedSource::from_label(label);
         match (&source, at) {
             (LastUsedSource::None, _) | (_, None) => LastUsed {
                 at: None,
                 source: LastUsedSource::None,
                 atime,
+                why_none,
             },
-            _ => LastUsed { at, source, atime },
+            _ => LastUsed {
+                at,
+                source,
+                atime,
+                why_none: None,
+            },
+        }
+    }
+
+    /// The stored spelling of the source: [`LastUsedSource::label`], or
+    /// `none:<why>` when a consulted source was set aside.
+    pub fn source_column(&self) -> String {
+        match (&self.source, self.why_none) {
+            (LastUsedSource::None, Some(why)) => format!("none:{}", why.label()),
+            (source, _) => source.label(),
+        }
+    }
+
+    /// A probe that hit its listing limit, as a fact about this unit.
+    pub(crate) fn probe_limit_reached() -> LastUsed {
+        LastUsed {
+            why_none: Some(NoRecordWhy::ProbeLimit),
+            ..LastUsed::default()
         }
     }
 
@@ -156,7 +267,11 @@ impl LastUsed {
     /// precedence rule (the key files' access time it already carries
     /// stays available).
     pub fn with_tool_native(&self, name: &str, at: u64) -> LastUsed {
-        resolve(Some((name, at)), self.atime)
+        let mut merged = resolve(Some((name, at)), self.atime);
+        if merged.at.is_none() {
+            merged.why_none = merged.why_none.or(self.why_none);
+        }
+        merged
     }
 
     /// The row text, as a fact with its source:
@@ -165,7 +280,10 @@ impl LastUsed {
     pub fn describe(&self, now: u64) -> String {
         match (self.at, self.source.describe()) {
             (Some(at), Some(source)) => format!("{LABEL}: {} ({source})", format_day(at, now)),
-            _ => format!("{LABEL}: no record"),
+            _ => match self.why_none {
+                Some(why) => format!("{LABEL}: no record ({})", why.describe()),
+                None => format!("{LABEL}: no record"),
+            },
         }
     }
 }
@@ -366,20 +484,22 @@ pub(crate) struct UnitLastUse {
 /// Sources that live outside the folded walk (Xcode's plist) contribute
 /// nothing here; `consumer_wiring` folds them in where its plist reads
 /// already happen.
-pub(crate) fn probe(path: &Path, sources: &[LastUseSource]) -> UnitLastUse {
+pub(crate) fn probe(path: &Path, sources: &[LastUseSource], now: u64) -> UnitLastUse {
     let mut tool_native: Option<(&'static str, u64)> = None;
     let mut atime: Option<u64> = None;
     let mut children: BTreeMap<String, LastUsed> = BTreeMap::new();
+    let mut limit_reached = false;
     for source in sources {
         match *source {
             LastUseSource::KeyFileAtime { max_depth } => {
                 let scan = scan_key_file_atimes(path, max_depth);
                 if scan.truncated {
+                    limit_reached = true;
                     continue;
                 }
                 atime = atime.max(scan.newest);
                 for (name, at) in scan.by_child {
-                    children.insert(name, resolve(None, Some(at)));
+                    children.insert(name, resolve_at(None, Some(at), now));
                 }
             }
             LastUseSource::CargoGlobalCache { table, up } => {
@@ -390,11 +510,17 @@ pub(crate) fn probe(path: &Path, sources: &[LastUseSource]) -> UnitLastUse {
                     tool_native = Some((CARGO_GLOBAL_CACHE, at));
                 }
             }
+            // Read where its plist reads already happen
+            // (`consumer_wiring::attach_build_output_associations`), not here.
             LastUseSource::XcodeDerivedDataPlist => {}
         }
     }
+    let mut last_used = resolve_at(tool_native, atime, now);
+    if last_used.at.is_none() && limit_reached {
+        last_used = LastUsed::probe_limit_reached();
+    }
     UnitLastUse {
-        last_used: resolve(tool_native, atime),
+        last_used,
         children,
     }
 }
@@ -601,6 +727,7 @@ mod tests {
                     up: 2,
                 },
             ],
+            crate::entities::now(),
         );
         assert_eq!(found.last_used.at, Some(sep6));
         assert_eq!(
@@ -649,7 +776,11 @@ mod tests {
         // And none of that is a date: the unit falls to no record.
         let unit = empty.path().join("registry/src");
         std::fs::create_dir_all(&unit).unwrap();
-        let found = probe(&unit, &[LastUseSource::CargoGlobalCache { table, up: 2 }]);
+        let found = probe(
+            &unit,
+            &[LastUseSource::CargoGlobalCache { table, up: 2 }],
+            crate::entities::now(),
+        );
         assert_eq!(found.last_used, LastUsed::default());
     }
 

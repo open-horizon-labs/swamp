@@ -1062,7 +1062,7 @@ pub fn observe_external(
             observed_at,
             crate::entities::now(),
         ));
-        let found = crate::last_used::probe(&path, &last_use_sources);
+        let found = crate::last_used::probe(&path, &last_use_sources, observed_at);
         units.push(ExternalUnit {
             detector_id,
             detector_name,
@@ -1133,7 +1133,7 @@ pub fn observe_external(
                 ),
             };
             let sources = sources_by_key.get(key).cloned().unwrap_or_default();
-            let found = crate::last_used::probe(&path_buf, &sources);
+            let found = crate::last_used::probe(&path_buf, &sources, observed_at);
             let unit_id =
                 crate::growth::external_unit_table_id(&detector_id, &category_s, &path_buf);
             let children = lower_children

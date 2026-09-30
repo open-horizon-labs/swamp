@@ -3250,7 +3250,7 @@ fn stored_child_rows(
             entries: c.entries,
             not_measured: c.not_measured,
             last_used: c.last_used.at,
-            last_used_source: Some(c.last_used.source.label()),
+            last_used_source: Some(c.last_used.source_column()),
             last_used_atime: c.last_used.atime,
         })
         .collect()
@@ -3656,7 +3656,7 @@ pub fn write_unit_tables(
             ),
             observed_at: u.observed_at,
             last_used: u.last_used.at,
-            last_used_source: Some(u.last_used.source.label()),
+            last_used_source: Some(u.last_used.source_column()),
             last_used_atime: u.last_used.atime,
             bytes_counted_elsewhere: u.bytes_counted_elsewhere,
             overlap_count: u.overlap_count,
