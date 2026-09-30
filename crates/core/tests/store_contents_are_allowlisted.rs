@@ -26,7 +26,12 @@ const MAX_CONTROL_JSON_BYTES: u64 = 64 * 1024;
 /// Exact basenames allowed anywhere under the store, other than tables:
 /// what the no-JSON rule allows -- `config.toml`, a tiny `ui_state.json`,
 /// lock files (below), and the scheduled-observation text log.
-const ALLOWED_NAMES: &[&str] = &["config.toml", "ui_state.json", "observe.log"];
+const ALLOWED_NAMES: &[&str] = &[
+    "config.toml",
+    "ui_state.json",
+    "observe.log",
+    "first-run-asked",
+];
 
 /// Every Parquet table the store may hold, by exact basename -- the
 /// runtime twin of the source audit's `TABLE_WRITERS`

@@ -210,13 +210,56 @@ scanned for projects)` for the second class.
    the exact detector IDs and catalog version in use.
 
    A detector-resolved location that falls *inside* another kept
-   project root (a config `include`, `~/src`, or another detector's own
+   project root (a declared root, `~/src`, or another detector's own
    base directory) is pruned from that root's walk and measured
    exactly once, as its own external unit -- see
    [coverage-and-history.md](../skills/swamp/references/coverage-and-history.md)'s
    "External/shared storage units".
-3. **`[scan] include`** in `config.toml`: extra project roots always in
-   scope.
+3. **Declared roots: `[scan] include`** in `config.toml`: the directories
+   you say hold your source code, always in scope. swamp never works
+   these out: it does not read your shell history, your editor's recent
+   projects, `~/.gitconfig` or Spotlight to guess them. Declare them with:
+
+   ```sh
+   swamp config add-root ~/code             # a directory that holds projects
+   swamp config add-root /Volumes/data/src --allow-missing   # not mounted yet
+   swamp config remove-root ~/code
+   swamp config show                        # lists them: present / missing / unreadable, with bytes
+   ```
+
+   `add-root` edits `config.toml` in place: your comments, key order and
+   other settings stay, the write is atomic (a temp file renamed over the
+   old one), and two `add-root` calls at once both land. It refuses a path
+   that does not exist (unless `--allow-missing`, which records a root that
+   is not mounted yet; it is then reported `missing`, a coverage fact and
+   never an error or a deletion), a file, a directory you cannot read, `/`,
+   and a directory inside a root you already declared (it names which). A
+   root you already declared is a no-op however it is spelled (trailing
+   slash, `..`, a symlink, `~`, a relative path). Declaring a directory
+   that contains declared roots replaces them and says so. What is stored
+   is what you typed (with `~` kept), not the resolved path.
+
+   When your roots change (`add-root`, `remove-root`, or an upgrade that adds a
+   detector), `swamp report` and `swamp ui` keep showing the most recent
+   observation whose roots overlap, labelled `showing the previous scope`, until
+   `R` or the next `swamp observe` builds the new one: nothing is walked to show
+   it and no growth is computed across the two scopes. The TUI header carries a
+   `N declared roots` clause and the help screen lists them, and
+   `swamp report --json` has a `declared_roots` array.
+
+   `swamp scope`, `swamp config show` and `swamp report` print each
+   declared root as `present` (with the bytes from the last stored
+   observation, or `not measured yet`), `missing`, or `unreadable`, and
+   never walk anything to do it.
+
+   **First run.** When nothing has been observed yet and `config.toml` has
+   no `[scan]` section, an interactive `swamp ui` or `swamp observe` asks
+   `Where is your source code? Press Enter for ~/src` (offering `~/src`
+   only if it exists; otherwise just asking for a directory; `~/src` stays a
+   built-in default either way), records the answer and carries on. It looks at nothing else on disk to propose a
+   candidate. Without a terminal it never waits: it prints
+   `swamp config add-root <path>` as the way to declare a root and uses the
+   built-in defaults. A skipped answer is remembered, so it is asked once.
 4. **`exclude`** and **`disabled_detectors`**: pruned last, and always
    win over every other source -- including an explicit root you pass
    on the command line. Disabling a detector does not hide a path
@@ -264,18 +307,47 @@ deny-list reading), and the reviewer's own
 reading, set `enabled_detectors` rather than relying on
 `disabled_detectors`.
 
-**Homebrew is off by default**, even under ordinary `defaults = true`
-scope -- the one detector in the catalog whose store is not per-user.
-`/opt/homebrew` (or `/usr/local`) is a **system-wide install tree**:
-shared by every account on the machine, installed once regardless of
-which developer runs swamp, and its Cellar/Caskroom can hold GUI
-applications and system tools with nothing to do with any project.
-`swamp scope` reports it `disabled (default off)`, distinct from a
-detector you disabled yourself (plain `disabled`); turn it on with:
+**Homebrew is reported in two parts by default.** `/opt/homebrew` (or
+`/usr/local`) is a **system-wide install tree**, shared by every account
+on the machine, and its Cellar and Caskroom hold GUI applications and
+system tools with nothing to do with any project. So swamp counts by
+default only what is unambiguously developer tooling: an allowlist of
+language toolchains and build tools (`llvm`, `openjdk`, `dotnet`, `zig`,
+`go`, `rust`, `node`, `python`, `ruby`, `cmake`, `gradle`, `maven`,
+`ninja`, `mise`, `terraform`, ...; `llvm@20` and `llvm@21` are both
+`llvm`), the developer casks (`android-platform-tools`,
+`android-studio`), and Homebrew's Android command-line tools. Each of
+those is a unit of its own. Everything else under the prefix is not
+dropped: it is one measured line, `Homebrew (other)`, and the two add up
+to the prefix. Ambiguous tools (qemu, ansible, pandoc, duckdb, mlx, GUI
+casks) are in `Homebrew (other)` until someone argues them in with
+evidence; a `Brewfile` naming one would be that evidence, but reading
+`Brewfile`s is not implemented yet. The Android bytes Homebrew installs
+are counted once, by the `android` detector's directories, not again in
+the Homebrew unit. The allowlist is in
+[docs/locations.md](locations.md#homebrew-dev-tooling-allowlist-174).
+
+swamp only reports these. If you decide to remove one, Homebrew
+re-obtains it with `brew reinstall <formula>`, a network download.
+
+To see Cellar and Caskroom whole instead of the split (the full
+detector, which `swamp scope` reports `disabled (default off)`):
 
 ```toml
 [scan]
 enabled_detectors = ["homebrew"]  # everything else keeps its own default
+```
+
+`disabled_detectors = ["homebrew"]` turns off **all** Homebrew reporting, as it did
+before the split (the id names the family of three); the member ids
+`homebrew-devtools` and `homebrew-other` work on their own.
+
+To drop the remainder line, or Homebrew entirely:
+
+```toml
+[scan]
+disabled_detectors = ["homebrew-other"]                      # keep the dev tooling only
+# disabled_detectors = ["homebrew-devtools", "homebrew-other"]   # no Homebrew at all
 ```
 
 The same `enabled_detectors` key that means "only these" under

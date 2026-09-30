@@ -278,6 +278,70 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
     (candidates, out_of_scope)
 }
 
+/// Replaces each candidate its detector proposed as a *container*
+/// (`Detector::select_children`: Homebrew's Cellar and Caskroom) with the
+/// subdirectories the detector selects, so those are measured as units of
+/// their own and the container's unselected remainder is never measured
+/// as a unit at all.
+///
+/// The one place a listing happens for this, and it is the observation
+/// pass's: the container is listed once through the capped
+/// `locations::shallow_list`. Returns the new candidates, the out-of-scope
+/// list extended with selected children the user excluded (so a parent
+/// that absorbs them subtracts them, as for any other excluded nested
+/// location), and the containers that could not be listed completely
+/// (unreadable, or cut at the listing cap), which the ownership sweep must
+/// leave alone: an unlistable directory is not an empty one, and units
+/// stored under it are not gone.
+fn expand_containers(
+    candidates: Vec<Candidate>,
+    mut out_of_scope: Vec<PathBuf>,
+    scope: &EffectiveScope,
+    detectors: &crate::locations::Registry,
+) -> (Vec<Candidate>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut partial: Vec<PathBuf> = Vec::new();
+    for c in candidates {
+        let detector = detectors
+            .detectors()
+            .iter()
+            .find(|d| d.id() == c.detector_id);
+        // Asking with no names first is how a detector says whether this
+        // path is a container at all, before anything is listed.
+        if !detector.is_some_and(|d| d.select_children(&c.path, &[]).is_some()) {
+            out.push(c);
+            continue;
+        }
+        let listing = crate::locations::shallow_list(&c.path);
+        if listing.truncation.is_truncated() {
+            partial.push(crate::fs_gate::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone()));
+        }
+        let names: Vec<String> = listing
+            .iter()
+            .filter(|e| e.is_dir)
+            .map(|e| e.name.clone())
+            .collect();
+        let selected = detector
+            .and_then(|d| d.select_children(&c.path, &names))
+            .unwrap_or_default();
+        for name in selected {
+            let child = c.path.join(&name);
+            if scope.exclusion_for(&child).is_some() {
+                out_of_scope.push(crate::fs_gate::canonicalize(&child).unwrap_or(child));
+                continue;
+            }
+            out.push(Candidate {
+                detector_id: c.detector_id.clone(),
+                detector_name: c.detector_name.clone(),
+                category: c.category,
+                provenance: c.provenance.clone(),
+                path: child,
+            });
+        }
+    }
+    (out, out_of_scope, partial)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "testing")]
 pub fn discover_and_measure_with_worktrees(
@@ -340,6 +404,10 @@ pub struct ExternalObservation {
     /// store; a unit's store is the external unit whose `path` its own
     /// path lies under.
     pub interiors: Vec<crate::artifact::NestedArtifact>,
+    /// Coverage facts of this pass, for the report's notes: a container
+    /// that could not be listed completely, so what it holds was not
+    /// measured (not measured, never zero).
+    pub notes: Vec<String>,
 }
 
 /// [`discover_and_measure`], plus the store interiors. Takes the
@@ -364,7 +432,10 @@ pub fn observe_external(
     // was exactly this loop reading `scope.detectors` and so never
     // seeing the user's exclusion
     // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
+    let detectors = crate::locations::Registry::with_builtins();
     let (candidates, out_of_scope) = authorized_candidates(scope);
+    let (candidates, out_of_scope, partial_containers) =
+        expand_containers(candidates, out_of_scope, scope, &detectors);
     // Detector display names, captured from the authorized scope before
     // the candidates are consumed: a coverage note for an unreadable
     // unit still needs a human-readable tool name, and must not reach
@@ -397,7 +468,6 @@ pub fn observe_external(
     // adapter identifies each: the detector's declaration against the
     // adapter's, nothing else (`crate::build_stores::containers_for`).
     let adapters = crate::build_adapters::registry::Registry::with_builtins();
-    let detectors = crate::locations::Registry::with_builtins();
     let store_containers: HashMap<usize, crate::build_adapters::BuildContainer> = {
         let located: Vec<crate::build_stores::Located> = canon_candidates
             .iter()
@@ -458,7 +528,29 @@ pub fn observe_external(
         })
         .collect();
 
-    for (idx, (candidate, canonical)) in canon_candidates.iter().enumerate() {
+    // A remainder unit (`Detector::remainder_of`) is measured whole and
+    // then has its sibling's measured units subtracted, so it goes after
+    // every sibling. Units whose measurement did not complete this pass
+    // are remembered: a remainder over one of them cannot be derived.
+    let remainder_roles: HashMap<usize, crate::locations::Remainder> = canon_candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (c, _))| {
+            detectors
+                .detectors()
+                .iter()
+                .find(|d| d.id() == c.detector_id)
+                .and_then(|d| d.remainder_of())
+                .map(|r| (i, r))
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..canon_candidates.len()).collect();
+    order.sort_by_key(|i| remainder_roles.contains_key(i));
+    let mut unmeasured: Vec<PathBuf> = Vec::new();
+
+    for idx in order {
+        let (candidate, canonical) = &canon_candidates[idx];
+        let role = remainder_roles.get(&idx).copied();
         let Candidate {
             detector_id,
             detector_name,
@@ -486,10 +578,13 @@ pub fn observe_external(
         let mut nested_exclusions: Vec<PathBuf> = canon_candidates
             .iter()
             .enumerate()
-            .filter(|(j, (_, other_canonical))| {
+            .filter(|(j, (other, other_canonical))| {
                 *j != idx
                     && other_canonical != &canonical
                     && other_canonical.starts_with(&canonical)
+                    // A remainder keeps its sibling's bytes in the whole
+                    // measurement and subtracts them afterwards.
+                    && role.is_none_or(|r| other.detector_id != r.of)
             })
             .map(|(_, (_, other_canonical))| other_canonical.clone())
             .collect();
@@ -587,6 +682,7 @@ pub fn observe_external(
             // tombstoning, and skip measuring rather than guessing.
             // Coverage is incomplete, which is not a storage change.
             crate::folded_measurement::UnitObservation::Unreadable(_) => {
+                unmeasured.push(canonical.clone());
                 protected_keys.insert(key);
                 continue;
             }
@@ -608,6 +704,7 @@ pub fn observe_external(
                     reused_unit_paths.push(canonical.display().to_string());
                 }
                 lower_bounds.insert(key.clone(), row);
+                unmeasured.push(canonical.clone());
                 protected_keys.insert(key);
                 continue;
             }
@@ -615,6 +712,24 @@ pub fn observe_external(
         };
         if row.reused {
             reused_unit_paths.push(canonical.display().to_string());
+        }
+        let mut row = row;
+        if let Some(role) = role {
+            // The whole, minus the sibling's units: the parts add up to
+            // the whole, and a file hardlinked between a sibling unit and
+            // the rest is counted in the sibling's unit, once. If a
+            // sibling unit could not be measured, the remainder cannot be
+            // derived this pass.
+            if unmeasured.iter().any(|p| p.starts_with(&canonical)) {
+                protected_keys.insert(key);
+                continue;
+            }
+            let taken: u64 = meta_by_key
+                .values()
+                .filter(|m| m.detector_id == role.of && m.path.starts_with(&canonical))
+                .map(|m| m.bytes)
+                .sum();
+            row.bytes = row.bytes.saturating_sub(taken);
         }
         observed.push(crate::growth::ObservedExternal {
             key: key.clone(),
@@ -646,13 +761,28 @@ pub fn observe_external(
     // that was excluded, whose detector was disabled, or that could not
     // be read contributes nothing here, so nothing under it is
     // tombstoned (`.oh/guardrails/history-sweeps-are-owned.md`).
+    let notes: Vec<String> = partial_containers
+        .iter()
+        .map(|p| {
+            format!(
+                "{} could not be listed completely: the units inside it were not measured this pass",
+                p.display()
+            )
+        })
+        .collect();
     let ownership = crate::growth::ObservationOwnership::new(
         crate::growth::KeyFamily::External,
         meta_by_key.values().map(|m| m.path.clone()).collect(),
     )
     // Inside a covered root, outside this pass: an excluded nested
     // location keeps its stored row exactly as it is.
-    .excluding(out_of_scope.clone());
+    .excluding(
+        out_of_scope
+            .iter()
+            .cloned()
+            .chain(partial_containers)
+            .collect(),
+    );
     if let Some(dir) = swamp_dir
         && observe
     {
@@ -890,7 +1020,11 @@ pub fn observe_external(
                 .build();
         }
     }
-    Ok(ExternalObservation { units, interiors })
+    Ok(ExternalObservation {
+        units,
+        interiors,
+        notes,
+    })
 }
 
 pub(crate) fn category_from_str(s: &str) -> Option<StorageCategory> {

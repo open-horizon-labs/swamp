@@ -97,6 +97,31 @@ impl StoreDir {
         }
     }
 
+    /// Serializes read-modify-write edits of `config.toml` (`swamp config
+    /// add-root` / `remove-root`, the first-run answer) so two of them
+    /// racing never lose one's change. Waits up to ten seconds; the lock is
+    /// advisory and held only for the edit, never for an observation.
+    pub fn lock_config_edits(&self) -> io::Result<super::continuity::FileLock> {
+        self.create()?;
+        let path = self.0.join("config.lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(lock) = super::continuity::try_lock(&path, true)? {
+                return Ok(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "config.lock is held by another swamp process (waited 10 s): {}",
+                        path.display()
+                    ),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Whether derived tables belong to the current store generation.
     /// The marker read is bounded and never follows links or blocks on a FIFO.
     pub fn has_current_format(&self) -> io::Result<bool> {
@@ -780,11 +805,18 @@ pub fn read_json_bytes(file: JsonFile<'_>) -> io::Result<Option<Vec<u8>>> {
 /// Every non-JSON text file swamp writes.
 #[derive(Debug, Clone, Copy)]
 pub enum TextFile<'a> {
-    /// `<store>/config.toml`, written only by `swamp config init`.
+    /// `<store>/config.toml`, written by `swamp config init`, and edited in
+    /// place (under [`StoreDir::lock_config_edits`]) by `swamp config
+    /// add-root` / `remove-root` and the first-run answer.
     Config { store: &'a StoreDir },
     /// The scheduled refresh's LaunchAgent plist, where
     /// [`launch_agent_plist`] resolves it.
     LaunchAgent,
+    /// `<store>/first-run-asked`: the record that the first-run question
+    /// was asked or that the store already held an observation. Not a
+    /// derived table, so a store reset leaves it alone (like
+    /// `ui_state.json`).
+    Onboarded { store: &'a StoreDir },
 }
 
 impl TextFile<'_> {
@@ -792,6 +824,7 @@ impl TextFile<'_> {
         match *self {
             TextFile::Config { store } => Ok(store.0.join("config.toml")),
             TextFile::LaunchAgent => launch_agent_plist(),
+            TextFile::Onboarded { store } => Ok(store.0.join("first-run-asked")),
         }
     }
 }
@@ -811,6 +844,29 @@ pub fn launch_agent_plist() -> io::Result<PathBuf> {
 /// Writes `text` into `file`, atomically.
 pub fn write_text(file: TextFile<'_>, text: &str) -> io::Result<()> {
     write_atomic(&file.path()?, text.as_bytes())
+}
+
+/// Whether the `Onboarded` record exists.
+pub fn onboarded_recorded(store: &StoreDir) -> bool {
+    TextFile::Onboarded { store }
+        .path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Rewrites the user's `config.toml` in place: a symlinked config is
+/// followed and its target replaced (the link stays), the file's mode is
+/// kept, and the temporary file is created next to the target, so the
+/// rename never crosses a filesystem. Fails, leaving the old file, when
+/// that temporary file cannot be created.
+pub fn write_config_in_place(store: &StoreDir, text: &str) -> io::Result<()> {
+    let path = TextFile::Config { store }.path()?;
+    let target = match std::fs::symlink_metadata(&path) {
+        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(&path)?,
+        _ => path,
+    };
+    let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    write_atomic_with(&target, text.as_bytes(), perms)
 }
 
 /// Removes a file swamp wrote (the LaunchAgent plist on `schedule
@@ -918,6 +974,14 @@ impl ObserveLock<'_> {
 /// Best-effort: a filesystem that refuses to sync a directory handle
 /// must not fail the write that already succeeded.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with(path, bytes, None)
+}
+
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    perms: Option<std::fs::Permissions>,
+) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
@@ -929,6 +993,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         crate::entities::new_id()
     ));
     std::fs::write(&tmp, bytes)?;
+    if let Some(perms) = perms
+        && let Err(e) = std::fs::set_permissions(&tmp, perms)
+    {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if let Ok(f) = std::fs::File::open(&tmp) {
         let _ = f.sync_all();
     }

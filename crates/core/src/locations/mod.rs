@@ -205,7 +205,7 @@ pub fn shallow_dir_names(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-pub const CATALOG_VERSION: &str = "2026-09-29.1";
+pub const CATALOG_VERSION: &str = "2026-09-30.1";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any
 /// value so a Linux-configured `Environment` can be asserted to produce
@@ -980,6 +980,25 @@ pub enum RecoveryCost {
     LocalRebuild,
 }
 
+/// See [`Detector::remainder_of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Remainder {
+    /// The sibling detector whose units are subtracted.
+    pub of: &'static str,
+    /// The exact setting that reports the remainder in full.
+    pub include_all: &'static str,
+}
+
+/// Whether units of detector `detector_id` are a remainder (see
+/// [`Detector::remainder_of`]).
+pub fn remainder_of(detector_id: &str) -> Option<Remainder> {
+    Registry::with_builtins()
+        .detectors()
+        .iter()
+        .find(|d| d.id() == detector_id)
+        .and_then(|d| d.remainder_of())
+}
+
 /// What a human can do to re-obtain a detector's store if it is removed.
 /// Facts, never a verdict: this says what re-obtaining costs, not
 /// whether removing it is a good idea.
@@ -1053,6 +1072,43 @@ pub trait Detector: Send + Sync {
         true
     }
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation>;
+    /// A family this detector belongs to, whose id in `[scan]
+    /// disabled_detectors` turns off every member (`"homebrew"` for the
+    /// three Homebrew detectors: an existing config that disabled the one
+    /// it knew keeps all of them off). The member's own id still works.
+    fn group(&self) -> Option<&'static str> {
+        None
+    }
+    /// Marks this detector's units as the *remainder* of a sibling
+    /// detector's: what is left of the location after the sibling's units
+    /// are taken out. The observation pass measures the location whole and
+    /// subtracts the sibling's measured units, so the parts add up to the
+    /// whole even when files are hardlinked between them (a linked file is
+    /// counted in the sibling's unit, once). A headline that wants the
+    /// remainder selects units by this capability, never by id.
+    fn remainder_of(&self) -> Option<Remainder> {
+        None
+    }
+    /// For a location this detector proposes as a *container* rather than
+    /// a unit: which of its immediate subdirectories are measured, each as
+    /// its own unit, in place of the container as a whole. `None` (the
+    /// default) means `container` is an ordinary location measured as one
+    /// unit.
+    ///
+    /// Asked only by the observation pass (`external::observe_external`),
+    /// which lists the container once through the capped `shallow_list`;
+    /// scope resolution, `swamp scope`, `report` and the TUI never call it
+    /// and so never list anything. Pure: it sees the names, not the disk,
+    /// so the boundary it draws is testable without a filesystem. The
+    /// observation pass first asks with no names, to learn whether the
+    /// path is a container at all before listing it.
+    fn select_children(
+        &self,
+        _container: &std::path::Path,
+        _names: &[String],
+    ) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Static registration, mirroring `EventBus::with_builtins`: every
@@ -1070,6 +1126,8 @@ impl Registry {
                 Box::new(cargo_home::CargoHomeDetector),
                 Box::new(rustup::RustupDetector),
                 Box::new(homebrew::HomebrewDetector),
+                Box::new(homebrew::HomebrewDevToolsDetector),
+                Box::new(homebrew::HomebrewOtherDetector),
                 Box::new(claude_code::ClaudeCodeDetector),
                 Box::new(claude_code::ClaudeCodeScratchDetector),
                 Box::new(codex::CodexDetector),

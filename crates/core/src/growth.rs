@@ -1780,6 +1780,12 @@ fn write_unowned_family(dir: &Path, stem: &str, unowned: &[UnownedRow]) -> Resul
 /// a stored cell.
 #[derive(Debug, Clone)]
 pub struct ReportSnapshot {
+    /// `Some` when this is not the exact scope asked for but the most
+    /// recent stored observation of an overlapping one (the scope's roots
+    /// changed since: an added root, a new default detector). Nothing was
+    /// observed for the difference, and no growth is computed across the
+    /// two scopes.
+    pub previous_scope: Option<PreviousScope>,
     pub observed_at: u64,
     pub report: Report,
     pub coverage: Vec<crate::coverage::RootCoverage>,
@@ -2125,6 +2131,44 @@ pub(crate) fn invalidate_unique_estimate(swamp_dir: &Path, scope_key: &str) -> R
         columns::write_run_rows(&path, &rows)?;
     }
     Ok(())
+}
+
+/// The earlier scope a [`ReportSnapshot`] stands in for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviousScope {
+    /// How many roots that observation covered.
+    pub roots: usize,
+    pub observed_at: u64,
+}
+
+/// One stored observation: its key, when it was taken, and the roots it
+/// covered (from its coverage rows).
+#[derive(Debug, Clone)]
+pub(crate) struct StoredScope {
+    pub key: String,
+    pub observed_at: u64,
+    pub roots: Vec<PathBuf>,
+}
+
+/// Every scope the store holds an observation of: two small tables, no
+/// walk.
+pub(crate) fn stored_scopes(swamp_dir: &Path) -> Vec<StoredScope> {
+    let runs = columns::read_run_rows(&runs_path(swamp_dir)).unwrap_or_default();
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let coverage = columns::read_coverage_rows(&coverage_path(swamp_dir)).unwrap_or_default();
+    runs.into_iter()
+        .map(|r| StoredScope {
+            roots: coverage
+                .iter()
+                .filter(|c| c.scope_key == r.scope_key && c.class == "project")
+                .map(|c| PathBuf::from(&c.root_path))
+                .collect(),
+            key: r.scope_key,
+            observed_at: r.observed_at,
+        })
+        .collect()
 }
 
 /// `Some(observed_at)` when `scope_key` has ever been fully observed

@@ -68,6 +68,7 @@ pub mod reclaimability;
 pub mod recovery;
 pub mod render;
 pub mod report;
+pub mod roots;
 pub mod scan;
 pub mod schedule;
 pub mod scope;

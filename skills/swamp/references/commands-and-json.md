@@ -71,13 +71,18 @@ every reason it is in scope, plus the full detector catalog (including
 promoted to a root) and the catalog version. `disabled_detectors` is
 every detector not running this pass; `default_off_detectors` (stack/26)
 is the subset of those off because the detector itself defaults to off
-(a system-wide install tree -- currently only Homebrew) rather than
+(a system-wide install tree -- currently only the full `homebrew`
+detector; `homebrew-devtools` and `homebrew-other` are on by default and
+split Homebrew into developer tooling and one remainder) rather than
 because your config named it -- `[scan] enabled_detectors = ["homebrew"]`
-turns it back on:
+turns it back on. Source roots are declared, never inferred: `swamp config
+add-root <path>` / `remove-root <path>` edit `[scan] include`, and `swamp
+scope`, `swamp config show` and `swamp report` list each declared root as
+present (with stored bytes), missing or unreadable:
 
 ```json
 {
-  "catalog_version": "2026-09-29.1",
+  "catalog_version": "2026-09-30.1",
   "generated_at": 1758470400,
   "defaults_enabled": true,
   "disabled_detectors": ["homebrew"],

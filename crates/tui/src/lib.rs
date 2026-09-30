@@ -296,6 +296,11 @@ fn stored_multi_root_app(
     app.scope = Some(scope.clone());
     app.observed_label = "from last observation".into();
     app.disk_banner = banner;
+    app.previous_scope_roots = snapshot.previous_scope.as_ref().map(|p| p.roots);
+    app.set_declared_roots(&swamp_core::roots::declared_roots(
+        scope,
+        &snapshot.coverage,
+    ));
     finish_startup(&mut app, store, Some(&snapshot.coverage));
     Some(app)
 }
@@ -423,11 +428,16 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
     );
     let banner = disk_full_banner(&store);
     let stored = stored_multi_root_app(scope, &store, banner.clone());
-    let has_index = stored.is_some();
+    // "Is there an index" means the store holds an observation of any
+    // scope: the first scan is only for a store with none. A scope no
+    // stored observation overlaps opens empty and waits for `R`.
+    let has_index = stored.is_some() || swamp_core::report::store_has_observation(&store);
     let mut app = match stored {
         Some(app) => app,
         None => {
-            if let Some(b) = &banner {
+            if let Some(b) = &banner
+                && !has_index
+            {
                 // Never block startup on a walk the disk cannot take.
                 anyhow::bail!("{b}, and there is no stored observation to show yet");
             }
@@ -443,6 +453,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
             app.scope = Some(scope.clone());
             app.observed_label = "no observation yet".into();
             app.has_index = false;
+            app.set_declared_roots(&swamp_core::roots::declared_roots(scope, &[]));
             finish_startup(&mut app, &store, None);
             app
         }

@@ -1765,14 +1765,23 @@ pub fn render_view_external_with(
             .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{:<10} {:>+10}  {}  {}  ({})  {}{note}",
+            "{:<10} {:>+10}  {}  {}  {} ({})  {}{note}",
             human_bytes(u.bytes),
             growth,
             crate::external::category_str(u.category),
             u.path.display(),
+            u.detector_name,
             u.detector_id,
             consumers,
         );
+        if let Some(r) = crate::locations::remainder_of(&u.detector_id) {
+            let _ = writeln!(
+                out,
+                "    the rest of this location after the {} units (a file hardlinked between \
+                 them is counted in those, once); to report it whole: {}",
+                r.of, r.include_all
+            );
+        }
         for line in render_evidence_lines(&u.evidence) {
             let _ = writeln!(out, "    {line}");
         }

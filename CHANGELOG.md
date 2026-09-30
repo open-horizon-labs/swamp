@@ -29,6 +29,45 @@ observations, not general performance guarantees. See the README for current use
   much. On this machine every entry there was newer than the last boot; swamp does not
   assume it is cleared. The simulator runtime row is labelled as mounted size: runtimes
   that are not mounted are not measured.
+- **You declare where your source code is; swamp never guesses.** `swamp config add-root
+  <path>` and `remove-root <path>` edit `[scan] include` in your `config.toml` in place:
+  comments, key order and other settings stay, the write is atomic, and two calls at once
+  both land. A path that does not exist, is a file, is unreadable, or sits inside a root
+  you already declared is refused with the reason; a root you already declared is a no-op
+  however it is spelled (trailing slash, `..`, a symlink, `~`). `--allow-missing` records
+  a root that is not mounted yet. On a first run (nothing observed yet, no `[scan]`
+  section), an interactive `swamp ui` or `swamp observe` asks `Where is your source code?
+  Press Enter for ~/src` (offering `~/src` only if it exists); without a terminal it never
+  waits and prints `swamp config add-root <path>` instead. `swamp scope`, `swamp config
+  show` and `swamp report` list each declared root as present (with its bytes from the
+  last stored observation), missing or unreadable. A source check now fails the build if
+  any code reads shell history, editor recent projects, git configuration or Spotlight to
+  propose a root. Replaces the hard-coded `~/src` as the only way to say where your code is.
+- **Homebrew counts developer tooling by default, and shows the rest as one line.** It was
+  off by default because `/opt/homebrew` also holds GUI apps. Now the language toolchains
+  and build tools on an allowlist (`llvm@20` and `llvm@21` both match `llvm`; `gopls` does
+  not match `go`), the developer casks (`android-platform-tools`, `android-studio`) and
+  Homebrew's Android command-line tools are units of their own, and everything else under
+  the prefix is one `Homebrew (other)` unit, so the parts add up to the prefix. The Android
+  bytes are counted once. `[scan] enabled_detectors = ["homebrew"]` still reports Cellar
+  and Caskroom whole. Ambiguous tools (qemu, ansible, pandoc, duckdb, mlx) stay in
+  `Homebrew (other)`, shown with the setting that reports it whole and no recovery
+  hint (it is Homebrew itself, `bin`, `lib` and the GUI casks). A file hardlinked between a
+  dev keg and the rest of the prefix is counted once, in the dev unit. Removal of a dev
+  unit, if you decide to, is `brew reinstall <formula>`.
+  **Upgrade note:** `disabled_detectors = ["homebrew"]` still turns off all Homebrew
+  reporting (it now names the family of three); `enabled_detectors = ["homebrew"]` still
+  means the full detector.
+- **Changing your roots no longer hides your last observation.** The stored observation is
+  now keyed by your project roots, not by every detector location, so an upgrade that adds
+  a detector, or `swamp config add-root`, no longer makes `swamp report` say "no observation
+  yet" or `swamp ui` start a scan. When the roots did change, the most recent observation
+  that overlaps the new scope is shown, labelled `showing the previous scope (N roots); new
+  roots not yet observed; press R`, from stored tables with nothing walked and no growth
+  computed across the two scopes. The first run after this upgrade shows your v0.7.5
+  observation that way; `R` or the next scheduled `observe` builds the new one. `swamp ui`
+  scans on its own only when the store holds no observation at all.
+- **Declared roots are in the TUI header and help and in `report --json`** (`declared_roots`).
 
 ## v0.7.5
 

@@ -2623,6 +2623,7 @@ pub fn observe_scope(
         );
         external_ok = measured.is_ok();
         let observation = measured.unwrap_or_default();
+        merged.notes.extend(observation.notes);
         let mut units = observation.units;
         crate::consumer_wiring::attach_associations(&mut merged, &mut units, store_dir);
         (units, observation.interiors)
@@ -3322,8 +3323,19 @@ pub use crate::growth::ReportSnapshot;
 /// it built, and re-resolving the same scope always finds what the
 /// last observation of it wrote.
 pub fn scope_snapshot_key(scope: &crate::scope::EffectiveScope) -> String {
-    let mut paths: Vec<String> = scope
-        .roots
+    // The stored observation is keyed by the PROJECT roots (built-in
+    // defaults, declared roots, explicit roots): detector locations are
+    // external units with their own coverage, so adding a detector to the
+    // catalog does not orphan an existing observation. A scope with no
+    // project root at all (detectors only) is keyed by every root.
+    let project: Vec<&crate::scope::ScopeRoot> =
+        scope.roots.iter().filter(|r| r.is_project_root()).collect();
+    let chosen: Vec<&crate::scope::ScopeRoot> = if project.is_empty() {
+        scope.roots.iter().collect()
+    } else {
+        project
+    };
+    let mut paths: Vec<String> = chosen
         .iter()
         .map(|r| r.path.display().to_string())
         .collect();
@@ -3440,7 +3452,7 @@ fn merge_stored_worktree_metadata(old: &mut WorktreeRow, incoming: WorktreeRow) 
 /// `projects.parquet` rows yet (an older store), leaving `snapshot`
 /// untouched.
 fn rebuild_projects_from_tables(
-    scope: &crate::scope::EffectiveScope,
+    roots: &[PathBuf],
     store_dir: &Path,
     key: &str,
     snapshot: &mut ReportSnapshot,
@@ -3451,8 +3463,7 @@ fn rebuild_projects_from_tables(
 
     let mut shape_by_worktree = crate::growth::artifact_shape_rows_by_worktree(store_dir, key);
 
-    let roots: Vec<PathBuf> = scope.roots.iter().map(|r| r.path.clone()).collect();
-    let facts = crate::growth::artifact_table_facts_for_roots(store_dir, &roots);
+    let facts = crate::growth::artifact_table_facts_for_roots(store_dir, roots);
 
     let mut new_projects = Vec::with_capacity(tables.projects.len());
     let mut seen_projects = std::collections::HashSet::new();
@@ -3718,42 +3729,10 @@ fn rebuild_evidence_from_tables(store_dir: &Path, key: &str, snapshot: &mut Repo
     }
 }
 
-/// R18a-3b: no JSON cell anywhere holds a `Report` -- this assembles the
-/// whole thing from typed tables, starting from an empty [`ReportSnapshot`]
-/// and running every `rebuild_*_from_tables` function in the same order
-/// as before (each one either fills in its own fields or is a no-op, so
-/// running them against an empty starting value is exactly as safe as
-/// running them against a stored one). "Has this scope ever been
-/// observed" is answered by `growth::scope_observed_at`
-/// (`summary.parquet` having a row for `key`), not by `projects.parquet`
-/// having one: a scope with genuinely zero discovered projects (external
-/// / agent units only, no git checkouts) still gets a `summary.parquet`
-/// row every full observe, but never gets a `projects.parquet` row at
-/// all, which would make "zero projects" indistinguishable from "never
-/// observed" -- and would leave `observed_at` at its default too, since
-/// that timestamp would otherwise only ever come from a `projects.parquet`
-/// row.
-pub fn report_scope_from_store(
-    scope: &crate::scope::EffectiveScope,
-    store_dir: &Path,
-) -> std::result::Result<ReportSnapshot, NoObservation> {
-    // Do not parse caches from an incompatible generation. The observer
-    // owns reset + rescan; report remains a pure read and reports no snapshot.
-    if !crate::fs_gate::store::StoreDir::at(store_dir)
-        .and_then(|store| store.has_current_format())
-        .unwrap_or(false)
-    {
-        return Err(NoObservation {
-            scope_description: describe_scope_for_error(scope),
-        });
-    }
-    let key = scope_snapshot_key(scope);
-    let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) else {
-        return Err(NoObservation {
-            scope_description: describe_scope_for_error(scope),
-        });
-    };
-    let mut snapshot = ReportSnapshot {
+/// A snapshot with nothing in it, for the table rebuilds to fill.
+fn empty_snapshot(observed_at: u64, store_dir: &Path) -> ReportSnapshot {
+    ReportSnapshot {
+        previous_scope: None,
         observed_at,
         report: Report {
             observed_at,
@@ -3789,9 +3768,138 @@ pub fn report_scope_from_store(
         external_units: Vec::new(),
         agent_units: Vec::new(),
         store_interiors: Vec::new(),
+    }
+}
+
+/// Which stored observation stands for `scope`: its own, or, when its
+/// roots changed since the last observation (a declared root added or
+/// removed, a default detector added by an upgrade), the most recent one
+/// whose roots overlap the current scope's. `None` when the store holds
+/// nothing that overlaps. Reads two small tables.
+struct StoredChoice {
+    key: String,
+    observed_at: u64,
+    roots: Vec<PathBuf>,
+    previous: Option<crate::growth::PreviousScope>,
+}
+
+fn stored_choice(scope: &crate::scope::EffectiveScope, store_dir: &Path) -> Option<StoredChoice> {
+    let key = scope_snapshot_key(scope);
+    if let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) {
+        return Some(StoredChoice {
+            key,
+            observed_at,
+            roots: scope.roots.iter().map(|r| r.path.clone()).collect(),
+            previous: None,
+        });
+    }
+    // A scope the user named on the command line answers only for exactly
+    // the roots named: a narrower or wider snapshot is never passed off as
+    // it. The fallback is for the configured scope, whose roots change
+    // underneath the user (add-root, an upgrade).
+    if scope.explicit {
+        return None;
+    }
+    let current: Vec<PathBuf> = scope.roots.iter().map(|r| r.path.clone()).collect();
+    crate::growth::stored_scopes(store_dir)
+        .into_iter()
+        .filter(|c| {
+            c.roots.iter().any(|old| {
+                current
+                    .iter()
+                    .any(|new| old == new || old.starts_with(new) || new.starts_with(old))
+            })
+        })
+        .max_by_key(|c| c.observed_at)
+        .map(|c| StoredChoice {
+            previous: Some(crate::growth::PreviousScope {
+                roots: c.roots.len(),
+                observed_at: c.observed_at,
+            }),
+            key: c.key,
+            observed_at: c.observed_at,
+            roots: c.roots,
+        })
+}
+
+/// Whether the store holds any observation at all, of any scope: the
+/// "is there an index" question the TUI asks before deciding to scan.
+pub fn store_has_observation(store_dir: &Path) -> bool {
+    crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false)
+        && !crate::growth::stored_scopes(store_dir).is_empty()
+}
+
+/// The per-root coverage rows the last observation of `scope` (or, when
+/// its roots changed since, of the overlapping scope
+/// [`report_scope_from_store`] shows instead) stored: one small table
+/// read, no walk. Empty when nothing overlapping was ever observed, which
+/// callers show as "not measured", never as zero bytes. This is what lets
+/// `swamp scope` and `swamp report` state what a declared root held at the
+/// last observation.
+pub fn stored_root_coverage(
+    scope: &crate::scope::EffectiveScope,
+    store_dir: &Path,
+) -> Vec<crate::coverage::RootCoverage> {
+    if !crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    let Some(choice) = stored_choice(scope, store_dir) else {
+        return Vec::new();
     };
+    let mut snapshot = empty_snapshot(choice.observed_at, store_dir);
+    crate::growth::rebuild_coverage_and_notes_from_tables(store_dir, &choice.key, &mut snapshot);
+    snapshot.coverage
+}
+
+/// R18a-3b: no JSON cell anywhere holds a `Report` -- this assembles the
+/// whole thing from typed tables, starting from an empty [`ReportSnapshot`]
+/// and running every `rebuild_*_from_tables` function in the same order
+/// as before (each one either fills in its own fields or is a no-op, so
+/// running them against an empty starting value is exactly as safe as
+/// running them against a stored one). "Has this scope ever been
+/// observed" is answered by `growth::scope_observed_at`
+/// (`summary.parquet` having a row for `key`), not by `projects.parquet`
+/// having one: a scope with genuinely zero discovered projects (external
+/// / agent units only, no git checkouts) still gets a `summary.parquet`
+/// row every full observe, but never gets a `projects.parquet` row at
+/// all, which would make "zero projects" indistinguishable from "never
+/// observed" -- and would leave `observed_at` at its default too, since
+/// that timestamp would otherwise only ever come from a `projects.parquet`
+/// row.
+pub fn report_scope_from_store(
+    scope: &crate::scope::EffectiveScope,
+    store_dir: &Path,
+) -> std::result::Result<ReportSnapshot, NoObservation> {
+    // Do not parse caches from an incompatible generation. The observer
+    // owns reset + rescan; report remains a pure read and reports no snapshot.
+    if !crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false)
+    {
+        return Err(NoObservation {
+            scope_description: describe_scope_for_error(scope),
+        });
+    }
+    let Some(choice) = stored_choice(scope, store_dir) else {
+        return Err(NoObservation {
+            scope_description: describe_scope_for_error(scope),
+        });
+    };
+    let StoredChoice {
+        key,
+        observed_at,
+        roots,
+        previous,
+    } = choice;
+    let mut snapshot = empty_snapshot(observed_at, store_dir);
+    snapshot.previous_scope = previous;
     crate::growth::rebuild_coverage_and_notes_from_tables(store_dir, &key, &mut snapshot);
-    rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
+    rebuild_projects_from_tables(&roots, store_dir, &key, &mut snapshot);
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
     rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);

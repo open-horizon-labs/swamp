@@ -127,6 +127,21 @@ enum ConfigAction {
     Show,
     Path,
     Init,
+    /// Declare a directory that holds your source code (writes `[scan]
+    /// include`; comments and other keys in config.toml are kept). A root
+    /// inside one already declared is refused, one already declared is a
+    /// no-op, and one that contains declared roots keeps them (shown as covered).
+    AddRoot {
+        path: String,
+        /// Record a root that does not exist yet (an unmounted volume);
+        /// it is reported as missing, never as an error.
+        #[arg(long)]
+        allow_missing: bool,
+    },
+    /// Stop declaring a source root (matched however it is spelled).
+    RemoveRoot {
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -323,9 +338,11 @@ enum Command {
         collector: bool,
         roots: Vec<PathBuf>,
     },
-    /// The configuration file: `config show` prints effective values,
-    /// `config path` where it lives, `config init` writes one with every
-    /// key and its meaning (never overwrites an existing file).
+    /// The configuration file: `config show` prints effective values and
+    /// the declared source roots, `config path` where it lives, `config
+    /// init` writes one with every key and its meaning (never overwrites
+    /// an existing file), `config add-root` / `remove-root` declare or
+    /// drop a source directory.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -925,6 +942,54 @@ fn report_json_envelope(
     Ok(value)
 }
 
+const PREVIOUS_SCOPE_NOTE: &str = "the scope's roots changed since this observation; nothing was walked and no growth is computed across the two scopes";
+
+/// Where a typed root path is read from: the real home and working
+/// directory.
+fn roots_reach() -> swamp_core::roots::Reach {
+    swamp_core::roots::Reach {
+        home: swamp_core::locations::Environment::from_process().home,
+        cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+    }
+}
+
+/// The declared-roots block for `scope`, with bytes from the stored
+/// observation (one small table read, never a walk). Empty for an
+/// explicit-root invocation, which replaces the configured roots.
+fn declared_roots_text(scope: &swamp_core::scope::EffectiveScope, store_dir: &Path) -> String {
+    if scope.explicit {
+        return String::new();
+    }
+    let coverage = swamp_core::report::stored_root_coverage(scope, store_dir);
+    swamp_core::roots::render_declared_roots(&swamp_core::roots::declared_roots(scope, &coverage))
+}
+
+/// First run: when nothing has been observed and the config has no
+/// `[scan]` section, ask where the source code is (interactive terminal)
+/// or print the one-line instruction (never blocks without one).
+fn first_run_declaration() -> Result<()> {
+    use std::io::IsTerminal;
+    let store = swamp_core::fs_gate::store::StoreDir::resolved();
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let mut read_line = || {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        }
+    };
+    let mut out = std::io::stderr();
+    swamp_core::roots::first_run(
+        &store,
+        &roots_reach(),
+        interactive,
+        &mut read_line,
+        &mut out,
+    )
+    .map(|_| ())
+    .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Ui { root: None }) {
@@ -988,6 +1053,7 @@ fn main() -> Result<()> {
                 // including a root with no Git checkout in it at all,
                 // not just the first present root the CLI used to pick
                 // before the TUI even started.
+                first_run_declaration()?;
                 let scope = resolve_scope(&[])?;
                 if scope.scan_paths().is_empty() {
                     if scope.is_empty_scope() {
@@ -1089,6 +1155,22 @@ fn main() -> Result<()> {
                 }
             };
             let r = snapshot.report;
+            // The declared source roots, from this same stored
+            // observation: present/missing/unreadable with bytes. Never a
+            // walk; `report` stays a pure read.
+            let declared_json_roots = if scope.explicit {
+                Vec::new()
+            } else {
+                swamp_core::roots::declared_roots(&scope, &snapshot.coverage)
+            };
+            let declared_block = swamp_core::roots::render_declared_roots(&declared_json_roots);
+            let previous_scope = snapshot.previous_scope.clone();
+            if let Some(prev) = &previous_scope {
+                eprintln!(
+                    "showing the previous scope ({} roots); new roots not yet observed; run `swamp observe` ({PREVIOUS_SCOPE_NOTE})",
+                    prev.roots
+                );
+            }
             // An explicit root is a scope of one (#42): it never carried
             // scope-level coverage noise even when the underlying pass
             // is now the same coherent scope pipeline the catalog uses,
@@ -1142,6 +1224,23 @@ fn main() -> Result<()> {
                     &store_interiors,
                 )?;
                 bound_interior_units(&mut value, unit_limit, unit_offset);
+                if let Some(obj) = value.as_object_mut() {
+                    // From this same stored observation; never a walk.
+                    obj.insert(
+                        "declared_roots".to_string(),
+                        serde_json::to_value(declared_json_roots)?,
+                    );
+                    if let Some(prev) = &previous_scope {
+                        obj.insert(
+                            "previous_scope".to_string(),
+                            serde_json::json!({
+                                "roots": prev.roots,
+                                "observed_at": prev.observed_at,
+                                "note": PREVIOUS_SCOPE_NOTE,
+                            }),
+                        );
+                    }
+                }
                 safe_println!("{}", serde_json::to_string_pretty(&value)?);
             } else if let Some(wt_path) = worktree {
                 match render_worktree_signals(&r, &wt_path) {
@@ -1268,10 +1367,20 @@ fn main() -> Result<()> {
                         eprintln!("--view {} is JSON only; add --json", v.name());
                         std::process::exit(1);
                     }
-                    None => safe_print!(
-                        "{}",
-                        render_overview_sorted(&r, all, verify_du, docker, sort.into(), reverse)
-                    ),
+                    None => {
+                        safe_print!("{declared_block}");
+                        safe_print!(
+                            "{}",
+                            render_overview_sorted(
+                                &r,
+                                all,
+                                verify_du,
+                                docker,
+                                sort.into(),
+                                reverse
+                            )
+                        )
+                    }
                 }
             }
         }
@@ -1286,11 +1395,48 @@ fn main() -> Result<()> {
                         "{}",
                         swamp_core::growth::load_config_checked(&dir)?.to_toml()
                     );
+                    safe_print!("{}", declared_roots_text(&resolve_scope(&[])?, &dir));
                     if !swamp_core::fs_gate::exists(&path) {
                         eprintln!(
                             "(defaults; no file at {} — `swamp config init` writes one)",
                             path.display()
                         );
+                    }
+                }
+                ConfigAction::AddRoot {
+                    path: typed,
+                    allow_missing,
+                } => {
+                    let store = swamp_core::fs_gate::store::StoreDir::resolved();
+                    match swamp_core::roots::add_root(&store, &roots_reach(), &typed, allow_missing)
+                    {
+                        Ok(swamp_core::roots::AddOutcome::Added { stored, absorbed }) => {
+                            safe_println!("declared {stored} in {}", path.display());
+                            for a in absorbed {
+                                safe_println!(
+                                    "  {a} is inside it and stays declared; it shows as covered"
+                                );
+                            }
+                        }
+                        Ok(swamp_core::roots::AddOutcome::AlreadyDeclared { entry }) => {
+                            safe_println!("already declared as {entry}; nothing changed");
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigAction::RemoveRoot { path: typed } => {
+                    let store = swamp_core::fs_gate::store::StoreDir::resolved();
+                    match swamp_core::roots::remove_root(&store, &roots_reach(), &typed) {
+                        Ok(entry) => {
+                            safe_println!("no longer declared: {entry} (in {})", path.display())
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
                 ConfigAction::Init => {
@@ -1318,6 +1464,7 @@ fn main() -> Result<()> {
                 safe_println!("{}", serde_json::to_string_pretty(&scope)?);
             } else {
                 safe_print!("{}", render_scope_text(&scope, verbose));
+                safe_print!("{}", declared_roots_text(&scope, &swamp_dir()));
                 if scope.is_empty_scope() {
                     eprintln!(
                         "effective scan scope is empty: no built-in default, detector, or configured include is enabled -- this is explicit, never a silent fallback to cwd or home."
@@ -1349,6 +1496,9 @@ fn main() -> Result<()> {
                     swamp_core::disk_guard::abort_message(&store_dir, free, threshold)
                 );
                 std::process::exit(swamp_core::disk_guard::EXIT_DISK_FULL);
+            }
+            if roots.is_empty() {
+                first_run_declaration()?;
             }
             let scope = resolve_scope(&roots)?;
             if scope.scan_paths().is_empty() {

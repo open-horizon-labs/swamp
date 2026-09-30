@@ -12,6 +12,12 @@
 //!   (`.oh/guardrails/one-byte-formatter.md`): a formatted quantity with a
 //!   binary or decimal unit (`"{v:.1} KiB"`) is rendered only by
 //!   `render.rs`.
+//! * `no_root_inference_sources` -- roots are declared, never inferred
+//!   (`.oh/guardrails/roots-are-declared-never-inferred.md`): no
+//!   production literal names shell history, an editor's recent-project
+//!   list, git's `includeIf`/`safe.directory`, a directory-jumper's
+//!   database or Spotlight, the places a program could guess a user's
+//!   source directories from.
 //! * `ids_only_in_their_module` -- adapters and detectors are pluggable
 //!   (`agent-adapters-are-pluggable`, `detector-ids-only-in-registry`): a
 //!   tool or detector id literal appears only in its own module and the
@@ -387,6 +393,88 @@ pub fn ids_only_in_their_module(ws: &Workspace) -> Vec<String> {
     problems
 }
 
+/// Substrings (lower case) of the names of the places a source directory
+/// could be guessed from. Matched inside every production literal, so a
+/// path, a file name, a config key or a program name spelled anywhere,
+/// including through `format!`/`concat!` arguments, is caught.
+const INFERENCE_SOURCES: &[(&str, &str)] = &[
+    ("histfile", "shell history"),
+    (".python_history", "a REPL's history"),
+    (".node_repl_history", "a REPL's history"),
+    ("zsh_history", "shell history"),
+    ("bash_history", "shell history"),
+    ("fish_history", "shell history"),
+    (".zhistory", "shell history"),
+    (".gitconfig", "git configuration"),
+    ("includeif", "git configuration"),
+    ("safe.directory", "git configuration"),
+    ("mdfind", "Spotlight"),
+    ("mdls", "Spotlight"),
+    ("kmditem", "Spotlight"),
+    ("com.apple.spotlight", "Spotlight"),
+    ("recentlyopened", "an editor's recent projects"),
+    ("openedpathslist", "an editor's recent projects"),
+    ("recentprojects", "an editor's recent projects"),
+    ("recent-projects", "an editor's recent projects"),
+    ("recent_projects", "an editor's recent projects"),
+    ("recentworkspaces", "an editor's recent projects"),
+    ("recently-used", "a desktop's recent files"),
+    ("recentitems", "a desktop's recent files"),
+    (".config/git/config", "git configuration"),
+    ("state.vscdb", "an editor's recent projects"),
+    ("globalstorage/storage.json", "an editor's recent projects"),
+    (".sfl2", "a desktop's recent files"),
+    (".sfl3", "a desktop's recent files"),
+    ("mdutil", "Spotlight"),
+    ("fasd", "a directory jumper's database"),
+    ("zoxide", "a directory jumper's database"),
+    ("autojump", "a directory jumper's database"),
+];
+
+/// Needles that name a file an AI-tool adapter legitimately measures as
+/// that tool's own storage (never as a source of roots), with the modules
+/// that may say so. A reviewed exception, added here in the open.
+const REVIEWED_ADAPTER_FILES: &[(&str, &[&[&str]])] = &[(
+    "state.vscdb",
+    &[&["agents", "vscode_family"], &["agents", "matrix"]],
+)];
+
+pub fn no_root_inference_sources(ws: &Workspace) -> Vec<String> {
+    let mut problems = Vec::new();
+    for m in &ws.modules {
+        for l in &m.literals {
+            if l.test {
+                continue;
+            }
+            let lower = l.value.to_lowercase();
+            // rupa/z's data file is too short to match as a substring.
+            if lower == ".z" || lower.ends_with("/.z") {
+                problems.push(format!(
+                    "{}: \"{}\" names a directory jumper's database: source roots are declared \
+                     with `swamp config add-root`, never inferred from it \
+                     (roots-are-declared-never-inferred)",
+                    l.site, l.value
+                ));
+            }
+            for (needle, what) in INFERENCE_SOURCES {
+                let reviewed = REVIEWED_ADAPTER_FILES.iter().any(|(n, mods)| {
+                    n == needle && mods.iter().any(|p| m.is_within(Krate::Core, p))
+                });
+                if lower.contains(needle) && !reviewed {
+                    problems.push(format!(
+                        "{}: \"{}\" names {what}: source roots are declared with `swamp \
+                         config add-root`, never inferred from {what} \
+                         (roots-are-declared-never-inferred)",
+                        l.site,
+                        l.value.replace('\n', " ")
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
 pub const RULES: &[Rule] = &[
     ("no_verdict_literals", |ws| {
         verdict(
@@ -396,6 +484,12 @@ pub const RULES: &[Rule] = &[
     }),
     ("byte_units_only_in_the_formatter", |ws| {
         verdict("one byte formatter", byte_units_only_in_the_formatter(ws))
+    }),
+    ("no_root_inference_sources", |ws| {
+        verdict(
+            "source roots are declared, never inferred from history, recents, git config or Spotlight",
+            no_root_inference_sources(ws),
+        )
     }),
     ("ids_only_in_their_module", |ws| {
         verdict(

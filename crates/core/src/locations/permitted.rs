@@ -33,6 +33,17 @@ impl PermittedDetectors {
     pub fn from_config(config: &ScanConfig, registry: &Registry) -> PermittedDetectors {
         let permitted = crate::scope::detectors_permitted(config);
         let mut disabled = config.disabled_detectors.clone();
+        // A family id in `disabled_detectors` disables every member.
+        for d in registry.detectors() {
+            // A member named in `enabled_detectors` stays on: naming it is
+            // the more specific statement.
+            if let Some(group) = d.group()
+                && config.disabled_detectors.iter().any(|x| x == group)
+                && !config.enabled_detectors.iter().any(|x| x == d.id())
+            {
+                disabled.push(d.id().to_string());
+            }
+        }
         let mut default_off: Vec<String> = Vec::new();
         if !config.defaults {
             disabled.push(super::builtin::BUILTIN_DEFAULTS_DETECTOR_ID.to_string());
