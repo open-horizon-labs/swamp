@@ -398,27 +398,19 @@ fn fit_lines(
     cap: usize,
     more: &dyn Fn(usize) -> String,
 ) -> Vec<(String, Color)> {
-    let rows: Vec<usize> = lines.iter().map(|(l, _)| wrapped_rows(l, width)).collect();
-    if rows.iter().sum::<usize>() <= cap {
-        return lines.to_vec();
-    }
-    // Something is left out, so one row is kept for saying how much. Lines
-    // stay whole and in order; a line too tall for what is left is skipped
-    // and a shorter one after it takes the space, so the sheet is full.
-    let room = cap.saturating_sub(1);
     let mut used = 0usize;
     let mut fit: Vec<(String, Color)> = Vec::new();
-    let mut left_out = 0usize;
-    for (i, line) in lines.iter().enumerate() {
-        if used + rows[i] <= room || fit.is_empty() {
-            used += rows[i];
-            fit.push(line.clone());
-        } else {
-            left_out += 1;
+    for (i, (l, c)) in lines.iter().enumerate() {
+        let rows = wrapped_rows(l, width);
+        let left = lines.len() - i - 1;
+        // Keep one row for the "+N more" line when something is left over.
+        let reserve = usize::from(left > 0);
+        if used + rows + reserve > cap && !fit.is_empty() {
+            fit.push((more(left + 1), Color::Yellow));
+            return fit;
         }
-    }
-    if left_out > 0 {
-        fit.push((more(left_out), Color::Yellow));
+        used += rows;
+        fit.push((l.clone(), *c));
     }
     fit
 }
