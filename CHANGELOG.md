@@ -21,15 +21,19 @@ observations, not general performance guarantees. See the README for current use
   the observation and the ledger. `report --json` has the same numbers as a `headline`
   object, and the Reclaim JSON adds `headline_relation`. This also puts the "System
   volumes" line (#170) in the TUI. Reading it starts nothing and lists nothing.
-- **The TUI names its views and how to reach them.** A row under the headline shows
-  every view with its key, the current one in reverse video (`1 Projects ... 9 External c
-  Reclaim D Disk I Agents`, windowed with `…` on a narrow screen). New keys: `c`
-  opens Reclaim, `D` opens a new Disk view (the stored volume ledger as rows),
-  `I` opens the AI tools' storage; `?` help lists every view with its key and what
-  it shows. The headline block points at Reclaim and Disk with their keys, and a
-  store that has never opened either shows one line saying so until it does
-  (`ui_state.json` `views_seen`). The block is four rows, so on a 24-row
-  screen the table has 15 rows where it had 19.
+- **BREAKING (TUI keys): views are nested in three sections.** In 0.7.x the digits `1`-`9`
+  selected views; now `1` Projects, `2` Tools, `3` Disk select *sections*, `Tab` /
+  `Shift-Tab` move between them, and `v` cycles the views inside the current one
+  (Projects: Projects, Tree, Builds, Deps, Types, Kinds, Docker, Unowned; Tools: Reclaim,
+  External, Agents; Disk: Summary, Not measured). Digits 4-9 are unbound. A row under the
+  headline names the sections (current one in reverse video) and the view line reads
+  `view: Tools › Reclaim (1 of 3 · v next)`. Disk is new: Summary is the stored volume
+  ledger as rows, Not measured lists the unreadable and not-yet-measured folders. The
+  legend is `Tab section  v view  / filter  R refresh  ⌫ delete ...`; `?` help lists every
+  section and view. The headline block points at Reclaim and Disk (`Tab to Tools`, `3`),
+  and a store that has never opened Tools or Disk shows one line saying so until it does
+  (`ui_state.json` `views_seen`). The block is four rows plus the strip, so on a 24-row
+  screen the table has 14 rows where it had 19.
 - **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
   unit of developer storage, largest first, with what getting it back costs in the
   tool's own words, when it was last used and from what record, who is known to

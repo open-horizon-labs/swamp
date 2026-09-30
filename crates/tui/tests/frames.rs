@@ -1138,20 +1138,23 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
     assert!(before.contains("1 Projects"), "{before}");
+    assert!(
+        before.contains("view: Projects › Projects (1 of 8 · v next)"),
+        "{before}"
+    );
     assert!(before.contains("filter: none"), "{before}");
-    assert!(before.contains("v next"), "{before}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
     let tree = capture(&app, 200, 60);
     assert!(
-        tree.contains("2 Tree of "),
-        "the strip must name the scope:\n{tree}"
+        tree.contains("view: Projects › Tree of "),
+        "the view line must name the scope:\n{tree}"
     );
     assert!(tree.contains("Esc: projects"), "{tree}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
-    assert!(back.contains("1 Projects"), "{back}");
+    assert!(back.contains("view: Projects › Projects"), "{back}");
 }
 
 #[test]
@@ -2001,7 +2004,10 @@ fn one_down_moves_the_selection_one_row_at_80x24() {
         let mut t = Terminal::new(backend).unwrap();
         t.draw(|f| ui::draw(f, app)).unwrap();
         let buf = t.backend().buffer().clone();
+        // The section strip's current section is reversed too.
+        let strip_y = 1 + ui::headline_rows(24);
         (0..24u16)
+            .filter(|y| *y != strip_y)
             .find(|y| buf[(0, *y)].modifier.contains(Modifier::REVERSED))
             .expect("a selected row is drawn") as usize
     };
@@ -2268,12 +2274,12 @@ fn k_says_what_it_changed_and_the_legend_keeps_the_common_keys() {
     swamp_tui::handle_key(&mut app, KeyCode::Down);
     let f = capture(&app, 80, 24);
     assert!(
-        f.contains("/ filter  v view  R refresh  ⌫ delete"),
+        f.contains("Tab section  v view  / filter  R refresh  ⌫ delete"),
         "the four keys people reach for stay at 80 columns:\n{f}"
     );
     assert!(f.contains("? help  q quit"), "{f}");
     let f50 = capture(&app, 50, 24);
-    assert!(f50.contains("/ filter  v view  R refresh"), "{f50}");
+    assert!(f50.contains("Tab section  v view  / filter"), "{f50}");
     assert!(f50.contains("? help  q quit"), "{f50}");
 }
 
@@ -2289,9 +2295,8 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
     assert_eq!(app.view, ViewKind::Builds);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("3 Builds of mole"), "{f}");
-    swamp_tui::handle_key(&mut app, KeyCode::Char('2'));
-    assert_eq!(app.view, ViewKind::Tree);
+    assert!(f.contains("view: Projects › Builds of mole (3 of 8"), "{f}");
+    app.set_view(ViewKind::Tree);
     assert_eq!(app.selected, at, "the tree cursor came back");
     // Esc to projects and back to the same project row.
     swamp_tui::handle_key(&mut app, KeyCode::Esc);

@@ -344,19 +344,17 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
 fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
-    const BASE: [&str; 13] = [
-        "/ filter",
+    const BASE: [&str; 11] = [
+        "Tab section",
         "v view",
+        "/ filter",
         "R refresh",
         "⌫ delete",
-        "c reclaim",
-        "D disk",
         "Space mark",
         "A mark all",
         "↑↓ move",
         "→/← in/out",
         "g/s/n/t/a sort",
-        "r reverse",
         "? help",
     ];
     const TAIL: &str = "q quit";
@@ -1037,7 +1035,7 @@ pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
         third.push(if width >= 64 {
             vec!["FLAG: walk spot audit disagrees: see swamp report --view disk".to_string()]
         } else {
-            vec!["FLAG: spot audit disagrees (D)".to_string()]
+            vec!["FLAG: spot audit disagrees (3)".to_string()]
         });
     }
     match &h.disk {
@@ -1127,16 +1125,12 @@ fn pointer_line(
 ) -> String {
     use swamp_core::headline::Disk;
     use swamp_core::volume_ledger::age_text;
-    let (rk, dk) = (
-        crate::app::ViewKind::Reclaim.key(),
-        crate::app::ViewKind::Disk.key(),
-    );
     if !app.views_seen {
         return fit_tiered(
             &[vec![
-                format!("New: press {rk} for Reclaim, {dk} for Disk. Hides after you open either."),
-                format!("New: {rk} Reclaim, {dk} Disk (hides after use)"),
-                format!("New: {rk} Reclaim, {dk} Disk"),
+                "New: Tab opens Tools (Reclaim) and Disk. Hides after you open either.".to_string(),
+                "New: Tab opens Tools and Disk (hides after use)".to_string(),
+                "New: Tab opens Tools and Disk".to_string(),
             ]],
             width,
         );
@@ -1148,36 +1142,36 @@ fn pointer_line(
             let regen = human_bytes(view.totals.regenerable_bytes);
             vec![
                 format!(
-                    "Reclaim: {regen} regenerable across {n} unit{} (press {rk})",
+                    "Reclaim: {regen} regenerable across {n} unit{} (Tab to Tools)",
                     if n == 1 { "" } else { "s" }
                 ),
                 format!(
-                    "Reclaim: {regen} regenerable, {n} unit{} ({rk})",
+                    "Reclaim: {regen} regenerable, {n} unit{} (Tab)",
                     if n == 1 { "" } else { "s" }
                 ),
-                format!("Reclaim ({rk})"),
+                "Reclaim (Tab to Tools)".to_string(),
             ]
         }
-        None => vec![format!("Reclaim ({rk})")],
+        None => vec!["Reclaim (Tab to Tools)".to_string()],
     };
     let disk: Vec<String> = match h.map(|h| &h.disk) {
         Some(Disk::Measured(m)) => {
             let a = age_text(m.measured_at, now);
             vec![
-                format!("Disk: ledger measured {a} (press {dk})"),
-                format!("Disk: ledger {a} ({dk})"),
-                format!("Disk ({dk})"),
+                format!("Disk: ledger measured {a} (3)"),
+                format!("Disk: ledger {a} (3)"),
+                "Disk (3)".to_string(),
             ]
         }
         Some(Disk::NotMeasured) | None => vec![
-            format!("Disk: not measured; run swamp observe --volume (press {dk})"),
-            format!("Disk: not measured ({dk})"),
-            format!("Disk ({dk})"),
+            "Disk: not measured; run swamp observe --volume (3)".to_string(),
+            "Disk: not measured (3)".to_string(),
+            "Disk (3)".to_string(),
         ],
         Some(_) => vec![
-            format!("Disk: ledger not usable; run swamp observe --volume (press {dk})"),
-            format!("Disk: ledger not usable ({dk})"),
-            format!("Disk ({dk})"),
+            "Disk: ledger not usable; run swamp observe --volume (3)".to_string(),
+            "Disk: ledger not usable (3)".to_string(),
+            "Disk (3)".to_string(),
         ],
     };
     fit_tiered(&[reclaim, disk], width)
@@ -1309,105 +1303,49 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The view strip: one row naming every view by its key (`1 Projects 2
-/// Tree ... c Reclaim D Disk I Agents`), the current one in reverse video
-/// (an attribute, not a color: it survives `NO_COLOR` and any theme).
-///
-/// When the whole strip does not fit, it shows the current view and as
-/// many neighbors as fit, with `…` where it is cut; the current view is
-/// always on screen. After the tabs comes the hint (`v next · 1-9 c D I
-/// jump`, or `v next · Esc: projects` off the projects list), shortened
-/// and then dropped before the tabs are cut below 40 columns.
+/// The section strip: one row naming the three sections, the current one
+/// in reverse video (an attribute, not a color: it survives `NO_COLOR` and
+/// any theme). `1 Projects  2 Tools  3 Disk` while the digits fit, then the
+/// bare names; `· Tab section` follows when there is room. The sub-view is
+/// named on the line below (`view: Tools › Reclaim (1 of 3 · v next)`).
 pub fn view_strip_spans(app: &App, width: usize) -> Vec<Span<'static>> {
-    use crate::app::ViewKind;
+    use crate::app::Section;
     let dw = crate::model::display_width;
-    let labels: Vec<String> = ViewKind::ALL
-        .iter()
-        .map(|v| {
-            let of = match (*v == app.view, app.selected_project.as_deref()) {
-                (true, Some(p)) if *v != ViewKind::Projects => format!(" of {p}"),
-                _ => String::new(),
-            };
-            format!("{} {}{of}", v.key(), v.title())
-        })
-        .collect();
-    let cur = ViewKind::ALL
-        .iter()
-        .position(|v| *v == app.view)
-        .unwrap_or(0);
-    let hints: Vec<String> = if app.view == ViewKind::Projects {
-        vec![
-            "v next · 1-9 c D I jump".to_string(),
-            "v next".to_string(),
-            String::new(),
-        ]
+    let cur = app.view.section();
+    let build = |digits: bool| -> Vec<String> {
+        Section::ALL
+            .iter()
+            .map(|s| {
+                if digits {
+                    format!("{} {}", s.key(), s.title())
+                } else {
+                    s.title().to_string()
+                }
+            })
+            .collect()
+    };
+    let total = |l: &[String]| l.iter().map(|x| dw(x)).sum::<usize>() + 2 * (l.len() - 1);
+    let labels = if total(&build(true)) <= width {
+        build(true)
     } else {
-        vec![
-            "v next · Esc: projects".to_string(),
-            "Esc: projects".to_string(),
-            String::new(),
-        ]
+        build(false)
     };
-    let sep = " · ";
-    let all_tabs = labels.iter().map(|l| dw(l)).sum::<usize>() + 2 * (labels.len() - 1);
-    // The longest hint that still lets every tab show; when no hint does,
-    // the longest one that leaves the tabs 40 columns.
-    let room_for =
-        |h: &String| width.saturating_sub(if h.is_empty() { 0 } else { dw(sep) + dw(h) });
-    let hint = hints
-        .iter()
-        .find(|h| all_tabs <= room_for(h))
-        .or_else(|| hints.iter().find(|h| room_for(h) >= 40 || h.is_empty()))
-        .cloned()
-        .unwrap_or_default();
-    let tail = if hint.is_empty() {
-        String::new()
-    } else {
-        format!("{sep}{hint}")
-    };
-    let room = width.saturating_sub(dw(&tail));
-    // Grow a window of tabs around the current one, right then left, while
-    // it fits (two spaces between tabs, `… ` and ` …` at a cut edge).
-    let (mut lo, mut hi) = (cur, cur);
-    let cost = |lo: usize, hi: usize| -> usize {
-        let body: usize = labels[lo..=hi].iter().map(|l| dw(l)).sum::<usize>() + 2 * (hi - lo);
-        body + if lo > 0 { 2 } else { 0 } + if hi + 1 < labels.len() { 2 } else { 0 }
-    };
-    loop {
-        let mut grew = false;
-        if hi + 1 < labels.len() && cost(lo, hi + 1) <= room {
-            hi += 1;
-            grew = true;
-        }
-        if lo > 0 && cost(lo - 1, hi) <= room {
-            lo -= 1;
-            grew = true;
-        }
-        if !grew {
-            break;
-        }
-    }
+    let hint = " · Tab section";
     let quiet = Style::default().add_modifier(Modifier::DIM);
     let mut spans: Vec<Span<'static>> = Vec::new();
-    if lo > 0 {
-        spans.push(Span::styled("… ", quiet));
-    }
-    for (i, label) in labels.iter().enumerate().take(hi + 1).skip(lo) {
-        if i > lo {
+    for (i, label) in labels.iter().enumerate() {
+        if i > 0 {
             spans.push(Span::raw("  "));
         }
-        let l = clip_end(label, room.max(1));
-        spans.push(if i == cur {
+        let l = clip_end(label, width.max(1));
+        spans.push(if Section::ALL[i] == cur {
             Span::styled(l, selected_style())
         } else {
             Span::raw(l)
         });
     }
-    if hi + 1 < labels.len() {
-        spans.push(Span::styled(" …", quiet));
-    }
-    if !tail.is_empty() {
-        spans.push(Span::styled(tail, quiet));
+    if total(&labels) + dw(hint) <= width {
+        spans.push(Span::styled(hint.to_string(), quiet));
     }
     spans
 }
@@ -1440,7 +1378,22 @@ fn filter_clause(app: &App) -> String {
     } else {
         app.filter_text.clone()
     };
-    format!("filter: {filter}{sort}")
+    let of = match (app.view, app.selected_project.as_deref()) {
+        (crate::app::ViewKind::Projects, _) | (_, None) => String::new(),
+        (_, Some(p)) => format!(" of {p}"),
+    };
+    let esc = if app.view == crate::app::ViewKind::Projects {
+        ""
+    } else {
+        " · Esc: projects"
+    };
+    format!(
+        "view: {} › {}{of} ({} of {} · v next{esc}) · filter: {filter}{sort}",
+        app.view.section().title(),
+        app.view.title(),
+        app.view.position(),
+        app.view.section().views().len(),
+    )
 }
 
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
@@ -1521,7 +1474,7 @@ fn empty_state(app: &App) -> String {
             "No storage units in the stored observation. {}. Press v for another view, or R to scan again.",
             app.reclaim_view().scope.statement
         ),
-        V::Disk => {
+        V::Disk | V::DiskGaps => {
             let h = app.headline();
             let why = h
                 .disk_state_sentence()
@@ -2081,8 +2034,18 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     );
     entry(
         &mut out,
+        "Tab",
+        "next section (Projects, Tools, Disk); Shift-Tab goes back. In the filter, Tab completes as before",
+    );
+    entry(
+        &mut out,
         "v",
-        "next view (the strip under the headline names them all); Esc returns to projects. Each view also has its own key, listed under Views",
+        "next view inside the current section, wrapping around; Esc returns to projects",
+    );
+    entry(
+        &mut out,
+        "1 2 3",
+        "jump to a section: 1 Projects, 2 Tools, 3 Disk",
     );
     entry(
         &mut out,
@@ -2114,13 +2077,23 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "quit. While a check or a move runs, q and Esc stop it after the current item",
     );
     blank(&mut out);
-    heading(&mut out, "Views (press the key to open one)");
-    for v in crate::app::ViewKind::ALL {
+    heading(
+        &mut out,
+        "Sections and views (Tab, v and 1 2 3 reach every one)",
+    );
+    for sec in crate::app::Section::ALL {
         entry(
             &mut out,
-            &v.key().to_string(),
-            &format!("{}: {}", v.title(), v.describe()),
+            &format!("{} {}", sec.key(), sec.title()),
+            sec.describe(),
         );
+        for (i, v) in sec.views().iter().enumerate() {
+            entry(
+                &mut out,
+                "",
+                &format!("{}. {}: {}", i + 1, v.title(), v.describe()),
+            );
+        }
     }
     blank(&mut out);
     heading(&mut out, "Columns");

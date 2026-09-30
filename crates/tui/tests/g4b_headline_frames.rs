@@ -207,14 +207,15 @@ fn no_row_moves_between_states_or_views_at_any_width() {
                     let f = frame(&a, w, h);
                     let ctx = format!("{w}x{h} {name} {view:?}\n{}", f.join("\n"));
                     assert_eq!(f.len(), want_rows);
-                    // The strip row names the current view by its key.
+                    // The strip row names the current section by its key.
                     let strip = &f[1 + hr];
+                    let sec = view.section();
                     assert!(
-                        strip.contains(&format!("{} {}", view.key(), view.title())),
+                        strip.contains(&format!("{} {}", sec.key(), sec.title())),
                         "strip: {ctx}"
                     );
-                    // The filter line, then the body.
-                    assert!(f[2 + hr].starts_with("filter:"), "filter line: {ctx}");
+                    // The view line, then the body.
+                    assert!(f[2 + hr].starts_with("view: "), "view line: {ctx}");
                     let body = &f[3 + hr];
                     if !a.rows().is_empty() {
                         assert!(body.starts_with("Name"), "heading at the same row: {ctx}");
@@ -279,20 +280,20 @@ fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
     // The pointers name the views and the keys; at 80 columns they take
     // their shorter form.
     assert!(
-        f[4].contains("Reclaim: 3.0GB regenerable, 3 units (c)"),
+        f[4].contains("Reclaim: 3.0GB regenerable, 3 units (Tab)"),
         "{}",
         f[4]
     );
-    assert!(f[4].contains("Disk: ledger 3 h ago (D)"), "{}", f[4]);
+    assert!(f[4].contains("Disk: ledger 3 h ago (3)"), "{}", f[4]);
     // Wide enough, they spell the key out.
     let wide = frame(&a, 120, 30);
     assert!(
-        wide[4].contains("Reclaim: 3.0GB regenerable across 3 units (press c)"),
+        wide[4].contains("Reclaim: 3.0GB regenerable across 3 units (Tab to Tools)"),
         "{}",
         wide[4]
     );
     assert!(
-        wide[4].contains("Disk: ledger measured 3 h ago (press D)"),
+        wide[4].contains("Disk: ledger measured 3 h ago (3)"),
         "{}",
         wide[4]
     );
@@ -391,24 +392,24 @@ fn a_spot_audit_that_disagrees_is_the_first_thing_on_the_disk_line_at_every_widt
 }
 
 // ---------------------------------------------------------------------
-// The view strip
+// The section strip
 // ---------------------------------------------------------------------
 
-/// Tempting wrong patch: the strip highlights the current view with a
-/// color (lost under NO_COLOR and on a light theme), or shows a window that
-/// forgets the current view. It is reverse video only, on exactly the
-/// current tab, at every width.
+/// Tempting wrong patch: the strip highlights the current section with a
+/// color (lost under NO_COLOR and on a light theme), or highlights more
+/// than the current one. It is reverse video only, on exactly the current
+/// section's label, at every width.
 #[test]
-fn the_strip_highlights_the_current_view_with_reverse_video_and_no_color() {
+fn the_strip_highlights_the_current_section_with_reverse_video_and_no_color() {
     for w in [40u16, 50, 80, 120] {
         for view in ViewKind::ALL {
             let mut a = app();
             a.set_view(view);
             let b = buf(&a, w, 24);
             let y = 1 + ui::headline_rows(24);
-            let label = format!("{} {}", view.key(), view.title());
-            let cells: Vec<String> = (0..w).map(|x| b[(x, y)].symbol().to_string()).collect();
-            let line: String = cells.concat();
+            let sec = view.section();
+            let label = format!("{} {}", sec.key(), sec.title());
+            let line: String = (0..w).map(|x| b[(x, y)].symbol().to_string()).collect();
             let at = line
                 .find(&label)
                 .unwrap_or_else(|| panic!("{w} {view:?}: {line}"));
@@ -417,177 +418,201 @@ fn the_strip_highlights_the_current_view_with_reverse_video_and_no_color() {
                 .filter(|x| b[(*x, y)].modifier.contains(Modifier::REVERSED))
                 .collect();
             let want: Vec<u16> = (col..col + label.chars().count() as u16).collect();
-            assert_eq!(
-                reversed, want,
-                "{w} {view:?}: reverse video is the current tab only: {line}"
-            );
+            assert_eq!(reversed, want, "{w} {view:?}: {line}");
             for x in 0..w {
                 assert_eq!(b[(x, y)].fg, Color::Reset, "{w} {view:?}: no color");
                 assert_eq!(b[(x, y)].bg, Color::Reset, "{w} {view:?}: no color");
+            }
+            // All three sections are named, in order, on one row.
+            let mut from = 0;
+            for s in swamp_tui::app::Section::ALL {
+                let i = line[from..]
+                    .find(s.title())
+                    .unwrap_or_else(|| panic!("{w}: {line}"));
+                from += i + s.title().len();
             }
         }
     }
 }
 
-/// Tempting wrong patch: at 80 columns the strip is the whole 113-character
-/// list clipped at the edge (Reclaim and Disk fall off the end), or
-/// narrower screens show a partial word. It shows a window of whole tabs
-/// around the current one with `…` where it is cut.
+/// Tempting wrong patch: the sub-view is only on the strip (so a narrow
+/// screen loses it) or `v` runs into the next section. The view line names
+/// section, sub-view and place; `v` wraps inside the section.
 #[test]
-fn the_strip_shows_whole_tabs_around_the_current_view_with_ellipses() {
-    let strip = |view: ViewKind, w: u16| -> String {
+fn the_view_line_names_the_sub_view_and_v_wraps_inside_the_section() {
+    use swamp_tui::app::Section;
+    for w in [40u16, 50, 80, 120] {
         let mut a = app();
-        a.set_view(view);
-        frame(&a, w, 24)[1 + ui::headline_rows(24) as usize].clone()
-    };
-    // Wide enough for everything: all twelve tabs, in order.
-    let wide = strip(ViewKind::Projects, 200);
-    let mut at = 0;
-    for v in ViewKind::ALL {
-        let label = format!("{} {}", v.key(), v.title());
-        let i = wide[at..]
-            .find(&label)
-            .unwrap_or_else(|| panic!("{label} in {wide}"));
-        at += i + label.len();
-    }
-    assert!(wide.contains("v next"), "{wide}");
-    // At 80: Projects shows its first tabs then `…`, and names the jump keys.
-    let s80 = strip(ViewKind::Projects, 80);
-    assert!(s80.starts_with("1 Projects  2 Tree"), "{s80}");
-    assert!(s80.contains('…'), "{s80}");
-    assert!(s80.contains("v next"), "{s80}");
-    // Reclaim at 80: cut on the left, the current tab and its neighbors on screen.
-    let r80 = strip(ViewKind::Reclaim, 80);
-    assert!(r80.contains("c Reclaim"), "{r80}");
-    assert!(r80.contains('…'), "{r80}");
-    // Every tab is a whole label wherever the window sits, at 40 and 50.
-    for w in [40u16, 50] {
-        for v in ViewKind::ALL {
-            let s = strip(v, w);
-            assert!(
-                s.contains(&format!("{} {}", v.key(), v.title())),
-                "{w} {v:?}: {s}"
-            );
-            assert!(s.chars().count() <= w as usize);
+        a.set_section(Section::Tools);
+        let f = frame(&a, w, 24);
+        let line = &f[2 + ui::headline_rows(24) as usize];
+        assert!(
+            line.starts_with("view: Tools › Reclaim (1 of 3"),
+            "{w}: {line}"
+        );
+        for _ in 0..3 {
+            swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
         }
+        assert_eq!(a.view, ViewKind::Reclaim, "wrapped");
+        let line = frame(&a, w, 24)[2 + ui::headline_rows(24) as usize].clone();
+        assert!(
+            line.starts_with("view: Tools › Reclaim (1 of 3"),
+            "{w}: {line}"
+        );
     }
+    let mut a = app();
+    a.set_section(Section::Disk);
+    swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
+    assert_eq!(a.view, ViewKind::DiskGaps);
+    let line = frame(&a, 80, 24)[2 + ui::headline_rows(24) as usize].clone();
+    assert!(
+        line.starts_with("view: Disk › Not measured (2 of 2"),
+        "{line}"
+    );
 }
 
 // ---------------------------------------------------------------------
-// The direct keys
+// The keymap
 // ---------------------------------------------------------------------
 
-/// Tempting wrong patch: a new view gets a key another handler already
-/// owns (`d` opens the blocked list on a plan, `a` sorts by age), or two
-/// views share one. Every view has exactly one key, the keys are distinct,
-/// they open their view, none is a key the main keymap binds otherwise, and
-/// `?` help documents each.
+/// Tempting wrong patch: a second way into a view (digits 4-9, a letter
+/// per view) creeps back, or a key is bound twice, or a section is only
+/// reachable by a key that does not exist. Every section and sub-view is
+/// reachable with only Tab, Shift-Tab, `v` and 1-3; the main keymap is read
+/// from the source and no key is bound twice; the removed keys do nothing.
 #[test]
-fn every_view_is_reachable_by_one_documented_key_and_no_key_is_bound_twice() {
-    // 1. One key per view, all distinct, and `from_key` inverts `key`.
-    let mut seen: Vec<char> = Vec::new();
-    for v in ViewKind::ALL {
-        let k = v.key();
-        assert!(!seen.contains(&k), "{k} is the key of two views");
-        seen.push(k);
-        assert_eq!(ViewKind::from_key(k), Some(v));
+fn every_section_and_view_is_reachable_with_tab_v_and_1_to_3_and_no_key_is_bound_twice() {
+    use std::collections::HashSet;
+    use swamp_tui::app::Section;
+    // 1. Reachability from any start, by the allowed keys only.
+    let keys = [
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Char('v'),
+        KeyCode::Char('1'),
+        KeyCode::Char('2'),
+        KeyCode::Char('3'),
+    ];
+    let mut reached: HashSet<ViewKind> = HashSet::new();
+    let mut frontier: Vec<ViewKind> = vec![ViewKind::Projects];
+    reached.insert(ViewKind::Projects);
+    while let Some(v) = frontier.pop() {
+        for k in keys {
+            let mut a = app();
+            a.set_view(v);
+            swamp_tui::handle_key(&mut a, k);
+            if reached.insert(a.view) {
+                frontier.push(a.view);
+            }
+        }
     }
-    assert_eq!(seen.len(), ViewKind::ALL.len());
-    assert_eq!(ViewKind::from_key('0'), None, "0 clears the filter");
-    // 2. Pressing the key opens the view.
+    assert_eq!(reached.len(), ViewKind::ALL.len(), "{reached:?}");
     for v in ViewKind::ALL {
+        assert!(reached.contains(&v), "{v:?} is unreachable");
+    }
+    // 2. Sections: Tab and Shift-Tab are inverse and cover all three; 1-3 jump.
+    let mut a = app();
+    let mut seen = vec![a.view.section()];
+    for _ in 0..3 {
+        swamp_tui::handle_key(&mut a, KeyCode::Tab);
+        seen.push(a.view.section());
+    }
+    assert_eq!(
+        seen,
+        vec![
+            Section::Projects,
+            Section::Tools,
+            Section::Disk,
+            Section::Projects
+        ]
+    );
+    swamp_tui::handle_key(&mut a, KeyCode::BackTab);
+    assert_eq!(a.view.section(), Section::Disk);
+    for s in Section::ALL {
+        swamp_tui::handle_key(&mut a, KeyCode::Char(s.key()));
+        assert_eq!(a.view, s.default_view());
+    }
+    assert_eq!(ViewKind::Reclaim, Section::Tools.default_view());
+    // 3. The removed keys open nothing.
+    for k in ['4', '5', '6', '7', '8', '9', 'c', 'D', 'I'] {
         let mut a = app();
-        a.set_view(if v == ViewKind::Projects {
-            ViewKind::Tree
-        } else {
-            ViewKind::Projects
-        });
-        swamp_tui::handle_key(&mut a, KeyCode::Char(v.key()));
-        assert_eq!(a.view, v, "key {} opens {v:?}", v.key());
+        swamp_tui::handle_key(&mut a, KeyCode::Char(k));
+        assert_eq!(a.view, ViewKind::Projects, "{k} still opens a view");
     }
-    // 3. No other arm of the main keymap binds a view key. The keymap is
-    // read from the source: every `KeyCode::Char('x')` between the start of
-    // the main `match code` and the end of the function.
+    // 4. No key is bound twice in the main keymap (read from the source:
+    // every `KeyCode::Char('x')` from the start of the main `match code` to
+    // the end of the function), and no view key is a literal there other
+    // than the three digits.
     let src = include_str!("../src/lib.rs");
     let start = src
         .find("    match code {\n        KeyCode::Char('q') => app.quit = true,")
         .expect("the main keymap");
     let end = start + src[start..].find("\n}\n").expect("end of handle_key_mod");
     let region = &src[start..end];
-    let mut bound: Vec<char> = Vec::new();
+    let mut bound: Vec<String> = Vec::new();
     let mut rest = region;
-    while let Some(i) = rest.find("KeyCode::Char('") {
-        let tail = &rest[i + "KeyCode::Char('".len()..];
-        let c = tail.chars().next().unwrap();
-        // `Char(k) if ...` (the view arm) has no literal; a range arm is
-        // `Char('1'..='9')` and would show as '1' here.
-        bound.push(c);
-        rest = &tail[c.len_utf8()..];
+    while let Some(i) = rest.find("KeyCode::") {
+        let tail = &rest[i + "KeyCode::".len()..];
+        let name: String = if let Some(t) = tail.strip_prefix("Char('") {
+            let c = t.chars().next().unwrap();
+            format!("Char({c})")
+        } else {
+            tail.chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect()
+        };
+        bound.push(name);
+        rest = &tail[1..];
     }
-    for v in ViewKind::ALL {
-        assert!(
-            !bound.contains(&v.key()),
-            "the main keymap binds {:?} as well as the {v:?} view",
-            v.key()
-        );
-    }
-    // No literal key is bound twice in the main keymap either (`d` appears
-    // once, guarded by the plan being open).
+    // `d` is guarded by an open plan; count its guarded arm once.
     let mut sorted = bound.clone();
-    sorted.sort_unstable();
-    let dups: Vec<char> = sorted
+    sorted.sort();
+    let dups: Vec<&String> = sorted
         .windows(2)
         .filter(|w| w[0] == w[1])
-        .map(|w| w[0])
+        .map(|w| &w[0])
         .collect();
     assert!(dups.is_empty(), "bound twice in the main keymap: {dups:?}");
-    // 4. `?` help lists every view with its key and its description.
+    for gone in ["Char(4)", "Char(c)", "Char(D)", "Char(I)"] {
+        assert!(
+            !bound.contains(&gone.to_string()),
+            "{gone} is still in the keymap"
+        );
+    }
+    assert!(bound.contains(&"Tab".to_string()) && bound.contains(&"BackTab".to_string()));
+    // 5. `?` help lists every section and view with its key.
     let mut a = app();
     a.help_open = true;
     let mut text = String::new();
-    for scroll in [0usize, 20, 40, 60, 80] {
+    for scroll in [0usize, 15, 30, 45, 60, 75, 90] {
         a.help_scroll.set(scroll);
         text.push_str(&frame(&a, 120, 30).join("\n"));
         text.push('\n');
+    }
+    for s in Section::ALL {
+        assert!(
+            text.contains(&format!("{} {}", s.key(), s.title())),
+            "help lacks {s:?}"
+        );
     }
     for v in ViewKind::ALL {
         assert!(
             text.contains(&format!("{}:", v.title())),
             "help lacks {v:?}"
         );
-        let head: String = v.describe().chars().take(24).collect();
-        assert!(
-            text.contains(&head),
-            "help lacks the description of {v:?}: {head}"
-        );
+        let head: String = v.describe().chars().take(20).collect();
+        assert!(text.contains(&head), "help lacks the description of {v:?}");
     }
+    assert!(
+        text.contains("Shift-Tab") && text.contains("1 2 3"),
+        "{text}"
+    );
 }
 
-/// Tempting wrong patch: `c`, `D` or `I` are handled in a modal that a
-/// later key can never reach, or Ctrl-C is taken for `c`.
+/// Tempting wrong patch: Ctrl-C is taken for a view key, or `v` walks out
+/// of the section.
 #[test]
-fn the_direct_keys_work_from_any_view_and_ctrl_c_is_not_c() {
-    let mut a = app();
-    swamp_tui::handle_key(&mut a, KeyCode::Char('c'));
-    assert_eq!(a.view, ViewKind::Reclaim);
-    swamp_tui::handle_key(&mut a, KeyCode::Char('D'));
-    assert_eq!(a.view, ViewKind::Disk);
-    swamp_tui::handle_key(&mut a, KeyCode::Char('I'));
-    assert_eq!(a.view, ViewKind::Agents);
-    swamp_tui::handle_key(&mut a, KeyCode::Char('9'));
-    assert_eq!(a.view, ViewKind::External);
-    // v cycles through all twelve and comes back.
-    let mut a = app();
-    let mut order = vec![a.view];
-    for _ in 0..12 {
-        swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
-        order.push(a.view);
-    }
-    assert_eq!(order.first(), order.last());
-    for v in ViewKind::ALL {
-        assert!(order.contains(&v), "{v:?} is not reached by v");
-    }
-    // Ctrl-C quits (or cancels), it never opens Reclaim.
+fn ctrl_c_is_not_a_view_key_and_v_stays_in_its_section() {
     let mut a = app();
     swamp_tui::handle_terminal_key(
         &mut a,
@@ -597,30 +622,42 @@ fn the_direct_keys_work_from_any_view_and_ctrl_c_is_not_c() {
         ),
     );
     assert_eq!(a.view, ViewKind::Projects);
+    assert!(a.quit);
+    for s in swamp_tui::app::Section::ALL {
+        let mut a = app();
+        a.set_section(s);
+        for _ in 0..(s.views().len() * 2 + 1) {
+            swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
+            assert_eq!(a.view.section(), s);
+        }
+    }
 }
 
-/// Tempting wrong patch: the legend grows and pushes `? help  q quit` (or
-/// refresh and delete) off an 80 column screen to make room for the new
-/// keys. The priority order stays; the new keys appear only where they fit.
+/// Tempting wrong patch: the legend grows view keys, or loses `? help  q
+/// quit`. It is `Tab section  v view  / filter  R refresh  ⌫ delete` and
+/// the row keys that already existed, and never a key per view.
 #[test]
-fn the_legend_keeps_its_priority_order_and_adds_the_direct_keys_only_where_they_fit() {
+fn the_legend_names_tab_and_v_and_never_a_key_per_view() {
     let a = app();
     let f80 = frame(&a, 80, 24);
     let last = &f80[23];
     assert!(
-        last.starts_with("/ filter  v view  R refresh  ⌫ delete"),
+        last.starts_with("Tab section  v view  / filter  R refresh  ⌫ delete"),
         "{last}"
     );
     assert!(last.contains("? help  q quit"), "{last}");
-    let f120 = frame(&a, 120, 30);
-    let last = &f120[29];
-    assert!(last.contains("c reclaim  D disk"), "{last}");
-    assert!(last.contains("? help  q quit"), "{last}");
-    // In the Reclaim view (nothing to mark) the direct keys reach 80.
-    let mut a = app();
-    a.set_view(ViewKind::Reclaim);
-    let last = &frame(&a, 80, 24)[23];
-    assert!(last.contains("? help  q quit"), "{last}");
+    for w in [40u16, 50, 80, 120] {
+        for v in ViewKind::ALL {
+            let mut a = app();
+            a.set_view(v);
+            let last = frame(&a, w, 30).pop().unwrap();
+            assert!(last.contains("? help  q quit"), "{w} {v:?}: {last}");
+            assert!(
+                !last.contains("reclaim") && !last.contains("disk"),
+                "{last}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -629,36 +666,35 @@ fn the_legend_keeps_its_priority_order_and_adds_the_direct_keys_only_where_they_
 
 /// Tempting wrong patch: the pointer line is a permanent banner, or it is
 /// remembered only in memory, or it hides on any key. It shows on a store
-/// that has never opened Reclaim or Disk, ends when either is opened, and
-/// is written to `ui_state.json` (additive; an older reader ignores it).
+/// that has never opened Tools or Disk, ends when either is opened, and is
+/// written to `ui_state.json` (additive; an older reader ignores it).
 #[test]
-fn the_first_run_line_hides_after_reclaim_or_disk_is_opened_and_stays_hidden() {
+fn the_first_run_line_hides_after_tools_or_disk_is_opened_and_stays_hidden() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = app();
     a.store_dir = Some(dir.path().to_path_buf());
     a.views_seen = false;
-    let want = "New: press c for Reclaim, D for Disk. Hides after you open either.";
-    let f = frame(&a, 80, 24);
-    assert_eq!(f[4], want);
-    // Other keys do not end it.
+    let want = "New: Tab opens Tools (Reclaim) and Disk. Hides after you open either.";
+    assert_eq!(frame(&a, 80, 24)[4], want);
+    // Moving inside Projects does not end it.
     swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
     swamp_tui::handle_key(&mut a, KeyCode::Char('1'));
     assert_eq!(frame(&a, 80, 24)[4], want);
     // Opening Disk does.
-    swamp_tui::handle_key(&mut a, KeyCode::Char('D'));
+    swamp_tui::handle_key(&mut a, KeyCode::Char('3'));
     assert!(a.views_seen);
     let f = frame(&a, 80, 24);
     assert!(!f[4].starts_with("New:"), "{}", f[4]);
-    assert!(f[4].contains("Reclaim:"), "{}", f[4]);
-    // The state is on disk, written off the event thread, and a new
-    // session over the same store starts with it set.
+    assert!(
+        f[4].contains("Reclaim:") && f[4].contains("(Tab"),
+        "{}",
+        f[4]
+    );
     a.flush_ui_state();
     let raw = std::fs::read_to_string(dir.path().join("ui_state.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["views_seen"], true, "{raw}");
     assert!(swamp_tui::app::load_ui_state(dir.path()).views_seen);
-    // An older ui_state.json (no such key) loads as "not seen"; an older
-    // reader would ignore the key it does not know.
     let old = tempfile::tempdir().unwrap();
     std::fs::write(
         old.path().join("ui_state.json"),
@@ -666,23 +702,24 @@ fn the_first_run_line_hides_after_reclaim_or_disk_is_opened_and_stays_hidden() {
     )
     .unwrap();
     assert!(!swamp_tui::app::load_ui_state(old.path()).views_seen);
-    // Reclaim ends it too, on a fresh app.
+    // Tab into Tools ends it too.
     let mut b = app();
     b.views_seen = false;
-    swamp_tui::handle_key(&mut b, KeyCode::Char('c'));
+    swamp_tui::handle_key(&mut b, KeyCode::Tab);
+    assert_eq!(b.view, ViewKind::Reclaim);
     assert!(b.views_seen);
 }
 
 // ---------------------------------------------------------------------
-// The Disk view
+// The Disk section
 // ---------------------------------------------------------------------
 
-/// Tempting wrong patch: an unreadable folder shows `0B` in the Disk
-/// view, or the view works on a missing ledger by measuring one. It lists
-/// the parts, shows unreadable as unmeasured, and with no ledger says what
-/// to run, listing nothing itself.
+/// Tempting wrong patch: an unreadable folder shows `0B`, or a view works
+/// on a missing ledger by measuring one. Summary lists the parts, Not
+/// measured lists the gaps as unmeasured or pending, and with no ledger
+/// both say what to run and list nothing themselves.
 #[test]
-fn the_disk_view_lists_the_ledger_parts_and_never_shows_unreadable_as_zero() {
+fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
     let mut a = app();
     a.set_view(ViewKind::Disk);
     let f = frame(&a, 120, 30).join("\n");
@@ -691,71 +728,98 @@ fn the_disk_view_lists_the_ledger_parts_and_never_shows_unreadable_as_zero() {
         "{f}"
     );
     assert!(f.contains("Everything else (not developer storage)"), "{f}");
-    assert!(f.contains("/Users/x/Movies"), "{f}");
     assert!(f.contains("System volumes"), "{f}");
     let pic = f
         .lines()
         .find(|l| l.contains("/Users/x/Pictures"))
         .expect("named");
     assert!(pic.contains("unmeasured") && !pic.contains("0B"), "{pic}");
-    // No ledger: the empty state names the command, and nothing is listed.
-    let mut b = app();
-    b.set_ledger(LedgerReading::NotMeasured);
-    b.set_view(ViewKind::Disk);
-    let f = frame(&b, 80, 24).join(" ");
-    let f = f.split_whitespace().collect::<Vec<_>>().join(" ");
+    a.set_view(ViewKind::DiskGaps);
+    let f = frame(&a, 120, 30).join("\n");
+    assert!(f.contains("Could not be read: 1 directories"), "{f}");
+    let pic = f
+        .lines()
+        .find(|l| l.contains("/Users/x/Pictures"))
+        .expect("named");
+    assert!(pic.contains("unmeasured") && !pic.contains("0B"), "{pic}");
     assert!(
-        f.contains("disk ledger: not measured yet; run swamp observe --volume"),
+        f.contains("Largest measured folders outside developer storage"),
         "{f}"
     );
-    assert!(f.contains("opening the UI never scans"), "{f}");
-    let (_, work) = swamp_core::work_counters::measured(|| frame(&b, 80, 24));
-    assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+    assert!(f.contains("/Users/x/Movies"), "{f}");
+    for v in [ViewKind::Disk, ViewKind::DiskGaps] {
+        let mut b = app();
+        b.set_ledger(LedgerReading::NotMeasured);
+        b.set_view(v);
+        let f = frame(&b, 80, 24).join(" ");
+        let f = f.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            f.contains("disk ledger: not measured yet; run swamp observe --volume"),
+            "{f}"
+        );
+        assert!(f.contains("opening the UI never scans"), "{f}");
+        let (_, work) = swamp_core::work_counters::measured(|| frame(&b, 80, 24));
+        assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+    }
 }
 
-/// Tempting wrong patch: the view keys are matched before the modal
-/// handlers, so typing `c`, `D` or `I` into the filter (or the picker's
-/// text field), or pressing them on the plan, the blocked list or help,
-/// switches views instead. Every modal owns its keys first.
+// ---------------------------------------------------------------------
+// Typing
+// ---------------------------------------------------------------------
+
+/// Tempting wrong patch: view keys are matched before the modal handlers,
+/// so typing `Tab v 1 2 3 c D I` into the filter (or the picker's text
+/// field) switches views instead of typing. Tab completes in the filter as
+/// before; letters and digits land as text; the picker never switches.
 #[test]
-fn the_view_keys_type_letters_in_the_filter_and_do_nothing_in_other_modals() {
-    // Filter text editing: the letters land in the text.
+fn view_keys_are_text_while_typing_in_the_filter_and_the_picker() {
     let mut a = app();
     swamp_tui::handle_key(&mut a, KeyCode::Char(':'));
     assert!(a.editing_filter);
-    for k in ['c', 'D', 'I'] {
+    let before = a.filter_text.clone();
+    for k in ['v', '1', '2', '3', 'c', 'D', 'I'] {
         swamp_tui::handle_key(&mut a, KeyCode::Char(k));
     }
-    assert!(a.filter_text.ends_with("cDI"), "{}", a.filter_text);
-    assert_eq!(a.view, ViewKind::Projects);
+    swamp_tui::handle_key(&mut a, KeyCode::Tab);
+    assert!(a.filter_text.contains("v123cDI"), "{}", a.filter_text);
+    assert!(a.filter_text.starts_with(&before[..0]));
+    assert_eq!(a.view, ViewKind::Projects, "typing switched the view");
+    assert!(a.editing_filter, "Tab must not leave the edit");
     swamp_tui::handle_key(&mut a, KeyCode::Esc);
-    // Picker: its text field types them; its other fields ignore them.
+    // Picker: every field, then its text field.
     let mut a = app();
     swamp_tui::handle_key(&mut a, KeyCode::Char('/'));
-    for k in ['c', 'D', 'I'] {
-        swamp_tui::handle_key(&mut a, KeyCode::Char(k));
+    assert!(a.picker.is_some());
+    for k in [
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Char('v'),
+        KeyCode::Char('1'),
+        KeyCode::Char('2'),
+        KeyCode::Char('3'),
+        KeyCode::Char('c'),
+        KeyCode::Char('D'),
+        KeyCode::Char('I'),
+    ] {
+        swamp_tui::handle_key(&mut a, k);
+        assert_eq!(
+            a.view,
+            ViewKind::Projects,
+            "{k:?} switched the view in the picker"
+        );
+        assert!(a.picker.is_some() || k == KeyCode::Char('1'), "{k:?}");
     }
-    assert_eq!(a.view, ViewKind::Projects, "picker field");
-    swamp_tui::handle_key(&mut a, KeyCode::Esc);
-    // Help, the plan sheet and the blocked list keep their own keys.
+    // Help and the blocked list keep their own keys.
     let mut a = app();
     a.help_open = true;
-    swamp_tui::handle_key(&mut a, KeyCode::Char('c'));
-    assert_eq!(a.view, ViewKind::Projects);
-    // On an open plan the view keys act as the digits always did (the
-    // plan is not a modal here); they bind nothing the plan uses (its keys
-    // are Enter, Esc, d and k).
-    let mut a = app();
-    a.confirm_open = true;
-    swamp_tui::handle_key(&mut a, KeyCode::Char('9'));
-    let digit_switches = a.view != ViewKind::Projects;
-    let mut b = app();
-    b.confirm_open = true;
-    swamp_tui::handle_key(&mut b, KeyCode::Char('c'));
-    assert_eq!(b.view != ViewKind::Projects, digit_switches);
+    for k in [KeyCode::Tab, KeyCode::Char('2'), KeyCode::Char('v')] {
+        swamp_tui::handle_key(&mut a, k);
+        assert_eq!(a.view, ViewKind::Projects);
+    }
     let mut a = app();
     a.blocked_open = true;
-    swamp_tui::handle_key(&mut a, KeyCode::Char('D'));
-    assert_eq!(a.view, ViewKind::Projects);
-    assert!(a.blocked_open);
+    for k in [KeyCode::Tab, KeyCode::Char('2'), KeyCode::Char('v')] {
+        swamp_tui::handle_key(&mut a, k);
+        assert_eq!(a.view, ViewKind::Projects);
+    }
 }

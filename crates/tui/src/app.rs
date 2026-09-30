@@ -62,6 +62,83 @@ pub const REFUSAL_DISPLAY: Duration = Duration::from_secs(4);
 /// not an error): the schedule is meant to keep it younger.
 pub const STALE_AFTER_SECS: u64 = 15 * 60;
 
+/// The three sections the views are nested in. `Tab` / `Shift-Tab` move
+/// between them, `1` / `2` / `3` jump to one, and `v` cycles the views
+/// inside the current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Section {
+    Projects,
+    Tools,
+    Disk,
+}
+
+impl Section {
+    pub const ALL: [Section; 3] = [Section::Projects, Section::Tools, Section::Disk];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Section::Projects => "Projects",
+            Section::Tools => "Tools",
+            Section::Disk => "Disk",
+        }
+    }
+
+    /// The digit that jumps here.
+    pub fn key(self) -> char {
+        match self {
+            Section::Projects => '1',
+            Section::Tools => '2',
+            Section::Disk => '3',
+        }
+    }
+
+    pub fn from_key(k: char) -> Option<Section> {
+        Self::ALL.iter().copied().find(|s| s.key() == k)
+    }
+
+    /// The views inside, in the order `v` walks them; the first is the
+    /// one a jump lands on.
+    pub fn views(self) -> &'static [ViewKind] {
+        match self {
+            Section::Projects => &[
+                ViewKind::Projects,
+                ViewKind::Tree,
+                ViewKind::Builds,
+                ViewKind::Deps,
+                ViewKind::Types,
+                ViewKind::Kinds,
+                ViewKind::Docker,
+                ViewKind::Unowned,
+            ],
+            Section::Tools => &[ViewKind::Reclaim, ViewKind::External, ViewKind::Agents],
+            Section::Disk => &[ViewKind::Disk, ViewKind::DiskGaps],
+        }
+    }
+
+    pub fn default_view(self) -> ViewKind {
+        self.views()[0]
+    }
+
+    pub fn next(self) -> Section {
+        let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(at + 1) % 3]
+    }
+
+    pub fn prev(self) -> Section {
+        let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Self::ALL[(at + 2) % 3]
+    }
+
+    /// One line on what the section is for, for `?` help.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Section::Projects => "your projects and what they hold",
+            Section::Tools => "storage outside any project: toolchains, caches, AI tools",
+            Section::Disk => "where the whole disk went, from the stored volume ledger",
+        }
+    }
+}
+
 /// Same view set the CLI's `--view` exposes at root (`worktrees` there
 /// is `Projects` here: one row per project, same aggregation), plus
 /// `Tree`, the per-project drill-down `--project` renders (#33). `v`
@@ -90,6 +167,10 @@ pub enum ViewKind {
     /// be read). Read-only and built from the stored ledger: opening it
     /// scans nothing.
     Disk,
+    /// The Disk section's second view: what was not measured (unreadable
+    /// and not-yet-measured folders) and the largest measured folders
+    /// outside developer storage. Read-only, from the stored ledger.
+    DiskGaps,
     /// Agent-tool storage (#91/#92/#100): read-only, one row per
     /// `AgentUnit`. See `model::agent_rows`'s doc comment for why
     /// marking is not wired up in this chunk.
@@ -97,32 +178,20 @@ pub enum ViewKind {
 }
 
 impl ViewKind {
-    /// The one key that opens this view directly. Digits for the first
-    /// nine (`0` is the global "clear filter" key, so the digits stop at
-    /// 9); a letter that is free in every mode for the rest: `c` for
-    /// reClaim, `D` for Disk, `I` for the AI tools' storage. The strip,
-    /// the legend, `?` help and the handler all read this one table, and
-    /// a test pins that no key is bound twice.
-    pub fn key(self) -> char {
+    /// The section this view lives in.
+    pub fn section(self) -> Section {
         match self {
-            ViewKind::Projects => '1',
-            ViewKind::Tree => '2',
-            ViewKind::Builds => '3',
-            ViewKind::Deps => '4',
-            ViewKind::Docker => '5',
-            ViewKind::Kinds => '6',
-            ViewKind::Unowned => '7',
-            ViewKind::Types => '8',
-            ViewKind::External => '9',
-            ViewKind::Reclaim => 'c',
-            ViewKind::Disk => 'D',
-            ViewKind::Agents => 'I',
+            ViewKind::Projects
+            | ViewKind::Tree
+            | ViewKind::Builds
+            | ViewKind::Deps
+            | ViewKind::Types
+            | ViewKind::Kinds
+            | ViewKind::Docker
+            | ViewKind::Unowned => Section::Projects,
+            ViewKind::Reclaim | ViewKind::External | ViewKind::Agents => Section::Tools,
+            ViewKind::Disk | ViewKind::DiskGaps => Section::Disk,
         }
-    }
-
-    /// The view a key opens, if any.
-    pub fn from_key(k: char) -> Option<Self> {
-        Self::ALL.iter().copied().find(|v| v.key() == k)
     }
 
     /// The name on the view strip and in `?` help.
@@ -138,7 +207,8 @@ impl ViewKind {
             ViewKind::Types => "Types",
             ViewKind::External => "External",
             ViewKind::Reclaim => "Reclaim",
-            ViewKind::Disk => "Disk",
+            ViewKind::Disk => "Summary",
+            ViewKind::DiskGaps => "Not measured",
             ViewKind::Agents => "Agents",
         }
     }
@@ -162,45 +232,45 @@ impl ViewKind {
                 "where the whole disk went: accounted, everything else, system volumes, not measured"
             }
             ViewKind::Agents => "AI coding tools' sessions, caches and logs",
+            ViewKind::DiskGaps => {
+                "what could not be read or is not measured yet, and the largest measured folders outside developer storage"
+            }
         }
     }
 
-    /// Every view, in the order `v` walks them.
-    pub const ALL: [ViewKind; 12] = [
+    /// Every view, section by section, in the order `v` walks them within
+    /// each.
+    pub const ALL: [ViewKind; 13] = [
         ViewKind::Projects,
         ViewKind::Tree,
         ViewKind::Builds,
         ViewKind::Deps,
-        ViewKind::Docker,
-        ViewKind::Kinds,
-        ViewKind::Unowned,
         ViewKind::Types,
-        ViewKind::External,
+        ViewKind::Kinds,
+        ViewKind::Docker,
+        ViewKind::Unowned,
         ViewKind::Reclaim,
-        ViewKind::Disk,
+        ViewKind::External,
         ViewKind::Agents,
+        ViewKind::Disk,
+        ViewKind::DiskGaps,
     ];
 
-    /// 1-based place in [`ViewKind::ALL`], for "3 of 11".
+    /// 1-based place within the view's own section, for "2 of 3".
     pub fn position(self) -> usize {
-        Self::ALL.iter().position(|v| *v == self).unwrap_or(0) + 1
+        self.section()
+            .views()
+            .iter()
+            .position(|v| *v == self)
+            .unwrap_or(0)
+            + 1
     }
 
+    /// The next view within the same section, wrapping around (`v`).
     pub fn next(self) -> Self {
-        match self {
-            ViewKind::Projects => ViewKind::Tree,
-            ViewKind::Tree => ViewKind::Builds,
-            ViewKind::Builds => ViewKind::Deps,
-            ViewKind::Deps => ViewKind::Docker,
-            ViewKind::Docker => ViewKind::Kinds,
-            ViewKind::Kinds => ViewKind::Unowned,
-            ViewKind::Unowned => ViewKind::Types,
-            ViewKind::Types => ViewKind::External,
-            ViewKind::External => ViewKind::Reclaim,
-            ViewKind::Reclaim => ViewKind::Disk,
-            ViewKind::Disk => ViewKind::Agents,
-            ViewKind::Agents => ViewKind::Projects,
-        }
+        let views = self.section().views();
+        let at = views.iter().position(|v| *v == self).unwrap_or(0);
+        views[(at + 1) % views.len()]
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -215,6 +285,7 @@ impl ViewKind {
             ViewKind::External => "external",
             ViewKind::Reclaim => "reclaim",
             ViewKind::Disk => "disk",
+            ViewKind::DiskGaps => "not-measured",
             ViewKind::Agents => "agents",
         }
     }
@@ -1210,6 +1281,7 @@ impl App {
             // Parts of one disk, largest meaning first as the ledger
             // orders them: sort never reorders them.
             ViewKind::Disk => return model::disk_rows(&self.ledger),
+            ViewKind::DiskGaps => return model::disk_gaps_rows(&self.ledger),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
         rows
@@ -1251,7 +1323,7 @@ impl App {
         self.view = v;
         // Opening either of the two views the first-run hint points at
         // ends the hint, for good.
-        if matches!(v, ViewKind::Reclaim | ViewKind::Disk) && !self.views_seen {
+        if v.section() != Section::Projects && !self.views_seen {
             self.views_seen = true;
             self.persist_ui_state();
         }
@@ -1262,6 +1334,13 @@ impl App {
             .copied()
             .unwrap_or(0)
             .min(len.saturating_sub(1));
+    }
+
+    /// `Tab`, `Shift-Tab` and `1`-`3`: open a section on its first view.
+    pub fn set_section(&mut self, s: Section) {
+        if s != self.view.section() {
+            self.set_view(s.default_view());
+        }
     }
 
     pub fn move_selection(&mut self, delta: i32) {
@@ -4152,38 +4231,36 @@ mod tests {
     }
 
     #[test]
-    fn view_cycles_and_digit_keys() {
+    fn view_cycles_within_a_section_and_keys_jump_to_sections() {
         assert_eq!(ViewKind::Projects.next(), ViewKind::Tree);
-        assert_eq!(ViewKind::from_key('3'), Some(ViewKind::Builds));
-        assert_eq!(ViewKind::from_key('6'), Some(ViewKind::Kinds));
-        assert_eq!(ViewKind::from_key('8'), Some(ViewKind::Types));
-        assert_eq!(ViewKind::from_key('9'), Some(ViewKind::External));
-        // '0' is reserved for "clear filter" (crate::handle_key_mod); no
-        // view claims it. Reclaim, Disk and Agents have letter keys.
-        assert_eq!(ViewKind::from_key('c'), Some(ViewKind::Reclaim));
-        assert_eq!(ViewKind::from_key('D'), Some(ViewKind::Disk));
-        assert_eq!(ViewKind::from_key('I'), Some(ViewKind::Agents));
-        assert_eq!(ViewKind::from_key('0'), None);
-        // Full cycle returns to Projects, matching the CLI's view order:
-        // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/
-        // types/external/reclaim/agents.
-        let mut v = ViewKind::Projects;
-        for _ in 0..ViewKind::ALL.len() {
-            v = v.next();
+        assert_eq!(Section::from_key('1'), Some(Section::Projects));
+        assert_eq!(Section::from_key('2'), Some(Section::Tools));
+        assert_eq!(Section::from_key('3'), Some(Section::Disk));
+        // '0' is reserved for "clear filter" (crate::handle_key_mod), and
+        // 4-9 are no longer keys at all.
+        for k in ['0', '4', '9', 'c', 'D', 'I'] {
+            assert_eq!(Section::from_key(k), None, "{k}");
         }
-        assert_eq!(v, ViewKind::Projects);
-        // Reclaim and Agents are reachable by cycling even without their
-        // own digit, and Reclaim sits right after External.
-        let mut seen = std::collections::HashSet::new();
-        let mut v = ViewKind::Projects;
-        for _ in 0..ViewKind::ALL.len() {
-            seen.insert(v);
-            v = v.next();
+        // `v` wraps inside the section it is in.
+        for s in Section::ALL {
+            let mut v = s.default_view();
+            for _ in 0..s.views().len() {
+                assert_eq!(v.section(), s);
+                v = v.next();
+            }
+            assert_eq!(v, s.default_view());
         }
-        assert!(seen.contains(&ViewKind::Agents));
-        assert!(seen.contains(&ViewKind::Reclaim));
-        assert_eq!(ViewKind::External.next(), ViewKind::Reclaim);
-        assert_eq!(ViewKind::ALL.len(), seen.len());
+        assert_eq!(ViewKind::Docker.next(), ViewKind::Unowned);
+        assert_eq!(ViewKind::Unowned.next(), ViewKind::Projects);
+        assert_eq!(ViewKind::Agents.next(), ViewKind::Reclaim);
+        assert_eq!(Section::Disk.next(), Section::Projects);
+        assert_eq!(Section::Projects.prev(), Section::Disk);
+        // Every view is in exactly one section.
+        let total: usize = Section::ALL.iter().map(|s| s.views().len()).sum();
+        assert_eq!(total, ViewKind::ALL.len());
+        for v in ViewKind::ALL {
+            assert!(v.section().views().contains(&v), "{v:?}");
+        }
     }
 
     // -----------------------------------------------------------------

@@ -2669,6 +2669,102 @@ pub fn disk_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<Row> 
     rows
 }
 
+/// The Disk section's "Not measured" view: the folders that could not be
+/// read (never a size), the locations the pass has not reached yet, and the
+/// largest measured folders outside developer storage. Pure over the
+/// stored reading; empty without a usable ledger.
+pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<Row> {
+    use swamp_core::volume_ledger::LedgerReading;
+    let LedgerReading::Measured(a) = ledger else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    let group = |rows: &mut Vec<Row>, label: String, names: &[String], tag: &str, more: usize| {
+        let mut head = Row::leaf(0, label, 0, None);
+        head.size_text = Some(tag.to_string());
+        rows.push(head);
+        let n = names.len();
+        for (i, name) in names.iter().enumerate() {
+            let mut c = Row::leaf(1, name.clone(), 0, None);
+            c.size_text = Some(tag.to_string());
+            c.rail = if i + 1 == n && more == 0 {
+                "└─ ".into()
+            } else {
+                "├─ ".into()
+            };
+            rows.push(c);
+        }
+        if more > 0 {
+            let mut c = Row::leaf(
+                1,
+                format!("and {more} more (swamp report --view disk --json)"),
+                0,
+                None,
+            );
+            c.size_text = Some(tag.to_string());
+            c.rail = "└─ ".into();
+            rows.push(c);
+        }
+    };
+    group(
+        &mut rows,
+        format!(
+            "Could not be read: {} directories (protected folders)",
+            a.not_measured.count
+        ),
+        &a.not_measured.names,
+        "unmeasured",
+        a.not_measured
+            .count
+            .saturating_sub(a.not_measured.names.len()),
+    );
+    if let Some(est) = a.not_measured.estimate_bytes {
+        let mut e = Row::leaf(
+            0,
+            "The unexplained part of the Data volume (protected folders may hold up to this; an estimate, part of no check)".to_string(),
+            est,
+            None,
+        );
+        e.allocated = false;
+        rows.push(e);
+    }
+    if a.not_measured.not_yet_measured > 0 {
+        group(
+            &mut rows,
+            format!(
+                "Not measured yet in this pass: {} locations (the next observe continues)",
+                a.not_measured.not_yet_measured
+            ),
+            &a.not_measured.not_yet_measured_names,
+            "pending",
+            a.not_measured
+                .not_yet_measured
+                .saturating_sub(a.not_measured.not_yet_measured_names.len()),
+        );
+    }
+    let mut top = Row::leaf(
+        0,
+        "Largest measured folders outside developer storage".to_string(),
+        a.everything_else.bytes,
+        None,
+    );
+    top.allocated = true;
+    rows.push(top);
+    let n = a.everything_else.top.len();
+    for (i, r) in a.everything_else.top.iter().enumerate() {
+        let mut c = Row::leaf(1, r.path.clone(), r.bytes.unwrap_or(0), None);
+        c.rail = if i + 1 == n {
+            "└─ ".into()
+        } else {
+            "├─ ".into()
+        };
+        c.allocated = true;
+        c.signals = vec![r.exactness.as_str().replace('_', " ")];
+        rows.push(c);
+    }
+    rows
+}
+
 /// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped
 /// tool → category via the label text (a flat list, same shape as
 /// `unowned_rows`/`external_rows_with`; a real tool → category → unit tree is

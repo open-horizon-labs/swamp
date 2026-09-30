@@ -21,7 +21,7 @@ pub mod units;
 pub mod worker;
 
 use anyhow::Result;
-use app::{App, ViewKind};
+use app::App;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use model::Sort;
 use ratatui::Terminal;
@@ -192,12 +192,15 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('/') => app.open_picker(),
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
+        // Three sections, and the views inside them: Tab and Shift-Tab move
+        // between sections, `1` `2` `3` jump to one, `v` cycles the views of
+        // the current section. Nothing else opens a view.
+        KeyCode::Tab => app.set_section(app.view.section().next()),
+        KeyCode::BackTab => app.set_section(app.view.section().prev()),
         KeyCode::Char('v') => app.set_view(app.view.next()),
-        // Every view has one direct key (`ViewKind::key`): the digits, and
-        // `c`, `D` and `I` for the ones past nine.
-        KeyCode::Char(k) if ViewKind::from_key(k).is_some() => {
-            if let Some(v) = ViewKind::from_key(k) {
-                app.set_view(v);
+        KeyCode::Char(k @ '1'..='3') => {
+            if let Some(sec) = app::Section::from_key(k) {
+                app.set_section(sec);
             }
         }
         KeyCode::Char('g') => app.set_sort(Sort::Growth),

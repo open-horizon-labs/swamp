@@ -756,7 +756,7 @@ rows[]       { path, kind, detector, bytes, growth_bytes?,
 not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
 is not measured). `totals` is the object the storage headline reuses (`remainder_bytes` is the part of it that is not developer storage; see "Developer storage: the headline").
 
-In the TUI, `c` opens the Reclaim view directly (and `v` reaches it after External; the strip under the headline names it). It is built from the
+In the TUI, Reclaim is the first view of the Tools section (`2`, or `Tab` from Projects). It is built from the
 stored facts, scans nothing on open, and keeps the same layout as every view:
 the scope statement sits under the heading, the cost, last-used fact and removal
 path are the signals (and the detail pane's first lines at any width), `→` or
@@ -874,8 +874,7 @@ today vs. named-and-planned). In short:
   contributing tool in the text tree, and an `agent_storage: {units,
   total_bytes}` object in JSON.
 
-The TUI has a dedicated Agents view (`I`, or `v` to cycle; `0` is "clear
-filter"): the same per-unit facts as `--view agents`. `Space`/
+The TUI has a dedicated Agents view (Tools section: `2`, then `v` to Agents): the same per-unit facts as `--view agents`. `Space`/
 `Backspace` mark the selected unit and open the confirm banner showing
 its real consequences (session-removal loss warnings, the linked
 project); `Enter` moves it to the Trash through the same
@@ -888,6 +887,24 @@ same way, skipping protected/unmarkable ones and naming the skip in the
 status rows. The project tree's own Tree view also shows the collapsed
 "Agent storage (linked)" summary row (informational; marking a specific
 unit still happens in the Agents view).
+
+## The TUI's sections and views
+
+The TUI has three sections, each holding a few views. `Tab` and `Shift-Tab` move
+between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the
+current section (wrapping). Nothing else opens a view.
+
+| Section | Views (first is the default) |
+|---|---|
+| 1 Projects | Projects, Tree, Builds, Deps, Types, Kinds, Docker, Unowned |
+| 2 Tools | Reclaim, External, Agents |
+| 3 Disk | Summary (the stored volume ledger's parts), Not measured (unreadable and not-yet-measured folders, the largest measured folders outside developer storage) |
+
+A row under the headline names the three sections with the current one in reverse
+video; the line below it names the view (`view: Tools › Reclaim (1 of 3 · v next)`).
+`?` help lists every section and view with a line on each. **Changed in 0.8.0:** in
+0.7.x the digits `1`-`9` selected views; now `1`-`3` select sections and the old
+digits are unbound.
 
 ## Developer storage: the headline
 
@@ -979,8 +996,8 @@ In the TUI the same block is four rows under the header on every view and in
 every state (headline, breakdown, disk state and ages, then the pointers to
 Reclaim and Disk), two rows on a terminal under 22 rows tall (the headline and
 the pointers), one under 16, none under 12. Nothing changes its height, so no
-row moves when a warning appears. Until you have opened Reclaim or Disk once, the
-pointer row says `New: press c for Reclaim, D for Disk. Hides after you open
+row moves when a warning appears. Until you have opened Tools or Disk once, the
+pointer row says `New: Tab opens Tools (Reclaim) and Disk. Hides after you open
 either.`; that is remembered in `ui_state.json` (`views_seen`; an older swamp
 ignores the key).
 
@@ -1158,11 +1175,9 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | `/` | Open the filter form |
 | `:` | Edit the filter expression; Tab completes terms |
 | `0` | Clear the filter |
-| `v` | Next view. The strip under the headline names every view with its key, the current one in reverse video; on a narrow screen it shows the current view and its neighbors with `…` |
-| `1`–`9` | Projects, tree, builds, deps, Docker, kinds, unowned, types, external |
-| `c` | Reclaim: regenerable developer storage by unit, what getting it back costs, last used |
-| `D` | Disk: where the whole disk went (accounted, everything else, system volumes, not measured, the walk's spot audit), from the stored volume ledger |
-| `I` | Agents: AI coding tools' sessions, caches and logs |
+| `Tab` / `Shift-Tab` | Next / previous section: Projects, Tools, Disk. While you type a filter, Tab completes it as before |
+| `v` | Next view inside the current section, wrapping around |
+| `1`, `2`, `3` | Jump to a section: 1 Projects, 2 Tools, 3 Disk (help lists them; the legend does not) |
 | `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age |
 | `r` | Reverse the sort |
 | `?` | Show help |
