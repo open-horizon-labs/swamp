@@ -195,6 +195,8 @@ enum HeldReload {
     Snapshot(Box<swamp_core::report::ReportSnapshot>),
 }
 
+const REFRESH_WAITS: &str = "A check is running; press R after it finishes";
+
 /// The smallest terminal that shows the permanent-removal line of a plan.
 pub const CONFIRM_MIN_ROWS: u16 = 8;
 pub const CONFIRM_MIN_COLS: u16 = 40;
@@ -2379,6 +2381,9 @@ impl App {
                 }
             }
         }
+        if self.operation.is_none() && self.status.as_deref() == Some(REFRESH_WAITS) {
+            self.status = None;
+        }
         changed
     }
 
@@ -3093,6 +3098,12 @@ impl App {
 
     /// The `R` key: observe now, in the background. Never while one is
     /// already running, and never on a nearly full disk.
+    /// `R` while a check or a move runs: it does not start a scan, and the
+    /// header says why. The line goes when the operation ends.
+    pub fn say_refresh_waits(&mut self) {
+        self.status = Some(REFRESH_WAITS.to_string());
+    }
+
     pub fn refresh_now(&mut self) {
         if self.pending.is_some() {
             return;
@@ -4725,5 +4736,249 @@ mod tests {
         assert!(app.confirm_open);
         app.cancel_confirm();
         assert_eq!(app.marked.keys().cloned().collect::<Vec<_>>(), space);
+    }
+
+    // ---- v0.7.5 adversarial fixes ----
+
+    fn paint(app: &App, w: u16, h: u16) -> String {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| crate::ui::draw(f, app)).unwrap();
+        t.backend().to_string()
+    }
+
+    /// The event loop, one iteration at a time and without a key: what
+    /// arrives is applied, and the frame is painted whenever the gate says
+    /// so. Returns the last painted frame once `done` holds.
+    fn drive_without_keys(app: &mut App, done: impl Fn(&App) -> bool) -> String {
+        let mut gate = crate::RedrawGate::default();
+        // The size is already known, as it is after the first frame.
+        app.width = 100;
+        app.height = 30;
+        let mut frame = paint(app, 100, 30);
+        assert!(gate.due(app));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "never finished");
+            crate::advance(app, &mut gate, Some((100, 30)));
+            if gate.due(app) {
+                frame = paint(app, 100, 30);
+            }
+            if done(app) {
+                return frame;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn every_async_completion_is_on_the_very_next_frame_without_a_key() {
+        // (name, start the async work, text the finished frame must show,
+        //  text it must no longer show)
+        type Case = (&'static str, fn(&mut App), &'static str, &'static str);
+        fn check_finished(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(false, false);
+        }
+        fn confirm_opens(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(true, true);
+        }
+        fn cancelled(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(true, false);
+            app.cancel_operation();
+        }
+        fn delete_finished(app: &mut App) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.operation = Some(Operation {
+                label: "Deleting",
+                completed: 0,
+                total: 1,
+                succeeded: 0,
+                failed: 0,
+                current: String::new(),
+                bytes_done: 0,
+                bytes_total: 0,
+                started: Instant::now(),
+                cancel: Default::default(),
+                checking_open_files: None,
+            });
+            app.operation_rx = Some(rx);
+            tx.send(OperationEvent::Deleted {
+                results: Vec::new(),
+                total: 1,
+            })
+            .unwrap();
+        }
+        fn refresh_finished(app: &mut App) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.observed_label = "3 hours ago".into();
+            app.observing = Some((0, 0));
+            app.pending = Some(rx);
+            tx.send(Ok(RefreshedObservation {
+                per_root: Vec::new(),
+                merged: None,
+                external_units: None,
+                agent_units: None,
+                store_interiors: None,
+            }))
+            .unwrap();
+        }
+        fn lock_poll_change(app: &mut App) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.lock_poll_rx = Some(rx);
+            tx.send(LockPollMsg::Holder(Some(
+                swamp_core::schedule::LockHolder {
+                    pid: 4242,
+                    since: swamp_core::entities::now(),
+                },
+            )))
+            .unwrap();
+        }
+        fn blocked_check_again(app: &mut App) {
+            app.set_view(ViewKind::Deps);
+            app.review_in_background(true, true);
+            wait_operation(app);
+            app.blocked = vec![BlockedItem {
+                name: "x".into(),
+                reason: "in use".into(),
+                next: "close it".into(),
+            }];
+            app.open_blocked();
+            crate::handle_key(app, crossterm::event::KeyCode::Char('r'));
+        }
+        let cases: [Case; 7] = [
+            ("check finished", check_finished, "marked in all", "Checked"),
+            ("confirm opens", confirm_opens, "Enter confirm", "Checked"),
+            ("cancelled", cancelled, "Check stopped", "Stopping after"),
+            (
+                "delete finished",
+                delete_finished,
+                "Moved",
+                "Moving to Trash",
+            ),
+            (
+                "refresh finished",
+                refresh_finished,
+                "observed just now",
+                "3 hours ago",
+            ),
+            (
+                "lock poll change",
+                lock_poll_change,
+                "another observation running",
+                "Enter confirm",
+            ),
+            (
+                "blocked list check again",
+                blocked_check_again,
+                "Enter confirm",
+                "check again",
+            ),
+        ];
+        for (name, start, shows, gone) in cases {
+            let mut app = App::new(fixture_report(), "/root".into());
+            start(&mut app);
+            let frame = drive_without_keys(&mut app, |a| match name {
+                "refresh finished" => a.pending.is_none(),
+                "lock poll change" => a.external_observer.is_some(),
+                _ => a.operation.is_none(),
+            });
+            assert!(
+                frame.contains(shows),
+                "{name}: expected {shows:?} in\n{frame}"
+            );
+            assert!(
+                !frame.contains(gone),
+                "{name}: {gone:?} still on screen\n{frame}"
+            );
+        }
+    }
+
+    /// After `A`, a refreshed index that no longer lists one of the marked
+    /// rows must not leave Enter able to move it, and a reload that
+    /// arrives while the confirm is open waits for it.
+    #[test]
+    fn a_reload_during_a_confirm_waits_and_stale_marks_are_dropped_with_a_message() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, true);
+        wait_operation(&mut app);
+        assert!(app.confirm_open);
+        let marked_before: Vec<String> = app.marked.keys().cloned().collect();
+        assert!(marked_before.iter().any(|k| k.ends_with("node_modules")));
+        let summary_before = app.confirm_summary();
+        let mut newer = fixture_report();
+        newer.observed_at = 2000;
+        for wt in newer.projects.iter_mut().flat_map(|p| &mut p.worktrees) {
+            wt.artifacts.retain(|a| !a.path.ends_with("node_modules"));
+        }
+        let fresh = RefreshedObservation {
+            per_root: Vec::new(),
+            merged: Some(MergedReports {
+                by_root: Default::default(),
+                report: newer,
+            }),
+            external_units: None,
+            agent_units: None,
+            store_interiors: None,
+        };
+        app.land_observation(fresh);
+        assert!(app.new_data_waiting(), "the reload waits for the confirm");
+        assert_eq!(app.report.observed_at, 1000);
+        assert_eq!(
+            app.confirm_summary(),
+            summary_before,
+            "Enter's plan is unchanged"
+        );
+        assert!(paint(&app, 120, 30).contains("new data available"));
+        // Esc closes the confirm; the held index lands and the marks the
+        // press made are gone anyway.
+        app.cancel_confirm();
+        assert!(app.apply_held_reload());
+        assert!(!app.new_data_waiting());
+        assert_eq!(app.report.observed_at, 2000);
+        assert!(app.marked.keys().all(|k| !k.ends_with("node_modules")));
+        // Marks made earlier (Space) that the new index no longer lists are
+        // dropped at once, and the result line says so.
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(false, false);
+        wait_operation(&mut app);
+        assert!(!app.marked.is_empty());
+        let mut newer = fixture_report();
+        newer.observed_at = 2000;
+        for wt in newer.projects.iter_mut().flat_map(|p| &mut p.worktrees) {
+            wt.artifacts.clear();
+        }
+        app.land_observation(RefreshedObservation {
+            per_root: Vec::new(),
+            merged: Some(MergedReports {
+                by_root: Default::default(),
+                report: newer,
+            }),
+            external_units: None,
+            agent_units: None,
+            store_interiors: None,
+        });
+        assert!(app.marked.is_empty(), "{:?}", app.marked.keys());
+        let msg = app.result_active().unwrap_or_default();
+        assert!(msg.contains("no longer lists"), "{msg}");
+    }
+
+    #[test]
+    fn r_during_a_check_says_so() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Deps);
+        app.review_in_background(true, false);
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('R'));
+        let s = paint(&app, 100, 30);
+        assert!(
+            s.contains("A check is running; press R after it finishes"),
+            "{s}"
+        );
+        app.cancel_operation();
+        wait_operation(&mut app);
     }
 }

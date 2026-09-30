@@ -461,33 +461,47 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
         };
         lines.push(format!("Gone for good: {}{extra}", names.join(", ")));
     }
-    // Names, checkouts spelled out as such.
-    let names: Vec<String> = units
-        .iter()
-        .filter(|u| u.docker.is_none())
-        .take(3)
-        .map(|u| {
-            let name = u
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&u.label)
-                .to_string();
-            match &u.worktree {
-                Some(t) if t.whole_checkout => format!("checkout {name}"),
-                Some(_) => format!("worktree {name}"),
-                None => name,
-            }
-        })
-        .collect();
-    if !names.is_empty() {
-        let more = trash_units.saturating_sub(3);
-        let more = if more > 0 {
-            format!(" +{more} more")
+    // What kinds of things move, each name once with how many: never the
+    // same name repeated. Checkouts are spelled out as such.
+    let mut kinds: Vec<(String, usize)> = Vec::new();
+    for u in units.iter().filter(|u| u.docker.is_none()) {
+        let name = u
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&u.label)
+            .to_string();
+        let name = match &u.worktree {
+            Some(t) if t.whole_checkout => format!("checkout {name}"),
+            Some(_) => format!("worktree {name}"),
+            None => name,
+        };
+        match kinds.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, c)) => *c += 1,
+            None => kinds.push((name, 1)),
+        }
+    }
+    // Most common first; ties keep the order they were found in.
+    kinds.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    if !kinds.is_empty() {
+        let shown: Vec<String> = kinds
+            .iter()
+            .take(3)
+            .map(|(n, c)| {
+                if *c > 1 {
+                    format!("{n} ({c})")
+                } else {
+                    n.clone()
+                }
+            })
+            .collect();
+        let rest = kinds.len().saturating_sub(3);
+        let rest = if rest > 0 {
+            format!(", +{rest} kinds")
         } else {
             String::new()
         };
-        lines.push(format!("Includes: {}{more}", names.join(", ")));
+        lines.push(format!("Includes: {}{rest}", shown.join(", ")));
     }
     if units
         .iter()

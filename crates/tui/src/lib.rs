@@ -81,6 +81,8 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     if app.operation.is_some() {
         if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
             app.cancel_operation();
+        } else if code == KeyCode::Char('R') {
+            app.say_refresh_waits();
         }
         return;
     }
@@ -596,44 +598,50 @@ impl RedrawGate {
     }
 }
 
+/// Everything that arrives without a key: worker results, the lock poll,
+/// the terminal size. Each one that changed the screen's inputs touches the
+/// gate, so the very next frame shows it.
+fn advance(app: &mut App, gate: &mut RedrawGate, size: Option<(u16, u16)>) {
+    if app.poll_operation() {
+        gate.touch();
+    }
+    if app.apply_held_reload() {
+        gate.touch();
+    }
+    if app.operation.is_none()
+        && let Some(rx) = &app.pending
+        && let Ok(res) = rx.try_recv()
+    {
+        app.pending = None;
+        app.observing = None;
+        gate.touch();
+        match res {
+            Ok(fresh) => {
+                // Each re-observed root replaced exactly its own entry
+                // (#51) on the worker, which also merged: the event
+                // thread only installs what the worker prepared.
+                app.land_observation(fresh);
+            }
+            Err(e) => app.status = Some(format!("observation failed: {e}")),
+        }
+    }
+    if app.drain_lock_poll() {
+        gate.touch();
+    }
+    if let Some((w, h)) = size
+        && (app.width != w || app.height != h)
+    {
+        app.width = w;
+        app.height = h;
+        gate.touch();
+    }
+}
+
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut gate = RedrawGate::default();
     loop {
-        if app.poll_operation() {
-            gate.touch();
-        }
-        if app.apply_held_reload() {
-            gate.touch();
-        }
-        if app.operation.is_none()
-            && let Some(rx) = &app.pending
-            && let Ok(res) = rx.try_recv()
-        {
-            app.pending = None;
-            app.observing = None;
-            gate.touch();
-            match res {
-                Ok(fresh) => {
-                    // Each re-observed root replaced exactly its own
-                    // entry (#51) on the worker, which also merged: a
-                    // live/background refresh of one or more roots never
-                    // touches any other root's rows, and the event thread
-                    // only installs what the worker prepared.
-                    app.land_observation(fresh);
-                }
-                Err(e) => app.status = Some(format!("observation failed: {e}")),
-            }
-        }
-        if app.drain_lock_poll() {
-            gate.touch();
-        }
-        if let Ok(sz) = terminal.size()
-            && (app.width != sz.width || app.height != sz.height)
-        {
-            app.width = sz.width;
-            app.height = sz.height;
-            gate.touch();
-        }
+        let size = terminal.size().ok().map(|sz| (sz.width, sz.height));
+        advance(app, &mut gate, size);
         if gate.due(app) {
             app.frame = app.frame.wrapping_add(1);
             terminal.draw(|f| ui::draw(f, app))?;
@@ -1065,6 +1073,7 @@ mod tests {
         assert_eq!(RedrawGate::wait(&app), Duration::from_millis(200));
         assert!(gate.due(&app) && gate.due(&app));
         app.observing = None;
+        assert!(gate.due(&app), "the busy to idle frame is painted once");
         assert!(!gate.due(&app));
         // The index's age is a clock: crossing into the next minute paints.
         app.report.observed_at = now - 200;
@@ -1290,5 +1299,62 @@ mod tests {
             handle_key(&mut app, k);
             let _ = buffer_text(&app, 20, 5);
         }
+    }
+
+    // ---- v0.7.5 adversarial fixes ----
+
+    #[test]
+    fn plan_sheet_heads_ready_and_blocked_and_names_each_kind_once() {
+        let mut app = App::new(empty_report(), "/root".into());
+        for i in 0..40 {
+            let path = format!("/root/p{i}/node_modules");
+            app.marked.insert(path.clone(), unit(&path, 1 << 20, false));
+        }
+        for i in 0..3 {
+            let path = format!("/root/q{i}/.build");
+            app.marked.insert(path.clone(), unit(&path, 1 << 20, false));
+        }
+        app.blocked = vec![app::BlockedItem {
+            name: "x".into(),
+            reason: "nothing reclaimable in this project".into(),
+            next: "n".into(),
+        }];
+        app.confirm_open = true;
+        let s = buffer_text(&app, 100, 30);
+        assert!(s.contains("Ready: 43 items"), "{s}");
+        assert!(s.contains("Blocked: 1 (d to see why)"), "{s}");
+        assert!(s.contains("Ready, by project:"), "{s}");
+        assert!(s.contains("node_modules (40), .build (3)"), "{s}");
+        assert!(!s.contains("node_modules, node_modules"), "{s}");
+    }
+
+    #[test]
+    fn a_small_plan_sheet_fills_its_rows_with_count_first() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.marked
+            .insert("/root/p/a".into(), unit("/root/p/a", 1 << 20, false));
+        app.confirm_open = true;
+        let s = buffer_text(&app, 40, 10);
+        let rows: Vec<&str> = s.lines().collect();
+        let empty_inside = rows
+            .iter()
+            .filter(|r| r.starts_with('"') && r.trim_matches('"').trim().is_empty())
+            .count();
+        assert!(s.contains("Ready: 1 item"), "{s}");
+        assert_eq!(empty_inside, 0, "no blank row inside the box:\n{s}");
+    }
+
+    #[test]
+    fn a_fresh_index_reads_just_now_so_the_idle_screen_stays_still() {
+        let now = swamp_core::entities::now();
+        let (_s, _r, app) = stored_app(now - 5);
+        let mut gate = RedrawGate::default();
+        assert!(gate.due(&app));
+        assert!(app.live_age);
+        for _ in 0..3 {
+            assert!(!gate.due(&app));
+        }
+        let s = buffer_text(&app, 100, 24);
+        assert!(s.contains("observed just now"), "{s}");
     }
 }
