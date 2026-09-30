@@ -71,7 +71,7 @@ impl Manager {
 
     /// The manager version swamp's fixtures and tests were checked
     /// against; a different one is a warning on the confirm.
-    fn verified_version(self) -> &'static str {
+    pub fn verified_version(self) -> &'static str {
         match self {
             Manager::Mise => mise::VERIFIED_VERSION,
             Manager::Simulator => simctl::VERIFIED_VERSION,

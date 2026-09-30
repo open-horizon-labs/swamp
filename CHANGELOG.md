@@ -5,6 +5,22 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.8.0
 
+- **mise versions and simulator runtimes can be removed through their own manager, from
+  the TUI.** Trash would break these installs, so they had no removal at all. In the
+  external view, Backspace on the mise installs row or a simulator runtimes row shows the
+  manager's own list; Enter on one runs the manager's own dry run and shows a confirm with
+  the exact command, the dry run verbatim, the size (simctl's `sizeBytes`, 8.4 GB for
+  iOS 26.2 here, or "not measured"), what reinstalling costs, and "No Trash recovery: this
+  cannot be undone". Enter on the confirm checks everything again and runs exactly that
+  command: `mise -C / uninstall <tool>@<version>`, `mise -C / prune --tools`, or
+  `xcrun simctl runtime delete <UUID>`. swamp refuses, with the reason and the next step,
+  a version a config requests (mise's own dry run does not check this for the global
+  config), a version mise's prune does not list, a booted simulator (simctl would shut it
+  down and delete anyway), files held open or an open-file check that could not finish,
+  a dry run it cannot read, and anything that changed since the confirm. Devices on a
+  runtime are named on the confirm. Each removal is one `tool-remove` ledger row with the
+  command, the manager's version and what the re-read showed; there is no CLI for it.
+  `brew uninstall` and `rustup toolchain uninstall` have no dry run and stay facts only.
 - **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
   8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
   `dist/` (downloaded archives) and `python_env/` as separate rows, each with what

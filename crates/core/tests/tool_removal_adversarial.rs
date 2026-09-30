@@ -921,3 +921,80 @@ fn no_cli_path_reaches_tool_removal() {
         }
     }
 }
+
+/// Tempting wrong patch: "change the command or the pass-through list and
+/// leave the docs". `docs/usage.md` and the guardrail say what the code
+/// runs, which versions it was checked against, and what it passes on.
+#[test]
+fn the_docs_say_what_the_code_runs() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let usage = fs::read_to_string(root.join("docs/usage.md")).unwrap();
+    let guard =
+        fs::read_to_string(root.join(".oh/guardrails/tool-removal-refuses-on-manager-facts.md"))
+            .unwrap();
+    let sb = Sandbox::new();
+    sb.standard_mise();
+    let one = tool_removal::review_target(&sb.host(), &go(), &[]).unwrap();
+    let all = tool_removal::review_target(&sb.host(), &Target::MisePrune, &[]).unwrap();
+    let sim = Sandbox::new();
+    sim.standard_simctl("Shutdown");
+    let rt =
+        tool_removal::review_target(&sim.host(), &Target::SimRuntime { uuid: UUID.into() }, &[])
+            .unwrap();
+    for (p, doc_form) in [
+        (&one, "mise -C / uninstall <tool>@<version>"),
+        (&all, "mise -C / prune --tools"),
+        (&rt, "xcrun simctl runtime delete <UUID>"),
+    ] {
+        let line = p.command_line();
+        assert!(
+            usage.contains(doc_form),
+            "usage.md does not show `{doc_form}`"
+        );
+        let fixed: Vec<&str> = doc_form
+            .split(' ')
+            .filter(|w| !w.starts_with('<'))
+            .collect();
+        assert!(
+            line.split(' ').take(fixed.len()).eq(fixed.iter().copied()),
+            "`{line}` is not what usage.md documents: `{doc_form}`"
+        );
+    }
+    for m in [Manager::Mise, Manager::Simulator] {
+        let v = format!(
+            "{} {}",
+            if m == Manager::Mise { "mise" } else { "xcrun" },
+            m.verified_version()
+        );
+        assert!(usage.contains(&v), "usage.md does not name {v}");
+    }
+    for var in swamp_core::fs_gate::spawn::TOOL_ENV_PASSTHROUGH {
+        assert!(usage.contains(var), "usage.md does not name {var}");
+        assert!(guard.contains(var), "the guardrail does not name {var}");
+    }
+}
+
+/// Tempting wrong patch: "quote mise's help text" (`prune --help` says
+/// "Delete unused versions"). No source file of this action class holds
+/// an em dash or a verdict word in a string.
+#[test]
+fn no_verdict_words_or_em_dashes_in_this_action_class() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for f in [
+        "crates/core/src/tool_removal/mod.rs",
+        "crates/core/src/tool_removal/mise.rs",
+        "crates/core/src/tool_removal/simctl.rs",
+        "crates/tui/src/tool_sheet.rs",
+    ] {
+        let text = fs::read_to_string(root.join(f)).unwrap();
+        assert!(!text.contains('\u{2014}'), "{f} has an em dash");
+        for line in text.lines() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for lit in line.split('"').skip(1).step_by(2) {
+                assert_plain(lit);
+            }
+        }
+    }
+}

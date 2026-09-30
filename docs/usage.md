@@ -858,7 +858,32 @@ Images, volumes, and build-cache records join to projects using Compose metadata
 
 A project action expands to its actionable artifact rows. If it has none, a direct project action can offer the checkout. Bulk marking with `A` skips that fallback. The `ignored` and `untracked` remainder totals cover scattered files, so those summary buckets are not themselves deletion units.
 
-There is no re-check between marking and pressing Enter: no "this changed since you looked" refusal, and no veto based on whether something has a file open (that fact is shown, not enforced). The only way Enter refuses is an ordinary OS-level error -- the path is already gone, permission is denied, or the Trash is on a different filesystem with no permanent-delete fallback.
+There is no re-check between marking and pressing Enter: no "this changed since you looked" refusal, and no veto based on whether something has a file open (that fact is shown, not enforced). The only way Enter refuses is an ordinary OS-level error -- the path is already gone, permission is denied, or the Trash is on a different filesystem with no permanent-delete fallback. Tool-managed removal (below) is the one exception, because it has no Trash.
+
+### Tool-managed removal: mise versions and simulator runtimes
+
+Installs that Trash would break are removed by their own manager, permanently, and only from the TUI. In the external view, Backspace on the mise installs row or a simulator runtimes row (the row says `removed by mise itself · Backspace`) opens that manager's own list: mise's installed versions plus "every version mise reports prunable", or the simulator runtimes `simctl` lists with its size and last-use record. Nothing is read from a manager until that key press. Enter on an item reviews it:
+
+1. The manager's list is read again, and swamp's refusals run (below).
+2. The manager's **own dry run** runs with the exact command plus its dry-run flag: `mise -C / uninstall --dry-run <tool>@<version>`, `mise -C / prune --tools --dry-run`, or `xcrun simctl runtime delete <UUID> --dry-run`.
+3. Open files under what the dry run names are checked (`lsof`).
+
+The confirm shows what is removed, "No Trash recovery: this cannot be undone", the exact command Enter runs and the program path, the size (simctl's `sizeBytes`, swamp's stored measurement, or "not measured"), what reinstalling costs ("Reinstall is a download ..."), the open-file answer, mise's own reasons quoted (`mise says: "... is prunable: ..."`), which devices use a simulator runtime, any warnings, and the dry run verbatim (control characters stripped, bounded). Enter on the confirm runs the whole review again and refuses if anything changed; otherwise it runs exactly the command shown, reads the manager's list back and says plainly what it observed. Esc goes back and nothing runs.
+
+| Refusal | Why |
+|---|---|
+| A config requests the version (`mise ls` names a source); the global config is named as such | `mise uninstall` does not check this itself |
+| mise's prune does not list the version | only prune knows the configs mise tracks; `source: null` from one directory is not "nothing requests it" |
+| mise reports it active, it is a symlink install, or it sits outside mise's default data dir | removing it would go through a link or a directory swamp does not pass to mise |
+| The dry run exited non-zero, timed out, printed over 1 MiB, printed an error, a line swamp does not recognize, no dry-run marker, a configuration-links line, a path outside mise's own directories, or not exactly the target | a text swamp cannot read is not a preview |
+| A simulator on the runtime is booted; the runtime is not deletable or not Ready/Unusable | `simctl` shuts booted simulators down and deletes anyway |
+| Files are held open, or the open-file check could not finish | there is no Trash to recover from; CoreSimulator's own `SimLaunchHost` does not count |
+| Anything changed between the confirm and Enter | swamp runs only what you confirmed |
+| The confirm does not fit the terminal | Enter runs nothing it has not shown in full |
+
+Unbooted simulator devices do not refuse: the confirm names how many and which, and they stop working until you create them again. A manager version other than the one swamp was tested against (mise 2026.9.15, xcrun 72) is a warning on the confirm. The manager runs from a fixed list of directories (never `PATH`) with an environment built from nothing (`HOME`, a fixed `PATH`, `NO_COLOR=1`, pagers off; only `DEVELOPER_DIR`, `MISE_GLOBAL_CONFIG_FILE` and `RUSTUP_HOME` pass through), from `/`. A removal still running is not stopped by Esc or Ctrl-C: a manager killed halfway can leave a half-removed install; after 10 minutes it is killed and reported as not finished, and never retried.
+
+Not in this release: `brew uninstall` and `rustup toolchain uninstall` have no dry run, so swamp does not run them; `brew autoremove` waits for a captured real non-empty dry run.
 
 | Unit | Removal and recovery |
 |---|---|
@@ -868,12 +893,14 @@ There is no re-check between marking and pressing Enter: no "this changed since 
 | Docker image | Removed by Docker, permanently -- no Trash. Pulling or rebuilding depends on the image still being available or reproducible. |
 | Docker volume | Removed by Docker, permanently. Swamp creates no copy of its contents. |
 | Docker build-cache record | Reported, but individual removal is refused (Docker has no per-entry API for it). |
+| mise tool version, or every version mise reports prunable | Removed by mise (`mise -C / uninstall <tool>@<version>`, `mise -C / prune --tools`), permanently -- no Trash. Reinstall with `mise install`. |
+| Simulator runtime | Removed by simctl (`xcrun simctl runtime delete <UUID>`), permanently -- no Trash. Reinstall from Xcode > Settings > Components; whether Apple still offers the version is not checked. |
 
 `--keep-executables` (a TUI toggle) copies supported Rust executables from `target/{release,debug}` and Python wheels/shared libraries from `dist` or `build` into the worktree's `bin/` before removal. It is not a backup of everything in the selected directory.
 
 The ledger lives at `~/.local/share/swamp/ledger.parquet` (+ `ledger_facts.parquet`, the facts shown on the confirm line): one row per Trash move, naming the path, recovery location, bytes and time. Trashed bytes and freed disk space are different quantities -- moving to Trash does not free space until the Trash itself is emptied. Consult the reported recovery location for restoration; swamp has no general undo command.
 
-The ledger lives at `~/.local/share/swamp/ledger.parquet`. Trashed bytes, permanent removals, and measured free-space change are different quantities. Consult the reported recovery location for restoration; swamp has no general undo command.
+The ledger lives at `~/.local/share/swamp/ledger.parquet`. Trashed bytes, permanent removals, and measured free-space change are different quantities. A tool-managed removal is one `tool-remove` row (a swamp older than 0.8.0 reads it as an ordinary removal) with no recovery location; its facts name the manager and its version, the program path, the exact command and dry-run command, the dry run's digest and first 4 KB, the targets, the exit code, whether it timed out, and what the re-read observed (`completed`, `completed_with_error:<code>`, `failed:<code>`, `failed:exit 0, still listed`, `unknown:timed_out`, or `refused:<reason>` when Enter refused). Consult the reported recovery location for restoration; swamp has no general undo command.
 
 ## Decision evidence
 
