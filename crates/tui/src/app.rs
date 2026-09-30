@@ -1912,6 +1912,34 @@ impl App {
         } else {
             None
         };
+        // A standalone Cargo target directory (#171) is planned through
+        // core like any other build output, so its confirm line says what
+        // it is and what a rebuild costs, and carries the fresh open-file
+        // reading taken when it was planned. Execution is the ordinary
+        // path Trash move; nothing here changes what moves.
+        if self.report.unowned.iter().any(|u| {
+            u.reason == swamp_core::report::UnownedReason::StandaloneCargoTarget
+                && Path::new(&u.path_or_object) == unit_path.as_path()
+        }) {
+            match swamp_core::actions::propose_checking_protection(
+                &self.report,
+                None,
+                std::slice::from_ref(&unit_path),
+                "human:tui",
+                &[],
+            ) {
+                Ok(units) => {
+                    for u in &units {
+                        warnings.extend(u.warnings().iter().cloned());
+                        warnings.extend(swamp_core::render::evidence_warnings(u.evidence()));
+                    }
+                }
+                Err(e) => {
+                    self.refuse(&e.to_string());
+                    return;
+                }
+            }
+        }
         // Agent-storage unit (#101's TUI wiring): every `agent_rows` row
         // carries `unit: Some(...)` regardless of whether it is
         // protected or has a supported action, so this branch is reached
@@ -4097,6 +4125,10 @@ mod tests {
             consumers: Vec::new(),
             note: None,
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         }]);
         assert!(app.rows().is_empty(), "no projects, no project rows");
         app.set_view(ViewKind::External);
@@ -4133,6 +4165,10 @@ mod tests {
             consumers: Vec::new(),
             note: None,
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         }]);
         let c = BuildContainer::shared_store_of(
             "maven",
@@ -4183,6 +4219,151 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
         }
+    }
+
+    fn drilled_unit(
+        path: &str,
+        children: Vec<swamp_core::drilldown::UnitChild>,
+    ) -> swamp_core::external::ExternalUnit {
+        swamp_core::external::ExternalUnit {
+            detector_id: "rustup".into(),
+            detector_name: "rustup".into(),
+            category: swamp_core::locations::StorageCategory::Installation,
+            provenance: swamp_core::locations::Provenance::BuiltinConvention,
+            path: path.into(),
+            bytes: 1_000,
+            mtime_max: 0,
+            hardlinked: false,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1_790_000_000,
+            consumers: Vec::new(),
+            note: None,
+            evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: swamp_core::last_used::resolve(None, Some(1_783_468_800)),
+            children,
+        }
+    }
+
+    /// #176/#178 in the External view: the unit's last-used fact with its
+    /// source, its folders as inspection-only rows that add up, and a
+    /// folder that could not be read never drawn as `0B`.
+    #[test]
+    fn an_external_unit_opens_onto_its_depth_two_rows_and_says_when_it_was_last_used() {
+        use swamp_core::drilldown::{ChildKind, ChildMeasure, UnitChild};
+        let child = |name: &str, bytes: Option<i64>, measure| UnitChild {
+            kind: ChildKind::Entry,
+            name: name.into(),
+            bytes,
+            measure,
+            mtime_max: 1_789_000_000,
+            entries: 0,
+            not_measured: 0,
+            last_used: swamp_core::last_used::resolve(None, Some(1_783_468_800)),
+        };
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        let mut rest = child("", Some(100), ChildMeasure::Complete);
+        rest.kind = ChildKind::Remainder;
+        rest.entries = 3;
+        app.set_external_units(vec![drilled_unit(
+            "/fixture/.rustup/toolchains",
+            vec![
+                child("stable", Some(600), ChildMeasure::Complete),
+                child("nightly", Some(300), ChildMeasure::Complete),
+                child("locked", None, ChildMeasure::NotMeasured),
+                rest,
+            ],
+        )]);
+        app.set_view(ViewKind::External);
+        let closed = app.rows();
+        assert_eq!(closed.len(), 1);
+        assert!(closed[0].expandable, "a unit with rows opens");
+        let fact = closed[0].last_used.as_deref().unwrap();
+        assert!(
+            fact.starts_with("Last run or opened: Jul 8") && fact.ends_with("(file access time)"),
+            "{fact}"
+        );
+        app.selected = 0;
+        app.enter_row();
+        let open = app.rows();
+        assert_eq!(open.len(), 5);
+        let shown: u64 = open.iter().skip(1).map(|r| r.bytes).sum();
+        assert_eq!(shown, 1_000, "the rows add up to the unit");
+        let locked = open.iter().find(|r| r.label.contains("locked")).unwrap();
+        assert!(
+            locked.label.contains("not measured"),
+            "never a bare size for an unreadable folder: {}",
+            locked.label
+        );
+        for r in open.iter().skip(1) {
+            assert!(r.unit.is_none() && r.signals.iter().any(|s| s == "blocked"));
+        }
+        let stable = open.iter().find(|r| r.label == "stable").unwrap();
+        assert!(
+            stable
+                .last_used
+                .as_deref()
+                .unwrap()
+                .contains("(file access time)")
+        );
+        // The detail pane carries the fact.
+        let lines = crate::detail::lines(&closed[0], &[]);
+        assert!(
+            lines.iter().any(|l| l.starts_with("Last run or opened:")),
+            "{lines:?}"
+        );
+    }
+
+    /// #171: a standalone Cargo target directory marks like any unowned
+    /// row and its confirm line says what it is and that Cargo remakes it.
+    #[test]
+    fn a_standalone_cargo_target_marks_with_its_consequence_on_the_confirm_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path())
+            .unwrap()
+            .join("scratch-target");
+        std::fs::create_dir_all(dir.join("debug")).unwrap();
+        std::fs::write(dir.join("debug/blob"), vec![1u8; 4096]).unwrap();
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        report.unowned.push(swamp_core::report::UnownedRow {
+            measurement: Some(swamp_core::report::UnownedMeasurement::Subtree),
+            path_or_object: dir.display().to_string(),
+            bytes: 4096,
+            reason: swamp_core::report::UnownedReason::StandaloneCargoTarget,
+            shared_bytes: None,
+            note: Some("standalone Cargo target: rebuild with `cargo build`; nothing in it records which project built it, so none is named".into()),
+            docker_kind: None,
+            created_at: None,
+            containers: Vec::new(),
+            shared_with: Vec::new(),
+            dangling: false,
+            evidence: Vec::new(),
+        });
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        app.set_view(ViewKind::Unowned);
+        let rows = app.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].label.contains("standalone Cargo target"),
+            "{}",
+            rows[0].label
+        );
+        assert!(rows[0].label.contains("cargo build"));
+        let row = rows[0].clone();
+        app.mark_row(&row);
+        let marked = app
+            .marked
+            .values()
+            .next()
+            .expect("marked like any unowned row");
+        let text = marked.warnings.join(" | ");
+        assert!(text.contains("cargo build"), "{text}");
+        assert!(text.contains("Trash"), "{text}");
     }
 
     // ---- adversarial review (audit/v0.7.5-adversarial) ----

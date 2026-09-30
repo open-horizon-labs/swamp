@@ -106,7 +106,17 @@ chunk; all three now ship:
   `ScopeObservation::store_interiors` of the same pass. The Docker view
   gains one row per BuildKit builder that opens the same way; its member
   rows say "created (daemon)" rather than "modified", because the time
-  is the daemon's record, not a file's.
+  is the daemon's record, not a file's. A unit that declares a last-use
+  source, and an unclassified root of 1 GiB or more, also opens onto its
+  depth-2 rows first (its top 15 child folders largest first, then one
+  remainder row that makes the rows sum to the unit's total; a folder that
+  could not be read says "not measured" and never shows `0B`). Every such
+  row is `blocked`, no `UnitId`, and the table layout is unchanged: the
+  last-used fact (`Last run or opened: Jul 8 (file access time)`) is the
+  first line under the signals in the selected-row detail pane, not a
+  column, so no width rule moves. An unowned row for a standalone Cargo
+  target directory is markable like any unowned row and its confirm line
+  says what it is and that `cargo build` remakes it.
 - **Agents rows.** `ViewKind::Agents` (no dedicated digit -- `0` is
   "clear filter"; reached by cycling with `v`) lists `AgentUnit`s the
   same way: tool/category/relative-path/project-link facts. Every row

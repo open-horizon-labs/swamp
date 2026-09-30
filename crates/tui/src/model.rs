@@ -146,6 +146,10 @@ pub struct Row {
     /// for a structural row with no single unit backing it (a project
     /// header, a worktree row, an aggregated kind/type bucket).
     pub evidence: Vec<swamp_core::evidence::Evidence>,
+    /// Already-worded last-used fact with its source
+    /// (`Last run or opened: Jul 8 (file access time)`), for a row whose
+    /// unit has one. Shown in the detail pane, never as a table column.
+    pub last_used: Option<String>,
 }
 
 impl Row {
@@ -172,6 +176,7 @@ impl Row {
             allocated: false,
             project: None,
             evidence: Vec::new(),
+            last_used: None,
         }
     }
 }
@@ -546,6 +551,7 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             // worktree/artifact below it); drill into the tree/worktree
             // rows for evidence, same as every other per-project fact.
             evidence: Vec::new(),
+            last_used: None,
         });
     }
     out
@@ -675,6 +681,7 @@ pub fn tree_rows_with_agents(
                 .find(|a| a.kind == ArtifactKind::Source)
                 .map(|a| a.evidence.clone())
                 .unwrap_or_default(),
+            last_used: None,
         });
         if is_collapsed {
             continue;
@@ -1650,6 +1657,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             allocated: false,
             project: None,
             evidence: Vec::new(),
+            last_used: None,
         })
         .collect()
 }
@@ -2094,9 +2102,20 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
         .iter()
         .filter(|u| u.reason != UnownedReason::DockerNoJoin)
         .map(|u| {
+            let standalone = u.reason == UnownedReason::StandaloneCargoTarget;
             let mut row = Row::leaf(
                 0,
-                format!("{:?} · {}", u.reason, u.path_or_object),
+                if standalone {
+                    // What it is and what losing it costs, in the row
+                    // itself: a Cargo target directory with no project
+                    // recorded, rebuilt by `cargo build`.
+                    format!(
+                        "standalone Cargo target · {} · rebuild with `cargo build`",
+                        u.path_or_object
+                    )
+                } else {
+                    format!("{:?} · {}", u.reason, u.path_or_object)
+                },
                 u.bytes,
                 None,
             );
@@ -2105,11 +2124,16 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
             // Except one the walk could not even read — there is nothing
             // to stand behind.
             if u.reason != UnownedReason::PermissionDenied {
-                row.kind = Some(ArtifactKind::Loose);
+                row.kind = Some(if standalone {
+                    ArtifactKind::BuildOutput
+                } else {
+                    ArtifactKind::Loose
+                });
                 row.unit = Some(UnitId::for_artifact(std::path::Path::new(
                     &u.path_or_object,
                 )));
             }
+            row.evidence = u.evidence.clone();
             row
         })
         .collect()
@@ -2155,19 +2179,35 @@ pub fn external_rows_with(
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        row.last_used = Some(u.last_used.describe(observed_at));
         let has_interior = interiors
             .iter()
             .any(|i| i.path != u.path && i.path.starts_with(&u.path));
-        if has_interior {
+        if has_interior || !u.children.is_empty() {
             let key = format!("store-open:{}", u.path.display());
             let open = collapsed.contains(&key);
-            let children =
-                family_tree_children_of(interiors, observed_at, &u.path, 1, "", collapsed);
+            // The drilldown first (this unit's own folders, rows adding
+            // up to its total), then the identified interior beneath.
+            let mut children = unit_child_rows(u, observed_at);
+            if has_interior {
+                children.extend(family_tree_children_of(
+                    interiors,
+                    observed_at,
+                    &u.path,
+                    1,
+                    "",
+                    collapsed,
+                ));
+            }
             row.expandable = !children.is_empty();
             row.expansion_key = Some(key);
             row.rail = if open { "▾ ".into() } else { "▸ ".into() };
             row.collapsed_children = (!open).then_some(children.len());
-            row.signals = vec!["store interior below · inspection only".into()];
+            row.signals = vec![if has_interior {
+                "store interior below · inspection only".into()
+            } else {
+                "folders below · inspection only".into()
+            }];
             rows.push(row);
             if open {
                 rows.extend(children);
@@ -2177,6 +2217,52 @@ pub fn external_rows_with(
         }
     }
     rows
+}
+
+/// One unit's depth-2 drilldown as inspection-only rows (#178). A folder
+/// that could not be read says so instead of showing `0B`, and the last
+/// row is the remainder that makes the rows add up to the unit's total.
+fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row> {
+    use swamp_core::drilldown::{ChildKind, ChildMeasure};
+    let count = u.children.len();
+    u.children
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let last = i + 1 == count;
+            let label = match (c.kind, c.measure) {
+                (ChildKind::Entry, ChildMeasure::NotMeasured) => {
+                    format!("{} · not measured (unreadable, not zero)", c.name)
+                }
+                (ChildKind::Entry, ChildMeasure::Partial) => {
+                    format!("{} · partly measured, size is a lower bound", c.name)
+                }
+                (ChildKind::Entry, ChildMeasure::Complete) => c.name.clone(),
+                (ChildKind::Adjustment, _) => format!(
+                    "{} ({})",
+                    swamp_core::render::describe_unit_child(c, now),
+                    swamp_core::render::unit_child_size(c)
+                ),
+                (ChildKind::Remainder, _) => swamp_core::render::describe_unit_child(c, now),
+            };
+            let mut row = Row::leaf(1, label, c.bytes.unwrap_or(0).max(0) as u64, None);
+            row.rail = if last {
+                "└─ ".into()
+            } else {
+                "├─ ".into()
+            };
+            row.allocated = true;
+            row.mtime_max = c.mtime_max;
+            row.signals = vec![
+                swamp_core::render::describe_unit_child(c, now),
+                "blocked".into(),
+            ];
+            if c.kind == ChildKind::Entry {
+                row.last_used = Some(c.last_used.describe(now));
+            }
+            row
+        })
+        .collect()
 }
 
 /// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped

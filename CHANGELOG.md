@@ -5,6 +5,46 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.8.0
 
+- **Each unit says when it was last run or opened, and where that comes from.**
+  `swamp report --view external` (and `--json`, and the TUI's selected-row detail)
+  now shows `Last run or opened: Jul 8 (file access time)`, `... Sep 6 (Xcode
+  DerivedData record)` or `... no record`, never "unused". A tool's own record wins:
+  Xcode DerivedData's `LastAccessedDate` (on this machine, the one project's Sep 6)
+  and Cargo's `~/.cargo/.global-cache` (opened read-only, per subtree). Otherwise the
+  access time of the files directly in a `bin` folder (rustup toolchains, mise
+  installs, pyenv versions, Homebrew Cellar, Android SDK packages, ESP-IDF tools),
+  never a directory's own time and never a symlink's; on this machine rustup showed
+  Sep 25 for 1.90 against Sep 30 for stable. No signal is `no record`, never a date
+  taken from a modification time. The docs list which source each kind uses, which
+  were checked here, and the ways access time misleads (backups, antivirus,
+  indexers, `--version`). It is read fresh on every observation, opens no file, and
+  `swamp report` only reads the stored value.
+- **`~/Library/Caches` and the other big roots are no longer one number.**
+  `~/Library/Caches` (36.9 GB, one row) now lists its top 15 child folders with size,
+  modification time and last-used, plus a remainder row, so the rows add up to the
+  total exactly (it needs one signed adjustment row for hardlinks counted once, -3.7
+  MB here). A folder that cannot be listed says `not measured`, never `0B`. Toolchain
+  roots (rustup, mise, pyenv, Cellar, ESP-IDF, Android packages), DerivedData and the
+  Cargo stores list their children the same way. Names, sizes and dates only.
+- **Standalone Cargo target directories are their own kind.** A directory that
+  `CARGO_TARGET_DIR` built into (Cargo's `CACHEDIR.TAG` signature and
+  `.rustc_info.json`), inside a root you declared, shows as `standalone-cargo-target`
+  with its size, age and "rebuild with `cargo build`" instead of unowned residual, and
+  can be planned for the Trash with the usual in-use reading. A directory with only the
+  tag (pytest, uv) is not called Cargo's, and a project's own `target/` is still counted
+  once, under the project.
+- **The overlap note is data now.** The bytes a unit holds that are counted under
+  project worktrees are two fields (`bytes_counted_elsewhere`, `overlap_count`) in
+  `--json` and the store; the sentence is rendered from them. This is a store-format
+  change: the first `swamp observe` after upgrading rebuilds the derived tables
+  (configuration, protection, notes and the ledger are kept).
+- **An adapter change under the same catalog version no longer replays old rows.** The
+  stored identification of build stores now carries a digest of the adapters' source,
+  so developers no longer need `swamp observe --full` after editing an adapter.
+- **Xcode's `WorkspacePath` is worded as what it is.** It was listed as a declared
+  consumer; it is a link Xcode recorded about its own output, so it shows as a
+  recorded link.
+
 - **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
   8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
   `dist/` (downloaded archives) and `python_env/` as separate rows, each with what

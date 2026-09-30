@@ -751,6 +751,10 @@ fn external_view() {
             consumers: Vec::new(),
             note: None,
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         }]);
         app.set_view(ViewKind::External);
         check(&format!("external_{w}x{h}"), &capture(&app, w, h));
@@ -1192,6 +1196,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         allocated: false,
         project: None,
         evidence: Vec::new(),
+        last_used: None,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [

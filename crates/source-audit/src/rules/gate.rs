@@ -363,8 +363,9 @@ const LITERAL_SITES: &[(&str, &[MintSite], &str)] = &[
             (Krate::Core, &["actions"], "unit_from_row"),
             (Krate::Core, &["actions"], "unit_from_external"),
             (Krate::Core, &["actions"], "unit_from_agent"),
+            (Krate::Core, &["actions"], "unit_from_standalone_target"),
         ],
-        "a plan unit is built from a report row, an external unit or an agent unit",
+        "a plan unit is built from a report row, an external unit, an agent unit or a standalone Cargo target row",
     ),
     (
         "@core::fs_gate::destroy::Trashed",

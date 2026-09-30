@@ -878,6 +878,50 @@ pub struct BuildStoreDecl {
     pub anchor: StoreAnchor,
 }
 
+/// Which table of Cargo's own last-use tracker (`<cargo home>/.global-cache`)
+/// records the use of a location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoCacheTable {
+    /// `registry/cache`: downloaded `.crate` files.
+    RegistryCrate,
+    /// `registry/src`: extracted crate sources.
+    RegistrySrc,
+    /// `git/db`: bare git databases.
+    GitDb,
+    /// `git/checkouts`: checked-out git dependencies.
+    GitCheckout,
+}
+
+/// Where the record of a location's last use lives: the capability a
+/// detector declares (`Detector::last_use_sources`) and
+/// [`crate::last_used`] evaluates, so no consumer holds a table of tool
+/// names (`.oh/guardrails/detector-ids-only-in-registry.md`).
+///
+/// Precedence when a location declares more than one: a tool-native
+/// record beats file access time (`crate::last_used::resolve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastUseSource {
+    /// File access time of the regular files directly inside a directory
+    /// named `bin`, found at most `max_depth` levels below the location
+    /// (the location itself is level 0). Never a directory's own access
+    /// time, never a symlink's, never an opened file.
+    KeyFileAtime { max_depth: u8 },
+    /// Xcode DerivedData: each child folder's own `info.plist`
+    /// `LastAccessedDate`, written by Xcode for exactly this purpose.
+    XcodeDerivedDataPlist,
+    /// Cargo's last-use tracker, a SQLite database read read-only. The
+    /// cargo home is `up` path components above the location.
+    CargoGlobalCache { table: CargoCacheTable, up: usize },
+}
+
+/// One declaration: which of a detector's locations records its last use
+/// in `source`, against what the detector already publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastUseDecl {
+    pub anchor: StoreAnchor,
+    pub source: LastUseSource,
+}
+
 /// How a shared package store answers "do you hold this exact package
 /// identity?". Each variant names an on-disk *layout*, so a new detector
 /// for a tool that reuses an existing layout needs no consumer change;
@@ -1051,6 +1095,13 @@ pub trait Detector: Send + Sync {
     /// that declares nothing contributes no interior, only its whole
     /// external units.
     fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[]
+    }
+    /// Where the record of each of this detector's locations' last use
+    /// lives (`LastUseSource`). A location it declares nothing for shows
+    /// no last-used value at all, never one derived from a modification
+    /// time.
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
         &[]
     }
     /// Whether this detector runs under ordinary `defaults = true` scope

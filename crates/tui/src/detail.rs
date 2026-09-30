@@ -129,6 +129,10 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
             text.to_string()
         });
     }
+    // The last-used fact, worded with its source by the core, is one
+    // line of its own: never blended into the modification sentence
+    // below, which is a different fact.
+    out.extend(row.last_used.iter().cloned());
     let mut facts: Vec<&Evidence> = row.evidence.iter().collect();
     facts.sort_by_key(|e| priority(e.kind));
     out.extend(facts.iter().copied().filter_map(sentence));

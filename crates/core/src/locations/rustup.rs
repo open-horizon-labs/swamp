@@ -9,8 +9,9 @@
 
 use super::{
     ConventionRole, Detector, Environment, GlobalDefaultFile, GlobalDefaultFormat,
-    InstalledVersionLayout, InstalledVersionNaming, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
+    InstalledVersionLayout, InstalledVersionNaming, LastUseDecl, LastUseSource, LocationStatus,
+    ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint,
+    StorageCategory, StoreAnchor,
 };
 
 pub const RUSTUP_DETECTOR_ID: &str = "rustup";
@@ -57,6 +58,17 @@ impl Detector for RustupDetector {
             command: "rustup toolchain install <toolchain>",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        // `toolchains/<toolchain>/bin/{rustc,cargo,...}`.
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["toolchains"],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 2 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

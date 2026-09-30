@@ -101,6 +101,13 @@ pub enum UnownedReason {
     /// recorded as 0; the row exists so the count is visible instead of
     /// silently dropped.
     PermissionDenied,
+    /// A directory outside every checkout that carries Cargo's own
+    /// signature: a `CACHEDIR.TAG` whose first line is the Cache
+    /// Directory Tagging signature, beside `.rustc_info.json` (#171).
+    /// It is what `CARGO_TARGET_DIR` builds into. Nothing in it records
+    /// which project built it (its `.d` files use relative paths), so no
+    /// project is named, and the Trash flow can plan it.
+    StandaloneCargoTarget,
     /// A Docker object (image/build-cache/volume) with no explicit join
     /// evidence: no matching compose-project label, no label whose value
     /// is a path inside a discovered worktree, and no
@@ -3615,6 +3622,17 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
             .push(m);
     }
 
+    let mut children_by_unit: std::collections::HashMap<
+        String,
+        Vec<&crate::growth::columns::StoredUnitChildRow>,
+    > = std::collections::HashMap::new();
+    for c in &tables.children {
+        children_by_unit
+            .entry(c.unit_id.clone())
+            .or_default()
+            .push(c);
+    }
+
     snapshot.external_units = tables
         .external
         .iter()
@@ -3631,7 +3649,11 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
                     note: c.basis.clone(),
                 })
                 .collect();
-            crate::growth::external_unit_from_stored(stored, consumers)
+            let children = children_by_unit
+                .get(&stored.id)
+                .cloned()
+                .unwrap_or_default();
+            crate::growth::external_unit_from_stored(stored, consumers, &children)
         })
         .collect();
 

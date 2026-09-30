@@ -42,7 +42,13 @@ use std::path::{Path, PathBuf};
 pub struct StoreDir(PathBuf);
 
 impl StoreDir {
-    const FORMAT: &'static str = "2\n";
+    /// The store-format generation. Bumped whenever a derived table's
+    /// columns change, so an older store resets its recognized derived
+    /// tables and rebuilds under the writer lock instead of failing to
+    /// read a table that lacks a column:
+    /// 3 = last-used columns and structured overlap fields on
+    /// `external_units`, and the `unit_children` drilldown table.
+    const FORMAT: &'static str = "3\n";
     /// `$SWAMP_DIR`, else `$HOME/.local/share/swamp`: the one resolver.
     pub fn resolved() -> StoreDir {
         if let Some(dir) = std::env::var_os("SWAMP_DIR") {
@@ -262,7 +268,8 @@ fn is_derived_table(name: &str) -> bool {
         | "docker_images" | "docker_build_cache" | "docker_volumes" | "docker_builders"
         | "docker_values" | "docker_containers" | "runs" | "coverage" | "projects"
         | "worktrees" | "worktree_facts" | "artifact_shape" | "artifact_shape_lists"
-        | "external_units" | "agent_units" | "agent_unit_members" | "unit_consumers"
+        | "external_units" | "unit_children" | "agent_units" | "agent_unit_members"
+        | "unit_consumers"
         | "agent_identifications" | "agent_containers" | "nested_artifacts"
         | "nested_artifact_lists" | "nested_artifact_evidence" | "evidence"
         // Historical rendered caches and removed derived views.

@@ -1566,6 +1566,7 @@ fn unowned_reason_to_str(reason: &UnownedReason) -> &'static str {
         UnownedReason::NoContainingRepo => "NoContainingRepo",
         UnownedReason::SharedCache => "SharedCache",
         UnownedReason::PermissionDenied => "PermissionDenied",
+        UnownedReason::StandaloneCargoTarget => "StandaloneCargoTarget",
         UnownedReason::DockerNoJoin => "DockerNoJoin",
     }
 }
@@ -1577,6 +1578,7 @@ fn unowned_reason_from_str(s: &str) -> UnownedReason {
         "InconclusiveEvidence" => UnownedReason::InconclusiveEvidence,
         "SharedCache" => UnownedReason::SharedCache,
         "PermissionDenied" => UnownedReason::PermissionDenied,
+        "StandaloneCargoTarget" => UnownedReason::StandaloneCargoTarget,
         "DockerNoJoin" => UnownedReason::DockerNoJoin,
         _ => UnownedReason::NoContainingRepo,
     }
@@ -3217,6 +3219,89 @@ fn unit_consumers_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_consumers.parquet")
 }
 
+fn unit_children_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("unit_children.parquet")
+}
+
+/// One `unit_children.parquet` row per drilldown line, in display order.
+fn stored_child_rows(
+    scope_key: &str,
+    unit_id: &str,
+    children: &[crate::drilldown::UnitChild],
+) -> Vec<columns::StoredUnitChildRow> {
+    children
+        .iter()
+        .enumerate()
+        .map(|(seq, c)| columns::StoredUnitChildRow {
+            scope_key: scope_key.to_string(),
+            unit_id: unit_id.to_string(),
+            seq: seq as u32,
+            kind: c.kind.label().to_string(),
+            name: c.name.clone(),
+            bytes: c.bytes,
+            measure: c.measure.label().to_string(),
+            mtime_max: c.mtime_max,
+            entries: c.entries,
+            not_measured: c.not_measured,
+            last_used: c.last_used.at,
+            last_used_source: Some(c.last_used.source.label()),
+            last_used_atime: c.last_used.atime,
+        })
+        .collect()
+}
+
+fn children_from_stored(rows: &[&columns::StoredUnitChildRow]) -> Vec<crate::drilldown::UnitChild> {
+    use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
+    let mut sorted: Vec<&&columns::StoredUnitChildRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.seq);
+    sorted
+        .into_iter()
+        .filter_map(|r| {
+            Some(UnitChild {
+                kind: ChildKind::from_label(&r.kind)?,
+                name: r.name.clone(),
+                bytes: r.bytes,
+                measure: ChildMeasure::from_label(&r.measure)?,
+                mtime_max: r.mtime_max,
+                entries: r.entries,
+                not_measured: r.not_measured,
+                last_used: crate::last_used::LastUsed::from_columns(
+                    r.last_used,
+                    r.last_used_source.as_deref(),
+                    r.last_used_atime,
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The drilldown rows an earlier pass stored for each unit id, across
+/// every scope. Lets an unchanged unit -- whose folded rows are replayed
+/// instead of re-walked -- keep its drilldown without a listing.
+pub(crate) fn previous_unit_children(
+    swamp_dir: &Path,
+) -> std::collections::HashMap<String, Vec<crate::drilldown::UnitChild>> {
+    let rows = columns::read_unit_child_rows(&unit_children_path(swamp_dir)).unwrap_or_default();
+    let mut by_unit: std::collections::HashMap<String, Vec<&columns::StoredUnitChildRow>> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        by_unit.entry(r.unit_id.clone()).or_default().push(r);
+    }
+    by_unit
+        .into_iter()
+        .map(|(id, rows)| {
+            // Two scopes can store the same unit; the first scope's rows
+            // are used whole, never interleaved with another's.
+            let first_scope = rows[0].scope_key.clone();
+            let same: Vec<&columns::StoredUnitChildRow> = rows
+                .into_iter()
+                .filter(|r| r.scope_key == first_scope)
+                .collect();
+            (id, children_from_stored(&same))
+        })
+        .collect()
+}
+
 fn agent_unit_members_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("agent_unit_members.parquet")
 }
@@ -3412,6 +3497,11 @@ fn stored_row_from_external_unit(
         tool_home: None,
         relative_path: None,
         action: None,
+        last_used: u.last_used.at,
+        last_used_source: Some(u.last_used.source.label()),
+        last_used_atime: u.last_used.atime,
+        bytes_counted_elsewhere: u.bytes_counted_elsewhere,
+        overlap_count: u.overlap_count,
     }
 }
 
@@ -3445,6 +3535,11 @@ fn stored_row_from_agent_unit(
         tool_home: Some(u.tool_home.display().to_string()),
         relative_path: Some(u.relative_path.clone()),
         action: Some(u.action.label().to_string()),
+        last_used: None,
+        last_used_source: None,
+        last_used_atime: None,
+        bytes_counted_elsewhere: 0,
+        overlap_count: 0,
     }
 }
 
@@ -3526,6 +3621,24 @@ pub fn write_unit_tables(
     columns::write_unit_rows(&agent_file, &agent_rows)
         .with_context(|| format!("write {}", agent_file.display()))?;
 
+    let children_file = unit_children_path(swamp_dir);
+    let mut child_rows: Vec<columns::StoredUnitChildRow> =
+        columns::read_unit_child_rows(&children_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    for u in external_units {
+        let unit_id = external_unit_table_id(
+            &u.detector_id,
+            crate::external::category_str(u.category),
+            &u.path,
+        );
+        child_rows.extend(stored_child_rows(scope_key, &unit_id, &u.children));
+    }
+    columns::write_unit_child_rows(&children_file, &child_rows)
+        .with_context(|| format!("write {}", children_file.display()))?;
+
     let consumers_file = unit_consumers_path(swamp_dir);
     let mut consumer_rows: Vec<columns::StoredUnitConsumerRow> =
         columns::read_unit_consumer_rows(&consumers_file)
@@ -3579,6 +3692,7 @@ pub(crate) struct StoredUnitTables {
     pub(crate) agent: Vec<columns::StoredUnitRow>,
     pub(crate) consumers: Vec<columns::StoredUnitConsumerRow>,
     pub(crate) agent_members: Vec<columns::StoredAgentMemberRow>,
+    pub(crate) children: Vec<columns::StoredUnitChildRow>,
 }
 
 pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<StoredUnitTables> {
@@ -3608,11 +3722,18 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
             .into_iter()
             .filter(|r| r.scope_key == scope_key)
             .collect();
+    let children: Vec<columns::StoredUnitChildRow> =
+        columns::read_unit_child_rows(&unit_children_path(swamp_dir))
+            .ok()?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
     Some(StoredUnitTables {
         external,
         agent,
         consumers,
         agent_members,
+        children,
     })
 }
 
@@ -3626,6 +3747,7 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
 pub(crate) fn external_unit_from_stored(
     stored: &columns::StoredUnitRow,
     consumers: Vec<crate::external::ExternalConsumer>,
+    children: &[&columns::StoredUnitChildRow],
 ) -> crate::external::ExternalUnit {
     let category = crate::external::category_from_str(&stored.category)
         .unwrap_or(crate::locations::StorageCategory::Unclassified);
@@ -3648,6 +3770,14 @@ pub(crate) fn external_unit_from_stored(
         consumers,
         note: stored.consequence.clone(),
         evidence: Vec::new(),
+        bytes_counted_elsewhere: stored.bytes_counted_elsewhere,
+        overlap_count: stored.overlap_count,
+        last_used: crate::last_used::LastUsed::from_columns(
+            stored.last_used,
+            stored.last_used_source.as_deref(),
+            stored.last_used_atime,
+        ),
+        children: children_from_stored(children),
     }
 }
 
@@ -4519,6 +4649,7 @@ fn fact_subtype_label(s: crate::evidence::FactSubtype) -> &'static str {
         ToolReportedUse => "tool-reported-use",
         DeclaredConsumer => "declared-consumer",
         InferredConsumer => "inferred-consumer",
+        RecordedLink => "recorded-link",
         Process => "process",
         OpenFile => "open-file",
         Lock => "lock",
@@ -4546,6 +4677,7 @@ fn fact_subtype_from_label(s: &str) -> crate::evidence::FactSubtype {
         "tool-reported-use" => ToolReportedUse,
         "declared-consumer" => DeclaredConsumer,
         "inferred-consumer" => InferredConsumer,
+        "recorded-link" => RecordedLink,
         "process" => Process,
         "open-file" => OpenFile,
         "lock" => Lock,
@@ -8946,6 +9078,10 @@ mod tests {
             ],
             note: Some("coverage incomplete this pass: could not be read".into()),
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         };
 
         let link_states = [
@@ -9054,7 +9190,8 @@ mod tests {
                 note: c.basis.clone(),
             })
             .collect();
-        let rebuilt_external = external_unit_from_stored(&tables.external[0], rebuilt_consumers);
+        let rebuilt_external =
+            external_unit_from_stored(&tables.external[0], rebuilt_consumers, &[]);
         assert_eq!(
             serde_json::to_value(&rebuilt_external).unwrap(),
             serde_json::to_value(&external).unwrap(),

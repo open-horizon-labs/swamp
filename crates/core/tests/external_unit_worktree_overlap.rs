@@ -93,6 +93,8 @@ fn a_worktree_inside_a_unit_is_counted_once_and_the_unit_names_the_overlap() {
     // Without the worktree list the unit still holds everything.
     assert!(whole.bytes >= wt_bytes, "{} < {wt_bytes}", whole.bytes);
     assert!(whole.note.is_none());
+    assert_eq!(whole.overlap_count, 0);
+    assert_eq!(whole.bytes_counted_elsewhere, 0);
     // With it, the worktree's bytes are gone from the unit ...
     assert!(
         split.bytes + wt_bytes <= whole.bytes + (1 << 20),
@@ -107,10 +109,28 @@ fn a_worktree_inside_a_unit_is_counted_once_and_the_unit_names_the_overlap() {
     let diff = sum.abs_diff(du_total);
     assert!(diff <= 64 * 1024, "sum {sum} vs du {du_total}: {diff}");
     // ... and the row says so instead of silently disagreeing with du.
-    let note = split.note.expect("the overlap is named on the row");
+    // The overlap is two numbers on the unit (#185); the sentence is
+    // rendered from them, never stored as text.
+    assert_eq!(split.overlap_count, 1);
+    assert_eq!(split.bytes_counted_elsewhere, wt_bytes);
+    assert!(split.note.is_none(), "no free-text overlap note is stored");
+    let note = split
+        .overlap_note()
+        .expect("the overlap is named on the row");
     assert!(
         note.contains("counted under projects") && note.contains("1 worktree"),
         "{note}"
+    );
+    assert_eq!(split.display_note().as_deref(), Some(note.as_str()));
+    // The tempting wrong patch: a structured field that only carries the
+    // count, or bytes that do not add back. The parts sum with the
+    // parent so no bytes vanish and none are counted twice.
+    let parts = split.bytes + split.bytes_counted_elsewhere;
+    assert!(
+        parts.abs_diff(du_total) <= 64 * 1024,
+        "parent {} + counted elsewhere {} != du {du_total}",
+        split.bytes,
+        split.bytes_counted_elsewhere
     );
 }
 
@@ -129,6 +149,8 @@ fn a_worktree_outside_the_unit_changes_nothing() {
     );
     assert_eq!(whole.bytes, same.bytes);
     assert!(same.note.is_none());
+    assert_eq!(same.overlap_count, 0);
+    assert_eq!(same.bytes_counted_elsewhere, 0);
 }
 
 #[test]

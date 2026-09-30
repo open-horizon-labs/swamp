@@ -655,7 +655,7 @@ fn an_unchanged_external_cache_root_is_not_re_traversed() {
     let store = tempfile::tempdir().unwrap();
 
     let started = std::time::Instant::now();
-    let (units, first) = measure(|| {
+    let (first_units, first) = measure(|| {
         swamp_core::external::discover_and_measure(
             &scope,
             Some(store.path()),
@@ -666,10 +666,17 @@ fn an_unchanged_external_cache_root_is_not_re_traversed() {
             &swamp_core::fs_events::EventCoverage::untrusted(),
         )
         .expect("external discovery")
-        .len()
     });
     let first_elapsed = started.elapsed();
+    let units = first_units.len();
     assert!(units > 0, "precondition: the Cargo home must be measured");
+    // A unit that declares a last-use source also has a depth-2 drilldown,
+    // stored with the unit tables that `observe_scope` writes after every
+    // pass. This harness calls the measurement directly, so it writes them
+    // itself: without them the replayed unit would have no drilldown to
+    // replay and would be walked again to produce one.
+    swamp_core::growth::write_unit_tables(store.path(), "fixture-scope", &first_units, &[])
+        .expect("unit tables");
 
     let started = std::time::Instant::now();
     let (_, second) = measure(|| {
@@ -747,7 +754,7 @@ fn a_changed_external_cache_root_is_measured_again() {
     );
     let store = tempfile::tempdir().unwrap();
     let measure_pass = |at: u64, coverage: &EventCoverage| {
-        swamp_core::external::discover_and_measure(
+        let units = swamp_core::external::discover_and_measure(
             &scope,
             Some(store.path()),
             true,
@@ -756,10 +763,12 @@ fn a_changed_external_cache_root_is_measured_again() {
             3600,
             coverage,
         )
-        .expect("external discovery")
-        .into_iter()
-        .map(|u| u.bytes)
-        .sum::<u64>()
+        .expect("external discovery");
+        // The stored drilldown a replayed unit carries (see the note in
+        // `an_unchanged_external_cache_root_is_not_re_traversed`).
+        swamp_core::growth::write_unit_tables(store.path(), "fixture-scope", &units, &[])
+            .expect("unit tables");
+        units.into_iter().map(|u| u.bytes).sum::<u64>()
     };
     let (first_bytes, _) = measure(|| measure_pass(1_000, &EventCoverage::untrusted()));
     let (_, second) = measure(|| measure_pass(2_000, &quiet_window(&root, 1_000)));

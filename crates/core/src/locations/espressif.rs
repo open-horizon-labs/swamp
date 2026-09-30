@@ -17,8 +17,8 @@
 //! job, in Espressif's own commands.
 
 use super::{
-    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
-    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LastUseDecl, LastUseSource,
+    LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 use std::path::PathBuf;
 
@@ -77,6 +77,17 @@ impl Detector for EspressifDetector {
                 },
             },
         ]
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        // `tools/<tool>/<version>/<tool>/bin`.
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &[],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 4 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

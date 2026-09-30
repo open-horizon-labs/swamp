@@ -220,6 +220,24 @@ pub(crate) fn self_declared_cache(dir: &Path) -> Option<ArtifactKind> {
     (head.bytes == SIGNATURE).then_some(ArtifactKind::Cache)
 }
 
+/// What a standalone Cargo target directory costs to lose, in Cargo's
+/// own terms. Said on the row and on the confirm line.
+pub(crate) const STANDALONE_CARGO_TARGET_NOTE: &str = "standalone Cargo target: rebuild with `cargo build`; \
+     nothing in it records which project built it, so none is named";
+
+/// A directory `CARGO_TARGET_DIR` built into: Cargo's own signature, both
+/// halves. The Cache Directory Tagging signature at byte 0 of a regular
+/// `CACHEDIR.TAG` ([`self_declared_cache`]) is shared with pytest, uv and
+/// others, so it is not enough alone; `.rustc_info.json`, a regular file
+/// Cargo writes into every target directory, is what says Cargo. A
+/// directory with only the tag is a cache of some other tool's, and is
+/// not called Cargo's.
+pub(crate) fn is_standalone_cargo_target(dir: &Path) -> bool {
+    self_declared_cache(dir).is_some()
+        && crate::fs_gate::symlink_metadata(dir.join(".rustc_info.json"))
+            .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+}
+
 /// Basenames that, when found *outside* every checkout/worktree, are a
 /// shared cache rather than an ordinary unowned path.
 const SHARED_CACHE_NAMES: &[&str] = &[

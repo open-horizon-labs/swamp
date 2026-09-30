@@ -26,8 +26,8 @@
 //!   other two, so nothing is counted twice.
 
 use super::{
-    CommandOutcome, Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance,
-    StorageCategory,
+    CommandOutcome, Detector, Environment, LastUseDecl, LastUseSource, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 
 pub const HOMEBREW_DETECTOR_ID: &str = "homebrew";
@@ -302,6 +302,16 @@ impl Detector for HomebrewDetector {
     /// enabled_detectors = ["homebrew"]` turns it on.
     fn default_enabled(&self) -> bool {
         false
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["Cellar"],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 3 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

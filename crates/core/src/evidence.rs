@@ -217,6 +217,11 @@ pub enum FactSubtype {
     // Consumer (#56, #57)
     DeclaredConsumer,
     InferredConsumer,
+    /// A link the tool itself recorded about the unit (Xcode
+    /// DerivedData's `info.plist` `WorkspacePath`, a virtualenv's
+    /// `pyvenv.cfg` `home`): evidence at the second tier, weaker than a
+    /// declaration a project or a human made, and worded that way.
+    RecordedLink,
 
     // CurrentUse (#55)
     Process,

@@ -95,6 +95,7 @@ const TABLES: &[&str] = &[
     "artifact_shape.parquet",
     "artifact_shape_lists.parquet",
     "external_units.parquet",
+    "unit_children.parquet",
     "agent_units.parquet",
     "agent_unit_members.parquet",
     "unit_consumers.parquet",

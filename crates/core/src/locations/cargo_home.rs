@@ -16,9 +16,9 @@
 use std::path::PathBuf;
 
 use super::{
-    ConventionRole, Detector, Environment, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
-    StoreEntryLookup,
+    CargoCacheTable, ConventionRole, Detector, Environment, LastUseDecl, LastUseSource,
+    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
+    RecoveryHint, StorageCategory, StoreAnchor, StoreEntryLookup,
 };
 
 pub const CARGO_HOME_DETECTOR_ID: &str = "cargo-home";
@@ -64,6 +64,53 @@ impl Detector for CargoHomeDetector {
             command: "cargo fetch",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        // Cargo's own tracker (`<cargo home>/.global-cache`) records the
+        // last use of each of these four subtrees.
+        &[
+            LastUseDecl {
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Downloads,
+                    suffix: &["registry", "cache"],
+                },
+                source: LastUseSource::CargoGlobalCache {
+                    table: CargoCacheTable::RegistryCrate,
+                    up: 2,
+                },
+            },
+            LastUseDecl {
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &["registry", "src"],
+                },
+                source: LastUseSource::CargoGlobalCache {
+                    table: CargoCacheTable::RegistrySrc,
+                    up: 2,
+                },
+            },
+            LastUseDecl {
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Downloads,
+                    suffix: &["git", "db"],
+                },
+                source: LastUseSource::CargoGlobalCache {
+                    table: CargoCacheTable::GitDb,
+                    up: 2,
+                },
+            },
+            LastUseDecl {
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Cache,
+                    suffix: &["git", "checkouts"],
+                },
+                source: LastUseSource::CargoGlobalCache {
+                    table: CargoCacheTable::GitCheckout,
+                    up: 2,
+                },
+            },
+        ]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
