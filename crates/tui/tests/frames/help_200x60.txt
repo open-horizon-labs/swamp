@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · since 1w · 2 pr┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-58 of 78 ───────────────────────────────┐                                                    "
-"Developer storage: 10.9GB across 2 locations        │Keys                                                                                          │                                                    "
+"Developer storage: 10.9GB across 2 projects         │Keys                                                                                          │                                                    "
 "projects 10.9GB                                     │  ↑ ↓        move the cursor                                                                  │                                                    "
 "disk ledger: not measured yet; run swamp observe --v│  PgUp PgDn  move a screenful · Home and End jump to the first and last row                   │                                                    "
 "Reclaim: 0B regenerable across 0 units (Tab to Tools│  → / ←      in and out: open or expand · collapse or go back                                 │                                                    "

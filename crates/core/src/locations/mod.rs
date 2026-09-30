@@ -1043,15 +1043,6 @@ pub enum HeadlineGroup {
     Containers,
 }
 
-/// The headline group a detector claims for its units, if any.
-pub fn headline_group_of(detector_id: &str) -> Option<HeadlineGroup> {
-    Registry::with_builtins()
-        .detectors()
-        .iter()
-        .find(|d| d.id() == detector_id)
-        .and_then(|d| d.headline_group())
-}
-
 /// Whether units of detector `detector_id` are a remainder (see
 /// [`Detector::remainder_of`]).
 pub fn remainder_of(detector_id: &str) -> Option<Remainder> {

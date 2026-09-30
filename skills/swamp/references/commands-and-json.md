@@ -143,6 +143,18 @@ added and the top-level `projects` array bounded by `--limit`/
 NAME` reports, present here too so a project-scoped query never has to
 also pass `--view agents` to see it.
 
+The full report (no `--view`) also carries a `headline` object, the same
+numbers as the first line of the text report: `developer_bytes`, `locations`,
+`categories` (bytes and counts that add up to `developer_bytes`), `not_counted`
+(the remainder unit and mounted images), `mixed_owners`, `percent_of_used` (null
+when there is no honest percent: no ledger, an unreadable, newer or future-dated
+one, a previous scope, one command-line root, or developer storage above used),
+`disk` (`state` and, when measured, the ledger's parts, the spot audit and
+`accounted_check`), `flags`, `measured_at` (times, not ages) and `line`. `--view
+reclaim --json` adds `headline` and `headline_relation` (`holds`: the Reclaim
+totals add up to `developer_bytes`). Percent is of the container's used bytes,
+rounded down to one decimal.
+
 ### `--view <name> --json`
 
 Every view returns the envelope:

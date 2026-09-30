@@ -167,6 +167,14 @@ pub struct CategoryRow {
     pub bytes: u64,
 }
 
+/// A counted location whose storage category says it holds more than one
+/// owner's files (`~/Library/Caches`): counted, and named as mixed.
+#[derive(Debug, Clone, Serialize)]
+pub struct MixedOwner {
+    pub path: String,
+    pub bytes: u64,
+}
+
 /// What the headline leaves out on purpose, with its bytes.
 #[derive(Debug, Clone, Serialize)]
 pub struct NotCounted {
@@ -253,6 +261,10 @@ pub struct Measured {
     /// The ledger is older than the observation by more than a day, by
     /// how much.
     pub older_than_observation_secs: Option<u64>,
+    /// The observation is more than a day older than the ledger, by how
+    /// much: developer storage from an old observation is divided by a
+    /// newer disk reading.
+    pub observation_older_than_ledger_secs: Option<u64>,
     pub everything_else: Elsewhere,
     pub system_volumes: SystemPart,
     pub not_measured: NotMeasuredPart,
@@ -287,6 +299,10 @@ pub struct Headline {
     pub not_counted: NotCounted,
     /// Units whose own measurement is a lower bound (a coverage note).
     pub lower_bound_units: usize,
+    /// Counted units the catalog could not attribute to a developer tool
+    /// (category `unclassified`): part of "other developer units", named
+    /// here because they hold other owners' files too.
+    pub mixed_owners: Vec<MixedOwner>,
     pub scope: &'static str,
     pub previous_scope_roots: Option<usize>,
     pub observed_at: u64,
@@ -294,6 +310,9 @@ pub struct Headline {
     /// Data-quality flags: overflow, inconsistent inputs, developer storage
     /// larger than the disk's used bytes.
     pub flags: Vec<String>,
+    /// A total did not fit in 64 bits and was capped: the rows do not add
+    /// up to the headline.
+    pub capped: bool,
     /// The first line, as text prints it.
     pub line: String,
 }
@@ -359,6 +378,7 @@ pub fn build(input: &Input<'_>) -> Headline {
         mounted_image_bytes: 0,
     };
     let mut lower_bound_units = 0usize;
+    let mut mixed_owners: Vec<MixedOwner> = Vec::new();
     for u in input.units {
         let d = detector_of(&u.detector_id);
         if d.is_some_and(|d| d.remainder_of().is_some()) {
@@ -382,6 +402,12 @@ pub fn build(input: &Input<'_>) -> Headline {
         }
         if u.note.is_some() {
             lower_bound_units += 1;
+        }
+        if u.category == StorageCategory::Unclassified {
+            mixed_owners.push(MixedOwner {
+                path: path.clone(),
+                bytes: counted,
+            });
         }
         let c = category_of_unit(d.and_then(|d| d.headline_group()), u.category);
         add(&mut bytes[idx(c)], counted, &mut overflow);
@@ -471,7 +497,9 @@ pub fn build(input: &Input<'_>) -> Headline {
             developer,
             nc.remainder_bytes,
             input.observed_at,
-            input.scope == ScopeKind::Current || matches!(input.scope, ScopeKind::Previous { .. }),
+            // A previous scope's developer storage divided by today's disk
+            // mixes two scopes: no percent for it.
+            input.scope == ScopeKind::Current,
         ))),
     };
     if let Disk::Measured(m) = &disk
@@ -490,11 +518,13 @@ pub fn build(input: &Input<'_>) -> Headline {
         categories,
         not_counted: nc,
         lower_bound_units,
+        mixed_owners,
         scope,
         previous_scope_roots: previous,
         observed_at: input.observed_at,
         disk,
         flags,
+        capped: overflow,
         line: String::new(),
     };
     h.line = h.first_line();
@@ -514,8 +544,12 @@ fn measured(
         Some(u) if !exceeds && whole_scope => percent_tenths(developer, u),
         _ => None,
     };
-    let older = (observed_at > 0 && a.measured_at + LEDGER_MUCH_OLDER_SECS < observed_at)
+    let older = (observed_at > 0
+        && a.measured_at.saturating_add(LEDGER_MUCH_OLDER_SECS) < observed_at)
         .then(|| observed_at - a.measured_at);
+    let observation_older = (observed_at > 0
+        && observed_at.saturating_add(LEDGER_MUCH_OLDER_SECS) < a.measured_at)
+        .then(|| a.measured_at - observed_at);
     let sum = developer.saturating_add(remainder);
     let diff =
         (a.accounted.bytes as i128 - sum as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
@@ -525,6 +559,7 @@ fn measured(
         percent_of_used_tenths: percent,
         exceeds_used: exceeds,
         older_than_observation_secs: older,
+        observation_older_than_ledger_secs: observation_older,
         everything_else: Elsewhere {
             bytes: a.everything_else.bytes,
             folders: a.everything_else.folders,
@@ -574,11 +609,24 @@ fn measured(
 impl Headline {
     /// `Developer storage: 224.1GB across 61 locations (57.4% of used)`.
     fn first_line(&self) -> String {
+        let projects = self
+            .categories
+            .iter()
+            .find(|c| c.category == Category::Projects)
+            .map_or(0, |c| c.count);
+        let tools = self.locations.saturating_sub(projects);
+        let across = match (projects, tools) {
+            (0, t) => format!("{t} tool {}", plural(t, "location", "locations")),
+            (p, 0) => format!("{p} {}", plural(p, "project", "projects")),
+            (p, t) => format!(
+                "{p} {} and {t} tool {}",
+                plural(p, "project", "projects"),
+                plural(t, "location", "locations")
+            ),
+        };
         let base = format!(
-            "Developer storage: {} across {} {}",
-            human(self.developer_bytes),
-            self.locations,
-            plural(self.locations, "location", "locations")
+            "Developer storage: {} across {across}",
+            human(self.developer_bytes)
         );
         if self.scope == "explicit_root" {
             return format!("{base} (only the root named on the command line, not the machine)");
@@ -639,7 +687,7 @@ impl Headline {
     pub fn scope_sentence(&self) -> Option<String> {
         match (self.scope, self.previous_scope_roots) {
             ("previous", Some(n)) => Some(format!(
-                "covers the previous scope ({n} {}); new roots are not observed yet, run swamp observe",
+                "covers the previous scope ({n} {}), so no percent of used is shown; new roots are not observed yet, run swamp observe",
                 plural(n, "root", "roots")
             )),
             ("explicit_root", _) => Some(
@@ -663,6 +711,12 @@ impl Headline {
                     "; disk ledger measured {}",
                     age_text(m.measured_at, now)
                 ));
+                if let Some(secs) = m.observation_older_than_ledger_secs {
+                    s.push_str(&format!(
+                        "; this observation is {} older than the ledger, so the percent divides older developer storage by a newer disk reading",
+                        span_text(secs)
+                    ));
+                }
                 if let Some(secs) = m.older_than_observation_secs {
                     s.push_str(&format!(
                         "; the ledger is {} older than this observation, so the percent divides newer developer storage by an older disk reading",
@@ -703,13 +757,29 @@ impl Headline {
                 (Some(0), _) => Some(
                     "disk ledger: the container reports 0 bytes used; no percent".to_string(),
                 ),
-                (Some(_), None) if m.exceeds_used => Some(format!(
-                    "FLAG: developer storage is more than the disk's used bytes ({}); a measurement is wrong or counts shared bytes twice; no percent is shown",
-                    human(m.container_used.unwrap_or(0))
-                )),
+                // Developer storage above used is a FLAG in `flags`, once.
                 (Some(_), None) => None,
                 (Some(_), Some(_)) => None,
             },
+        }
+    }
+
+    /// A plain line whenever the ledger's accounted part does not equal
+    /// developer storage plus the remainder units: the two are computed from
+    /// the same observation unless the ledger's rows came from another.
+    pub fn accounted_sentence(&self) -> Option<String> {
+        match &self.disk {
+            Disk::Measured(m) if !m.accounted_check.agrees => {
+                let c = &m.accounted_check;
+                Some(format!(
+                    "disk view check: the ledger's accounted bytes ({}) differ from developer storage plus the remainder units ({}) by {}{}; the ledger's accounted rows may come from a different observation than these units",
+                    human(c.disk_view_accounted),
+                    human(c.developer_plus_remainder),
+                    if c.difference < 0 { "-" } else { "+" },
+                    human(c.difference.unsigned_abs()),
+                ))
+            }
+            _ => None,
         }
     }
 
@@ -803,6 +873,9 @@ impl Headline {
         if let Some(s) = self.audit_sentence() {
             let _ = writeln!(out, "  {s}");
         }
+        if let Some(s) = self.accounted_sentence() {
+            let _ = writeln!(out, "  {s}");
+        }
         for f in &self.flags {
             let _ = writeln!(out, "  FLAG: {f}");
         }
@@ -824,11 +897,26 @@ impl Headline {
                 c.count
             );
         }
-        let _ = writeln!(
-            out,
-            "  the rows add up to {} bytes, the figure above; each row is rounded on its own",
-            group_digits(self.developer_bytes)
-        );
+        if self.capped {
+            let _ = writeln!(
+                out,
+                "  the rows cannot be added to a figure that fits in 64 bits; the total above is capped"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  the rows add up to {} bytes, the figure above; each row is rounded on its own",
+                group_digits(self.developer_bytes)
+            );
+        }
+        for m in &self.mixed_owners {
+            let _ = writeln!(
+                out,
+                "  other developer units include {} in {}: other, mixed owners (not only developer tools)",
+                human(m.bytes),
+                m.path
+            );
+        }
         if self.lower_bound_units > 0 {
             let _ = writeln!(
                 out,
@@ -848,7 +936,7 @@ impl Headline {
         if self.not_counted.mounted_image_bytes > 0 {
             let _ = writeln!(
                 out,
-                "  not counted: {} of mounted disk images (views of image files, counted where the files are stored)",
+                "  not counted: {} of mounted disk images (views of image files; the disk cost is the image files themselves, listed under Everything else, not in developer storage)",
                 human(self.not_counted.mounted_image_bytes)
             );
         }
@@ -882,6 +970,7 @@ impl Headline {
         });
         v["disk_state"] = json!(self.disk_state_sentence());
         v["audit_warning"] = json!(self.audit_sentence());
+        v["accounted_check_line"] = json!(self.accounted_sentence());
         v["scope_sentence"] = json!(self.scope_sentence());
         v
     }

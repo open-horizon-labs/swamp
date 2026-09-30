@@ -912,7 +912,7 @@ The first thing `swamp report` prints, the top of the TUI and the top of
 `swamp report --view reclaim` is one line:
 
 ```text
-Developer storage: 224.1GB across 61 locations (57.4% of used)
+Developer storage: 224.1GB across 40 projects and 77 tool locations (57.4% of used)
 ```
 
 It reads stored facts only: no listing, no `stat`, no program (a test counts
@@ -922,21 +922,29 @@ work and asserts zero). Sizes use the one byte formatter (decimal, `GB`).
 
 - **projects**: everything under the declared (or built-in default) source
   roots, less the standalone Cargo target directories found there (they have
-  their own row). Worktrees that live inside a tool's folder are counted here,
-  and the tool's unit already leaves them out
-  (`bytes_counted_elsewhere`), so nothing is counted twice;
+  their own row), **plus git worktrees outside those roots that a checkout's
+  worktree registry names** (on the reporting machine 23.9 GB of a 42.0 GB
+  projects row: mostly agent worktrees under `/private/tmp`, and
+  `~/.codex/mcp/...`). The unit that holds such a folder already leaves the
+  worktree out (`bytes_counted_elsewhere`), so nothing is counted twice in the
+  headline;
 - **toolchains and SDKs** (installations and environments), **caches**
   (downloads, caches, build output), **agent storage** (an AI tool's home,
   from the detector's own declaration), **containers and VMs** (Docker,
   OrbStack), **other developer units** (local state, models, and anything a
-  build of swamp does not place: a unit is never left out for want of a row);
+  build of swamp does not place: a unit is never left out for want of a row).
+  A folder the catalog cannot attribute to one tool (category `unclassified`:
+  `~/Library/Caches`, 36.5 GB on the reporting machine) is counted here and named
+  on its own line as "other, mixed owners (not only developer tools)";
 - **standalone Cargo targets**.
 
 **What it never counts:** system volumes; the measured "Everything else"
 bucket; the *remainder* of a location after its developer tooling (Homebrew's
 "other", selected by the detector's `remainder_of` capability, never by name);
-mounted disk images (a view of image files stored, and counted, elsewhere:
-taken out only when the disk ledger knows them); the unattributed residual; and
+mounted disk images (a view of image files: the disk cost is the image files
+themselves, which the disk view lists under **Everything else**, not in
+developer storage; the mounted size is taken out only when the disk ledger knows
+the mounts); the unattributed residual; and
 protected or not-yet-measured estimates. A location is counted when it holds
 bytes; the count is the number of rows added.
 
@@ -985,8 +993,18 @@ disk view "accounted" = developer storage + remainder units
 
 `swamp report --view reclaim` prints the first line after its headline, and its
 JSON carries `headline_relation` (`holds`); `headline.disk.accounted_check`
-carries the second. They differ only when the ledger's accounted rows came from a
-different observation than the units read here, and then the difference is shown.
+carries the second. They differ when the ledger's accounted rows came from a
+different observation than the units read here, or when a unit's row was lost.
+Whenever they differ the report prints a plain line (`disk view check: the
+ledger's accounted bytes (X) differ from developer storage plus the remainder units
+(Y) by Z`) and the Disk view repeats it on its Accounted row. (A same-path
+collision that used to lose ~/.codex's 6.8 GB is fixed: an agent tool's home at a
+catalog unit's path folds into that unit's row as a note.)
+
+A report that covers a previous scope shows no percent (it would divide one scope's
+storage by today's disk). When the observation is more than a day older than the
+ledger, or the ledger more than a day older than the observation, the ages line says
+which way the percent mixes them.
 
 `swamp report --json` carries the same numbers as a `headline` object
 (`developer_bytes`, `locations`, `categories`, `not_counted`, `percent_of_used`,

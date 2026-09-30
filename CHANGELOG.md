@@ -6,7 +6,7 @@ observations, not general performance guarantees. See the README for current use
 ## v0.8.0
 
 - **The first line of `swamp report`, the TUI and the Reclaim view is now "Developer
-  storage: X across N locations (P% of used)".** It replaces headlining ~/src alone
+  storage: X across N projects and M tool locations (P% of used)".** It replaces headlining ~/src alone
   (16 GB on the reporting machine, while developer storage was about 224 GB). It
   counts the source roots (less standalone Cargo targets, which get their own row), every catalog unit
   (toolchains and SDKs, caches, agent storage, containers and VMs, other), and never
@@ -21,6 +21,8 @@ observations, not general performance guarantees. See the README for current use
   the observation and the ledger. `report --json` has the same numbers as a `headline`
   object, and the Reclaim JSON adds `headline_relation`. This also puts the "System
   volumes" line (#170) in the TUI. Reading it starts nothing and lists nothing.
+  It also fixes the volume ledger losing a folder's bytes when an agent tool's home and a
+  catalog unit share a path (~/.codex, 6.8 GB on the reporting machine, was counted in no row).
 - **BREAKING (TUI keys): views are nested in three sections.** In 0.7.x the digits `1`-`9`
   selected views; now `1` Projects, `2` Tools, `3` Disk select *sections*, `Tab` /
   `Shift-Tab` move between them, and `v` cycles the views inside the current one

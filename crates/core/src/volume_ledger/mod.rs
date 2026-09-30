@@ -361,10 +361,32 @@ pub fn accounted_rows(list: &[Accounted], mounts: &[MountView]) -> Vec<Row> {
             .then((a.category as u8).cmp(&(b.category as u8)))
     });
     let mut rows = Vec::new();
+    // The ledger keeps one row per path. An agent tool's home that is also
+    // a catalog unit's path is a finer view of bytes the unit already
+    // holds: it is folded into the unit's row as a note, never a second
+    // row that could win the path (and leave the bytes counted nowhere).
+    let unit_paths: std::collections::HashSet<&std::path::Path> = order
+        .iter()
+        .filter(|a| !a.subset_of_enclosing)
+        .map(|a| a.path.as_path())
+        .collect();
+    let folded: Vec<&Accounted> = order
+        .iter()
+        .copied()
+        .filter(|a| a.subset_of_enclosing && unit_paths.contains(a.path.as_path()))
+        .collect();
+    order.retain(|a| !(a.subset_of_enclosing && unit_paths.contains(a.path.as_path())));
     for a in &order {
         let mut overlap = 0u64;
         let mut category = a.category;
         let mut notes: Vec<String> = a.note.iter().cloned().collect();
+        for f in folded.iter().filter(|f| f.path == a.path) {
+            notes.push(format!(
+                "{} of it is {} (a finer view, counted here once)",
+                crate::render::human_bytes_pub(f.bytes),
+                f.note.as_deref().unwrap_or("an agent tool's storage")
+            ));
+        }
         let other_volume = mounts
             .iter()
             .filter(|m| a.path.starts_with(&m.path) && m.kind != MountKind::SameContainer)

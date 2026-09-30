@@ -14,9 +14,7 @@ use swamp_core::headline::{
 };
 use swamp_core::last_used::LastUsed;
 use swamp_core::locations::homebrew::HOMEBREW_OTHER_DETECTOR_ID;
-use swamp_core::locations::{
-    HeadlineGroup, Provenance, StorageCategory, headline_group_of, remainder_of,
-};
+use swamp_core::locations::{HeadlineGroup, Provenance, StorageCategory, remainder_of};
 use swamp_core::manager_facts::ManagerFacts;
 use swamp_core::reclaim::{ReclaimInput, build as build_reclaim};
 use swamp_core::report::{Report, UnownedReason, UnownedRow};
@@ -259,7 +257,7 @@ fn the_known_fixture_produces_the_exact_headline_and_rows() {
     // 28 + 2 + 5 + 3 + 1 + 20 + 1 = 60 GB of 200 GB used: 30.0%.
     assert_eq!(
         h.line,
-        "Developer storage: 60.0GB across 8 locations (30.0% of used)"
+        "Developer storage: 60.0GB across 1 project and 7 tool locations (30.0% of used)"
     );
     assert_eq!(h.developer_bytes, 60 * GB);
     assert_eq!(category(&h, Category::Projects), (1, 28 * GB));
@@ -271,7 +269,7 @@ fn the_known_fixture_produces_the_exact_headline_and_rows() {
     assert_eq!(category(&h, Category::OtherDeveloperUnits), (1, GB));
     let text = h.render_text(NOW);
     let want = "\
-Developer storage: 60.0GB across 8 locations (30.0% of used)
+Developer storage: 60.0GB across 1 project and 7 tool locations (30.0% of used)
   observed 4 min ago; disk ledger measured 3 h ago
   projects                       28.0GB     1 project
   toolchains and SDKs             5.0GB     1 location
@@ -282,7 +280,7 @@ Developer storage: 60.0GB across 8 locations (30.0% of used)
   other developer units           1.0GB     1 location
   the rows add up to 60,000,000,000 bytes, the figure above; each row is rounded on its own
   not counted: 12.0GB in Homebrew (other) (the rest of a location after its developer tooling)
-  not counted: 40.0GB of mounted disk images (views of image files, counted where the files are stored)
+  not counted: 40.0GB of mounted disk images (views of image files; the disk cost is the image files themselves, listed under Everything else, not in developer storage)
 Everything else (measured, not developer storage): 34.0GB across 2 folders
       25.0GB  /System/Library/AssetsV2  (exact)
        9.0GB  /Users/x/Movies  (exact)
@@ -414,7 +412,7 @@ fn developer_storage_larger_than_used_is_flagged_and_has_no_percent() {
     assert!(!h.line.contains('%'), "{}", h.line);
     let text = h.render_text(NOW);
     assert!(
-        text.contains("FLAG: developer storage is more than the disk's used bytes"),
+        text.contains("FLAG: developer storage (60.0GB) is more than the disk's used bytes"),
         "{text}"
     );
     assert!(
@@ -787,7 +785,7 @@ fn every_catalog_kind_maps_to_a_row_and_a_new_kind_fails_until_it_does() {
     let adapters = swamp_core::agents::registry::Registry::with_builtins().ids();
     let mut claiming: Vec<&str> = Vec::new();
     for d in swamp_core::locations::Registry::with_builtins().detectors() {
-        match headline_group_of(d.id()) {
+        match d.headline_group() {
             Some(HeadlineGroup::AgentStorage) => claiming.push(d.id()),
             Some(HeadlineGroup::Containers) => assert_eq!(d.id(), "docker-desktop"),
             None => {}
@@ -856,7 +854,9 @@ fn the_headline_the_reclaim_totals_and_the_disk_view_agree() {
     // The text says how the parts add up.
     let text = render_reclaim_header(&h, &view.totals, NOW);
     assert!(
-        text.starts_with("Developer storage: 60.0GB across 8 locations (30.0% of used)"),
+        text.starts_with(
+            "Developer storage: 60.0GB across 1 project and 7 tool locations (30.0% of used)"
+        ),
         "{text}"
     );
     assert!(
@@ -1010,7 +1010,7 @@ fn an_explicit_root_and_a_previous_scope_are_stated() {
     let text = prev.render_text(NOW);
     assert!(
         text.contains(
-            "covers the previous scope (3 roots); new roots are not observed yet, run swamp observe"
+            "covers the previous scope (3 roots), so no percent of used is shown; new roots are not observed yet, run swamp observe"
         ),
         "{text}"
     );
@@ -1227,4 +1227,116 @@ impl ToStored for Row {
             note: self.note.clone(),
         }
     }
+}
+
+/// Tempting wrong patch: the ledger keeps one row per path, and an agent
+/// tool's home that is also a catalog unit's path (a bigger "view" than the
+/// unit's net bytes) wins the path: the row is marked "counted elsewhere"
+/// and the bytes are counted nowhere. The view folds into the unit's row;
+/// the disk view's accounted bytes equal developer storage plus the
+/// remainder, and when they do not, a plain line says so.
+#[test]
+fn an_agent_home_view_at_a_unit_path_does_not_swallow_the_unit() {
+    let units = vec![unit(
+        "codex",
+        "Codex",
+        StorageCategory::LocalState,
+        "/h/.codex",
+        7 * GB,
+    )];
+    let list = vec![
+        Accounted {
+            path: PathBuf::from("/h/.codex"),
+            bytes: 7 * GB,
+            category: LedgerCategory::Catalog,
+            subset_of_enclosing: false,
+            measured_at: NOW - 60,
+            incomplete: false,
+            note: None,
+        },
+        // The view is LARGER than the unit (the unit excludes a worktree).
+        Accounted {
+            path: PathBuf::from("/h/.codex"),
+            bytes: 7 * GB + 120_000_000,
+            category: LedgerCategory::Catalog,
+            subset_of_enclosing: true,
+            measured_at: NOW - 60,
+            incomplete: false,
+            note: Some("agent sessions, caches and logs".into()),
+        },
+    ];
+    let rows = accounted_rows(&list, &[]);
+    assert_eq!(rows.iter().filter(|r| r.path == "/h/.codex").count(), 1);
+    let row = rows.iter().find(|r| r.path == "/h/.codex").unwrap();
+    assert_eq!(row.bytes, Some(7 * GB));
+    assert_eq!(row.overlap_bytes, 0, "the unit's bytes must be counted");
+    assert!(row.note.as_deref().unwrap().contains("agent sessions"));
+    let ledger = reading(rows, meta(Some(50 * GB), Some(40 * GB), NOW - 60));
+    let h = headline_of(&units, &report(0, &[]), &ledger, ScopeKind::Current);
+    let Disk::Measured(m) = &h.disk else { panic!() };
+    assert!(m.accounted_check.agrees, "{:?}", m.accounted_check);
+    assert!(h.accounted_sentence().is_none());
+    // A disagreement is said in the text and the JSON.
+    let other = reading(vec![], meta(Some(50 * GB), Some(40 * GB), NOW - 60));
+    let h = headline_of(&units, &report(0, &[]), &other, ScopeKind::Current);
+    let text = h.render_text(NOW);
+    assert!(text.contains("disk view check: the ledger's accounted bytes (0B) differ from developer storage plus the remainder units (7.0GB) by -7.0GB"), "{text}");
+    assert!(h.to_json()["accounted_check_line"].is_string());
+}
+
+/// Tempting wrong patch: a folder shared by many owners (~/Library/Caches,
+/// category unclassified) is counted as developer storage with no word
+/// about who else owns its files.
+#[test]
+fn a_mixed_owner_folder_is_counted_and_named_as_mixed() {
+    let units = vec![
+        unit(
+            "builtin-defaults",
+            "Built-in",
+            StorageCategory::Unclassified,
+            "/h/Library/Caches",
+            36 * GB,
+        ),
+        unit("rustup", "rustup", StorageCategory::Installation, "/a", GB),
+    ];
+    let h = headline_of(
+        &units,
+        &report(0, &[]),
+        &LedgerReading::NotMeasured,
+        ScopeKind::Current,
+    );
+    assert_eq!(h.developer_bytes, 37 * GB);
+    assert_eq!(h.mixed_owners.len(), 1);
+    let text = h.render_text(NOW);
+    assert!(
+        text.contains("other developer units include 36.0GB in /h/Library/Caches: other, mixed owners (not only developer tools)"),
+        "{text}"
+    );
+}
+
+/// The one-line headline names projects and tool locations apart.
+#[test]
+fn the_first_line_counts_projects_and_tool_locations_separately() {
+    let units = vec![unit(
+        "rustup",
+        "rustup",
+        StorageCategory::Installation,
+        "/a",
+        GB,
+    )];
+    let mut r = report(2 * GB, &[]);
+    r.projects = Vec::new();
+    let h = headline_of(&units, &r, &LedgerReading::NotMeasured, ScopeKind::Current);
+    assert!(
+        h.line.ends_with("across 1 project and 1 tool location"),
+        "{}",
+        h.line
+    );
+    let h = headline_of(
+        &[],
+        &report(0, &[]),
+        &LedgerReading::NotMeasured,
+        ScopeKind::Current,
+    );
+    assert!(h.line.ends_with("across 0 tool locations"), "{}", h.line);
 }

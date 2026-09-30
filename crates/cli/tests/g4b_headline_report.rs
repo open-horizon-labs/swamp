@@ -125,10 +125,7 @@ fn the_report_starts_with_the_headline_and_says_what_to_run_without_a_ledger() {
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let first = text.lines().next().unwrap();
     assert!(first.starts_with("Developer storage: "), "{text}");
-    assert!(
-        first.ends_with(" across 1 location") || first.contains(" locations"),
-        "{first}"
-    );
+    assert!(first.ends_with(" across 1 project"), "{first}");
     assert!(!first.contains('%'), "{first}");
     assert!(
         text.contains("disk ledger: not measured yet; run swamp observe --volume"),
@@ -195,7 +192,8 @@ fn a_ledger_gives_the_percent_of_the_containers_used_bytes_and_both_ages() {
         String::from_utf8_lossy(&swamp(store.path(), home.path(), &["report"]).stdout).to_string();
     assert!(!text.lines().next().unwrap().contains('%'), "{text}");
     assert!(
-        text.contains("FLAG: developer storage is more than the disk's used bytes"),
+        text.contains("FLAG: developer storage (")
+            && text.contains(") is more than the disk's used bytes"),
         "{text}"
     );
 }

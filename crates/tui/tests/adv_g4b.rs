@@ -175,7 +175,7 @@ fn adv_strip_never_wider_than_the_terminal_and_current_always_shown() {
                 if text.contains('\n') {
                     bad.push(format!("{v:?} w={w} newline"));
                 }
-                if w >= 12 && !text.contains(&format!("{} ", v.key())) {
+                if w >= 12 && !text.contains(v.section().title()) {
                     bad.push(format!(
                         "{v:?} {name:?} w={w} current key missing: {text:?}"
                     ));
@@ -250,8 +250,26 @@ fn adv_every_key_on_an_empty_store_at_every_size_does_not_panic() {
     a.has_index = false;
     a.views_seen = false;
     for v in ViewKind::ALL {
-        swamp_tui::handle_key(&mut a, KeyCode::Char(v.key()));
+        a.set_view(v);
         assert_eq!(a.view, v);
+        // Every navigation key on an empty store, too.
+        for k in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('v'),
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+            KeyCode::Char('3'),
+        ] {
+            let mut b = App::new(
+                Report::empty(PathBuf::from("/h/src")),
+                PathBuf::from("/h/src"),
+            );
+            b.has_index = false;
+            b.set_view(v);
+            swamp_tui::handle_key(&mut b, k);
+            let _ = buf(&b, 80, 24);
+        }
         for (w, h) in [
             (0u16, 0u16),
             (1, 1),
@@ -267,7 +285,7 @@ fn adv_every_key_on_an_empty_store_at_every_size_does_not_panic() {
             let _ = buf(&a, w, h);
         }
         let f = frame(&a, 80, 24).join("\n");
-        if v == ViewKind::Disk {
+        if matches!(v, ViewKind::Disk | ViewKind::DiskGaps) {
             assert!(
                 f.contains("swamp observe"),
                 "Disk empty state must say what to run:\n{f}"
@@ -314,7 +332,7 @@ fn adv_strip_row_has_no_color_cells() {
 #[test]
 fn adv_disk_view_not_measured_row_is_singular_for_one() {
     // The fixture ledger has exactly one unreadable directory.
-    let rows = swamp_tui::model::disk_rows(&measured(now() - 60));
+    let rows = swamp_tui::model::disk_rows(&measured(now() - 60), None);
     let nm: Vec<&String> = rows
         .iter()
         .map(|r| &r.label)

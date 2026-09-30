@@ -1045,12 +1045,11 @@ pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
                 "FLAG: over used; no percent".to_string(),
             ])
         }
-        Disk::Measured(m) if m.percent_of_used_tenths.is_none() && h.scope != "explicit_root" => {
-            third.push(vec![
+        Disk::Measured(m) if m.percent_of_used_tenths.is_none() && h.scope == "current" => third
+            .push(vec![
                 "disk ledger: no used figure; no percent".to_string(),
                 "ledger: no percent".to_string(),
-            ])
-        }
+            ]),
         Disk::Measured(_) => {}
         Disk::NotMeasured => third.push(vec![
             "disk ledger: not measured yet; run swamp observe --volume".to_string(),
@@ -1327,8 +1326,12 @@ pub fn view_strip_spans(app: &App, width: usize) -> Vec<Span<'static>> {
     let total = |l: &[String]| l.iter().map(|x| dw(x)).sum::<usize>() + 2 * (l.len() - 1);
     let labels = if total(&build(true)) <= width {
         build(true)
-    } else {
+    } else if total(&build(false)) <= width {
         build(false)
+    } else {
+        // Too narrow for all three: the current section alone, cut to fit.
+        let name = cur.title().to_string();
+        vec![clip_end(&name, width.max(1))]
     };
     let hint = " · Tab section";
     let quiet = Style::default().add_modifier(Modifier::DIM);
@@ -1338,7 +1341,7 @@ pub fn view_strip_spans(app: &App, width: usize) -> Vec<Span<'static>> {
             spans.push(Span::raw("  "));
         }
         let l = clip_end(label, width.max(1));
-        spans.push(if Section::ALL[i] == cur {
+        spans.push(if labels.len() == 1 || Section::ALL[i] == cur {
             Span::styled(l, selected_style())
         } else {
             Span::raw(l)

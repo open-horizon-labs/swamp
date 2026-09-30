@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed  "
-"Developer storage: 13.4GB across 3 locations                                    "
+"Developer storage: 13.4GB across 2 projects and 1 tool location                 "
 "projects 10.9GB · caches 2.5GB                                                  "
 "disk ledger: not measured yet; run swamp observe --volume · observed 749 d ago  "
 "Reclaim: 2.5GB regenerable, 1 unit (Tab) · Disk: not measured (3)               "

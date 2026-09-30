@@ -2475,7 +2475,10 @@ const DISK_FOLDERS_SHOWN: usize = 30;
 /// unexplained remainder. Pure over the stored reading: opening the view
 /// lists nothing, stats nothing and starts no process. Empty when there is
 /// no usable ledger: the empty state then says why (`ui::empty_state`).
-pub fn disk_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<Row> {
+pub fn disk_rows(
+    ledger: &swamp_core::volume_ledger::LedgerReading,
+    accounted_note: Option<String>,
+) -> Vec<Row> {
     use swamp_core::volume_ledger::{Category, LedgerReading};
     let LedgerReading::Measured(a) = ledger else {
         return Vec::new();
@@ -2496,6 +2499,7 @@ pub fn disk_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<Row> 
     accounted.detail_lines = vec![
         "The developer storage headline is this, less the remainder of a location after its developer tooling, and less mounted disk images.".to_string(),
     ];
+    accounted.detail_lines.extend(accounted_note);
     rows.push(accounted);
 
     let mut elsewhere: Vec<&swamp_core::volume_ledger::Row> = a
@@ -2569,8 +2573,13 @@ pub fn disk_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<Row> 
     let mut nm = Row::leaf(
         0,
         format!(
-            "Not measured: {} directories could not be read",
-            a.not_measured.count
+            "Not measured: {} {} could not be read",
+            a.not_measured.count,
+            if a.not_measured.count == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
         ),
         0,
         None,
@@ -2709,8 +2718,13 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
     group(
         &mut rows,
         format!(
-            "Could not be read: {} directories (protected folders)",
-            a.not_measured.count
+            "Could not be read: {} {} (protected folders)",
+            a.not_measured.count,
+            if a.not_measured.count == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
         ),
         &a.not_measured.names,
         "unmeasured",

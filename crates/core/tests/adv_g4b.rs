@@ -15,9 +15,7 @@ use swamp_core::headline::{
 };
 use swamp_core::last_used::LastUsed;
 use swamp_core::locations::homebrew::HOMEBREW_OTHER_DETECTOR_ID;
-use swamp_core::locations::{
-    HeadlineGroup, Provenance, StorageCategory, headline_group_of, remainder_of,
-};
+use swamp_core::locations::{HeadlineGroup, Provenance, StorageCategory, remainder_of};
 use swamp_core::manager_facts::ManagerFacts;
 use swamp_core::reclaim::{ReclaimInput, build as build_reclaim};
 use swamp_core::report::{Report, UnownedReason, UnownedRow};

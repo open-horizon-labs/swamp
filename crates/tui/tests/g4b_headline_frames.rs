@@ -266,7 +266,7 @@ fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
     let f = frame(&a, 80, 24);
     assert_eq!(
         f[1],
-        "Developer storage: 39.0GB across 4 locations (39.0% of used)"
+        "Developer storage: 39.0GB across 1 project and 3 tool locations (39.0% of used)"
     );
     // Breakdown: projects, toolchains, caches, agents.
     assert!(f[2].contains("projects 30.0GB"), "{}", f[2]);
@@ -736,7 +736,7 @@ fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
     assert!(pic.contains("unmeasured") && !pic.contains("0B"), "{pic}");
     a.set_view(ViewKind::DiskGaps);
     let f = frame(&a, 120, 30).join("\n");
-    assert!(f.contains("Could not be read: 1 directories"), "{f}");
+    assert!(f.contains("Could not be read: 1 directory"), "{f}");
     let pic = f
         .lines()
         .find(|l| l.contains("/Users/x/Pictures"))

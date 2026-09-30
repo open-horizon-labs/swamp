@@ -385,6 +385,11 @@ impl RefreshedObservation {
     }
 }
 
+/// What the cached headline was built from: the report's time, the scope
+/// it covers, and the clock minute (a ledger dated ahead of now is judged
+/// against it).
+type HeadlineKey = (u64, Option<usize>, bool, u64);
+
 pub struct App {
     /// Ephemeral on-demand details; never persisted in the observation store.
     pub cargo_inspection: Option<Vec<String>>,
@@ -603,6 +608,11 @@ pub struct App {
     /// The Reclaim view built from the stored facts above, kept until one
     /// of them changes: building it joins every unit to its interior.
     reclaim_cache: std::cell::RefCell<Option<std::sync::Arc<swamp_core::reclaim::ReclaimView>>>,
+    /// The headline built from the facts above, kept until one of them
+    /// (or the clock minute) changes: drawing reuses it instead of
+    /// rebuilding it every frame.
+    headline_cache:
+        std::cell::RefCell<Option<(HeadlineKey, std::sync::Arc<swamp_core::headline::Headline>)>>,
     /// The authorized scope this TUI is showing. Every refresh --
     /// background, post-action re-observe -- goes through it,
     /// so exclusions and external pruning survive an update rather than
@@ -851,6 +861,7 @@ impl App {
             ledger: swamp_core::volume_ledger::LedgerReading::NotMeasured,
             views_seen: true,
             reclaim_cache: std::cell::RefCell::new(None),
+            headline_cache: std::cell::RefCell::new(None),
             scope: None,
         }
     }
@@ -878,26 +889,42 @@ impl App {
     /// Sets what the stored disk ledger says.
     pub fn set_ledger(&mut self, ledger: swamp_core::volume_ledger::LedgerReading) {
         self.ledger = ledger;
+        self.headline_cache.borrow_mut().take();
     }
 
     /// The developer-storage headline over the stored facts this app
     /// holds: a pure function of them (`swamp_core::headline::build`),
     /// so drawing it lists nothing, stats nothing and starts no process.
-    pub fn headline(&self) -> swamp_core::headline::Headline {
+    pub fn headline(&self) -> std::sync::Arc<swamp_core::headline::Headline> {
         use swamp_core::headline::ScopeKind;
         let explicit = self.scope.as_ref().is_some_and(|s| s.explicit);
-        swamp_core::headline::build(&swamp_core::headline::Input {
-            units: &self.external_units,
-            report: &self.report,
-            ledger: &self.ledger,
-            scope: match (explicit, self.previous_scope_roots) {
-                (true, _) => ScopeKind::ExplicitRoot,
-                (false, Some(roots)) => ScopeKind::Previous { roots },
-                (false, None) => ScopeKind::Current,
-            },
-            observed_at: self.report.observed_at,
-            now: swamp_core::entities::now(),
-        })
+        let now = swamp_core::entities::now();
+        let key: HeadlineKey = (
+            self.report.observed_at,
+            self.previous_scope_roots,
+            explicit,
+            now / 60,
+        );
+        if let Some((k, h)) = self.headline_cache.borrow().as_ref()
+            && *k == key
+        {
+            return h.clone();
+        }
+        let built =
+            std::sync::Arc::new(swamp_core::headline::build(&swamp_core::headline::Input {
+                units: &self.external_units,
+                report: &self.report,
+                ledger: &self.ledger,
+                scope: match (explicit, self.previous_scope_roots) {
+                    (true, _) => ScopeKind::ExplicitRoot,
+                    (false, Some(roots)) => ScopeKind::Previous { roots },
+                    (false, None) => ScopeKind::Current,
+                },
+                observed_at: self.report.observed_at,
+                now,
+            }));
+        *self.headline_cache.borrow_mut() = Some((key, built.clone()));
+        built
     }
 
     /// The Reclaim view over the stored facts this app holds. A pure
@@ -932,6 +959,7 @@ impl App {
     pub fn set_external_units(&mut self, units: Vec<swamp_core::external::ExternalUnit>) {
         self.external_units = units;
         self.reclaim_cache.borrow_mut().take();
+        self.headline_cache.borrow_mut().take();
     }
 
     /// Sets the store interiors shown under `ViewKind::External`. Same
@@ -1049,6 +1077,7 @@ impl App {
         // the new report sorts it.
         let anchor = self.selected_row_key();
         self.report = report;
+        self.headline_cache.borrow_mut().take();
         self.restore_selection(anchor);
     }
 
@@ -1280,7 +1309,9 @@ impl App {
             ViewKind::Agents => model::agent_rows(&self.agent_units),
             // Parts of one disk, largest meaning first as the ledger
             // orders them: sort never reorders them.
-            ViewKind::Disk => return model::disk_rows(&self.ledger),
+            ViewKind::Disk => {
+                return model::disk_rows(&self.ledger, self.headline().accounted_sentence());
+            }
             ViewKind::DiskGaps => return model::disk_gaps_rows(&self.ledger),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
