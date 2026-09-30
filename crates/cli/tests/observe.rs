@@ -494,6 +494,14 @@ fn observe_summary_line_reports_the_real_reason_not_the_no_store_fallback() {
             .arg(root.path())
             .env("SWAMP_DIR", store.path())
             .env("SWAMP_TEST_MODE", "1")
+            // The second pass must land inside the FSEvents too-soon floor
+            // to report `too_soon`. At the default 3 s floor it did not
+            // when the first pass took 3 s or more (a loaded runner, or
+            // the brew manager pass now running on macOS), and the second
+            // then said `incremental`: a real reason, but not the one this
+            // test pins. A wide floor makes the outcome independent of
+            // timing.
+            .env("SWAMP_FSEVENTS_MIN_INTERVAL_SECS", "3600")
             .output()
             .expect("run observe");
         assert!(
