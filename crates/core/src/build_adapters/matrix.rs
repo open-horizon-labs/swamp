@@ -60,8 +60,10 @@ pub struct MatrixEntry {
     pub actions: &'static str,
 }
 
-const INSPECTION_ONLY: &str = "inspection only";
-const PROJECT_TRASH: &str = "TUI Trash for project-local outputs, test output and intermediates; shared stores and installations inspection only";
+const DAEMON_RECORDS: &str =
+    "daemon records are not paths: nothing to move to Trash; `docker buildx prune` acts on them";
+const STORE_FOLDERS: &str = "Space on a folder moves that exact path to Trash; the confirm says a running Claude Code session breaks if its scratch goes";
+const PROJECT_TRASH: &str = "TUI Trash for project-local outputs, test output and intermediates; anything else: no cleanup rule, Space marks that exact path on its own row and the confirm says what the adapter could not establish";
 
 pub const MATRIX: &[MatrixEntry] = &[
     MatrixEntry {
@@ -360,7 +362,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         operation_granularity: "daemon-side only: `docker buildx prune --filter id=<id>` \
                                 removes a record with its dependents; `docker builder prune` \
                                 removes every record not in use that matches its filters",
-        actions: INSPECTION_ONLY,
+        actions: DAEMON_RECORDS,
     },
     MatrixEntry {
         id: "tool-stores",
@@ -377,7 +379,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "scratch is measured while a session may be writing to it; an open-file check is evidence, never proof",
         ],
         operation_granularity: "one whole store directory",
-        actions: INSPECTION_ONLY,
+        actions: STORE_FOLDERS,
     },
 ];
 
