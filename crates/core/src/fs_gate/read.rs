@@ -166,6 +166,7 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 /// file is read: a FIFO, socket, device or dataless placeholder is an
 /// error, never a wait (see [`open_regular`]).
 pub fn bounded_read(path: impl AsRef<Path>, cap: BoundedCap) -> io::Result<BoundedBytes> {
+    let _step = crate::beacon::enter("read", path.as_ref());
     let file = open_regular(path.as_ref())?;
     // The length the `fstat` reports tells a complete file from a
     // truncated one without reading a byte past the cap.

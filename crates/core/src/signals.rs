@@ -238,6 +238,7 @@ pub fn age_signals(rows: &[Signal], raw: &RawSignals, elapsed: u64) -> (Vec<Sign
 }
 
 pub fn compute_signals_raw(dir: &Path, observed_at: u64) -> (Vec<Signal>, RawSignals) {
+    let _step = crate::beacon::enter("git signals", dir);
     let Some(repo) = Repo::open(dir) else {
         let unknown = SignalValue::Unknown.render();
         let idle_v = idle_for(dir, observed_at, None);

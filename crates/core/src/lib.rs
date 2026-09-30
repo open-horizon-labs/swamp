@@ -31,6 +31,7 @@ pub mod agents;
 pub mod artifact;
 pub mod assoc_store;
 pub mod attribution;
+pub mod beacon;
 pub mod build_adapters;
 pub(crate) mod build_stores;
 pub mod bus;

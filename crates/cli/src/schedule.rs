@@ -56,6 +56,23 @@ pub fn cmd_observe(
         }
     };
 
+    // A path an earlier pass was stopped on is skipped as not measured
+    // for a day, so one blocking path cannot fail every scheduled pass
+    // (#190).
+    let mut scope = scope;
+    let mut quarantine_notes = Vec::new();
+    for (at, path) in schedule::quarantined(&store_dir, swamp_core::entities::now()) {
+        let reason = format!("not measured (stalled on {})", schedule::utc_date(at));
+        if scope.quarantine(&path, &reason) {
+            quarantine_notes.push(format!("{}: {reason}", path.display()));
+        }
+    }
+    let stall = Duration::from_secs(
+        config
+            .observe_stall_secs
+            .max(swamp_core::growth::MIN_OBSERVE_STALL_SECS),
+    );
+
     let start = Instant::now();
     if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
         swamp_core::work_counters::reset();
@@ -84,7 +101,7 @@ pub fn cmd_observe(
         let _ = tx.send(res);
     });
 
-    match wait_for_observation(&rx, start, timeout) {
+    match wait_with(&rx, start, timeout, stall, Duration::from_secs(1)) {
         Ok(Ok(observation)) => {
             let wall_ms = start.elapsed().as_millis() as u64;
             let now = swamp_core::entities::now();
@@ -124,6 +141,12 @@ pub fn cmd_observe(
                     c.walked_total,
                     c.projects
                 );
+            }
+            for note in &quarantine_notes {
+                safe_println!("  {note}");
+            }
+            for (path, why) in swamp_core::fs_gate::git::declined() {
+                safe_println!("  {}: git repository not measured ({why})", path.display());
             }
             safe_println!(
                 "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
@@ -179,6 +202,9 @@ pub fn cmd_observe(
                 mode: "full".to_string(),
                 outcome: timeout_outcome(stuck.as_ref()),
             };
+            if let Some((_, path, _)) = &stuck {
+                let _ = schedule::record_stalled(&store_dir, path, now);
+            }
             append_log(&log_file(), &outcome)?;
             let _ = write_last_run(&store_dir, &outcome);
             // Released before exiting so the next observation (and the
@@ -199,30 +225,19 @@ pub fn cmd_observe(
     }
 }
 
-/// A walk that has sat in one directory this long is stuck in a blocking
-/// filesystem call, not slow: the slowest single directory measured on
-/// the maintainer's machine lists in well under a second. The pass is
-/// abandoned (lock released, path logged) instead of holding the writer
-/// lock for the rest of `observe_timeout_sec` (#190).
-const DIRECTORY_STALL: Duration = Duration::from_secs(300);
-
 /// How a wait for the observation thread ended without a result.
 enum Waited {
-    /// Past `observe_timeout_sec`, or one directory past
-    /// [`DIRECTORY_STALL`]; carries the directory the walk was inside
-    /// longest, if any, and for how long.
-    TimedOut(Option<(PathBuf, Duration)>),
+    /// Past `observe_timeout_sec`, or nothing progressed for
+    /// `observe_stall_secs`; carries the step running longest (phase,
+    /// path, how long), if any.
+    TimedOut(Option<(&'static str, PathBuf, Duration)>),
     Died,
 }
 
-fn wait_for_observation<T>(
-    rx: &mpsc::Receiver<T>,
-    start: Instant,
-    timeout: Duration,
-) -> std::result::Result<T, Waited> {
-    wait_with(rx, start, timeout, DIRECTORY_STALL, Duration::from_secs(5))
-}
-
+/// Waits for the pass, checking the progress beacon every `tick`: a pass
+/// that is slow but still moving (directories entered and left, long
+/// listings beating) is never stopped early; one where nothing has moved
+/// for `stall` is (#190).
 fn wait_with<T>(
     rx: &mpsc::Receiver<T>,
     start: Instant,
@@ -236,21 +251,24 @@ fn wait_with<T>(
             Ok(v) => return Ok(v),
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Waited::Died),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let oldest = swamp_core::walk::in_flight::oldest();
-                let stalled = oldest.as_ref().is_some_and(|(_, d)| *d >= stall);
-                if stalled || start.elapsed() >= timeout {
-                    return Err(Waited::TimedOut(oldest));
+                let idle = swamp_core::beacon::idle_for().min(start.elapsed());
+                if idle >= stall || start.elapsed() >= timeout {
+                    return Err(Waited::TimedOut(swamp_core::beacon::stuck()));
                 }
             }
         }
     }
 }
 
-/// The log's outcome for a stopped pass: which directory it was stuck
-/// in, when the walk was inside one.
-fn timeout_outcome(stuck: Option<&(PathBuf, Duration)>) -> String {
+/// The log's outcome for a stopped pass: which step it was stuck in, and
+/// on which path, when one was running.
+fn timeout_outcome(stuck: Option<&(&'static str, PathBuf, Duration)>) -> String {
     match stuck {
-        Some((path, d)) => format!("timeout(stuck {}s in {})", d.as_secs(), path.display()),
+        Some((phase, path, d)) => format!(
+            "timeout(stuck {}s in {phase} at {})",
+            d.as_secs(),
+            path.display()
+        ),
         None => "timeout".to_string(),
     }
 }
@@ -286,14 +304,16 @@ pub fn cmd_schedule(
 #[cfg(test)]
 mod watchdog_tests {
     use super::*;
+    use std::path::Path;
+
+    /// The beacon is process-wide; tests that read it run one at a time.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A pass whose result never comes back is stopped by the overall
-    /// timeout; the channel's sender is kept alive so this is a timeout,
-    /// not a dead worker. Tempting wrong patch: a single
-    /// `recv_timeout(timeout)`, which cannot notice a stalled directory
-    /// before the full `observe_timeout_sec` (30 minutes) runs out.
+    /// timeout. Tempting wrong patch: a single `recv_timeout(timeout)`,
+    /// which cannot notice a stall before `observe_timeout_sec` runs out.
     #[test]
-    fn a_silent_pass_times_out_and_a_stalled_directory_stops_it_early() {
+    fn a_silent_pass_times_out_and_names_the_stuck_step() {
         let (_tx, rx) = mpsc::channel::<()>();
         let start = Instant::now();
         let got = wait_with(
@@ -307,24 +327,89 @@ mod watchdog_tests {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_eq!(timeout_outcome(None), "timeout");
         let named = timeout_outcome(Some(&(
-            PathBuf::from("/x/Caches"),
+            "git signals",
+            PathBuf::from("/x/proj"),
             Duration::from_secs(301),
         )));
-        assert_eq!(named, "timeout(stuck 301s in /x/Caches)");
+        assert_eq!(named, "timeout(stuck 301s in git signals at /x/proj)");
     }
 
-    /// docs/usage.md states the stall bound and the log line; keep both
-    /// in step with the code.
+    /// Slow but progressing: a step that keeps beating (a 200k-entry
+    /// listing under load) is not stopped, however long it takes.
+    /// Tempting wrong patch: stopping on the age of the oldest running
+    /// step rather than on time since the last progress.
     #[test]
-    fn usage_doc_states_the_directory_stall_bound() {
+    fn a_slow_pass_that_keeps_progressing_is_not_stopped() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _step = swamp_core::beacon::enter("walk", Path::new("/x/huge"));
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(50));
+                swamp_core::beacon::beat();
+            }
+            drop(_step);
+            let _ = tx.send(());
+        });
+        let got = wait_with(
+            &rx,
+            Instant::now(),
+            Duration::from_secs(60),
+            Duration::from_millis(400),
+            Duration::from_millis(20),
+        );
+        worker.join().unwrap();
+        assert!(got.is_ok(), "a progressing pass was stopped");
+    }
+
+    /// Parked: a step that stops beating is stopped at `stall`, long
+    /// before the overall timeout, and named.
+    #[test]
+    fn a_parked_step_is_stopped_at_the_stall_bound_and_named() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (_tx, rx) = mpsc::channel::<()>();
+        let (park_tx, park_rx) = mpsc::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _step = swamp_core::beacon::enter("ignore lens", Path::new("/x/parked"));
+            ready_tx.send(()).unwrap();
+            let _ = park_rx.recv();
+        });
+        ready_rx.recv().unwrap();
+        let start = Instant::now();
+        let got = wait_with(
+            &rx,
+            start,
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+            Duration::from_millis(20),
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+        match got {
+            Err(Waited::TimedOut(Some((phase, path, _)))) => {
+                assert_eq!((phase, path), ("ignore lens", PathBuf::from("/x/parked")));
+            }
+            _ => panic!("not stopped at the stall bound"),
+        }
+        park_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    /// docs/usage.md states the stall key and the log line.
+    #[test]
+    fn usage_doc_states_the_stall_key_and_log_line() {
         let doc = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/usage.md"),
         )
         .unwrap();
         assert!(doc.contains(&format!(
-            "one directory for {} seconds",
-            DIRECTORY_STALL.as_secs()
+            "observe_stall_secs = {}",
+            swamp_core::growth::DEFAULT_OBSERVE_STALL_SECS
         )));
-        assert!(doc.contains("timeout(stuck <N>s in <path>)"));
+        assert!(doc.contains(&format!(
+            "minimum {}",
+            swamp_core::growth::MIN_OBSERVE_STALL_SECS
+        )));
+        assert!(doc.contains("timeout(stuck <N>s in <phase> at <path>)"));
     }
 }

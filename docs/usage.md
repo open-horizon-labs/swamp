@@ -1080,6 +1080,7 @@ since = "24h"
 retention_days = 30
 large_file_min_bytes = 1048576
 observe_timeout_sec = 1800
+observe_stall_secs = 300
 # min_free_bytes = 1073741824   # unset: the greater of 1 GiB and 1% of the volume; 0 disables
 
 [scan]
@@ -1092,15 +1093,27 @@ enabled_detectors = []
 
 ### Stuck observations
 
-`observe_timeout_sec` bounds a whole `swamp observe`. Separately, when the
-walk has sat inside one directory for 300 seconds, the pass is stopped:
-the writer lock is released, and `observe.log` records
-`timeout(stuck <N>s in <path>)` naming that directory, so the next
-observation is not left waiting behind it. Files the walk or git reads
-open are never opened when they could block: a FIFO, socket or device is
-skipped, and a dataless file provider placeholder (an iCloud Drive or
-CloudStorage item whose contents are not downloaded) is neither opened
-nor listed; such a directory is reported as not measured.
+`observe_timeout_sec` bounds a whole `swamp observe`. Separately, every
+step that touches your files (a walk directory, a repository's git
+signals, its ignore rules, an agent session store, an external unit)
+reports progress. When nothing has progressed for `observe_stall_secs`
+(default 300, minimum 30), the pass is stopped: the writer lock is
+released and `observe.log` records `timeout(stuck <N>s in <phase> at <path>)`,
+so the next observation is not left waiting behind it. That path is then
+skipped for 24 hours and reported as `not measured (stalled on <date>)`
+(kept in `stalled-paths.tsv` in the store, which a store reset keeps), so
+one blocking path cannot fail every scheduled pass.
+
+Files are never opened when opening them could block. A FIFO or device
+is refused by `stat` alone (opening even the read end of a FIFO would
+wake a program waiting to write to it). A dataless file provider
+placeholder (an iCloud Drive or CloudStorage item whose contents are not
+downloaded) is neither opened nor listed; such a directory is reported as
+not measured. Before git reads a repository, its git directory is swept
+once (loose objects and packs skipped); a repository with a FIFO, device
+or dataless file there, or with more than 50,000 entries to check, is
+reported as not measured. When your global git config could block, git
+reads repositories without it.
 
 ### Full-disk guard
 

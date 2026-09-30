@@ -204,6 +204,7 @@ fn read_session_rows(
     db_path: &Path,
     ctx: &IdentifyCtx,
 ) -> Option<HashMap<PathBuf, Option<PathBuf>>> {
+    let _step = crate::beacon::enter("agent units", db_path);
     // Reject non-SQLite files before SQLite gets a chance to initialize or
     // resize a WAL shared-memory sidecar beside a damaged/renamed file.
     // This is the 16-byte SQLite file signature, not transcript content.

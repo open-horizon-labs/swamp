@@ -305,7 +305,7 @@ fn discover_one(
     if excluded.iter().any(|e| dir == e || dir.starts_with(e)) {
         return;
     }
-    let _entered = in_flight::enter(dir);
+    let _entered = crate::beacon::enter("walk", dir);
     crate::work_counters::record_files_statted(1);
     let Ok(meta) = crate::fs_gate::symlink_metadata(dir) else {
         return;
@@ -507,51 +507,6 @@ pub mod progress {
             DIRS.load(Ordering::Relaxed),
             ACTIVE.load(Ordering::Relaxed),
         )
-    }
-}
-
-/// The directories walk-pool workers are inside right now, with when
-/// each was entered, so a watchdog can name the path a stalled pass is
-/// stuck on (#190: a worker parked in one blocking `open(2)` while every
-/// other worker idled at 0% CPU, and nothing said where).
-pub mod in_flight {
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, Instant};
-
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    static JOBS: Mutex<Option<HashMap<u64, (PathBuf, Instant)>>> = Mutex::new(None);
-
-    /// Held while one directory is processed; dropping it leaves.
-    pub(crate) struct Entered(u64);
-
-    pub(crate) fn enter(path: &Path) -> Entered {
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        JOBS.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(HashMap::new)
-            .insert(id, (path.to_path_buf(), Instant::now()));
-        Entered(id)
-    }
-
-    impl Drop for Entered {
-        fn drop(&mut self) {
-            if let Some(jobs) = JOBS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                jobs.remove(&self.0);
-            }
-        }
-    }
-
-    /// The directory a worker has been inside the longest, and for how
-    /// long. `None` when no walk is in a directory.
-    pub fn oldest() -> Option<(PathBuf, Duration)> {
-        let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
-        jobs.as_ref()?
-            .values()
-            .min_by_key(|(_, at)| *at)
-            .map(|(p, at)| (p.clone(), at.elapsed()))
     }
 }
 
@@ -995,7 +950,8 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     if !meta.is_dir() {
         return;
     }
-    let _entered = in_flight::enter(&path);
+    let _entered = crate::beacon::enter("walk", &path);
+    crate::beacon::test_park(&path);
 
     // A dataless directory (file provider placeholder) is never listed:
     // listing it would ask the provider to fetch it, which can block
@@ -1050,7 +1006,10 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     // that must win over a fabricated zero.
     let mut dir_mtime_max: i64 = meta.mtime();
 
-    for entry in entries.flatten() {
+    for (i, entry) in entries.flatten().enumerate() {
+        if i % 1024 == 1023 {
+            crate::beacon::beat();
+        }
         let Ok(ft) = entry.file_type() else { continue };
         let child_path = entry.path();
         if ft.is_symlink() {
@@ -1351,9 +1310,10 @@ fn process_size(
         finish_size_job(group, shared);
         return;
     }
-    let _entered = in_flight::enter(&path);
+    let _entered = crate::beacon::enter("walk", &path);
     // Dataless placeholder: not listed, so not fetched (#190); counted as
     // an unreadable directory (incomplete), never as an empty one.
+    crate::work_counters::record_files_statted(1);
     let dataless = crate::fs_gate::symlink_metadata(&path)
         .is_ok_and(|m| crate::fs_gate::read::is_dataless(&m));
     let listed = if dataless {
@@ -1412,7 +1372,10 @@ fn process_size(
         });
     }
     let mut dir_mtime_max: i64 = own_meta.map(|m| m.mtime()).unwrap_or(0);
-    for entry in entries {
+    for (i, entry) in entries.enumerate() {
+        if i % 1024 == 1023 {
+            crate::beacon::beat();
+        }
         let Ok(entry) = entry else {
             shared.incomplete.store(true, Ordering::Relaxed);
             continue;
@@ -1986,6 +1949,7 @@ pub fn resize_artifact_stamped(
     excluded: &[PathBuf],
     stamp_dirs: bool,
 ) -> (ArtifactRow, Vec<DirRollup>, Vec<DirStamp>, bool) {
+    let _step = crate::beacon::enter("external unit", root_path);
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
     // took ~1.8 s serially; on the pool it takes what the full walk
@@ -2631,7 +2595,7 @@ mod blocking_kind_tests {
     }
 
     /// Pool starvation: one job blocked indefinitely must not stop the
-    /// other jobs from running, and `in_flight::oldest` must name the
+    /// other jobs from running, and `beacon::stuck` must name the
     /// blocked directory so the observe watchdog can log it and release
     /// the writer lock. Tempting wrong patch: tracking in-flight paths
     /// per pool with no global view; the watchdog, on another thread,
@@ -2651,7 +2615,7 @@ mod blocking_kind_tests {
             let done = AtomicUsize::new(0);
             pool.drain(4, |i| {
                 if i == 0 {
-                    let _e = in_flight::enter(&blocked2);
+                    let _e = crate::beacon::enter("walk", &blocked2);
                     release_rx.lock().unwrap().recv().unwrap();
                 } else if done.fetch_add(1, Ordering::SeqCst) + 1 == 199 {
                     done_tx.send(199).unwrap();
@@ -2659,11 +2623,11 @@ mod blocking_kind_tests {
             });
         });
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)).unwrap(), 199);
-        let (path, _) = in_flight::oldest().expect("the blocked directory is in flight");
-        assert_eq!(path, blocked);
+        let (phase, path, _) = crate::beacon::stuck().expect("the blocked directory is in flight");
+        assert_eq!((phase, path), ("walk", blocked.clone()));
         release_tx.send(()).unwrap();
         handle.join().unwrap();
-        assert!(in_flight::oldest().is_none_or(|(p, _)| p != blocked));
+        assert!(crate::beacon::stuck().is_none_or(|(_, p, _)| p != blocked));
     }
 
     /// Stress: many cold discoveries + attributions over a tree seeded

@@ -1319,3 +1319,92 @@ mod tests {
         assert_eq!(format_elapsed(5), "5s");
     }
 }
+
+/// How long a path an `observe` pass was stopped on is skipped (#190).
+pub const STALL_QUARANTINE_SECS: u64 = 24 * 3600;
+
+fn stalled_file(store_dir: &Path) -> Result<PathBuf> {
+    Ok(store::TextFile::Stalled {
+        store: &store::StoreDir::at(store_dir)?,
+    }
+    .path()?)
+}
+
+fn read_stalled(store_dir: &Path) -> Vec<(u64, PathBuf)> {
+    let Ok(path) = stalled_file(store_dir) else {
+        return Vec::new();
+    };
+    let Ok(text) = read_owned_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            let (at, p) = l.split_once('\t')?;
+            Some((at.parse().ok()?, PathBuf::from(p)))
+        })
+        .collect()
+}
+
+/// Paths a pass was stopped on within the last [`STALL_QUARANTINE_SECS`],
+/// with when.
+pub fn quarantined(store_dir: &Path, now: u64) -> Vec<(u64, PathBuf)> {
+    read_stalled(store_dir)
+        .into_iter()
+        .filter(|(at, _)| now.saturating_sub(*at) < STALL_QUARANTINE_SECS)
+        .collect()
+}
+
+/// Records that a pass was stopped on `path` at `now`, dropping entries
+/// past the quarantine.
+pub fn record_stalled(store_dir: &Path, path: &Path, now: u64) -> Result<()> {
+    let mut rows: Vec<(u64, PathBuf)> = quarantined(store_dir, now)
+        .into_iter()
+        .filter(|(_, p)| p != path)
+        .collect();
+    rows.push((now, path.to_path_buf()));
+    let text: String = rows
+        .iter()
+        .map(|(at, p)| format!("{at}\t{}\n", p.display()))
+        .collect();
+    let store = store::StoreDir::at(store_dir)?;
+    store.create()?;
+    store::write_text(store::TextFile::Stalled { store: &store }, &text)
+        .context("write stalled-paths.tsv")
+}
+
+/// `YYYY-MM-DD` (UTC) for unix seconds.
+pub fn utc_date(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+#[cfg(test)]
+mod stall_quarantine_tests {
+    use super::*;
+
+    /// A stalled path is skipped for a day, then retried; the file keeps
+    /// one row per path. Tempting wrong patch: appending forever, so an
+    /// old stall is never retried.
+    #[test]
+    fn a_stalled_path_is_quarantined_for_a_day_then_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = Path::new("/x/Library/Caches");
+        record_stalled(tmp.path(), p, 1_000).unwrap();
+        record_stalled(tmp.path(), p, 2_000).unwrap();
+        assert_eq!(
+            quarantined(tmp.path(), 3_000),
+            vec![(2_000, p.to_path_buf())]
+        );
+        assert!(quarantined(tmp.path(), 2_000 + STALL_QUARANTINE_SECS).is_empty());
+        assert_eq!(utc_date(1_790_773_352), "2026-09-30");
+    }
+}
