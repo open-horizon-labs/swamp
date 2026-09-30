@@ -1075,7 +1075,10 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
     );
     assert_eq!(second.reconciliation.unowned, full.reconciliation.unowned);
     // The only change is the 8 KiB probe.
-    assert_eq!(full.reconciliation.walked_total, full_before + 8192);
+    assert_eq!(
+        full.reconciliation.walked_total,
+        full_before + fixture::allocated_of(&target.join("touched.bin"))
+    );
 
     // Per-row equality, order-independent.
     let rows = |r: &swamp_core::Report| {
@@ -1271,7 +1274,8 @@ fn docker_rows_stay_out_of_walked_total_and_are_not_duplicated_on_incremental() 
     );
     assert_eq!(
         full.reconciliation.walked_total,
-        first.reconciliation.walked_total + 4096
+        first.reconciliation.walked_total
+            + fixture::allocated_of(&fx.node_modules.join("touched.bin"))
     );
     let second_docker = docker_rows(&second);
     assert_eq!(

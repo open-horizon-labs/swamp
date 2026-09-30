@@ -174,7 +174,7 @@ fn growing_one_artifact_shows_growth_there_and_zero_elsewhere() {
         .expect("node_modules row");
     assert_eq!(
         node_modules_row.growth_bytes,
-        Some(grow_bytes as i64),
+        Some(fixture::allocated_of(&fx.node_modules.join("growth-probe")) as i64),
         "node_modules should show exactly the added bytes as growth"
     );
 

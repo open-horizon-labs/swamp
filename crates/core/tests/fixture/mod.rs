@@ -81,6 +81,32 @@ fn write_files(dir: &Path, count: u64, total_bytes: u64) -> u64 {
     written
 }
 
+/// `st_blocks * 512` of one file: what the filesystem says it occupies.
+#[allow(dead_code)]
+pub fn allocated_of(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).expect("stat").blocks() * 512
+}
+
+/// Sum of `st_blocks * 512` over the regular files under `dir`, taken
+/// straight from `symlink_metadata` (no hardlinks in this fixture).
+fn allocated_under(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).expect("read fixture dir").flatten() {
+            let m = fs::symlink_metadata(e.path()).expect("stat fixture entry");
+            if m.is_dir() {
+                stack.push(e.path());
+            } else if m.is_file() {
+                total += m.blocks() * 512;
+            }
+        }
+    }
+    total
+}
+
 fn run_git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .arg("-C")
@@ -129,18 +155,18 @@ pub fn build(tmp: &Path) -> Fixture {
 
     // node_modules/: ~3 MB across several files
     let node_modules = checkout.join("node_modules");
-    let node_modules_bytes = write_files(&node_modules, 6, 3 * 1024 * 1024);
+    write_files(&node_modules, 6, 3 * 1024 * 1024);
 
     // target/: ~2 MB
     let target_dir = checkout.join("target");
-    let target_bytes = write_files(&target_dir, 4, 2 * 1024 * 1024);
+    write_files(&target_dir, 4, 2 * 1024 * 1024);
 
     // dist/: ~1 MB. `dist` is an artifact only next to a marker of an
     // ecosystem that generates it; this checkout is a Node project.
     fs::write(checkout.join("package.json"), b"{\"name\": \"fixture\"}\n")
         .expect("write package.json");
     let dist_dir = checkout.join("dist");
-    let dist_bytes = write_files(&dist_dir, 2, 1024 * 1024);
+    write_files(&dist_dir, 2, 1024 * 1024);
 
     // --- linked worktree ---
     let linked_worktree = tmp.join("checkout-linked");
@@ -182,7 +208,7 @@ pub fn build(tmp: &Path) -> Fixture {
     fs::write(nested_repo.join("CMakeLists.txt"), b"project(nested)\n")
         .expect("write CMakeLists.txt");
     let nested_repo_build = nested_repo.join("build");
-    let nested_repo_build_bytes = write_files(&nested_repo_build, 2, 512 * 1024);
+    write_files(&nested_repo_build, 2, 512 * 1024);
 
     // --- shared cache dir outside any repo ---
     // R3 sizes artifacts as allocated bytes (st_blocks*512), which rounds
@@ -191,13 +217,12 @@ pub fn build(tmp: &Path) -> Fixture {
     // this uses a total that is both divisible by 3 and by 4096, keeping
     // every file's logical size equal to its allocated size exactly.
     let shared_cache = tmp.join("cache").join(".cargo-registry");
-    let shared_cache_bytes = write_files(&shared_cache, 3, 3 * 85 * 4096);
+    write_files(&shared_cache, 3, 3 * 85 * 4096);
 
     // --- loose files outside any repo ---
     let loose_dir = tmp.join("loose");
     let loose_file = loose_dir.join("orphan.bin");
-    let loose_file_bytes = 4096u64;
-    write_pattern(&loose_file, loose_file_bytes);
+    write_pattern(&loose_file, 4096);
 
     // --- mocked `docker system df -v` + `docker image inspect` JSON ---
     // This mirrors the real two-source shape: `docker system df -v
@@ -385,6 +410,18 @@ pub fn build(tmp: &Path) -> Fixture {
     // written reads as a token size per file; every consumer measures it
     // next, so the wait happens once, here.
     swamp_core::fs_gate::settle::settle();
+    // The expected sizes are what the filesystem reports for the files
+    // just written (`st_blocks * 512`, the walker's contract, read here
+    // independently of the walker). On APFS, tmpfs and ext4 that equals
+    // the logical size chosen above; on ZFS it also carries the pool's
+    // per-file metadata overhead (measured: 2 MiB of noise reports
+    // 2,131,968 bytes on the fleet).
+    let node_modules_bytes = allocated_under(&node_modules);
+    let target_bytes = allocated_under(&target_dir);
+    let dist_bytes = allocated_under(&dist_dir);
+    let nested_repo_build_bytes = allocated_under(&nested_repo_build);
+    let shared_cache_bytes = allocated_under(&shared_cache);
+    let loose_file_bytes = allocated_under(&loose_dir);
 
     Fixture {
         root: tmp.to_path_buf(),

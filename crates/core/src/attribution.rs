@@ -952,7 +952,13 @@ mod tests {
             1,
             "the shared cache dir is exactly one row, not one per file: {cache_rows:?}"
         );
-        assert_eq!(cache_rows[0].bytes, 8192);
+        let on_disk = |n: &str| {
+            fs::symlink_metadata(root.join("cache/.cargo-registry").join(n))
+                .unwrap()
+                .blocks()
+                * 512
+        };
+        assert_eq!(cache_rows[0].bytes, on_disk("a") + on_disk("b"));
         assert_eq!(result.attributed_total, 0);
     }
 
