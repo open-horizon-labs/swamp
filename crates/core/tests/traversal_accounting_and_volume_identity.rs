@@ -314,6 +314,7 @@ fn a_file_that_vanishes_mid_walk_does_not_fail_the_measurement() {
         fs::write(root.join(format!("{i}.bin")), vec![1u8; 4_096]).unwrap();
     }
     settle(&root);
+    let one = fs::symlink_metadata(root.join("0.bin")).unwrap().blocks() * 512;
     let doomed = root.join("32.bin");
 
     let handle = std::thread::spawn({
@@ -328,7 +329,11 @@ fn a_file_that_vanishes_mid_walk_does_not_fail_the_measurement() {
 
     // Either 63 or 64 files, depending on the race. Both are correct;
     // what must not happen is a zero, a panic, or a hang.
-    let one = 4_096u64;
+    // One file's allocation is what the filesystem reports for a sibling
+    // (4096 on tmpfs/APFS/settled ext4; a token 512 on a filesystem with
+    // delayed allocation, #197), so the threshold is the same 60 of 64
+    // files everywhere instead of a constant that assumes a filesystem.
+    assert!(one > 0, "fixture files report no allocation at all");
     assert!(
         row.bytes >= 60 * one,
         "a concurrent unlink collapsed the measurement to {}",
