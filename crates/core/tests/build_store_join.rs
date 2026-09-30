@@ -562,6 +562,7 @@ fn both_orders_with_agent_discovery_leave_store_history_alone() {
                 swamp_core::external::observe_external(
                     &swamp_core::report::DiscoveryPass::for_tests(),
                     &scope,
+                    &[],
                     Some(store.path()),
                     true,
                     at,
@@ -621,6 +622,7 @@ fn an_unchanged_store_replays_its_units_with_zero_listings_and_zero_reads() {
         swamp_core::external::observe_external(
             &swamp_core::report::DiscoveryPass::for_tests(),
             &scope,
+            &[],
             Some(store.path()),
             true,
             at,
@@ -710,6 +712,7 @@ fn store_units_persist_as_a_parquet_table_and_replay_across_passes() {
     swamp_core::external::observe_external(
         &swamp_core::report::DiscoveryPass::for_tests(),
         &scope,
+        &[],
         Some(store.path()),
         true,
         1_000,
@@ -728,6 +731,7 @@ fn store_units_persist_as_a_parquet_table_and_replay_across_passes() {
         swamp_core::external::observe_external(
             &swamp_core::report::DiscoveryPass::for_tests(),
             &scope,
+            &[],
             Some(store.path()),
             true,
             2_000,

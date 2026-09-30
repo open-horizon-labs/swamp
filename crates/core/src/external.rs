@@ -195,6 +195,21 @@ struct MeasuredUnit {
     bytes: u64,
     hardlinked: bool,
     mtime_max: u64,
+    /// Project worktrees that live inside this unit and were subtracted
+    /// from it: their count and the bytes the project rows report for
+    /// them.
+    overlap: Option<(usize, u64)>,
+}
+
+/// A project worktree the report already measured, handed to the
+/// external pass so bytes inside it are counted under its project and
+/// not a second time under an external unit that contains it.
+#[derive(Debug, Clone)]
+pub struct NestedWorktree {
+    pub path: PathBuf,
+    /// What the project rows report for it (artifact bytes), for the
+    /// overlap note only; never subtracted arithmetically.
+    pub reported_bytes: u64,
 }
 
 /// Every detector-proposed location the *authorized* scope actually lets
@@ -265,6 +280,32 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(feature = "testing")]
+pub fn discover_and_measure_with_worktrees(
+    scope: &EffectiveScope,
+    worktrees: &[NestedWorktree],
+    swamp_dir: Option<&Path>,
+    observe: bool,
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+    coverage: &crate::fs_events::EventCoverage,
+) -> Result<Vec<ExternalUnit>> {
+    observe_external(
+        &crate::report::DiscoveryPass::for_tests(),
+        scope,
+        worktrees,
+        swamp_dir,
+        observe,
+        observed_at,
+        retention_days,
+        since_secs,
+        coverage,
+    )
+    .map(|o| o.units)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "testing")]
 pub fn discover_and_measure(
     scope: &EffectiveScope,
     swamp_dir: Option<&Path>,
@@ -277,6 +318,7 @@ pub fn discover_and_measure(
     observe_external(
         &crate::report::DiscoveryPass::for_tests(),
         scope,
+        &[],
         swamp_dir,
         observe,
         observed_at,
@@ -309,6 +351,7 @@ pub struct ExternalObservation {
 pub fn observe_external(
     _pass: &crate::report::DiscoveryPass,
     scope: &EffectiveScope,
+    worktrees: &[NestedWorktree],
     swamp_dir: Option<&Path>,
     observe: bool,
     observed_at: u64,
@@ -401,6 +444,20 @@ pub fn observe_external(
     let mut lower_bounds: HashMap<String, crate::folded_measurement::FoldedUnit> = HashMap::new();
     let mut meta_by_key: HashMap<String, MeasuredUnit> = HashMap::new();
 
+    // Project worktrees, one spelling. A worktree inside an external
+    // unit is measured by its project's walk; the same nested-exclusion
+    // that keeps one detector location out of another keeps it out of
+    // the unit that contains it, so its bytes are counted once.
+    let canonical_worktrees: Vec<(PathBuf, u64)> = worktrees
+        .iter()
+        .map(|w| {
+            (
+                crate::fs_gate::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()),
+                w.reported_bytes,
+            )
+        })
+        .collect();
+
     for (idx, (candidate, canonical)) in canon_candidates.iter().enumerate() {
         let Candidate {
             detector_id,
@@ -442,6 +499,17 @@ pub fn observe_external(
                 .filter(|p| *p != &canonical && p.starts_with(&canonical))
                 .cloned(),
         );
+        let inside_worktrees: Vec<&(PathBuf, u64)> = canonical_worktrees
+            .iter()
+            .filter(|(p, _)| *p != canonical && p.starts_with(&canonical))
+            .collect();
+        nested_exclusions.extend(inside_worktrees.iter().map(|(p, _)| p.clone()));
+        let overlap = (!inside_worktrees.is_empty()).then(|| {
+            (
+                inside_worktrees.len(),
+                inside_worktrees.iter().map(|(_, b)| *b).sum::<u64>(),
+            )
+        });
         nested_exclusions.sort();
         nested_exclusions.dedup();
         let device = device_of(&canonical);
@@ -568,6 +636,7 @@ pub fn observe_external(
                 bytes: row.bytes,
                 hardlinked: row.hardlinked,
                 mtime_max: row.mtime_max,
+                overlap,
             },
         );
     }
@@ -702,6 +771,7 @@ pub fn observe_external(
             bytes,
             hardlinked,
             mtime_max,
+            overlap,
         },
     ) in meta_by_key
     {
@@ -730,7 +800,13 @@ pub fn observe_external(
             regrowth_count,
             observed_at,
             consumers,
-            note: None,
+            note: overlap.map(|(n, b)| {
+                format!(
+                    "{} inside is counted under projects ({n} worktree{}), not in this total",
+                    crate::render::human_bytes_pub(b),
+                    if n == 1 { "" } else { "s" }
+                )
+            }),
             evidence,
         });
     }
