@@ -231,7 +231,9 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
         /// Show all text rows: projects, agent units, or Rust units
-        /// (Rust defaults to 30 per container). JSON uses --limit/--offset.
+        /// (Rust defaults to 30 per container). JSON uses --limit/--offset,
+        /// except the volume ledger (`--view disk`, and the `disk` object):
+        /// its JSON `rows` are the 50 largest unless `--all`.
         #[arg(long)]
         all: bool,
         /// List every unjoined Docker object individually instead of the

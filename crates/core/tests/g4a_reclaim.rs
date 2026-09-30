@@ -1394,3 +1394,66 @@ fn a_manager_quote_carries_its_age_in_json() {
     assert!(q["covers"].as_str().unwrap().contains("version 2.1.3 only"));
     assert!(render_text(&v).contains("10 days before this listing; older than this listing"));
 }
+
+/// The tempting wrong patch: a quote dated after the listing reads
+/// "beside", and a hold a few hours older than the listing reads as
+/// current. Both say what they are.
+#[test]
+fn a_pass_after_the_listing_and_a_hold_hours_older_say_so() {
+    let mut u = unit(
+        "mise",
+        StorageCategory::Installation,
+        "/h/.local/share/mise/installs",
+        GB,
+    );
+    u.children = vec![entry("poetry", GB as i64), entry("node", GB as i64)];
+    let at = |f: ManagerFact, t: u64| ManagerFact {
+        observed_at: t,
+        ..f
+    };
+    let mf = facts(vec![
+        at(pass(), NOW + 60),
+        at(
+            fact(
+                "mise",
+                "prune-dry-run",
+                FactKind::ReportsPrunable,
+                Some("poetry@2.1.3"),
+                "mise poetry@2.1.3 is prunable: x",
+            ),
+            NOW + 60,
+        ),
+        at(
+            fact("mise", "prune-dry-run", FactKind::Checked, None, ""),
+            NOW + 60,
+        ),
+        at(
+            fact(
+                "mise",
+                "global-tools",
+                FactKind::ActiveDefault,
+                Some("node"),
+                "listed",
+            ),
+            NOW - 3 * 3_600,
+        ),
+        at(
+            fact("mise", "global-tools", FactKind::Checked, None, ""),
+            NOW - 3 * 3_600,
+        ),
+    ]);
+    let v = view_of(&[u], &[], &mf, &[present_root("/h/src")]);
+    let text = render_text(&v);
+    assert!(
+        text.contains("from the pass right after this listing"),
+        "{text}"
+    );
+    let r = row(&v, "/h/.local/share/mise/installs");
+    let hold = r.children[1].hold.as_ref().expect("still held");
+    assert!(
+        hold.label.contains("read 3 hours before this listing"),
+        "{}",
+        hold.label
+    );
+    assert_eq!(r.held_bytes, GB);
+}

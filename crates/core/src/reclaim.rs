@@ -194,6 +194,12 @@ pub struct ManagerQuote {
     /// The pass is older than the observation beside it: a later
     /// observation did not run one.
     pub older_than_listing: bool,
+    /// Seconds between that pass and this listing's observation (0 when
+    /// the pass ran with or after it).
+    pub seconds_before_listing: u64,
+    /// The pass ran after this listing's observation (the usual case: it
+    /// runs when an observation finishes).
+    pub after_listing: bool,
     /// What the statement covers when it names less than the folder it
     /// sits on (one version of a tool).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,14 +212,11 @@ impl ManagerQuote {
     pub fn line(&self) -> String {
         let age = if self.older_than_listing {
             format!(
-                "quoted {} day{} before this listing; older than this listing",
-                self.days_before_listing,
-                if self.days_before_listing == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+                "quoted {} before this listing; older than this listing",
+                age_words(self.seconds_before_listing)
             )
+        } else if self.after_listing {
+            "quoted from the pass right after this listing".to_string()
         } else {
             "quoted from the pass beside this listing".to_string()
         };
@@ -225,6 +228,22 @@ impl ManagerQuote {
         format!("{}: \"{}\" ({age}{covers})", self.attribution, self.quote)
     }
 }
+
+/// A span as a person reads it: `20 minutes`, `2 hours`, `10 days`.
+pub fn age_words(secs: u64) -> String {
+    let (n, unit) = if secs < 3_600 {
+        ((secs / 60).max(1), "minute")
+    } else if secs < 2 * 86_400 {
+        (secs / 3_600, "hour")
+    } else {
+        (secs / 86_400, "day")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+/// A hold read from a pass this much older than the observation is not
+/// trusted: the standing is unknown, and unknown is held out.
+const HOLD_MAX_AGE_SECS: u64 = 86_400;
 
 /// A pass this much older than the observation is not "beside" it.
 const SAME_PASS_SLACK_SECS: u64 = 3_600;
@@ -551,7 +570,7 @@ fn regeneration_of(
     let (class, default_words) = crate::locations::regeneration_for_category(u.category);
     if let Some((words, adapter)) = tool_consequence(u, interiors) {
         return Regeneration {
-            class: class_from_consequence(&words, class),
+            class: class_from_consequence(&words),
             words,
             source: format!("tool consequence text ({adapter} build adapter)"),
         };
@@ -581,13 +600,14 @@ fn regeneration_of(
 }
 
 /// The class a consequence text supports. The category's class is only a
-/// default: the tool's own words win. Text that says the bytes are gone or
+/// default for units with no such text: the tool's own words win. Text that says the bytes are gone or
 /// unique is not regenerable; text that says removal breaks something is
 /// not established; text that names a download or a rebuild keeps the
 /// category's class (rebuild wording picks Rebuild); anything else says
 /// nothing about cost, so the class is not established.
-fn class_from_consequence(words: &str, category_class: RegenClass) -> RegenClass {
-    let w = words.to_lowercase();
+pub fn class_from_consequence(words: &str) -> RegenClass {
+    // "already-downloaded sources" names what stays on disk, not a fetch.
+    let w = words.to_lowercase().replace("already-downloaded", "local");
     let has = |needles: &[&str]| needles.iter().any(|n| w.contains(n));
     if has(&[
         "are gone",
@@ -602,14 +622,49 @@ fn class_from_consequence(words: &str, category_class: RegenClass) -> RegenClass
     if has(&["breaks"]) {
         return RegenClass::NotEstablished;
     }
-    if has(&["rebuild", "recompile", "regenerat"]) && !has(&["download", "reinstall"]) {
-        return RegenClass::Rebuild;
+    if has(&[
+        "download",
+        "reinstall",
+        "fetch",
+        "unpacks",
+        "install again",
+        "clones the repository",
+        "registry access",
+        "index access",
+        "network access",
+        "proxy access",
+    ]) {
+        return RegenClass::Download;
     }
-    if has(&["download", "reinstall", "fetch", "unpacks", "install again"]) {
-        return match category_class {
-            RegenClass::Rebuild => RegenClass::Rebuild,
-            _ => RegenClass::Download,
-        };
+    if has(&[
+        "rebuild",
+        "recompil",
+        "regenerat",
+        "repackag",
+        "cold build",
+        "re-deriv",
+        "recreat",
+        "re-run",
+        "re-lint",
+        "re-analys",
+        "re-optimiz",
+        "re-execut",
+        "re-resolv",
+        "re-index",
+        "reconfigur",
+        "builds it again",
+        "produces it again",
+        "stages them again",
+        "restage",
+        "writes it again",
+        "rewrites",
+        "relink",
+        "runs it again",
+        "uploads its context",
+        "type-checks every",
+        "starts a new",
+    ]) {
+        return RegenClass::Rebuild;
     }
     RegenClass::NotEstablished
 }
@@ -680,6 +735,8 @@ fn quote(
             0
         },
         older_than_listing: older,
+        seconds_before_listing: if older { listing_at - f.observed_at } else { 0 },
+        after_listing: f.observed_at > listing_at,
         covers,
     }
 }
@@ -696,6 +753,8 @@ struct ManagerJoin {
     /// that stands for what the manager did not measure separately.
     unmatched_hold_subjects: Vec<String>,
     unmatched_hold_kind: Option<HoldKind>,
+    /// The oldest age, before the listing, of a hold fact read.
+    hold_age_secs: u64,
 }
 
 fn hold_kind_of(kind: FactKind) -> HoldKind {
@@ -773,7 +832,14 @@ fn join_manager(
             let Some(subject) = f.subject.as_deref() else {
                 continue;
             };
-            let label = manager_facts::attribution(decl.display, *probe, kind);
+            let age = listing_at.saturating_sub(f.observed_at);
+            if kind.holds() {
+                join.hold_age_secs = join.hold_age_secs.max(age);
+            }
+            let mut label = manager_facts::attribution(decl.display, *probe, kind);
+            if kind.holds() && age > SAME_PASS_SLACK_SECS {
+                label.push_str(&format!(", read {} before this listing", age_words(age)));
+            }
             let to_unit =
                 !folder.is_empty() && manager_facts::subject_matches(decl.subject, subject, folder);
             let matched: Vec<usize> = u
@@ -877,6 +943,19 @@ fn join_manager(
                 whole_unit: true,
             });
         }
+    }
+    // A hold read from a pass long before this listing may describe a
+    // default that has changed since.
+    if join.hold_age_secs > HOLD_MAX_AGE_SECS {
+        join.unit_hold = Some(Hold {
+            kind: HoldKind::Unknown,
+            label: format!(
+                "unknown (the manager's record was read {} before this listing; `swamp observe` reads it again)",
+                age_words(join.hold_age_secs)
+            ),
+            subjects: Vec::new(),
+            whole_unit: true,
+        });
     }
     join
 }
@@ -1483,32 +1562,19 @@ mod tests {
         use RegenClass::*;
         let c = class_from_consequence;
         assert_eq!(
-            c(
-                "session scratch; removing it during a session breaks that session",
-                Download
-            ),
+            c("session scratch; removing it during a session breaks that session"),
             NotEstablished
         );
         assert_eq!(
-            c(
-                "this emulator's apps and data are gone; a recreated AVD starts empty",
-                NotEstablished
-            ),
+            c("this emulator's apps and data are gone; a recreated AVD starts empty"),
             NotRegenerable
         );
         assert_eq!(
-            c(
-                "iOS_23F77 is downloaded again when a simulator needs it",
-                Download
-            ),
+            c("iOS_23F77 is downloaded again when a simulator needs it"),
             Download
         );
-        assert_eq!(c("the next simulator boot rebuilds it", Download), Rebuild);
-        assert_eq!(
-            c("reinstall `ndk;29` with sdkmanager: a download", Download),
-            Download
-        );
-        assert_eq!(c("something with no cost in it", Download), NotEstablished);
+        assert_eq!(c("the next simulator boot rebuilds it"), Rebuild);
+        assert_eq!(c("something with no cost in it"), NotEstablished);
     }
 
     #[test]

@@ -2651,9 +2651,10 @@ fn reclaim_app(declared_missing: bool) -> App {
             Vec::new(),
         ),
     ]);
+    let listing_at = app.report.observed_at;
     app.set_manager_facts(swamp_core::manager_facts::ManagerFacts {
         observed: true,
-        facts: vec![
+        facts: [
             manager_fact("", "", K::Pass, None, ""),
             manager_fact(
                 "rustup",
@@ -2679,7 +2680,14 @@ fn reclaim_app(declared_missing: bool) -> App {
                 "mise java@temurin-17.0.20+101 is prunable: java is required at zulu-8.96.0.19 by ~/src/etl/mise.toml",
             ),
             manager_fact("mise", "prune-dry-run", K::Checked, None, ""),
-        ],
+        ]
+        .into_iter()
+        // Read by the pass that follows the observation the units come from.
+        .map(|f| swamp_core::manager_facts::ManagerFact {
+            observed_at: listing_at,
+            ..f
+        })
+        .collect(),
     });
     let mut roots = vec![swamp_core::roots::DeclaredRoot {
         path: "/Users/dev/src".into(),

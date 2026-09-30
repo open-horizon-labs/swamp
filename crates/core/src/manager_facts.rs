@@ -250,17 +250,20 @@ pub fn parse_toolchain(name: &str) -> Option<Toolchain<'_>> {
     }
     let mut date = None;
     if let Some(r) = rest {
+        // Bytes only: a name is user data and may hold multi-byte text, so
+        // nothing here slices at a fixed byte offset without `get`.
         let b = r.as_bytes();
-        let looks_dated = r.len() >= 10
+        let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+        let looks_dated = b.len() >= 10
+            && (0..4).all(digit)
             && b[4] == b'-'
+            && (5..7).all(digit)
             && b[7] == b'-'
-            && r[..4].bytes().all(|x| x.is_ascii_digit())
-            && r[5..7].bytes().all(|x| x.is_ascii_digit())
-            && r[8..10].bytes().all(|x| x.is_ascii_digit())
-            && (r.len() == 10 || b[10] == b'-');
+            && (8..10).all(digit)
+            && (b.len() == 10 || b[10] == b'-');
         if looks_dated {
-            date = Some(&r[..10]);
-            rest = if r.len() > 11 { Some(&r[11..]) } else { None };
+            date = r.get(..10);
+            rest = if b.len() > 11 { r.get(11..) } else { None };
         }
     }
     let host = rest.filter(|h| !h.is_empty());
@@ -271,11 +274,33 @@ pub fn parse_toolchain(name: &str) -> Option<Toolchain<'_>> {
     })
 }
 
-/// mise names a tool's install folder from its identifier by turning the
-/// backend separators into dashes: `npm:prettier` is `npm-prettier`,
-/// `aqua:cli/cli` is `aqua-cli-cli`.
+/// mise names a tool's install folder by kebab-casing the whole backend
+/// argument (checked against mise 2026.9.15 in a sandboxed data directory):
+/// `[options]` are dropped, an upper-case letter starts a new word, and every
+/// other character that is not a letter or digit (`:`, `/`, `@`, `_`, `.`)
+/// is one dash. `npm:@scope/pkg` is `npm-scope-pkg`, `ubi:BurntSushi/ripgrep`
+/// is `ubi-burnt-sushi-ripgrep`, `cargo:foo_bar` is `cargo-foo-bar`.
 fn mise_folder_name(tool: &str) -> String {
-    tool.replace([':', '/'], "-")
+    let mut tool = tool;
+    let stripped;
+    if let Some(open) = tool.find('[') {
+        stripped = tool[..open].to_string();
+        tool = &stripped;
+    }
+    let mut out = String::new();
+    for c in tool.chars() {
+        if c.is_uppercase() {
+            if !out.is_empty() && !out.ends_with('-') {
+                out.push('-');
+            }
+            out.extend(c.to_lowercase());
+        } else if c.is_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
 }
 
 /// Whether a manager's `subject` names the folder `folder` of its store,
@@ -967,13 +992,16 @@ mise poetry@2.1.3 [dryrun]  remove ~/.local/share/mise/installs/poetry/2.1.3\n";
         use SubjectShape::NameBeforeAt as N;
         for (tool, folder) in [
             ("npm:prettier", "npm-prettier"),
-            ("npm:@scope/pkg", "npm-@scope-pkg"),
+            ("npm:@scope/pkg", "npm-scope-pkg"),
+            ("ubi:BurntSushi/ripgrep", "ubi-burnt-sushi-ripgrep"),
+            ("cargo:foo_bar", "cargo-foo-bar"),
+            ("github:owner/repo[bin=x]", "github-owner-repo"),
             ("cargo:ripgrep", "cargo-ripgrep"),
             ("aqua:cli/cli", "aqua-cli-cli"),
             ("github:owner/repo", "github-owner-repo"),
             ("ubi:owner/repo", "ubi-owner-repo"),
             ("pipx:black", "pipx-black"),
-            ("go:golang.org/x/tools/gopls", "go-golang.org-x-tools-gopls"),
+            ("go:golang.org/x/tools/gopls", "go-golang-org-x-tools-gopls"),
             ("gem:rubocop", "gem-rubocop"),
             ("asdf:plugin", "asdf-plugin"),
             ("node", "node"),

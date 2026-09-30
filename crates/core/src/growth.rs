@@ -3282,6 +3282,11 @@ pub fn try_lock_volume_pass(
     Ok(store::StoreDir::at(swamp_dir)?.try_lock_volume_pass()?)
 }
 
+/// Deletes quarantined ledger files older than seven days.
+pub fn remove_stale_quarantined_ledgers(swamp_dir: &Path, now: u64) -> Result<usize> {
+    Ok(store::StoreDir::at(swamp_dir)?.remove_stale_quarantine(now, 7 * 86_400)?)
+}
+
 /// Moves an unreadable ledger (and its meta) aside so the next pass can
 /// start fresh.
 pub fn quarantine_volume_ledger(swamp_dir: &Path, stamp: u64) -> Result<()> {
