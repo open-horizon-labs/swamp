@@ -656,8 +656,8 @@ pub fn blocked_next_step(reason: &str) -> &'static str {
         "open the project with Enter and mark what you want inside it"
     } else if r.contains("category total") {
         "open the category and mark one of its items"
-    } else if r.contains("inspection-only") {
-        "nothing to do here: swamp only shows this, it cannot clean it"
+    } else if r.contains("not a path swamp can move") {
+        "mark a folder or file listed under it instead"
     } else if r.contains("agent-storage") || r.contains("active") {
         "close the agent session that uses it, then check again"
     } else {
@@ -1750,13 +1750,21 @@ impl App {
         // static per-kind refusal strings below.
         let mut agent_skipped = 0usize;
         let mut path_skipped = 0usize;
+        let mut individual = 0usize;
         for row in rows {
+            // A path no cleanup rule covers is marked one at a time.
+            if row.individual_only {
+                individual += 1;
+                continue;
+            }
             // Reclaim and External: each top-level row is a real path. Its
             // listed folders are inside it (marking both would overlap) and
             // stay for Space on the folder itself. A row already marked is
             // left marked: `A` adds, it does not toggle.
-            if matches!(self.view, ViewKind::Reclaim | ViewKind::External)
-                && row.kind.is_none()
+            if matches!(
+                self.view,
+                ViewKind::Reclaim | ViewKind::External | ViewKind::Disk | ViewKind::DiskGaps
+            ) && row.kind.is_none()
                 && row.project.is_none()
                 && let Some(id) = row.unit.clone()
             {
@@ -1817,6 +1825,13 @@ impl App {
                     refused.push(why.into())
                 }
             }
+        }
+        if individual > 0 && marked > 0 {
+            refused.push(format!(
+                "{individual} row{} no cleanup rule covers {} left out: Space marks one at a time",
+                if individual == 1 { "" } else { "s" },
+                if individual == 1 { "was" } else { "were" }
+            ));
         }
         if path_skipped > 0 {
             refused.push(format!(
@@ -1972,6 +1987,7 @@ impl App {
             .iter()
             .filter(|r| {
                 r.unit.is_some()
+                    && !r.individual_only
                     && r.kind
                         .as_ref()
                         .is_some_and(|k| crate::units::markable(k).is_ok())
@@ -2088,9 +2104,9 @@ impl App {
             return;
         }
         if let Some(id) = row.unit.clone()
-            && self.is_reclaim_path(&id.0)
+            && let Some(target) = self.path_target(&id.0, row)
         {
-            self.mark_reclaim_row(row, &id);
+            self.mark_reclaim_row(row, &id, target);
             return;
         }
         let Some(unit_id) = row.unit.clone() else {
@@ -2100,7 +2116,7 @@ impl App {
             }
             if row.signals.iter().any(|s| s == "blocked") {
                 self.refuse(
-                    "Inspection-only: this output cannot be selected for cleanup. Nothing changed.",
+                    "Not a path swamp can move: this row stands for an aggregate or a daemon's record, not a folder or file. Nothing changed.",
                 );
                 return;
             }
@@ -2392,19 +2408,61 @@ impl App {
         }
     }
 
-    /// Whether a row's path is a row of the Reclaim view (a unit, or one
-    /// of its listed folders) reached from the Reclaim or External view.
-    /// A standalone Cargo target keeps its own reviewed flow.
-    fn is_reclaim_path(&self, id: &str) -> bool {
-        if !matches!(self.view, ViewKind::Reclaim | ViewKind::External) {
-            return false;
-        }
+    /// What marking this row's path needs to know, when the row is a real
+    /// path that goes to the reviewed Trash flow without a project behind
+    /// it: a row of the Reclaim view (a unit, or one of its listed
+    /// folders) reached from Reclaim or External, a store interior folder
+    /// under no checkout, or a measured folder in the Disk views. A
+    /// standalone Cargo target keeps its own reviewed flow.
+    fn path_target(&self, id: &str, row: &Row) -> Option<swamp_core::reclaim_trash::ReclaimTarget> {
+        use swamp_core::reclaim_trash::{ReclaimTarget, find_target};
         let path = Path::new(id);
-        let standalone = self.report.unowned.iter().any(|u| {
-            u.reason == swamp_core::report::UnownedReason::StandaloneCargoTarget
-                && Path::new(&u.path_or_object) == path
-        });
-        !standalone && swamp_core::reclaim_trash::find_target(&self.reclaim_view(), path).is_ok()
+        if matches!(self.view, ViewKind::Reclaim | ViewKind::External) {
+            let standalone = self.report.unowned.iter().any(|u| {
+                u.reason == swamp_core::report::UnownedReason::StandaloneCargoTarget
+                    && Path::new(&u.path_or_object) == path
+            });
+            if !standalone && let Ok(t) = find_target(&self.reclaim_view(), path) {
+                return Some(t);
+            }
+        }
+        // A build-store interior no checkout owns: there is no project to
+        // plan it through, so it is the path and what its adapter said.
+        let owned = self
+            .report
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .any(|wt| path != wt.path && swamp_core::scope::under(path, &wt.path));
+        if !owned
+            && let Some(n) = self
+                .report
+                .nested_artifacts
+                .iter()
+                .chain(self.store_interiors.iter())
+                .find(|n| n.present && n.path == path && n.reported_by.is_none())
+        {
+            return Some(ReclaimTarget::for_path(
+                n.path.clone(),
+                "store interior",
+                Some(n.bytes),
+                n.consequence.as_deref(),
+                n.advisories(),
+            ));
+        }
+        if matches!(self.view, ViewKind::Disk | ViewKind::DiskGaps) && path.is_absolute() {
+            return Some(ReclaimTarget::for_path(
+                path.to_path_buf(),
+                "outside developer storage",
+                Some(row.bytes),
+                None,
+                vec![format!(
+                    "measured by the disk ledger ({}); swamp has no record of what uses it",
+                    row.signals.first().cloned().unwrap_or_default()
+                )],
+            ));
+        }
+        None
     }
 
     /// Space/Backspace on a Reclaim or External row: a real path goes to
@@ -2412,19 +2470,17 @@ impl App {
     /// only that it is not a real entry, the person's own `swamp protect`
     /// mark, or an overlap with another mark; everything else swamp knows
     /// or does not know is a line on the confirm. Marking again unmarks.
-    fn mark_reclaim_row(&mut self, row: &Row, id: &UnitId) {
+    fn mark_reclaim_row(
+        &mut self,
+        row: &Row,
+        id: &UnitId,
+        target: swamp_core::reclaim_trash::ReclaimTarget,
+    ) {
         if self.marked.remove(&id.0).is_some() {
             return; // toggle off
         }
         let path = PathBuf::from(&id.0);
-        let view = self.reclaim_view();
-        let target = match swamp_core::reclaim_trash::find_target(&view, &path) {
-            Ok(t) => t,
-            Err(e) => {
-                self.refuse(&e);
-                return;
-            }
-        };
+        let observed_at = self.report.observed_at;
         if let Some(other) = self
             .marked
             .values()
@@ -2464,7 +2520,7 @@ impl App {
                 docker: None,
                 worktree_path,
                 bytes: target.bytes.unwrap_or(0),
-                observed_at: view.observed_at,
+                observed_at,
                 worktree: None,
                 label: row.label.trim().to_string(),
                 warnings: review.warnings,
@@ -2659,6 +2715,8 @@ impl App {
         // skip the check the main thread makes. The Reclaim view is the
         // one this screen shows, not one rebuilt from nothing.
         worker.store_dir = self.store_dir.clone();
+        worker.store_interiors = self.store_interiors.clone();
+        worker.agent_units = self.agent_units.clone();
         *worker.reclaim_cache.borrow_mut() = Some(self.reclaim_view());
         worker.review_cancel = Some(cancel.clone());
         worker.review_progress = Some(tx.clone());
@@ -4915,7 +4973,7 @@ mod tests {
     /// uses -- closed until opened, every row blocked, and nothing
     /// selectable -- at both a narrow and a wide terminal.
     #[test]
-    fn a_store_interior_opens_under_its_external_row_and_stays_inspection_only() {
+    fn a_store_interior_opens_under_its_external_row_in_family_groups() {
         use swamp_core::artifact::{AccountingBasis, ArtifactRole, TimeSource};
         use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
         let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
@@ -4978,13 +5036,22 @@ mod tests {
             "the family group appears: {:?}",
             open.iter().map(|r| r.label.clone()).collect::<Vec<_>>()
         );
+        // Tempting wrong patch: interior rows are "blocked" and never
+        // selectable. A family header groups paths (no single path, no
+        // unit, and it no longer says "blocked" or "inspection only"); the
+        // paths under it are marked on their own rows.
         for r in open.iter().skip(1) {
             assert!(
                 r.unit.is_none(),
-                "{}: an interior row is never selectable",
+                "{}: a group header is not one path",
                 r.label
             );
-            assert!(r.signals.iter().any(|s| s == "blocked"), "{}", r.label);
+            assert!(r.signals.iter().all(|s| s != "blocked"), "{}", r.label);
+            assert!(
+                r.signals.iter().all(|s| !s.contains("inspection only")),
+                "{:?}",
+                r.signals
+            );
         }
         for width in [80u16, 160] {
             let backend = ratatui::backend::TestBackend::new(width, 24);

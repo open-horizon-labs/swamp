@@ -210,9 +210,13 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
             .contains("1 candidate ·"),
         "empty and unsupported groups are not cleanup opportunities"
     );
+    // Tempting wrong patch: the category's own folder is swept into an
+    // exact cleanup selection (bulk mark, a group mark, a project mark).
+    // It is a real folder, so Space on its own row may move it, but it is
+    // marked one at a time and never by `A` or a group.
     assert!(
-        rows[incremental].unit.is_none(),
-        "category must not become an exact cleanup selection"
+        rows[incremental].unit.is_some() && rows[incremental].individual_only,
+        "the folder is markable on its own row only"
     );
     assert!(!rows.iter().any(|r| r.label.contains("crate-a")));
     // Advice must be visible while a different row is selected, not just in
@@ -1267,6 +1271,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         last_used: None,
         size_text: None,
         detail_lines: Vec::new(),
+        individual_only: false,
     };
     let mut app = App::new(fixture_report(), std::path::PathBuf::from("/Users/dev/src"));
     for (m, expect_warning) in [

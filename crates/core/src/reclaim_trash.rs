@@ -56,6 +56,48 @@ pub struct ReclaimTarget {
     /// with the manager's name.
     pub manager_lines: Vec<String>,
     pub hold: Option<String>,
+    /// Facts from wherever the row came from that are not one of the
+    /// fields above (what an adapter could not establish, what a ledger
+    /// row measured), worded, each a line on the confirm.
+    pub notes: Vec<String>,
+}
+
+impl ReclaimTarget {
+    /// A real path a view shows without a Reclaim row behind it (a
+    /// store interior folder, a measured folder outside developer
+    /// storage): what its row knows, and plainly that the rest is not
+    /// established.
+    pub fn for_path(
+        path: PathBuf,
+        category: &str,
+        bytes: Option<u64>,
+        consequence: Option<&str>,
+        notes: Vec<String>,
+    ) -> Self {
+        let (class, words) = match consequence {
+            Some(c) => (crate::reclaim::class_from_consequence(c), c.to_string()),
+            None => (
+                RegenClass::NotEstablished,
+                "nothing recorded says what getting it back costs".to_string(),
+            ),
+        };
+        ReclaimTarget {
+            path,
+            category: category.to_string(),
+            is_folder: false,
+            listed_folders: 0,
+            bytes,
+            coverage_note: None,
+            regeneration_class: class,
+            regeneration_words: words,
+            regeneration_source: "the view's own row".to_string(),
+            last_used_text: "no record".to_string(),
+            consumers: "who needs it: not established for this path".to_string(),
+            manager_lines: Vec::new(),
+            hold: None,
+            notes,
+        }
+    }
 }
 
 /// A child folder's path, refusing a name that is not one plain name:
@@ -130,6 +172,7 @@ pub fn find_target(view: &ReclaimView, id: &Path) -> Result<ReclaimTarget, Strin
             consumers: r.consumers.summary.clone(),
             manager_lines: r.manager.iter().map(|q| q.line()).collect(),
             hold: r.hold.as_ref().map(hold_line),
+            notes: Vec::new(),
         };
         if unit_path == id {
             return Ok(base(unit_path.to_path_buf(), false));
@@ -335,6 +378,7 @@ pub fn warnings_for(t: &ReclaimTarget, kind_note: &str, home: Option<&Path>) -> 
         w.push(h.clone());
     }
     w.extend(t.manager_lines.iter().take(3).cloned());
+    w.extend(t.notes.iter().cloned());
     if !t.is_folder && t.listed_folders > 0 {
         w.push(format!(
             "this is the whole folder, including the {} folders listed under it",

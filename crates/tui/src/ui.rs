@@ -910,11 +910,17 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 // The keys are named only while the row under the cursor
                 // has a mark to make; a row that is not a folder shows why
                 // in the detail pane instead.
-                crate::app::ViewKind::Reclaim => app.selected_row_markable(),
-                crate::app::ViewKind::Disk | crate::app::ViewKind::DiskGaps => false,
+                crate::app::ViewKind::Reclaim
+                | crate::app::ViewKind::Disk
+                | crate::app::ViewKind::DiskGaps => app.selected_row_markable(),
                 _ => true,
             },
-            app.view == crate::app::ViewKind::Reclaim,
+            matches!(
+                app.view,
+                crate::app::ViewKind::Reclaim
+                    | crate::app::ViewKind::Disk
+                    | crate::app::ViewKind::DiskGaps
+            ),
         )
     };
     frame.render_widget(Paragraph::new(footer_text), chunks[6]);

@@ -620,3 +620,111 @@ fn a_huge_list_reviews_every_folder() {
     });
     assert_eq!(n, 500);
 }
+
+// ---------------------------------------------------------------------
+// Nested build units: an adapter that has no cleanup rule for a folder
+// inside a checkout no longer makes it unplannable.
+// ---------------------------------------------------------------------
+
+fn project_with_target(f: &Fx) -> (swamp_core::report::Report, PathBuf) {
+    use swamp_core::entities::Confidence;
+    use swamp_core::report::{
+        ArtifactKind, ArtifactRow, ProjectRow, Report, Source, WorktreeKind, WorktreeRow,
+    };
+    let wt = f.home.join("proj");
+    let target = wt.join("target");
+    make_dir(&target);
+    let mut report = Report::empty(f.home.clone());
+    report.observed_at = NOW;
+    report.projects.push(ProjectRow {
+        project_id: "p".into(),
+        name: "proj".into(),
+        remote: None,
+        ecosystems: Vec::new(),
+        worktrees: vec![WorktreeRow {
+            worktree_id: "w".into(),
+            path: wt.clone(),
+            kind: WorktreeKind::Main,
+            artifacts: vec![ArtifactRow {
+                kind: ArtifactKind::BuildOutput,
+                path: target.clone(),
+                bytes: 100,
+                mtime_max: 0,
+                ecosystem: None,
+                hardlinked: false,
+                dedup_stale: false,
+                allocated_bytes: None,
+                allocated_growth_bytes: None,
+                local_bytes: 0,
+                track: None,
+                growth_bytes: None,
+                regrowth_count: 0,
+                observed_at: NOW,
+                confidence: Confidence::High,
+                source: Source::new("fixture"),
+                note: None,
+                created_at: None,
+                containers: Vec::new(),
+                shared_with: Vec::new(),
+                dangling: false,
+                evidence: Vec::new(),
+            }],
+            signals: Vec::new(),
+            branch: None,
+            github: None,
+            merge_complete: None,
+            idle_secs: None,
+        }],
+    });
+    (report, target)
+}
+
+/// Tempting wrong patch: a nested unit an adapter gave no cleanup rule
+/// ("inspection only", or "unsupported: shared") is refused by propose.
+/// It plans as that exact path, verb delete, and its confirm carries the
+/// adapter's reason, what it could not read, and a lock warning.
+#[test]
+fn a_nested_unit_with_no_cleanup_rule_plans_as_its_exact_path_with_the_reason() {
+    use swamp_core::artifact::{AccountingBasis, ArtifactRole};
+    use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
+    let f = fx();
+    let (mut report, target) = project_with_target(&f);
+    let wt = f.home.join("proj");
+    let c = BuildContainer::project("cargo", target.clone(), wt);
+    let shared = target.join("debug/deps/libshared");
+    make_dir(&shared);
+    let inspect = target.join("debug/deps/libinspect");
+    make_dir(&inspect);
+    report.nested_artifacts = vec![
+        NestedUnitBuilder::new(&c, ArtifactRole::Dependency, shared.clone())
+            .is_dir(true)
+            .bytes_on_basis(10, AccountingBasis::Allocated)
+            .no_action_because("shared by other projects")
+            .limit("the walk could not read all of this directory")
+            .build(),
+        NestedUnitBuilder::new(&c, ArtifactRole::Dependency, inspect.clone())
+            .is_dir(true)
+            .bytes_on_basis(10, AccountingBasis::Allocated)
+            .build(),
+    ];
+    for (p, needle) in [
+        (&shared, "shared by other projects"),
+        (&shared, "could not read all of this directory"),
+        (&inspect, "has no cleanup rule"),
+    ] {
+        let units = swamp_core::actions::propose(&report, None, std::slice::from_ref(p), "t")
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        assert_eq!(units[0].path(), p.as_path());
+        assert_eq!(units[0].verb(), "delete");
+        let w = units[0].warnings().join("\n");
+        assert!(w.contains(needle), "{needle}: {w}");
+    }
+    // A member that is not on disk is not a path: refused, never planned
+    // as a no-op (the plan must not mask a missing member).
+    let gone = target.join("debug/deps/libgone");
+    let mut missing = report.nested_artifacts[1].clone();
+    missing.path = gone.clone();
+    report.nested_artifacts.push(missing);
+    let err = swamp_core::actions::propose(&report, None, &[gone], "t").unwrap_err();
+    assert!(err.to_string().contains("gone"), "{err}");
+}

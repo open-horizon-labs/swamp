@@ -310,34 +310,48 @@ pub fn propose(
             continue;
         }
         if let Some(nested) = report.nested_artifacts.iter().find(|u| &u.path == p) {
-            if nested.action == crate::artifact::NestedActionCapability::TrashPath {
+            // One selected path to Trash, under the checkout that owns it.
+            // What the adapter could not establish about it is a warning
+            // on the confirm (`advisories`), never a reason it cannot be
+            // marked: the human decides, swamp says what it does not know.
+            let single = |extra: Vec<String>, must_exist: bool| -> Result<PlanUnit, String> {
+                if must_exist && fs_gate::symlink_metadata(p).is_err() {
+                    return Err("the path is gone or cannot be read".into());
+                }
                 let owner = report
                     .projects
                     .iter()
                     .flat_map(|project| project.worktrees.iter().map(move |wt| (project, wt)))
                     .filter(|(_, wt)| p != &wt.path && crate::scope::under(p, &wt.path))
                     .max_by_key(|(_, wt)| wt.path.components().count());
-                if let Some((project, wt)) = owner {
-                    let mut unit = unit_from_worktree(project, wt);
-                    unit.path = p.clone();
-                    unit.rel_path = crate::artifact::relative_path(&wt.path, p);
-                    unit.kind = ArtifactKind::BuildOutput;
-                    unit.verb = "delete".into();
-                    unit.bytes = nested.bytes;
-                    unit.growth_bytes = nested.growth_bytes;
-                    unit.recovery = nested
-                        .consequence
-                        .clone()
-                        .unwrap_or_else(|| "restore from Trash".into());
-                    unit.warnings = vec![unit.recovery.clone(),
-                        "moves only this selected path to Trash; stop its build before removing it; allocation is not guaranteed freed space".into()];
-                    unit.evidence = nested.decision_evidence.clone();
-                    units.push(unit);
-                } else {
-                    refused.push(Refused {
+                let Some((project, wt)) = owner else {
+                    return Err("no owning checkout for this project-local action".into());
+                };
+                let mut unit = unit_from_worktree(project, wt);
+                unit.path = p.clone();
+                unit.rel_path = crate::artifact::relative_path(&wt.path, p);
+                unit.kind = ArtifactKind::BuildOutput;
+                unit.verb = "delete".into();
+                unit.bytes = nested.bytes;
+                unit.growth_bytes = nested.growth_bytes;
+                unit.recovery = nested
+                    .consequence
+                    .clone()
+                    .unwrap_or_else(|| "restore from Trash".into());
+                unit.warnings = vec![unit.recovery.clone(),
+                    "moves only this selected path to Trash; stop its build before removing it; allocation is not guaranteed freed space".into()];
+                unit.warnings.extend(nested.advisories());
+                unit.warnings.extend(extra);
+                unit.evidence = nested.decision_evidence.clone();
+                Ok(unit)
+            };
+            if nested.action == crate::artifact::NestedActionCapability::TrashPath {
+                match single(Vec::new(), false) {
+                    Ok(unit) => units.push(unit),
+                    Err(cause) => refused.push(Refused {
                         path: p.clone(),
-                        cause: "no owning checkout for this project-local action".into(),
-                    });
+                        cause,
+                    }),
                 }
                 continue;
             }
@@ -352,49 +366,65 @@ pub fn propose(
                 .find(|(_, wt)| {
                     container.is_some_and(|c| wt.artifacts.iter().any(|a| a.path == c.path))
                 });
-            if let (Some(container), Some((project, wt))) = (container, owner) {
-                match crate::cargo_cleanup::propose(&report.nested_artifacts, p, &container.path) {
-                    Ok(group) => {
-                        let row = wt
-                            .artifacts
-                            .iter()
-                            .find(|a| a.path == container.path)
-                            .unwrap();
-                        let mut unit = unit_from_row(project, wt, row);
-                        unit.path = p.clone();
-                        unit.rel_path = crate::scope::relative_to(p, &wt.path)
-                            .unwrap_or(p)
-                            .display()
-                            .to_string();
-                        unit.bytes = group.members.iter().map(|m| m.bytes).sum();
-                        unit.dedup_stale = false; // selected members were freshly measured
-                        unit.growth_bytes = nested.growth_bytes;
-                        unit.verb = "cargo-group".into();
-                        unit.recovery = "Trash envelope with restore.json; rebuilding may require unavailable source/toolchains".into();
-                        unit.warnings = vec!["exact selected build, NOT proven obsolete; stop non-Cargo writers; advisory Cargo lock held during move".into()];
-                        unit.warnings.push("size is selected allocation, not promised free space; moving to Trash does not free these bytes immediately".into());
-                        if group.shared_storage {
-                            unit.warnings.push("selected files have hardlinks; any links outside the selection remain intact and reclaimable space is unknown".into());
-                        }
-                        unit.warnings.extend(
-                            group
-                                .members
-                                .iter()
-                                .map(|m| format!("member: {}", m.path.display())),
-                        );
-                        unit.cargo_group = Some(group);
-                        units.push(unit);
-                    }
-                    Err(e) => refused.push(Refused {
-                        path: p.clone(),
-                        cause: e.to_string(),
-                    }),
+            // A Cargo group (companions moved together) is offered when
+            // Cargo's own rules cover the path; when they do not, the
+            // path itself goes to Trash, and the rule that did not cover
+            // it is a line on the confirm.
+            let group = match (container, owner) {
+                (Some(container), Some(_)) => {
+                    crate::cargo_cleanup::propose(&report.nested_artifacts, p, &container.path)
+                        .map_err(|e| e.to_string())
                 }
-            } else {
-                refused.push(Refused {
+                _ => Err("no observed owning container".to_string()),
+            };
+            match (group, container, owner) {
+                (Ok(group), Some(container), Some((project, wt))) => {
+                    let row = wt
+                        .artifacts
+                        .iter()
+                        .find(|a| a.path == container.path)
+                        .unwrap();
+                    let mut unit = unit_from_row(project, wt, row);
+                    unit.path = p.clone();
+                    unit.rel_path = crate::scope::relative_to(p, &wt.path)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string();
+                    unit.bytes = group.members.iter().map(|m| m.bytes).sum();
+                    unit.dedup_stale = false; // selected members were freshly measured
+                    unit.growth_bytes = nested.growth_bytes;
+                    unit.verb = "cargo-group".into();
+                    unit.recovery = "Trash envelope with restore.json; rebuilding may require unavailable source/toolchains".into();
+                    unit.warnings = vec!["exact selected build, NOT proven obsolete; stop non-Cargo writers; advisory Cargo lock held during move".into()];
+                    unit.warnings.push("size is selected allocation, not promised free space; moving to Trash does not free these bytes immediately".into());
+                    if group.shared_storage {
+                        unit.warnings.push("selected files have hardlinks; any links outside the selection remain intact and reclaimable space is unknown".into());
+                    }
+                    unit.warnings.extend(
+                        group
+                            .members
+                            .iter()
+                            .map(|m| format!("member: {}", m.path.display())),
+                    );
+                    unit.cargo_group = Some(group);
+                    units.push(unit);
+                }
+                (Err(why), _, _) => match single(
+                    vec![format!(
+                        "swamp's selection rules for this build folder do not cover it ({why}): only this path moves, companions are not included"
+                    )],
+                    true,
+                ) {
+                    Ok(unit) => units.push(unit),
+                    Err(cause) => refused.push(Refused {
+                        path: p.clone(),
+                        cause,
+                    }),
+                },
+                _ => refused.push(Refused {
                     path: p.clone(),
                     cause: "nested artifact has no observed owning container".into(),
-                });
+                }),
             }
             continue;
         }

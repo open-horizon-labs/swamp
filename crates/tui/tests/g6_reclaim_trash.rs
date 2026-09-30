@@ -718,3 +718,150 @@ fn a_moved_folder_leaves_the_rows_and_the_unit_shrinks() {
     );
     assert_eq!(rows[0].bytes, 4, "the unit lost the folder's bytes");
 }
+
+/// Tempting wrong patch: a store-interior folder is "inspection only" and
+/// the mark refuses it, or it is planned through a project and refused for
+/// having no owning checkout. A folder no checkout owns marks as the path
+/// plus what its adapter said it could not establish, and moves.
+#[test]
+fn a_store_interior_folder_marks_with_what_its_adapter_did_not_establish() {
+    use swamp_core::artifact::{AccountingBasis, ArtifactRole};
+    use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
+    let f = fx();
+    let store = f.root.join("go-build");
+    let inner = store.join("ab");
+    dir(&inner);
+    let c = BuildContainer::shared_store_of(
+        "go",
+        store.clone(),
+        swamp_core::locations::BuildStoreKind::GoBuildCache,
+    );
+    let n = NestedUnitBuilder::new(&c, ArtifactRole::Intermediate, inner.clone())
+        .is_dir(true)
+        .bytes_on_basis(300, AccountingBasis::Allocated)
+        .supported_with_reason("fixture")
+        .consequence("recompiled")
+        .no_action_because("shared by every Go project on this machine")
+        .build();
+    let mut a = app_with(
+        &f,
+        vec![unit(StorageCategory::Cache, &store, 300, vec![])],
+        ViewKind::External,
+    );
+    a.set_store_interiors(vec![n]);
+    // Open the unit, then each group under it, until the folder is a row.
+    for _ in 0..4 {
+        if a.rows().iter().any(|r| r.label == "ab") {
+            break;
+        }
+        let at = a
+            .rows()
+            .iter()
+            .position(|r| r.expandable && r.collapsed_children.is_some());
+        let Some(at) = at else { break };
+        a.selected = at;
+        handle_key(&mut a, KeyCode::Right);
+    }
+    select(&mut a, "ab");
+    assert!(
+        a.selected_row_markable(),
+        "the interior folder has a mark to make"
+    );
+    space(&mut a);
+    assert_eq!(a.marked.len(), 1, "{:?}", a.refusal_active());
+    let s = a.confirm_summary();
+    assert!(s.contains("shared by every Go project"), "{s}");
+    assert!(s.contains("recompiled"), "{s}");
+    let res = run_plan(&a, &f);
+    assert!(res[0].outcome.is_ok(), "{:?}", res[0].outcome);
+    assert!(!inner.exists());
+}
+
+/// Tempting wrong patch: the Disk view's measured folders stay read-only
+/// rows. Each measured folder is a path that marks; a folder that could
+/// not be read is not (the OS said no, there is no number either).
+#[test]
+fn a_measured_folder_in_the_disk_view_marks_and_an_unreadable_one_does_not() {
+    use swamp_core::growth::VolumeMetaRow;
+    use swamp_core::volume_ledger::{
+        Category as LC, Exactness, LedgerReading, Row as LRow, account,
+    };
+    let f = fx();
+    let big = f.root.join("Movies");
+    dir(&big);
+    let now = swamp_core::entities::now();
+    let lrow = |path: &Path, cat: LC, bytes: Option<u64>| LRow {
+        path: path.display().to_string(),
+        category: cat,
+        bytes,
+        overlap_bytes: 0,
+        entries: None,
+        unreadable: 0,
+        measured_at: now,
+        method: "walk".into(),
+        exactness: if bytes.is_some() {
+            Exactness::Exact
+        } else {
+            Exactness::NotMeasured
+        },
+        note: None,
+    };
+    let rows = vec![
+        lrow(&big, LC::Other, Some(5)),
+        lrow(&f.root.join("Pictures"), LC::Unreadable, None),
+    ];
+    let meta = VolumeMetaRow {
+        measured_at: now,
+        cycle_started_at: 1,
+        cycle_complete_at: now,
+        complete: true,
+        budget_secs: 120,
+        budget_used_ms: 1,
+        statfs_at: now,
+        container_total: Some(500),
+        container_used: Some(100),
+        container_free: Some(400),
+        data_volume_used: Some(90),
+    };
+    let mut a = app_with(&f, vec![], ViewKind::Disk);
+    a.set_ledger(LedgerReading::Measured(Box::new(account(&rows, &meta))));
+    select(&mut a, &big.display().to_string());
+    assert!(a.selected_row_markable());
+    space(&mut a);
+    assert_eq!(a.marked.len(), 1, "{:?}", a.refusal_active());
+    assert!(a.confirm_summary().contains("no record of what uses it"));
+    assert!(big.exists(), "marking moves nothing");
+    let res = run_plan(&a, &f);
+    assert!(res[0].outcome.is_ok() && !big.exists());
+    // The unreadable folder has no unit: no key is named for it.
+    let unreadable = a.rows().into_iter().find(|r| r.label.contains("Pictures"));
+    assert!(unreadable.is_none_or(|r| r.unit.is_none()));
+}
+
+/// Tempting wrong patch: Space on a manager-removed row (mise) still says
+/// "never moved to Trash". Space marks the folder for Trash (the confirm
+/// says the manager will not know it is gone); Backspace on an unmarked
+/// row still opens the manager's own list.
+#[test]
+fn a_tool_managed_row_marks_for_trash_and_keeps_its_own_command_on_backspace() {
+    let f = fx();
+    let p = f.root.join("mise/installs");
+    dir(&p);
+    let mut u = unit(StorageCategory::Installation, &p, 5, vec![]);
+    u.detector_id = "mise".into();
+    let mut a = app_with(&f, vec![u], ViewKind::External);
+    select(&mut a, "installs");
+    assert!(a.rows()[a.selected].tool.is_some());
+    space(&mut a);
+    assert_eq!(a.marked.len(), 1, "{:?}", a.refusal_active());
+    // Backspace on the row that is itself marked is the Trash confirm.
+    handle_key(&mut a, KeyCode::Backspace);
+    wait(&mut a);
+    assert!(a.confirm_open && a.tool_sheet.is_none());
+    assert!(p.exists());
+    handle_key(&mut a, KeyCode::Esc);
+    // With nothing marked, Backspace opens mise's own sheet instead.
+    a.marked.clear();
+    handle_key(&mut a, KeyCode::Backspace);
+    assert!(a.tool_sheet.is_some() || a.operation.is_some());
+}
