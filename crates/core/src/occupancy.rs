@@ -1388,3 +1388,35 @@ mod tests {
         ));
     }
 }
+
+/// Adversarial audit G5 (#177): the manager's-own exemption is exact.
+#[cfg(test)]
+mod adv_g5_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Tempting wrong patch: "`starts_with` because lsof prints
+    /// `SimLaunchHost.arm64`". A process merely named like it
+    /// (`SimLaunchHostX`, `SimLaunchHost-evil`) must still block.
+    #[test]
+    fn adv_simlaunchhost_exemption_is_not_a_prefix_match() {
+        for name in ["SimLaunchHostX", "SimLaunchHost-evil", "SimLaunchHostile"] {
+            let listing = format!("p1\nc{name}\nn/vol/iOS/lib.dylib\n");
+            let snap = OccupancySnapshot::from_lsof_run(Some(0), false, &listing, "");
+            let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+            assert!(
+                matches!(s, OccupancyState::Occupied(_)),
+                "{name} was treated as simctl's own host process: {s:?}"
+            );
+        }
+    }
+
+    /// A holder with no `c` line (command unknown) must block.
+    #[test]
+    fn adv_holder_without_command_name_blocks() {
+        let snap =
+            OccupancySnapshot::from_lsof_run(Some(0), false, "p1\nn/vol/iOS/lib.dylib\n", "");
+        let (s, _) = snap.holders_of(&[PathBuf::from("/vol/iOS")], &["SimLaunchHost"]);
+        assert!(matches!(s, OccupancyState::Occupied(_)), "{s:?}");
+    }
+}
