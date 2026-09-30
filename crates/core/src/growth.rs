@@ -7634,6 +7634,43 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     #[allow(unused_imports)]
     use std::fs::{self, File};
+
+    /// The tempting wrong patch: a manager-fact row whose kind this build
+    /// does not know (written by a newer swamp) fails the whole read. It is
+    /// skipped and the rest reads; a table that is absent is "not
+    /// observed", not an empty pass.
+    #[test]
+    fn a_manager_fact_row_of_an_unknown_kind_is_skipped_and_an_absent_table_is_not_observed() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(!read_manager_fact_table(dir).observed);
+        let row = |kind: &str, subject: Option<&str>| columns::StoredManagerFactRow {
+            manager: "brew".into(),
+            probe: "autoremove-dry-run".into(),
+            kind: kind.into(),
+            subject: subject.map(str::to_string),
+            text: "t".into(),
+            observed_at: 1,
+        };
+        columns::write_manager_fact_rows(
+            &manager_facts_path(dir),
+            &[
+                row("pass", None),
+                row("from-the-future", Some("x")),
+                row("reports-unneeded", Some("libevent")),
+            ],
+        )
+        .unwrap();
+        let got = read_manager_fact_table(dir);
+        assert!(got.observed);
+        assert_eq!(got.facts.len(), 2, "{:?}", got.facts);
+        assert!(
+            got.facts
+                .iter()
+                .all(|f| f.subject.as_deref() != Some("x"))
+        );
+    }
     #[test]
     fn artifact_and_file_compaction_preserve_sources_on_publish_failure() -> anyhow::Result<()> {
         use super::*;

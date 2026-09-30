@@ -607,6 +607,18 @@ fn settings_probe(
 /// its own read-only questions, each bounded by [`PROBE_TIMEOUT`] and the
 /// pass by [`PASS_BUDGET`]. The result replaces the stored table whole.
 pub fn collect(units: &[ExternalUnit], runner: &dyn ProbeRunner, now: u64) -> Vec<ManagerFact> {
+    collect_within(units, runner, now, PASS_BUDGET, PROBE_TIMEOUT)
+}
+
+/// [`collect`] with the pass budget and the per-command limit named, so
+/// a test can spend the budget without waiting for it.
+pub fn collect_within(
+    units: &[ExternalUnit],
+    runner: &dyn ProbeRunner,
+    now: u64,
+    budget: Duration,
+    probe_timeout: Duration,
+) -> Vec<ManagerFact> {
     let registry = Registry::with_builtins();
     let started = Instant::now();
     let mut rows = vec![row("", "", FactKind::Pass, None, String::new(), now)];
@@ -638,12 +650,12 @@ pub fn collect(units: &[ExternalUnit], runner: &dyn ProbeRunner, now: u64) -> Ve
     }
     for (decl, probes) in &managers {
         for probe in probes {
-            let remaining = PASS_BUDGET.saturating_sub(started.elapsed());
+            let remaining = budget.saturating_sub(started.elapsed());
             let Some((program, args)) = probe.invocation() else {
                 rows.extend(settings_probe(runner, &registry, decl, units, now));
                 continue;
             };
-            if remaining < Duration::from_secs(1) {
+            if remaining < Duration::from_millis(1) {
                 rows.push(row(
                     decl.manager,
                     probe.label(),
@@ -660,7 +672,7 @@ pub fn collect(units: &[ExternalUnit], runner: &dyn ProbeRunner, now: u64) -> Ve
                 *probe,
                 program,
                 args,
-                remaining.min(PROBE_TIMEOUT),
+                remaining.min(probe_timeout),
                 now,
             ));
         }

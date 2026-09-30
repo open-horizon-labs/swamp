@@ -126,7 +126,7 @@ impl ViewKind {
         ViewKind::Agents,
     ];
 
-    /// 1-based place in [`ViewKind::ALL`], for "3 of 10".
+    /// 1-based place in [`ViewKind::ALL`], for "3 of 11".
     pub fn position(self) -> usize {
         Self::ALL.iter().position(|v| *v == self).unwrap_or(0) + 1
     }
@@ -742,6 +742,7 @@ impl App {
                 unowned: &self.report.unowned,
                 manager_facts: &self.manager_facts,
                 declared_roots: &self.declared_roots,
+                explicit_scope: self.scope.as_ref().is_some_and(|s| s.explicit),
                 projects: self.report.projects.len(),
                 observed_at: self.report.observed_at,
             },
@@ -1383,7 +1384,7 @@ impl App {
         // builder (Docker).
         if !matches!(
             self.view,
-            ViewKind::Tree | ViewKind::External | ViewKind::Docker
+            ViewKind::Tree | ViewKind::External | ViewKind::Docker | ViewKind::Reclaim
         ) {
             return;
         }
@@ -1402,6 +1403,12 @@ impl App {
                 return;
             }
             self.confirm_delete();
+            return;
+        }
+        // A Reclaim row opens onto the unit's folders; there is no
+        // project to drill into from it.
+        if self.view == ViewKind::Reclaim {
+            self.enter_row();
             return;
         }
         if self.view == ViewKind::Projects
@@ -4028,24 +4035,29 @@ mod tests {
         assert_eq!(ViewKind::from_digit('8'), Some(ViewKind::Types));
         assert_eq!(ViewKind::from_digit('9'), Some(ViewKind::External));
         // '0' is reserved for "clear filter" (crate::handle_key_mod);
-        // Agents has no dedicated digit and must not silently claim '0'.
+        // Reclaim and Agents have no dedicated digit and must not silently
+        // claim '0'.
         assert_eq!(ViewKind::from_digit('0'), None);
         // Full cycle returns to Projects, matching the CLI's view order:
         // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/
-        // types/external/agents.
+        // types/external/reclaim/agents.
         let mut v = ViewKind::Projects;
-        for _ in 0..10 {
+        for _ in 0..ViewKind::ALL.len() {
             v = v.next();
         }
         assert_eq!(v, ViewKind::Projects);
-        // Agents is reachable by cycling even without its own digit.
+        // Reclaim and Agents are reachable by cycling even without their
+        // own digit, and Reclaim sits right after External.
         let mut seen = std::collections::HashSet::new();
         let mut v = ViewKind::Projects;
-        for _ in 0..10 {
+        for _ in 0..ViewKind::ALL.len() {
             seen.insert(v);
             v = v.next();
         }
         assert!(seen.contains(&ViewKind::Agents));
+        assert!(seen.contains(&ViewKind::Reclaim));
+        assert_eq!(ViewKind::External.next(), ViewKind::Reclaim);
+        assert_eq!(ViewKind::ALL.len(), seen.len());
     }
 
     // -----------------------------------------------------------------

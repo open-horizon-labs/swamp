@@ -1,5 +1,5 @@
 "/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed  "
-"view: docker (5 of 10 · v next · Esc: projects) · filter: growth > 100MB in 7d  "
+"view: docker (5 of 11 · v next · Esc: projects) · filter: growth > 100MB in 7d  "
 "Name                                                          Size     Change   "
 "swamp · docker-image /Users/dev/src/swamp/.docker/img        1.6GB   -104.9MB   "
 "                                                                                "

@@ -1214,6 +1214,7 @@ fn main() -> Result<()> {
                     unowned: &r.unowned,
                     manager_facts: &snapshot.manager_facts,
                     declared_roots: &declared_json_roots,
+                    explicit_scope: scope.explicit,
                     projects: r.projects.len(),
                     observed_at: r.observed_at,
                 })

@@ -69,13 +69,25 @@ pub struct ScopeStatement {
 }
 
 /// Builds the scope statement from the stored project count and the
-/// declared roots' states.
-pub fn scope_statement(projects: usize, roots: &[DeclaredRoot]) -> ScopeStatement {
+/// declared roots' states. `explicit` is true when the scope is a root
+/// named on the command line, which replaces the declared roots.
+pub fn scope_statement(projects: usize, roots: &[DeclaredRoot], explicit: bool) -> ScopeStatement {
     let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
-    let mut because: Vec<String> = Vec::new();
-    if roots.is_empty() {
-        because.push("no source roots are declared in this scope".to_string());
+    let projects_word = plural(projects, "project", "projects");
+    if explicit {
+        return ScopeStatement {
+            projects,
+            declared_roots: 0,
+            complete: false,
+            incomplete_because: vec![
+                "the root named on the command line replaces the declared roots".to_string(),
+            ],
+            statement: format!(
+                "consumer evidence checked against {projects} {projects_word} under the root named on the command line; incomplete: the declared roots were not used; a tool used only outside what was checked appears here with none listed"
+            ),
+        };
     }
+    let mut because: Vec<String> = Vec::new();
     for r in roots {
         match &r.state {
             DeclaredState::Missing => because.push(format!("{} is missing", r.path.display())),
@@ -91,18 +103,20 @@ pub fn scope_statement(projects: usize, roots: &[DeclaredRoot]) -> ScopeStatemen
             DeclaredState::Present { .. } | DeclaredState::CoveredBy { .. } => {}
         }
     }
-    let base = format!(
-        "consumer evidence checked against {projects} {} in {} declared {}",
-        plural(projects, "project", "projects"),
+    let mut base = format!(
+        "consumer evidence checked against {projects} {projects_word} in {} declared {}",
         roots.len(),
         plural(roots.len(), "root", "roots"),
     );
+    if roots.is_empty() {
+        base.push_str(" (the built-in default roots only; a project elsewhere was not checked)");
+    }
     let complete = because.is_empty();
     let statement = if complete {
         base
     } else {
         format!(
-            "{base}; incomplete: {}; a tool used only outside what was checked shows no consumer here",
+            "{base}; incomplete: {}; a tool used only outside what was checked appears here with none listed",
             because.join("; ")
         )
     };
@@ -187,6 +201,17 @@ pub struct Hold {
     /// True when the whole unit is held: it is itself the subject, or a
     /// subject could not be separated from it.
     pub whole_unit: bool,
+}
+
+impl Hold {
+    /// The two or three words a narrow row carries beside the name.
+    pub fn short(&self) -> &'static str {
+        match self.kind {
+            HoldKind::ActiveDefault => "active default",
+            HoldKind::InstalledOnRequest => "installed on request",
+            HoldKind::Unknown => "standing unknown",
+        }
+    }
 }
 
 /// Which removal path exists for a unit.
@@ -314,6 +339,9 @@ pub struct ReclaimInput<'a> {
     pub unowned: &'a [UnownedRow],
     pub manager_facts: &'a ManagerFacts,
     pub declared_roots: &'a [DeclaredRoot],
+    /// True when the scope is a root named on the command line, which
+    /// replaces the declared roots.
+    pub explicit_scope: bool,
     pub projects: usize,
     pub observed_at: u64,
 }
@@ -396,10 +424,15 @@ fn consumer_refs(
 }
 
 fn names(list: &[ConsumerRef]) -> String {
-    let shown: Vec<&str> = list
+    // A manager's own global default is a declaration too, but not a
+    // project's: say which it is.
+    let shown: Vec<String> = list
         .iter()
         .take(NAMES_SHOWN)
-        .map(|r| r.label.as_str())
+        .map(|r| match r.note.as_deref() {
+            Some(n) if n.starts_with("global default") => format!("{} (global default)", r.label),
+            _ => r.label.clone(),
+        })
         .collect();
     let rest = list.len().saturating_sub(NAMES_SHOWN);
     if rest > 0 {
@@ -564,8 +597,39 @@ fn merge_hold(slot: &mut Option<Hold>, kind: HoldKind, label: String, subject: &
     }
 }
 
+/// Whether some unit other than `index` that the same manager owns names
+/// `subject` (by its own folder or by one of its listed folders): a
+/// statement about it belongs there, not to a unit that only stands for
+/// what nothing else claims.
+fn claimed_elsewhere(
+    units: &[ExternalUnit],
+    managed: &HashMap<usize, ManagerDecl>,
+    index: usize,
+    manager: &str,
+    subject: &str,
+) -> bool {
+    managed.iter().any(|(&j, d)| {
+        j != index && d.manager == manager && {
+            let other = &units[j];
+            let folder = other.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            (!folder.is_empty() && manager_facts::subject_matches(d.subject, subject, folder))
+                || other.children.iter().any(|c| {
+                    c.kind == ChildKind::Entry
+                        && manager_facts::subject_matches(d.subject, subject, &c.name)
+                })
+        }
+    })
+}
+
 /// Joins the stored manager facts to one managed unit.
-fn join_manager(u: &ExternalUnit, decl: &ManagerDecl, facts: &ManagerFacts) -> ManagerJoin {
+fn join_manager(
+    units: &[ExternalUnit],
+    managed: &HashMap<usize, ManagerDecl>,
+    index: usize,
+    facts: &ManagerFacts,
+) -> ManagerJoin {
+    let u = &units[index];
+    let decl = &managed[&index];
     let mut join = ManagerJoin::default();
     let folder = u.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let has_remainder = u
@@ -617,7 +681,9 @@ fn join_manager(u: &ExternalUnit, decl: &ManagerDecl, facts: &ManagerFacts) -> M
                             .push(quote(decl, *probe, f));
                     }
                 }
-            } else if decl.catch_all {
+            } else if decl.catch_all
+                && !claimed_elsewhere(units, managed, index, decl.manager, subject)
+            {
                 if kind.holds() {
                     // It may be inside what this unit lists only in
                     // aggregate: the remainder row, or a unit with no
@@ -688,10 +754,10 @@ fn child_of(
     let is_entry = c.kind == ChildKind::Entry;
     let text = match (c.kind, c.measure) {
         (ChildKind::Entry, ChildMeasure::NotMeasured) => {
-            format!("{} (not measured: unreadable, not zero)", c.name)
+            format!("{} (not measured)", c.name)
         }
         (ChildKind::Entry, ChildMeasure::Partial) => {
-            format!("{} (partly measured, size is a lower bound)", c.name)
+            format!("{} (partly measured)", c.name)
         }
         (ChildKind::Entry, ChildMeasure::Complete) => c.name.clone(),
         _ => crate::render::describe_unit_child(c, now),
@@ -761,14 +827,17 @@ fn managed_units(units: &[ExternalUnit]) -> HashMap<usize, ManagerDecl> {
 }
 
 fn unit_row(
-    u: &ExternalUnit,
+    index: usize,
     input: &ReclaimInput<'_>,
     scope: &ScopeStatement,
-    managed: Option<&ManagerDecl>,
+    managed: &HashMap<usize, ManagerDecl>,
 ) -> ReclaimRow {
+    let u = &input.units[index];
     let now = input.observed_at;
     let regeneration = regeneration_of(u, input.interiors);
-    let join = managed.map(|d| join_manager(u, d, input.manager_facts));
+    let join = managed
+        .contains_key(&index)
+        .then(|| join_manager(input.units, managed, index, input.manager_facts));
     let (held, unit_quotes, unit_hold) = match &join {
         Some(j) => (held_bytes_of(u, j), j.unit_quotes.clone(), j.unit_hold.clone()),
         None => (0, Vec::new(), None),
@@ -919,13 +988,10 @@ fn coverage_notes(input: &ReclaimInput<'_>, managed: &HashMap<usize, ManagerDecl
 
 /// Builds the Reclaim view from stored facts.
 pub fn build(input: &ReclaimInput<'_>) -> ReclaimView {
-    let scope = scope_statement(input.projects, input.declared_roots);
+    let scope = scope_statement(input.projects, input.declared_roots, input.explicit_scope);
     let managed = managed_units(input.units);
-    let mut rows: Vec<ReclaimRow> = input
-        .units
-        .iter()
-        .enumerate()
-        .map(|(i, u)| unit_row(u, input, &scope, managed.get(&i)))
+    let mut rows: Vec<ReclaimRow> = (0..input.units.len())
+        .map(|i| unit_row(i, input, &scope, &managed))
         .collect();
     rows.extend(
         input
@@ -1023,16 +1089,22 @@ pub fn hold_line(h: &Hold) -> String {
     match h.kind {
         HoldKind::Unknown => format!("{}; held out of the regenerable total", h.label),
         _ if h.subjects.is_empty() => format!("{}; held out of the regenerable total", h.label),
-        _ => format!(
-            "{}: {}; held out of the regenerable total",
-            h.label,
-            h.subjects
+        _ => {
+            let rest = h.subjects.len().saturating_sub(NAMES_SHOWN);
+            let shown = h
+                .subjects
                 .iter()
                 .take(NAMES_SHOWN)
                 .cloned()
                 .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .join(", ");
+            let more = if rest > 0 {
+                format!(" and {rest} more")
+            } else {
+                String::new()
+            };
+            format!("{}: {shown}{more}; held out of the regenerable total", h.label)
+        }
     }
 }
 
@@ -1161,6 +1233,7 @@ mod tests {
                     complete: true,
                 },
             )],
+            false,
         );
         assert_eq!(
             s.statement,
@@ -1170,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_unreadable_or_absent_root_makes_the_evidence_incomplete() {
+    fn a_missing_unreadable_or_partly_read_root_makes_the_evidence_incomplete() {
         for roots in [
             vec![root("/h/src", DeclaredState::Missing)],
             vec![root(
@@ -1186,9 +1259,8 @@ mod tests {
                     complete: false,
                 },
             )],
-            Vec::new(),
         ] {
-            let s = scope_statement(3, &roots);
+            let s = scope_statement(3, &roots, false);
             assert!(!s.complete, "{roots:?}");
             assert!(s.statement.contains("incomplete"), "{}", s.statement);
         }

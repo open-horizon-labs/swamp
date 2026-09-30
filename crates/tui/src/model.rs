@@ -2363,7 +2363,19 @@ pub fn reclaim_rows(
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     for r in &view.rows {
-        let mut row = Row::leaf(0, format!("{} · {}", r.kind, r.path), r.bytes, r.growth_bytes);
+        // A held unit says so beside its name: at 80 columns the signals
+        // are not on screen, and a default must not look like any row.
+        let flag = r
+            .hold
+            .as_ref()
+            .map(|h| format!("  [{}]", h.short()))
+            .unwrap_or_default();
+        let mut row = Row::leaf(
+            0,
+            format!("{} · {}{flag}", r.kind, r.path),
+            r.bytes,
+            r.growth_bytes,
+        );
         row.signals = vec![
             r.regeneration.words.clone(),
             format!("last used {}", r.last_used_text),
@@ -2415,7 +2427,7 @@ fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
     let flag = c
         .hold
         .as_ref()
-        .map(|h| format!("  [{}]", h.label))
+        .map(|h| format!("  [{}]", h.short()))
         .unwrap_or_default();
     let mut row = Row::leaf(
         1,
