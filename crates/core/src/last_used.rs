@@ -383,7 +383,17 @@ pub(crate) fn scan_key_file_atimes(unit: &Path, max_depth: u8) -> KeyFileScan {
                     continue;
                 }
                 listings += 1;
-                for key in &crate::locations::shallow_list(&child).entries {
+                let keys = crate::locations::shallow_list(&child);
+                // A `bin` listed only in part (over the cap) or not at
+                // all yields the newest of a sample, which is not the
+                // unit's newest: the caller reports `no record`. Which
+                // entries a capped listing keeps is the filesystem's
+                // directory order, so a sample can even hold the real
+                // newest on one filesystem and miss it on another.
+                if !matches!(keys.truncation, crate::locations::Truncation::Complete) {
+                    scan.truncated = true;
+                }
+                for key in &keys.entries {
                     if key.is_dir {
                         continue;
                     }
@@ -586,6 +596,34 @@ pub(crate) fn with_child_last_used(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `bin` with more entries than the listing cap is a sample: its
+    /// newest access time must never stand for the unit's. Which entries
+    /// a capped listing keeps is the filesystem's directory order, so the
+    /// test holds every file at the same time and asserts the verdict on
+    /// the flag, not on which file was sampled.
+    ///
+    /// Tempting wrong patch this fails: using the capped `bin` listing's
+    /// entries without looking at its truncation (what the scan did: the
+    /// unit then reported a sampled file's time, or the real newest only
+    /// where directory order happened to include it).
+    #[test]
+    fn a_bin_over_the_listing_cap_is_no_record_not_a_sampled_newest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("tc/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for i in 0..=crate::locations::SHALLOW_LIST_CAP {
+            std::fs::write(bin.join(format!("f{i:05}")), b"").unwrap();
+        }
+        let scan = scan_key_file_atimes(tmp.path(), 2);
+        assert!(scan.truncated, "a capped bin listing must mark the scan");
+        let got = probe(
+            tmp.path(),
+            &[LastUseSource::KeyFileAtime { max_depth: 2 }],
+            1_790_000_000,
+        );
+        assert_eq!(got.last_used.at, None, "{:?}", got.last_used);
+    }
 
     #[test]
     fn a_tool_native_record_wins_over_a_newer_access_time_and_the_access_time_is_kept() {
