@@ -95,9 +95,15 @@ impl Drop for Entered {
 }
 
 /// Test hook for the end-to-end watchdog test: under `SWAMP_TEST_MODE=1`,
-/// a walk entering the directory named by `SWAMP_TEST_PARK_DIR` parks
-/// there without progressing, as a worker in a blocking `open(2)` did in
-/// #190. Inert otherwise (both variables are read once).
+/// a walk entering the directory named by the park variable parks there
+/// without progressing, as a worker in a blocking `open(2)` did in #190.
+///
+/// Compiled only with swamp-core's `testing` feature, which only
+/// `[dev-dependencies]` enable (resolver 2 never unifies it into a
+/// shipped build; `scripts/check.sh` proves that for the release graph and
+/// `scripts/release-smoke.sh` checks the packaged binary for the variable
+/// name). A release binary has no hook at all.
+#[cfg(feature = "testing")]
 pub(crate) fn test_park(path: &Path) {
     static PARK: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let park = PARK.get_or_init(|| {
@@ -114,6 +120,11 @@ pub(crate) fn test_park(path: &Path) {
     }
 }
 
+/// Release builds: no hook.
+#[cfg(not(feature = "testing"))]
+#[inline(always)]
+pub(crate) fn test_park(_path: &Path) {}
+
 /// The innermost step still running: of the steps in flight, the one
 /// entered last. At a stall every running step is stuck, and the latest
 /// one is the deepest (an external unit waits on the walk workers inside
@@ -125,6 +136,18 @@ pub fn stuck() -> Option<(&'static str, PathBuf, Duration)> {
         .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).clone())
         .max_by_key(|(_, _, at)| *at)
         .map(|(ph, p, at)| (ph, p, at.elapsed()))
+}
+
+/// Every step in flight, for tests that run beside other walks (the
+/// innermost one [`stuck`] names may belong to another test's thread).
+#[cfg(test)]
+pub(crate) fn running() -> Vec<(&'static str, PathBuf)> {
+    let used = NEXT_SLOT.load(Ordering::Relaxed).min(SLOTS);
+    TABLE[..used]
+        .iter()
+        .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .map(|(ph, p, _)| (ph, p))
+        .collect()
 }
 
 #[cfg(test)]
@@ -139,7 +162,7 @@ mod tests {
             let _o = enter("git signals", &p);
             {
                 let _i = enter("ignore lens", &q);
-                assert!(stuck().is_some_and(|(_, path, _)| path == p || path == q));
+                assert!(running().contains(&("ignore lens", q.clone())));
             }
             let mine = MINE.with(|s| s.0);
             let slot = TABLE[mine].lock().unwrap().clone();

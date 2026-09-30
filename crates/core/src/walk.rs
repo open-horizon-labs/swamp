@@ -2659,11 +2659,13 @@ mod blocking_kind_tests {
             });
         });
         assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)).unwrap(), 199);
-        let (phase, path, _) = crate::beacon::stuck().expect("the blocked directory is in flight");
-        assert_eq!((phase, path), ("walk", blocked.clone()));
+        assert!(
+            crate::beacon::running().contains(&("walk", blocked.clone())),
+            "the blocked directory is in flight"
+        );
         release_tx.send(()).unwrap();
         handle.join().unwrap();
-        assert!(crate::beacon::stuck().is_none_or(|(_, p, _)| p != blocked));
+        assert!(!crate::beacon::running().iter().any(|(_, p)| *p == blocked));
     }
 
     /// Stress: many cold discoveries + attributions over a tree seeded

@@ -153,7 +153,7 @@ These checks are executable constraints, not an OS security boundary or proof th
 
 `crate::beacon` is the shared progress beacon (#190): walk directories, git signals, the ignore lens, external units, the Codex database read and every bounded content read enter it with a phase and a path; `swamp observe` stops a pass with no progress for `observe_stall_secs`, logs the phase and path, and quarantines the path for 24 hours (`stalled-paths.tsv`, stored coverage `not measured (stalled on <date>)`).
 
-One test hook exists in the production binary, because the end-to-end watchdog test needs the real `swamp` executable: with `SWAMP_TEST_MODE=1` **and** `SWAMP_TEST_PARK_DIR=<dir>`, a walk entering exactly `<dir>` parks without progressing. Without both variables it does nothing (they are read once per process).
+One test hook exists, and only in test builds: with swamp-core's `testing` feature (enabled only by `[dev-dependencies]`, so `cargo test` builds the `swamp` binary with it and `cargo build --release` does not), `SWAMP_TEST_MODE=1` plus `SWAMP_TEST_PARK_DIR=<dir>` makes a walk entering exactly `<dir>` park without progressing, for the end-to-end watchdog test. `scripts/check.sh` fails if the shipped build graph enables `testing`, and `scripts/release-smoke.sh` fails if the packaged binary contains the variable name or parks on it.
 
 ## Limits of the current implementation
 

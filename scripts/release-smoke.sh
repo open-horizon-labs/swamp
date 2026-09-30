@@ -7,7 +7,8 @@
 #
 # Checks: the checksum; the version string; --help; the packaged skill;
 # an explicit-root `report --json`; `observe` into a scratch store and a
-# second `report --json` reading that history back; TUI startup and a
+# second `report --json` reading that history back; the absence of the
+# #190 test hook; TUI startup and a
 # clean quit under a pseudo-terminal; and, on Linux, linkage (`ldd`) and
 # the newest glibc symbol version the binary needs (`objdump -T`). With a
 # report dir, the linkage and the timings are written there as the CI
@@ -71,6 +72,28 @@ t2=$(now_ms)
 t3=$(now_ms)
 "$bin" report "$fx" --json > "$work/r1.json"
 grep -q '"projects"' "$work/r1.json"
+
+# The #190 watchdog's test hook must not ship: it exists only under
+# swamp-core's `testing` feature. The variable name is absent from the
+# packaged binary, and setting it (with SWAMP_TEST_MODE=1, already set
+# above) does not park an observe of a directory it names.
+if LC_ALL=C grep -a -q 'SWAMP_TEST_PARK_DIR' "$bin"; then
+    echo "release binary contains the SWAMP_TEST_PARK_DIR test hook" >&2
+    exit 1
+fi
+mkdir -p "$fx/parkme"
+SWAMP_TEST_PARK_DIR="$fx/parkme" "$bin" observe "$fx" > "$work/observe-park.txt" &
+park_pid=$!
+for _ in $(seq 1 60); do
+    kill -0 "$park_pid" 2>/dev/null || break
+    sleep 1
+done
+if kill -0 "$park_pid" 2>/dev/null; then
+    kill "$park_pid"
+    echo "release binary honored SWAMP_TEST_PARK_DIR (parked an observe)" >&2
+    exit 1
+fi
+wait "$park_pid"
 
 # TUI: starts, draws, quits on `q`, under a pseudo-terminal.
 tui="skipped (no script(1))"
