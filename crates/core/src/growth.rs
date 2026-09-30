@@ -3219,6 +3219,10 @@ fn unit_consumers_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_consumers.parquet")
 }
 
+fn unit_meta_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("unit_meta.parquet")
+}
+
 fn unit_children_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_children.parquet")
 }
@@ -3227,6 +3231,7 @@ fn unit_children_path(swamp_dir: &Path) -> PathBuf {
 fn stored_child_rows(
     scope_key: &str,
     unit_id: &str,
+    observed_at: u64,
     children: &[crate::drilldown::UnitChild],
 ) -> Vec<columns::StoredUnitChildRow> {
     children
@@ -3235,6 +3240,7 @@ fn stored_child_rows(
         .map(|(seq, c)| columns::StoredUnitChildRow {
             scope_key: scope_key.to_string(),
             unit_id: unit_id.to_string(),
+            observed_at,
             seq: seq as u32,
             kind: c.kind.label().to_string(),
             name: c.name.clone(),
@@ -3497,11 +3503,6 @@ fn stored_row_from_external_unit(
         tool_home: None,
         relative_path: None,
         action: None,
-        last_used: u.last_used.at,
-        last_used_source: Some(u.last_used.source.label()),
-        last_used_atime: u.last_used.atime,
-        bytes_counted_elsewhere: u.bytes_counted_elsewhere,
-        overlap_count: u.overlap_count,
     }
 }
 
@@ -3535,11 +3536,6 @@ fn stored_row_from_agent_unit(
         tool_home: Some(u.tool_home.display().to_string()),
         relative_path: Some(u.relative_path.clone()),
         action: Some(u.action.label().to_string()),
-        last_used: None,
-        last_used_source: None,
-        last_used_atime: None,
-        bytes_counted_elsewhere: 0,
-        overlap_count: 0,
     }
 }
 
@@ -3634,10 +3630,40 @@ pub fn write_unit_tables(
             crate::external::category_str(u.category),
             &u.path,
         );
-        child_rows.extend(stored_child_rows(scope_key, &unit_id, &u.children));
+        child_rows.extend(stored_child_rows(
+            scope_key,
+            &unit_id,
+            u.observed_at,
+            &u.children,
+        ));
     }
     columns::write_unit_child_rows(&children_file, &child_rows)
         .with_context(|| format!("write {}", children_file.display()))?;
+
+    let meta_file = unit_meta_path(swamp_dir);
+    let mut meta_rows: Vec<columns::StoredUnitMetaRow> = columns::read_unit_meta_rows(&meta_file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    for u in external_units {
+        meta_rows.push(columns::StoredUnitMetaRow {
+            scope_key: scope_key.to_string(),
+            unit_id: external_unit_table_id(
+                &u.detector_id,
+                crate::external::category_str(u.category),
+                &u.path,
+            ),
+            observed_at: u.observed_at,
+            last_used: u.last_used.at,
+            last_used_source: Some(u.last_used.source.label()),
+            last_used_atime: u.last_used.atime,
+            bytes_counted_elsewhere: u.bytes_counted_elsewhere,
+            overlap_count: u.overlap_count,
+        });
+    }
+    columns::write_unit_meta_rows(&meta_file, &meta_rows)
+        .with_context(|| format!("write {}", meta_file.display()))?;
 
     let consumers_file = unit_consumers_path(swamp_dir);
     let mut consumer_rows: Vec<columns::StoredUnitConsumerRow> =
@@ -3693,6 +3719,7 @@ pub(crate) struct StoredUnitTables {
     pub(crate) consumers: Vec<columns::StoredUnitConsumerRow>,
     pub(crate) agent_members: Vec<columns::StoredAgentMemberRow>,
     pub(crate) children: Vec<columns::StoredUnitChildRow>,
+    pub(crate) meta: Vec<columns::StoredUnitMetaRow>,
 }
 
 pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<StoredUnitTables> {
@@ -3724,11 +3751,19 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
             .collect();
     let children: Vec<columns::StoredUnitChildRow> =
         columns::read_unit_child_rows(&unit_children_path(swamp_dir))
-            .ok()?
+            .unwrap_or_default()
             .into_iter()
             .filter(|r| r.scope_key == scope_key)
             .collect();
+    // Sibling tables a swamp that predates them never wrote: absent or
+    // unreadable is "no last-used, no drilldown", never an error.
+    let meta: Vec<columns::StoredUnitMetaRow> = columns::read_unit_meta_rows(&unit_meta_path(swamp_dir))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key == scope_key)
+        .collect();
     Some(StoredUnitTables {
+        meta,
         external,
         agent,
         consumers,
@@ -3748,7 +3783,15 @@ pub(crate) fn external_unit_from_stored(
     stored: &columns::StoredUnitRow,
     consumers: Vec<crate::external::ExternalConsumer>,
     children: &[&columns::StoredUnitChildRow],
+    meta: Option<&columns::StoredUnitMetaRow>,
 ) -> crate::external::ExternalUnit {
+    // Sibling rows describe this unit only when written by the same pass.
+    let meta = meta.filter(|m| m.observed_at == stored.observed_at);
+    let children: Vec<&columns::StoredUnitChildRow> = children
+        .iter()
+        .copied()
+        .filter(|c| c.observed_at == stored.observed_at)
+        .collect();
     let category = crate::external::category_from_str(&stored.category)
         .unwrap_or(crate::locations::StorageCategory::Unclassified);
     let provenance = match &stored.provenance_kind {
@@ -3770,14 +3813,18 @@ pub(crate) fn external_unit_from_stored(
         consumers,
         note: stored.consequence.clone(),
         evidence: Vec::new(),
-        bytes_counted_elsewhere: stored.bytes_counted_elsewhere,
-        overlap_count: stored.overlap_count,
-        last_used: crate::last_used::LastUsed::from_columns(
-            stored.last_used,
-            stored.last_used_source.as_deref(),
-            stored.last_used_atime,
-        ),
-        children: children_from_stored(children),
+        bytes_counted_elsewhere: meta.map_or(0, |m| m.bytes_counted_elsewhere),
+        overlap_count: meta.map_or(0, |m| m.overlap_count),
+        last_used: meta
+            .map(|m| {
+                crate::last_used::LastUsed::from_columns(
+                    m.last_used,
+                    m.last_used_source.as_deref(),
+                    m.last_used_atime,
+                )
+            })
+            .unwrap_or_default(),
+        children: children_from_stored(&children),
     }
 }
 
@@ -9191,7 +9238,7 @@ mod tests {
             })
             .collect();
         let rebuilt_external =
-            external_unit_from_stored(&tables.external[0], rebuilt_consumers, &[]);
+            external_unit_from_stored(&tables.external[0], rebuilt_consumers, &[], None);
         assert_eq!(
             serde_json::to_value(&rebuilt_external).unwrap(),
             serde_json::to_value(&external).unwrap(),

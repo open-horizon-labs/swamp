@@ -2521,6 +2521,15 @@ pub fn observe_scope(
     };
     let mut force_full = force_full;
     if observe
+        && let Some(dir) = store_dir
+        && crate::fs_gate::store::StoreDir::at(dir)?.is_newer_generation()?
+    {
+        // Another swamp (a newer one) owns this store's format. Reading is
+        // fine; writing derived tables under a marker we do not know could
+        // corrupt it, and resetting would throw its work away.
+        anyhow::bail!("store written by a newer swamp; not modifying it");
+    }
+    if observe
         && owns_root_coverage
         && want == ObservationParts::ALL
         && let Some(dir) = store_dir
@@ -3633,6 +3642,8 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
             .push(c);
     }
 
+    let meta_by_unit: std::collections::HashMap<&str, &crate::growth::columns::StoredUnitMetaRow> =
+        tables.meta.iter().map(|m| (m.unit_id.as_str(), m)).collect();
     snapshot.external_units = tables
         .external
         .iter()
@@ -3653,7 +3664,8 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
                 .get(&stored.id)
                 .cloned()
                 .unwrap_or_default();
-            crate::growth::external_unit_from_stored(stored, consumers, &children)
+            let meta = meta_by_unit.get(stored.id.as_str()).copied();
+            crate::growth::external_unit_from_stored(stored, consumers, &children, meta)
         })
         .collect();
 

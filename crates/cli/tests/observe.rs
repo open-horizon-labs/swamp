@@ -276,7 +276,7 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
     assert!(store.path().join("notes.parquet").is_file());
     assert_eq!(
         std::fs::read_to_string(store.path().join("housekeeping.version")).unwrap(),
-        "3\n"
+        "2\n"
     );
 
     let report = Command::new(bin())
@@ -369,7 +369,7 @@ fn current_generation_narrow_observe_keeps_other_explicit_root_history() {
     );
     assert_eq!(
         std::fs::read_to_string(store.path().join("housekeeping.version")).unwrap(),
-        "3\n"
+        "2\n"
     );
     let other_volume = swamp_core::growth::volume_store_dir(store.path(), &paths[1]);
     let history = std::fs::read(other_volume.join("current.parquet")).unwrap();

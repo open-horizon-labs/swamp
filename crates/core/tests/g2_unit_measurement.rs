@@ -548,82 +548,195 @@ fn stored_facts_round_trip_and_reading_a_report_never_walks_or_probes() {
     assert_eq!(atime_of(&fx.rustc), OLD);
 }
 
+/// The v0.7.5 column list of `external_units.parquet`. v0.7.5 resets the
+/// store on any marker it does not know, so v0.8.0 keeps this table's schema
+/// exactly and puts what it adds in sibling tables.
+const V075_EXTERNAL_UNITS_COLUMNS: [&str; 24] = [
+    "scope_key",
+    "id",
+    "source_id",
+    "source_name",
+    "category",
+    "path",
+    "bytes",
+    "complete",
+    "mtime_max",
+    "linkage_state",
+    "linkage_basis",
+    "project_id",
+    "protected",
+    "protect_reason",
+    "consequence",
+    "observed_at",
+    "growth_bytes",
+    "regrowth_count",
+    "provenance_kind",
+    "provenance_value",
+    "hardlinked",
+    "tool_home",
+    "relative_path",
+    "action",
+];
+
+fn parquet_columns(path: &Path) -> Vec<String> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path).unwrap())
+        .unwrap()
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+fn store_snapshot(store: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![store.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(p);
+            } else if !p.ends_with("store-write.lock") {
+                out.push((p.clone(), fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[test]
-fn a_store_from_the_previous_format_rebuilds_without_losing_other_tables_or_crashing() {
+fn v080_leaves_the_marker_and_the_v075_unit_schema_alone() {
+    // Tempting wrong patch: widening external_units.parquet and bumping the
+    // marker, which makes an installed v0.7.5 reset the store on every
+    // alternation with this version.
+    let fx = stored_fixture();
+    observe(&fx.scope, &fx.store);
+    assert_eq!(
+        fs::read_to_string(fx.store.join("housekeeping.version")).unwrap(),
+        "2\n"
+    );
+    let cols = parquet_columns(&fx.store.join("external_units.parquet"));
+    assert_eq!(cols, V075_EXTERNAL_UNITS_COLUMNS);
+    assert!(fx.store.join("unit_meta.parquet").is_file());
+    assert!(fx.store.join("unit_children.parquet").is_file());
+}
+
+#[test]
+fn a_store_a_v075_swamp_wrote_reads_without_the_sibling_tables() {
+    let fx = stored_fixture();
+    observe(&fx.scope, &fx.store);
+    fs::remove_file(fx.store.join("unit_meta.parquet")).unwrap();
+    fs::remove_file(fx.store.join("unit_children.parquet")).unwrap();
+    let snapshot = report_scope_from_store(&fx.scope, &fx.store).expect("still readable");
+    let unit = unit_ending(&snapshot.external_units, "toolchains");
+    assert_eq!(unit.last_used, Default::default(), "no last-used, no error");
+    assert!(unit.children.is_empty());
+    assert_eq!(unit.overlap_count, 0);
+}
+
+#[test]
+fn sibling_rows_from_another_pass_are_not_shown_as_current_facts() {
+    // A v0.7.5 pass rewrites external_units and leaves unit_meta behind.
+    let fx = stored_fixture();
+    observe(&fx.scope, &fx.store);
+    let meta = fx.store.join("unit_meta.parquet");
+    let children = fx.store.join("unit_children.parquet");
+    let before = fs::read(&meta).unwrap();
+    // Age the sibling tables: a different observed_at than the units'.
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    for table in [&meta, &children] {
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(fs::File::open(table).unwrap()).unwrap();
+        let schema = builder.schema().clone();
+        let at = schema.index_of("observed_at").unwrap();
+        let batches: Vec<_> = builder.build().unwrap().map(|b| b.unwrap()).collect();
+        let mut w =
+            ArrowWriter::try_new(fs::File::create(table).unwrap(), schema.clone(), None).unwrap();
+        for b in batches {
+            let mut cols = b.columns().to_vec();
+            let old = cols[at]
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap();
+            cols[at] = std::sync::Arc::new(arrow_array::UInt64Array::from(
+                old.iter().map(|v| v.map(|x| x + 1)).collect::<Vec<_>>(),
+            ));
+            w.write(&arrow_array::RecordBatch::try_new(schema.clone(), cols).unwrap())
+                .unwrap();
+        }
+        w.close().unwrap();
+    }
+    assert_ne!(fs::read(&meta).unwrap(), before);
+    let snapshot = report_scope_from_store(&fx.scope, &fx.store).unwrap();
+    let unit = unit_ending(&snapshot.external_units, "toolchains");
+    assert_eq!(unit.last_used, Default::default());
+    assert!(unit.children.is_empty());
+}
+
+#[test]
+fn a_newer_marker_is_read_but_never_reset_or_written() {
+    // Tempting wrong patch: reset on any marker difference (the old rule,
+    // whose comment said "older"), which lets an older swamp wipe a newer
+    // one's store and the newer one wipe it back.
     let fx = stored_fixture();
     observe(&fx.scope, &fx.store);
     let marker = fx.store.join("housekeeping.version");
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "3\n");
+    fs::write(&marker, "9\n").unwrap();
+    let before = store_snapshot(&fx.store);
+    assert!(
+        report_scope_from_store(&fx.scope, &fx.store).is_ok(),
+        "a newer store is read, not refused"
+    );
+    let err = observe_scope(
+        &fx.scope,
+        ObservationParts::ALL,
+        None,
+        None,
+        false,
+        Some(&fx.store),
+        None,
+        true,
+        true,
+        false,
+        false,
+        swamp_core::fs_events::platform_source().as_ref(),
+        30,
+        24 * 3600,
+    )
+    .err()
+    .expect("observe refuses to write a newer store");
+    assert!(
+        err.to_string().contains("newer swamp; not modifying it"),
+        "{err}"
+    );
+    assert_eq!(store_snapshot(&fx.store), before, "not one byte changed");
+}
 
-    // Rewrite external_units.parquet as the previous generation wrote it:
-    // without the columns this change added.
-    let table = fx.store.join("external_units.parquet");
-    let new_columns = [
-        "last_used",
-        "last_used_source",
-        "last_used_atime",
-        "bytes_counted_elsewhere",
-        "overlap_count",
-    ];
-    let builder =
-        ParquetRecordBatchReaderBuilder::try_new(fs::File::open(&table).unwrap()).unwrap();
-    let schema = builder.schema().clone();
-    let keep: Vec<usize> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !new_columns.contains(&f.name().as_str()))
-        .map(|(i, _)| i)
-        .collect();
-    let old_schema = std::sync::Arc::new(schema.project(&keep).unwrap());
-    let batches: Vec<_> = builder.build().unwrap().map(|b| b.unwrap()).collect();
-    let mut writer =
-        ArrowWriter::try_new(fs::File::create(&table).unwrap(), old_schema.clone(), None).unwrap();
-    for b in &batches {
-        writer.write(&b.project(&keep).unwrap()).unwrap();
-    }
-    writer.close().unwrap();
-    fs::remove_file(fx.store.join("unit_children.parquet")).unwrap();
-    fs::write(&marker, "2\n").unwrap();
-    // Human state and history that must survive the rebuild.
+#[test]
+fn an_older_marker_still_resets_and_keeps_human_files() {
+    let fx = stored_fixture();
+    observe(&fx.scope, &fx.store);
+    let marker = fx.store.join("housekeeping.version");
+    fs::write(&marker, "1\n").unwrap();
     fs::write(fx.store.join("config.toml"), b"# keep me\n").unwrap();
     let ledger = fx.store.join("ledger.parquet");
     fs::write(&ledger, b"ledger state").unwrap();
-    // The record that the first-run question was answered is human intent,
-    // not a derived table: a format reset must not ask it again.
     let asked = fx.store.join("first-run-asked");
     fs::write(&asked, b"asked\n").unwrap();
-
-    // A report is a pure read: it refuses the old generation and changes
-    // nothing.
-    let before = fs::read(&table).unwrap();
     assert!(report_scope_from_store(&fx.scope, &fx.store).is_err());
-    assert_eq!(fs::read(&table).unwrap(), before);
+    observe(&fx.scope, &fx.store);
     assert_eq!(fs::read_to_string(&marker).unwrap(), "2\n");
-
-    // The observer rebuilds under the writer lock and republishes.
-    let rebuilt = observe(&fx.scope, &fx.store);
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "3\n");
-    assert_eq!(
-        fs::read(fx.store.join("config.toml")).unwrap(),
-        b"# keep me\n"
-    );
+    assert_eq!(fs::read(fx.store.join("config.toml")).unwrap(), b"# keep me\n");
     assert_eq!(fs::read(&ledger).unwrap(), b"ledger state");
+    assert_eq!(fs::read(&asked).unwrap(), b"asked\n");
+    let snapshot = report_scope_from_store(&fx.scope, &fx.store).unwrap();
     assert_eq!(
-        fs::read(&asked).unwrap(),
-        b"asked\n",
-        "the first-run marker survives a store-format reset"
+        unit_ending(&snapshot.external_units, "toolchains").last_used.at,
+        Some(OLD as u64)
     );
-    let snapshot = report_scope_from_store(&fx.scope, &fx.store).expect("readable after rebuild");
-    let got = unit_ending(&snapshot.external_units, "toolchains");
-    assert_eq!(got.last_used.at, Some(OLD as u64));
-    assert_eq!(
-        got.bytes,
-        unit_ending(&rebuilt.external_units, "toolchains").bytes
-    );
-    assert!(fx.store.join("unit_children.parquet").is_file());
 }
 
 #[test]

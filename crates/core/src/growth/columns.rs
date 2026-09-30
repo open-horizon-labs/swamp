@@ -2997,18 +2997,6 @@ pub(crate) struct StoredUnitRow {
     pub(crate) relative_path: Option<String>,
     /// [`crate::agents::AgentActionCapability::label`], agent-only (R18a).
     pub(crate) action: Option<String>,
-    /// [`crate::last_used::LastUsed::at`]: epoch seconds, `None` for no
-    /// record (#176). External units only.
-    pub(crate) last_used: Option<u64>,
-    /// [`crate::last_used::LastUsedSource::label`]: `tool_native:<name>`,
-    /// `file_atime` or `none`.
-    pub(crate) last_used_source: Option<String>,
-    /// The key files' access time kept beside a tool-native value.
-    pub(crate) last_used_atime: Option<u64>,
-    /// [`crate::external::ExternalUnit::bytes_counted_elsewhere`] (#185).
-    pub(crate) bytes_counted_elsewhere: u64,
-    /// [`crate::external::ExternalUnit::overlap_count`] (#185).
-    pub(crate) overlap_count: u32,
 }
 
 fn unit_schema() -> Arc<Schema> {
@@ -3037,11 +3025,6 @@ fn unit_schema() -> Arc<Schema> {
         Field::new("tool_home", DataType::Utf8, true),
         Field::new("relative_path", DataType::Utf8, true),
         Field::new("action", DataType::Utf8, true),
-        Field::new("last_used", DataType::UInt64, true),
-        Field::new("last_used_source", DataType::Utf8, true),
-        Field::new("last_used_atime", DataType::UInt64, true),
-        Field::new("bytes_counted_elsewhere", DataType::UInt64, false),
-        Field::new("overlap_count", DataType::UInt32, false),
     ]))
 }
 
@@ -3100,17 +3083,6 @@ pub(crate) fn write_unit_rows(path: &Path, rows: &[StoredUnitRow]) -> Result<()>
             opt_str_col!(rows, tool_home),
             opt_str_col!(rows, relative_path),
             opt_str_col!(rows, action),
-            opt_u64_col!(rows, last_used),
-            opt_str_col!(rows, last_used_source),
-            opt_u64_col!(rows, last_used_atime),
-            Arc::new(UInt64Array::from(
-                rows.iter()
-                    .map(|r| r.bytes_counted_elsewhere)
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|r| r.overlap_count).collect::<Vec<_>>(),
-            )),
         ],
     )?;
     crate::fs_gate::columns::write_parquet_atomic(
@@ -3144,8 +3116,6 @@ pub(crate) fn read_unit_rows(path: &Path) -> Result<Vec<StoredUnitRow>> {
         let mtime_max = downcast_u64(&batch, "mtime_max")?;
         let observed_at = downcast_u64(&batch, "observed_at")?;
         let regrowth_count = downcast_u32(&batch, "regrowth_count")?;
-        let bytes_counted_elsewhere = downcast_u64(&batch, "bytes_counted_elsewhere")?;
-        let overlap_count = downcast_u32(&batch, "overlap_count")?;
         for i in 0..batch.num_rows() {
             rows.push(StoredUnitRow {
                 scope_key: scope_key.value(i).to_string(),
@@ -3172,11 +3142,6 @@ pub(crate) fn read_unit_rows(path: &Path) -> Result<Vec<StoredUnitRow>> {
                 tool_home: opt_str(&batch, "tool_home", i)?,
                 relative_path: opt_str(&batch, "relative_path", i)?,
                 action: opt_str(&batch, "action", i)?,
-                last_used: opt_u64(&batch, "last_used", i)?,
-                last_used_source: opt_str(&batch, "last_used_source", i)?,
-                last_used_atime: opt_u64(&batch, "last_used_atime", i)?,
-                bytes_counted_elsewhere: bytes_counted_elsewhere.value(i),
-                overlap_count: overlap_count.value(i),
             });
         }
     }
@@ -4612,6 +4577,27 @@ table! {
 }
 
 table! {
+    /// `<store>/unit_meta.parquet` (#176, #185): what an external unit
+    /// carries beyond the v0.7.5 `external_units.parquet` columns -- its
+    /// last-used fact and the structured overlap. A sibling table, keyed by
+    /// the unit's id, so `external_units.parquet` keeps exactly the schema
+    /// v0.7.5 reads and no store-format bump is needed. A row applies only
+    /// to the `external_units` row with the same `observed_at`: a pass by
+    /// another swamp version rewrites the units and leaves this table
+    /// behind, and a stale row must not be shown as a current fact.
+    StoredUnitMetaRow, write_unit_meta_rows, read_unit_meta_rows {
+        scope_key: String,
+        unit_id: String,
+        observed_at: u64,
+        last_used: Option<u64>,
+        last_used_source: Option<String>,
+        last_used_atime: Option<u64>,
+        bytes_counted_elsewhere: u64,
+        overlap_count: u32,
+    }
+}
+
+table! {
     /// `<store>/unit_children.parquet` (#178): one row per line of an
     /// external unit's depth-2 drilldown -- the top child folders, one
     /// remainder row, and a signed adjustment when hardlinks make the
@@ -4623,6 +4609,7 @@ table! {
     StoredUnitChildRow, write_unit_child_rows, read_unit_child_rows {
         scope_key: String,
         unit_id: String,
+        observed_at: u64,
         seq: u32,
         kind: String,
         name: String,

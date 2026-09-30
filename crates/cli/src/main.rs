@@ -433,6 +433,13 @@ fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveSco
 /// history: it is coverage bookkeeping only, per
 /// `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
 fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::EffectiveScope) {
+    if swamp_core::fs_gate::StoreDir::at(store_dir)
+        .and_then(|store| store.is_newer_generation())
+        .unwrap_or(false)
+    {
+        eprintln!("store written by a newer swamp; not modifying it");
+        return;
+    }
     let current_store = swamp_core::fs_gate::StoreDir::at(store_dir)
         .and_then(|store| store.has_current_format())
         .unwrap_or(false);
