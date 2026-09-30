@@ -670,14 +670,10 @@ fn reclaim_lines(units: &[&MarkedUnit]) -> Vec<String> {
             if who.len() == units.len() {
                 lines.push(format!("⚠ {text} (all {} folders)", units.len()));
             } else {
-                let few: Vec<&str> = who.iter().take(3).map(String::as_str).collect();
-                let more = who.len().saturating_sub(3);
-                let more = if more > 0 {
-                    format!(" and {more} more")
-                } else {
-                    String::new()
-                };
-                lines.push(format!("⚠ {text}: {}{more}", few.join(", ")));
+                // Every folder the warning is about, by name: a count
+                // would hide which ones. A plan too long for the sheet
+                // offers no Enter (`confirm_fits`).
+                lines.push(format!("⚠ {text}: {}", who.join(", ")));
             }
         }
     }
