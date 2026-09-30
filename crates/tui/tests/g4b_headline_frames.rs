@@ -712,3 +712,50 @@ fn the_disk_view_lists_the_ledger_parts_and_never_shows_unreadable_as_zero() {
     let (_, work) = swamp_core::work_counters::measured(|| frame(&b, 80, 24));
     assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
 }
+
+/// Tempting wrong patch: the view keys are matched before the modal
+/// handlers, so typing `c`, `D` or `I` into the filter (or the picker's
+/// text field), or pressing them on the plan, the blocked list or help,
+/// switches views instead. Every modal owns its keys first.
+#[test]
+fn the_view_keys_type_letters_in_the_filter_and_do_nothing_in_other_modals() {
+    // Filter text editing: the letters land in the text.
+    let mut a = app();
+    swamp_tui::handle_key(&mut a, KeyCode::Char(':'));
+    assert!(a.editing_filter);
+    for k in ['c', 'D', 'I'] {
+        swamp_tui::handle_key(&mut a, KeyCode::Char(k));
+    }
+    assert!(a.filter_text.ends_with("cDI"), "{}", a.filter_text);
+    assert_eq!(a.view, ViewKind::Projects);
+    swamp_tui::handle_key(&mut a, KeyCode::Esc);
+    // Picker: its text field types them; its other fields ignore them.
+    let mut a = app();
+    swamp_tui::handle_key(&mut a, KeyCode::Char('/'));
+    for k in ['c', 'D', 'I'] {
+        swamp_tui::handle_key(&mut a, KeyCode::Char(k));
+    }
+    assert_eq!(a.view, ViewKind::Projects, "picker field");
+    swamp_tui::handle_key(&mut a, KeyCode::Esc);
+    // Help, the plan sheet and the blocked list keep their own keys.
+    let mut a = app();
+    a.help_open = true;
+    swamp_tui::handle_key(&mut a, KeyCode::Char('c'));
+    assert_eq!(a.view, ViewKind::Projects);
+    // On an open plan the view keys act as the digits always did (the
+    // plan is not a modal here); they bind nothing the plan uses (its keys
+    // are Enter, Esc, d and k).
+    let mut a = app();
+    a.confirm_open = true;
+    swamp_tui::handle_key(&mut a, KeyCode::Char('9'));
+    let digit_switches = a.view != ViewKind::Projects;
+    let mut b = app();
+    b.confirm_open = true;
+    swamp_tui::handle_key(&mut b, KeyCode::Char('c'));
+    assert_eq!(b.view != ViewKind::Projects, digit_switches);
+    let mut a = app();
+    a.blocked_open = true;
+    swamp_tui::handle_key(&mut a, KeyCode::Char('D'));
+    assert_eq!(a.view, ViewKind::Projects);
+    assert!(a.blocked_open);
+}
