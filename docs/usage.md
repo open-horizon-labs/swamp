@@ -1031,7 +1031,7 @@ is taken, so an aborted run changes no store file and no coverage fact
 run logs that one line and exits; there is no retry loop. `swamp ui` does
 not wait on it: it shows the last stored report at once with a
 `disk nearly full: refresh skipped (X free)` banner, and starts no
-refresh or live watch. With no stored report yet, it exits with the same
+refresh. With no stored report yet, it exits with the same
 message instead.
 
 `config init`'s `[scan]` table is not a frozen copy of the built-in

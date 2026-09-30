@@ -5461,8 +5461,8 @@ pub fn stage_tracked_reaching(
     // is not "no stored state" (re-review 4, C2): the pre-fix code's
     // rules-changed branch wrote exactly that file, and so does a
     // `--full`-only store. With the real FSEvents source the replay then
-    // refuses anyway; with the TUI's live plan (`LivePlanSource`) it did
-    // not, and the reclassification was skipped for good because the
+    // refuses anyway; with a live plan (a source handing back an incremental
+    // plan, as the TUI's removed live refresh did) it did not, and the reclassification was skipped for good because the
     // checkpoint stamps the current version. So a recorded version (any
     // non-zero one) that differs forces the walk, anchor or not. `0` is
     // "never recorded": a unit-root cursor file, or a first observation.
