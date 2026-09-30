@@ -2904,9 +2904,8 @@ fn adv_reclaim_view_survives_tiny_and_narrow_screens() {
         let r = capture(&app, w, h);
         app.set_view(ViewKind::External);
         let e = capture(&app, w, h);
-        assert_eq!(
-            line_of(&r, h as usize - 1).is_empty(),
-            false,
+        assert!(
+            !line_of(&r, h as usize - 1).is_empty(),
             "w={w} footer empty\n{r}"
         );
         assert_eq!(
