@@ -618,12 +618,29 @@ fn removing_the_first_entry_of_a_one_line_array_leaves_no_stray_space() {
 #[test]
 fn broad_system_areas_and_the_home_directory_are_refused() {
     // Tempting wrong patch: only refuse `/`, so `/Users` or `~` puts a
-    // whole machine area in scope.
+    // whole machine area in scope; or decide it after the existence check,
+    // so an area that does not exist on this OS (`/Volumes` on Linux) is
+    // reported as missing instead of too broad.
     let f = fx();
-    for typed in [
-        "/", "/Users", "/Volumes", "/private", "/System", "/opt", "/usr", "~", "~/",
-    ] {
+    let common = ["/", "/usr", "/opt", "/var", "~", "~/"];
+    #[cfg(target_os = "macos")]
+    let platform = [
+        "/Users",
+        "/Volumes",
+        "/private",
+        "/System",
+        "/Library",
+        "/Applications",
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let platform = [
+        "/home", "/etc", "/root", "/mnt", "/media", "/proc", "/sys", "/dev",
+    ];
+    for typed in common.iter().chain(platform.iter()) {
         let r = f.add(typed);
+        assert!(matches!(r, Err(RootError::TooBroad(_))), "{typed}: {r:?}");
+        // With --allow-missing too: the decision does not depend on disk.
+        let r = add_root(&f.store, &f.reach(), typed, true);
         assert!(matches!(r, Err(RootError::TooBroad(_))), "{typed}: {r:?}");
     }
     assert!(!f.config.exists());

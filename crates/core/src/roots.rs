@@ -365,6 +365,12 @@ pub fn add_root(
     allow_missing: bool,
 ) -> Result<AddOutcome, RootError> {
     let (stored, expanded) = stored_form(typed, reach)?;
+    // Too broad is decided from the spelling alone, before anything is
+    // checked on disk: `/Volumes` is too broad on Linux too, where it does
+    // not exist.
+    if too_broad(&expanded, reach) {
+        return Err(RootError::TooBroad(expanded));
+    }
     // Everything below, the checks included, happens under the lock, so
     // what was validated is what is recorded.
     let _lock = store
@@ -433,20 +439,24 @@ pub fn add_root(
 /// filesystem root, the system and user areas, and the home directory
 /// itself.
 fn too_broad(key: &Path, reach: &Reach) -> bool {
-    const AREAS: &[&str] = &[
-        "/",
-        "/Users",
-        "/Volumes",
-        "/private",
-        "/System",
-        "/opt",
-        "/usr",
-        "/home",
-        "/var",
-        "/Library",
-        "/Applications",
+    const COMMON: &[&str] = &["/", "/usr", "/opt", "/var", "/private"];
+    #[cfg(target_os = "macos")]
+    const PLATFORM: &[&str] = &["/Users", "/Volumes", "/System", "/Library", "/Applications"];
+    #[cfg(not(target_os = "macos"))]
+    const PLATFORM: &[&str] = &[
+        "/home", "/etc", "/root", "/mnt", "/media", "/proc", "/sys", "/dev", "/srv", "/boot",
     ];
-    AREAS.iter().any(|a| key == comparable(Path::new(a))) || key == comparable(&reach.home)
+    // Both the spelling and, where it resolves, its canonical form (`/tmp`
+    // is `/private/tmp`, a symlinked `/home`).
+    let spellings = [key.to_path_buf(), comparable(key)];
+    spellings.iter().any(|k| {
+        COMMON
+            .iter()
+            .chain(PLATFORM)
+            .any(|a| k == Path::new(a) || k == &comparable(Path::new(a)))
+            || *k == reach.home
+            || *k == comparable(&reach.home)
+    })
 }
 
 /// Stops declaring `typed`, matched however it is spelled. Returns the

@@ -221,7 +221,12 @@ fn a_store_directory_that_cannot_be_written_leaves_the_config_unchanged() {
     let dir = f.config.parent().unwrap().to_path_buf();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
     let r = f.add("~/a");
+    // A superuser can write into a 0555 directory; the refusal is for everyone else.
+    let bypassed = fs::write(dir.join("probe"), b"x").is_ok();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if bypassed {
+        return;
+    }
     assert!(matches!(r, Err(RootError::Io(_))), "{r:?}");
     assert_eq!(f.text(), before);
 }
@@ -538,7 +543,11 @@ fn nested_and_unreadable_declared_roots_are_reported_as_such() {
         1,
     );
     let text = render_declared_roots(&declared_roots(&scope, &[]));
+    // A superuser can open a mode-000 directory; it is unreadable for everyone else.
+    let bypassed = fs::read_dir(&locked).is_ok();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(text.contains("covered"), "{text}");
-    assert!(text.contains("unreadable"), "{text}");
+    if !bypassed {
+        assert!(text.contains("unreadable"), "{text}");
+    }
 }
