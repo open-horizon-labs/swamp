@@ -86,6 +86,37 @@ The header shows the root, observation status, available history, and totals as 
 
 Observation progress shows the elapsed time and the bytes seen; there is no percentage, because the total is not known. The TUI opens no filesystem watch: nothing scans on a file event, so a stored report is exactly as old as the header says. A lock poll only notices when another process observes, shows it, and reloads the stored report when that run ends. The right side of the header is the history sparkline with the net change it covers and the window it is over (`-41.4GB in 1w`); body rows use change bars.
 
+### The developer-storage headline block and the view strip
+
+Under the header, on every view and in every state, sits a headline block of a
+fixed number of rows chosen by the terminal's height alone: four at 22 rows and
+up (the headline with its percent; the breakdown rows, largest first, with
+`+N more` when a narrow screen cannot name them all; the disk state with the
+ages and the ledger's parts; the pointers to Reclaim and Disk with their keys),
+two from 16 rows (headline and pointers), one from 12, none below. Nothing
+changes that height: a warning, a missing ledger, a running scan, a previous
+scope, the first-run line and every view draw into the same rows, so no row of
+the table moves. Lines that come in shorter forms step together to the form
+that keeps the most leading clauses; the wording of the spot-audit warning is
+never traded away, so the clauses after it give way instead. The first-run line
+("New: press c for Reclaim, D for Disk. Hides after you open either.") takes the
+pointer row until either view is opened once, and is remembered in
+`ui_state.json`.
+
+Under the block is the view strip: one row naming every view by its key (`1
+Projects ... 9 External c Reclaim D Disk I Agents`), the current one in reverse
+video (an attribute, never a color, so `NO_COLOR` and light themes keep it). If
+all tabs do not fit it shows whole tabs around the current one with `…` at a cut
+edge, then `v next` and the jump keys as far as they fit. The filter and sort
+have their own row below it. Every view has exactly one direct key: digits for
+the first nine, then letters that no other mode binds (`c` reClaim, `D` Disk, `I`
+AI tools); a test reads the keymap and fails when a key is bound twice.
+
+The Disk view is the stored volume ledger as rows: accounted, everything else
+with its folders, system volumes, not measured (never a size), the protected
+folders estimate, the bookkeeping line and the walk's spot audit. It is read
+only and built from the stored ledger, so opening it lists nothing.
+
 ### External and Agents rows, and a scope-coverage header clause
 
 `report_scope`/`external.rs` (#42/#43) and `agents.rs` (#91/#92) gave

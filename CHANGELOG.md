@@ -5,6 +5,31 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.8.0
 
+- **The first line of `swamp report`, the TUI and the Reclaim view is now "Developer
+  storage: X across N locations (P% of used)".** It replaces headlining ~/src alone
+  (16 GB on the reporting machine, while developer storage was about 224 GB). It
+  counts the source roots (less standalone Cargo targets, which get their own row), every catalog unit
+  (toolchains and SDKs, caches, agent storage, containers and VMs, other), and never
+  system volumes, the measured "everything else", Homebrew's remainder unit or
+  mounted disk images. The percent is of the container's used bytes from the disk
+  ledger (never the Data volume), rounded down to one decimal, and is absent, with the
+  reason, when there is no ledger, when it is unreadable, from a newer swamp or dated
+  in the future, when used is zero or missing, or when developer storage exceeds
+  used (a FLAG instead of a percent above 100). The breakdown rows add up to the
+  headline exactly; below them: everything else (five largest), system volumes, not
+  measured with its count, the walk's spot-audit warning when it disagrees, and the ages of
+  the observation and the ledger. `report --json` has the same numbers as a `headline`
+  object, and the Reclaim JSON adds `headline_relation`. This also puts the "System
+  volumes" line (#170) in the TUI. Reading it starts nothing and lists nothing.
+- **The TUI names its views and how to reach them.** A row under the headline shows
+  every view with its key, the current one in reverse video (`1 Projects ... 9 External c
+  Reclaim D Disk I Agents`, windowed with `…` on a narrow screen). New keys: `c`
+  opens Reclaim, `D` opens a new Disk view (the stored volume ledger as rows),
+  `I` opens the AI tools' storage; `?` help lists every view with its key and what
+  it shows. The headline block points at Reclaim and Disk with their keys, and a
+  store that has never opened either shows one line saying so until it does
+  (`ui_state.json` `views_seen`). The block is four rows, so on a 24-row
+  screen the table has 15 rows where it had 19.
 - **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
   unit of developer storage, largest first, with what getting it back costs in the
   tool's own words, when it was last used and from what record, who is known to

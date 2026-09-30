@@ -139,7 +139,9 @@ fn frame(app: &App, w: u16, h: u16) -> Vec<String> {
         .collect()
 }
 
-fn states() -> Vec<(&'static str, Box<dyn Fn(&mut App)>)> {
+type Setter = Box<dyn Fn(&mut App)>;
+
+fn states() -> Vec<(&'static str, Setter)> {
     vec![
         ("fresh", Box::new(|_a: &mut App| {})),
         (
@@ -334,6 +336,58 @@ fn drawing_the_block_and_every_view_does_no_work() {
         }
     });
     assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+}
+
+/// Tempting wrong patch: the audit warning is only in `swamp report`, so a
+/// person who lives in the TUI never sees that the walk is being
+/// contradicted. It is the first clause of the block's third line at every
+/// width, and the row does not move.
+#[test]
+fn a_spot_audit_that_disagrees_is_the_first_thing_on_the_disk_line_at_every_width() {
+    let mut rows = vec![
+        lrow("/h/src", LedgerCategory::Declared, Some(30 * GB)),
+        lrow("/Users/x/Movies", LedgerCategory::Other, Some(9 * GB)),
+    ];
+    let mut audit = lrow(
+        "spot audit: /Users/x/Library",
+        LedgerCategory::Audit,
+        Some(130 * GB),
+    );
+    audit.entries = Some(100 * GB);
+    audit.exactness = Exactness::Estimated;
+    rows.push(audit);
+    let meta = VolumeMetaRow {
+        measured_at: now() - 3600,
+        cycle_started_at: 1,
+        cycle_complete_at: now() - 3600,
+        complete: true,
+        budget_secs: 120,
+        budget_used_ms: 1000,
+        statfs_at: now() - 3600,
+        container_total: Some(500 * GB),
+        container_used: Some(100 * GB),
+        container_free: Some(400 * GB),
+        data_volume_used: Some(90 * GB),
+    };
+    let mut a = app();
+    a.set_ledger(LedgerReading::Measured(Box::new(account(&rows, &meta))));
+    for w in [40u16, 50, 80, 120] {
+        let f = frame(&a, w, 24);
+        assert!(f[3].starts_with("FLAG: "), "{w}: {}", f[3]);
+        assert!(f[3].contains("spot audit"), "{w}: {}", f[3]);
+        if w >= 80 {
+            assert!(f[3].contains("swamp report --view disk"), "{w}: {}", f[3]);
+        }
+        // Same rows as the calm state: strip and table heading unmoved.
+        assert!(f[5].contains("Projects"), "{w}: {}", f[5]);
+    }
+    // The Disk view shows the audit as its own row.
+    a.set_view(ViewKind::Disk);
+    let f = frame(&a, 120, 30).join("\n");
+    assert!(
+        f.contains("FLAG: walk spot audit disagrees with the ledger"),
+        "{f}"
+    );
 }
 
 // ---------------------------------------------------------------------

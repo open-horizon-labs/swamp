@@ -2606,18 +2606,65 @@ pub fn disk_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<Row> 
     if let Some(est) = a.not_measured.estimate_bytes {
         let mut e = Row::leaf(
             0,
-            "Estimate for what could not be read (an estimate, not a measurement)".to_string(),
+            "Protected folders may hold up to this (an estimate, part of no check)".to_string(),
             est,
             None,
         );
-        e.detail_lines =
-            vec!["The Data volume's own size minus everything measured above.".to_string()];
+        e.detail_lines = vec![
+            "The unexplained part of the Data volume: its own size minus everything measured above.".to_string(),
+        ];
         rows.push(e);
     }
     if let Some(r) = a.residual.bytes {
-        let mut e = Row::leaf(0, a.residual.name.to_string(), r.unsigned_abs(), None);
+        let mut e = Row::leaf(
+            0,
+            format!("{} (bookkeeping)", a.residual.name),
+            r.unsigned_abs(),
+            None,
+        );
         e.size_text = Some(swamp_core::render::human_bytes_signed(r));
         rows.push(e);
+    }
+    // The independent spot audit: the one check that can fail from an
+    // undercounting walk.
+    let audit_label = if a.audit.folders.is_empty() {
+        format!(
+            "Walk spot audit: not run ({})",
+            a.audit.skipped.as_deref().unwrap_or("no reason recorded")
+        )
+    } else if a.audit.audit_flag {
+        "FLAG: walk spot audit disagrees with the ledger".to_string()
+    } else {
+        format!(
+            "Walk spot-audited: {} folders, max difference {:.1}%",
+            a.audit.folders.len(),
+            a.audit.max_difference_percent
+        )
+    };
+    let mut audit = Row::leaf(0, audit_label, 0, None);
+    audit.size_text = Some("check".to_string());
+    rows.push(audit);
+    for f in &a.audit.folders {
+        let mut c = Row::leaf(
+            1,
+            format!(
+                "{}: ledger {} vs audit {} ({:+.1}%)",
+                f.path,
+                swamp_core::render::human_bytes_pub(f.ledger_bytes),
+                swamp_core::render::human_bytes_pub(f.audited_bytes),
+                f.percent
+            ),
+            f.audited_bytes,
+            None,
+        );
+        c.rail = "├─ ".into();
+        c.allocated = true;
+        c.signals = vec![if f.outside_tolerance {
+            "outside tolerance".to_string()
+        } else {
+            "within tolerance".to_string()
+        }];
+        rows.push(c);
     }
     rows
 }

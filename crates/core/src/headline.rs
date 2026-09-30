@@ -207,8 +207,24 @@ pub struct NotMeasuredPart {
     pub names: Vec<String>,
     /// Locations no run of the current cycle has measured yet.
     pub not_yet_measured: usize,
-    /// What the Data volume holds beyond what was measured. An estimate.
+    /// The unexplained part of the Data volume (its own size minus every
+    /// measured part): the most the protected folders can hold. An
+    /// estimate, and part of no check.
     pub estimate_bytes: Option<u64>,
+}
+
+/// The independent spot audit of the walk (the one check that can fail
+/// from an undercounting walk), as the headline shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditPart {
+    /// Folders the pass audited.
+    pub folders: usize,
+    /// At least one folder's audit disagrees with the ledger beyond the
+    /// tolerance.
+    pub flag: bool,
+    pub max_difference_percent: f64,
+    /// Why nothing was audited, when nothing was.
+    pub skipped: Option<String>,
 }
 
 /// The disk ledger's agreement with the headline, on one store.
@@ -240,8 +256,14 @@ pub struct Measured {
     pub everything_else: Elsewhere,
     pub system_volumes: SystemPart,
     pub not_measured: NotMeasuredPart,
-    /// The disk view's own flag: its parts do not add up.
-    pub residual_flag: bool,
+    /// Bookkeeping only: the parts, with the estimate, add up to the
+    /// container's used bytes within 1%. Arithmetic, not evidence about the
+    /// walk (the estimate is a leftover); informational.
+    pub bookkeeping_balanced: Option<bool>,
+    /// Used bytes minus the measured parts only: what the measurements do
+    /// not explain, protected folders included. Informational.
+    pub unexplained_bytes: Option<i64>,
+    pub audit: AuditPart,
     pub accounted_check: AccountedCheck,
 }
 
@@ -532,7 +554,14 @@ fn measured(
             not_yet_measured: a.not_measured.not_yet_measured,
             estimate_bytes: a.not_measured.estimate_bytes,
         },
-        residual_flag: a.residual.residual_flag,
+        bookkeeping_balanced: a.residual.bookkeeping_balanced,
+        unexplained_bytes: a.residual.unexplained_bytes,
+        audit: AuditPart {
+            folders: a.audit.folders.len(),
+            flag: a.audit.audit_flag,
+            max_difference_percent: a.audit.max_difference_percent,
+            skipped: a.audit.skipped.clone(),
+        },
         accounted_check: AccountedCheck {
             disk_view_accounted: a.accounted.bytes,
             developer_plus_remainder: sum,
@@ -684,6 +713,16 @@ impl Headline {
         }
     }
 
+    /// The visible warning when the spot audit disagrees with the walk.
+    pub fn audit_sentence(&self) -> Option<String> {
+        match &self.disk {
+            Disk::Measured(m) if m.audit.flag => {
+                Some("FLAG: walk spot audit disagrees: see swamp report --view disk".to_string())
+            }
+            _ => None,
+        }
+    }
+
     /// `Everything else` and its largest pieces, `System volumes`,
     /// `Not measured`: the lines below the breakdown. Empty without a
     /// usable ledger.
@@ -717,15 +756,16 @@ impl Headline {
         ));
         let nm = &m.not_measured;
         let mut line = format!(
-            "Not measured: {} {} could not be read",
+            "Not measured: {} {}",
             nm.directories,
             plural(nm.directories, "directory", "directories")
         );
-        if let Some(est) = nm.estimate_bytes {
-            line.push_str(&format!(
-                "; the Data volume holds an estimated {} more than was measured (an estimate, not a measurement)",
+        match nm.estimate_bytes {
+            Some(est) => line.push_str(&format!(
+                " (protected folders); the unexplained part of the Data volume, up to {}, may be inside them (an estimate, not part of any check)",
                 human(est)
-            ));
+            )),
+            None => line.push_str(" could not be read"),
         }
         out.push(line);
         for n in &nm.names {
@@ -737,6 +777,14 @@ impl Headline {
                 nm.not_yet_measured,
                 plural(nm.not_yet_measured, "location", "locations")
             ));
+        }
+        match (&m.audit.skipped, m.audit.folders) {
+            (Some(why), 0) => out.push(format!("Walk spot audit: not run ({why})")),
+            (_, n) => out.push(format!(
+                "Walk spot-audited: {n} {}, max difference {:.1}%",
+                plural(n, "folder", "folders"),
+                m.audit.max_difference_percent
+            )),
         }
         out
     }
@@ -750,6 +798,9 @@ impl Headline {
         }
         let _ = writeln!(out, "  {}", self.ages_sentence(now));
         if let Some(s) = self.disk_state_sentence() {
+            let _ = writeln!(out, "  {s}");
+        }
+        if let Some(s) = self.audit_sentence() {
             let _ = writeln!(out, "  {s}");
         }
         for f in &self.flags {
@@ -807,9 +858,11 @@ impl Headline {
         out
     }
 
-    /// The `headline` object of `report --json`: the numbers text prints,
-    /// plus the ages at `now`.
-    pub fn to_json(&self, now: u64) -> serde_json::Value {
+    /// The `headline` object of `report --json`: the numbers text prints.
+    /// It carries the times its sources were measured, not ages: two
+    /// reports of one store are identical however far apart they run
+    /// (`ages_sentence` turns the times into "3 h ago" for text).
+    pub fn to_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         let ledger_at = match &self.disk {
             Disk::Measured(m) => Some(m.measured_at),
@@ -823,14 +876,12 @@ impl Headline {
                 .unwrap_or(serde_json::Value::Null),
             _ => serde_json::Value::Null,
         };
-        v["ages"] = json!({
+        v["measured_at"] = json!({
             "observed_at": self.observed_at,
-            "observed_age_secs": now.saturating_sub(self.observed_at),
             "ledger_measured_at": ledger_at,
-            "ledger_age_secs": ledger_at.map(|t| now.saturating_sub(t)),
-            "text": self.ages_sentence(now),
         });
         v["disk_state"] = json!(self.disk_state_sentence());
+        v["audit_warning"] = json!(self.audit_sentence());
         v["scope_sentence"] = json!(self.scope_sentence());
         v
     }

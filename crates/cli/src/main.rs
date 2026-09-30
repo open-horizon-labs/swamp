@@ -854,7 +854,7 @@ fn report_json_envelope(
         swamp_core::agent_json::apply_filter_to_report(&mut rr, f);
     }
     let observed_at = rr.observed_at;
-    let headline_json = headline.to_json(swamp_core::entities::now());
+    let headline_json = headline.to_json();
 
     if let Some(v) = view {
         let name = v.name();

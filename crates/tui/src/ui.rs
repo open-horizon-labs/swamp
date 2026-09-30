@@ -986,7 +986,7 @@ pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
         "no developer storage found in the stored observation".to_string()
     } else {
         let mut sorted = rows.clone();
-        sorted.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.bytes));
         let long: Vec<String> = sorted
             .iter()
             .map(|c| format!("{} {}", c.label, human_bytes(c.bytes)))
@@ -1028,6 +1028,17 @@ pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
             "only the root named on the command line".to_string(),
             "one root only".to_string(),
         ]);
+    }
+    // The spot audit is the one check that can catch an undercounting
+    // walk: when it disagrees, that is the first thing the block says.
+    if h.audit_sentence().is_some() {
+        // One form per width: the wording is never traded for the clauses
+        // after it, which give way instead.
+        third.push(if width >= 64 {
+            vec!["FLAG: walk spot audit disagrees: see swamp report --view disk".to_string()]
+        } else {
+            vec!["FLAG: spot audit disagrees (D)".to_string()]
+        });
     }
     match &h.disk {
         Disk::Measured(m) if m.percent_of_used_tenths.is_none() && m.exceeds_used => {
@@ -1381,11 +1392,11 @@ pub fn view_strip_spans(app: &App, width: usize) -> Vec<Span<'static>> {
     if lo > 0 {
         spans.push(Span::styled("… ", quiet));
     }
-    for i in lo..=hi {
+    for (i, label) in labels.iter().enumerate().take(hi + 1).skip(lo) {
         if i > lo {
             spans.push(Span::raw("  "));
         }
-        let l = clip_end(&labels[i], room.max(1));
+        let l = clip_end(label, room.max(1));
         spans.push(if i == cur {
             Span::styled(l, selected_style())
         } else {

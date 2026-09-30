@@ -754,9 +754,9 @@ rows[]       { path, kind, detector, bytes, growth_bytes?,
 
 `bytes == regenerable_bytes + held_bytes + not_regenerable_bytes +
 not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
-is not measured). `totals` is the object the storage headline reuses.
+is not measured). `totals` is the object the storage headline reuses (`remainder_bytes` is the part of it that is not developer storage; see "Developer storage: the headline").
 
-In the TUI, `v` reaches the Reclaim view (after External). It is built from the
+In the TUI, `c` opens the Reclaim view directly (and `v` reaches it after External; the strip under the headline names it). It is built from the
 stored facts, scans nothing on open, and keeps the same layout as every view:
 the scope statement sits under the heading, the cost, last-used fact and removal
 path are the signals (and the detail pane's first lines at any width), `→` or
@@ -874,7 +874,7 @@ today vs. named-and-planned). In short:
   contributing tool in the text tree, and an `agent_storage: {units,
   total_bytes}` object in JSON.
 
-The TUI has a dedicated Agents view (`v`, no digit -- `0` is "clear
+The TUI has a dedicated Agents view (`I`, or `v` to cycle; `0` is "clear
 filter"): the same per-unit facts as `--view agents`. `Space`/
 `Backspace` mark the selected unit and open the confirm banner showing
 its real consequences (session-removal loss warnings, the linked
@@ -888,6 +888,101 @@ same way, skipping protected/unmarkable ones and naming the skip in the
 status rows. The project tree's own Tree view also shows the collapsed
 "Agent storage (linked)" summary row (informational; marking a specific
 unit still happens in the Agents view).
+
+## Developer storage: the headline
+
+The first thing `swamp report` prints, the top of the TUI and the top of
+`swamp report --view reclaim` is one line:
+
+```text
+Developer storage: 224.1GB across 61 locations (57.4% of used)
+```
+
+It reads stored facts only: no listing, no `stat`, no program (a test counts
+work and asserts zero). Sizes use the one byte formatter (decimal, `GB`).
+
+**What it counts.** Allocated bytes of:
+
+- **projects**: everything under the declared (or built-in default) source
+  roots, less the standalone Cargo target directories found there (they have
+  their own row). Worktrees that live inside a tool's folder are counted here,
+  and the tool's unit already leaves them out
+  (`bytes_counted_elsewhere`), so nothing is counted twice;
+- **toolchains and SDKs** (installations and environments), **caches**
+  (downloads, caches, build output), **agent storage** (an AI tool's home,
+  from the detector's own declaration), **containers and VMs** (Docker,
+  OrbStack), **other developer units** (local state, models, and anything a
+  build of swamp does not place: a unit is never left out for want of a row);
+- **standalone Cargo targets**.
+
+**What it never counts:** system volumes; the measured "Everything else"
+bucket; the *remainder* of a location after its developer tooling (Homebrew's
+"other", selected by the detector's `remainder_of` capability, never by name);
+mounted disk images (a view of image files stored, and counted, elsewhere:
+taken out only when the disk ledger knows them); the unattributed residual; and
+protected or not-yet-measured estimates. A location is counted when it holds
+bytes; the count is the number of rows added.
+
+**The percent** is developer storage divided by the container's used bytes from
+the disk ledger, the number `df` calls used, never the Data volume's. It is
+rounded **down** to one decimal, in integer arithmetic, so it is never larger
+than the truth (99.96% reads 99.9%). It is absent, and the line says why, when
+there is no ledger yet (`disk ledger: not measured yet; run swamp observe
+--volume`), when the ledger is unreadable, written by a newer swamp or dated in
+the future, when the container's used bytes are missing or zero, when the report
+covers only a root named on the command line, and when developer storage is
+larger than used (a `FLAG` line instead: a measurement is wrong or counts shared
+bytes twice; never a percent above 100).
+
+Below the line, in order:
+
+- the ages: `observed 4 min ago; disk ledger measured 3 h ago`, and, when the
+  ledger is more than a day older than the observation, that the percent divides
+  newer developer storage by an older disk reading;
+- when the numbers cover a previous scope (roots changed since), or one root
+  named on the command line, the sentence that says so;
+- one row per breakdown category with its bytes and count. The rows add up to the
+  headline **exactly** (in bytes; the exact figure is printed once, after the
+  rows, because each row is rounded on its own);
+- what was left out on purpose, with bytes (the remainder unit, mounted images);
+- from the ledger: **Everything else** with its five largest measured folders,
+  **System volumes** (named, one sentence on sharing the free space),
+  **Not measured: N directories** with the first names, and, when something is
+  unreadable, "protected folders ... the unexplained part of the Data volume, up
+  to X, may be inside them (an estimate, not part of any check)";
+- the walk's spot audit: `FLAG: walk spot audit disagrees: see swamp report
+  --view disk` when it disagrees (the only check that can catch a walk that
+  undercounts), otherwise how many folders were audited.
+
+**How the numbers relate.** On one store, with `walked` the source roots'
+walked total and `standalone` the standalone Cargo targets:
+
+```text
+developer storage = (walked - standalone)                        projects
+                  + Reclaim totals (regenerable + held out
+                    + not regenerable + cost not established)   units and targets
+                  - Reclaim remainder units
+                  - mounted disk images
+disk view "accounted" = developer storage + remainder units
+```
+
+`swamp report --view reclaim` prints the first line after its headline, and its
+JSON carries `headline_relation` (`holds`); `headline.disk.accounted_check`
+carries the second. They differ only when the ledger's accounted rows came from a
+different observation than the units read here, and then the difference is shown.
+
+`swamp report --json` carries the same numbers as a `headline` object
+(`developer_bytes`, `locations`, `categories`, `not_counted`, `percent_of_used`,
+`disk` with its `state`, `ages`, `flags`, and `line`, the text's first line).
+
+In the TUI the same block is four rows under the header on every view and in
+every state (headline, breakdown, disk state and ages, then the pointers to
+Reclaim and Disk), two rows on a terminal under 22 rows tall (the headline and
+the pointers), one under 16, none under 12. Nothing changes its height, so no
+row moves when a warning appears. Until you have opened Reclaim or Disk once, the
+pointer row says `New: press c for Reclaim, D for Disk. Hides after you open
+either.`; that is remembered in `ui_state.json` (`views_seen`; an older swamp
+ignores the key).
 
 ## Where the whole disk went (the volume ledger)
 
@@ -1063,7 +1158,11 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | `/` | Open the filter form |
 | `:` | Edit the filter expression; Tab completes terms |
 | `0` | Clear the filter |
-| `v`, `1`–`9` | Cycle/select projects, tree, builds, deps, Docker, kinds, unowned, types, external; `v` also reaches agents (no digit -- `0` is clear filter) |
+| `v` | Next view. The strip under the headline names every view with its key, the current one in reverse video; on a narrow screen it shows the current view and its neighbors with `…` |
+| `1`–`9` | Projects, tree, builds, deps, Docker, kinds, unowned, types, external |
+| `c` | Reclaim: regenerable developer storage by unit, what getting it back costs, last used |
+| `D` | Disk: where the whole disk went (accounted, everything else, system volumes, not measured, the walk's spot audit), from the stored volume ledger |
+| `I` | Agents: AI coding tools' sessions, caches and logs |
 | `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age |
 | `r` | Reverse the sort |
 | `?` | Show help |

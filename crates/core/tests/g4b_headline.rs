@@ -287,8 +287,9 @@ Everything else (measured, not developer storage): 34.0GB across 2 folders
       25.0GB  /System/Library/AssetsV2  (exact)
        9.0GB  /Users/x/Movies  (exact)
 System volumes: 16.0GB (Preboot, VM) (separate volumes that share the container's free space)
-Not measured: 1 directory could not be read; the Data volume holds an estimated 78.0GB more than was measured (an estimate, not a measurement)
+Not measured: 1 directory (protected folders); the unexplained part of the Data volume, up to 78.0GB, may be inside them (an estimate, not part of any check)
   /Users/x/Pictures (not measured)
+Walk spot audit: not run (not run this pass)
 ";
     assert_eq!(text, want, "\n{text}");
 }
@@ -420,7 +421,7 @@ fn developer_storage_larger_than_used_is_flagged_and_has_no_percent() {
         !text.contains("120.0%") && !text.contains("100.0%"),
         "{text}"
     );
-    let j = h.to_json(NOW);
+    let j = h.to_json();
     assert!(j["percent_of_used"].is_null());
     assert_eq!(j["disk"]["exceeds_used"], true);
     assert!(!h.flags.is_empty());
@@ -445,7 +446,7 @@ fn zero_used_bytes_gives_no_percent_and_no_panic() {
         h.render_text(NOW)
             .contains("reports 0 bytes used; no percent")
     );
-    let v = h.to_json(NOW);
+    let v = h.to_json();
     assert!(v["percent_of_used"].is_null());
     // And a ledger with no container figure at all.
     let ledger = reading(vec![], meta(None, None, NOW - 60));
@@ -523,7 +524,7 @@ fn a_missing_corrupt_newer_or_future_dated_ledger_degrades_with_a_line_and_no_pe
         assert!(!h.line.contains('%'), "{name}: {}", h.line);
         let text = h.render_text(NOW);
         assert!(text.contains(sentence), "{name}: {text}");
-        assert!(h.to_json(NOW)["percent_of_used"].is_null(), "{name}");
+        assert!(h.to_json()["percent_of_used"].is_null(), "{name}");
         // The developer bytes do not depend on the ledger being readable.
         assert_eq!(h.developer_bytes, GB, "{name}");
     }
@@ -911,6 +912,78 @@ fn a_ledger_missing_a_unit_disagrees_with_the_headline_by_that_unit() {
 }
 
 // ---------------------------------------------------------------------
+// The walk's independent spot audit
+// ---------------------------------------------------------------------
+
+fn audit_row(folder: &str, ledger: u64, audited: u64, outside: bool) -> Row {
+    Row {
+        path: format!("spot audit: {folder}"),
+        category: LedgerCategory::Audit,
+        bytes: Some(audited),
+        overlap_bytes: 0,
+        entries: Some(ledger),
+        unreadable: 0,
+        measured_at: NOW - 60,
+        method: "spot audit: naive lstat sum".to_string(),
+        exactness: if outside {
+            Exactness::Estimated
+        } else {
+            Exactness::Exact
+        },
+        note: None,
+    }
+}
+
+/// Tempting wrong patch: the headline shows a percent and no warning while
+/// the spot audit says the walk undercounts (the only check that can catch
+/// it), or it shows the warning for an audit inside its tolerance. The
+/// warning is a line of the headline, in the text and in the JSON.
+#[test]
+fn a_walk_the_spot_audit_disagrees_with_is_warned_about_in_the_headline() {
+    let units = vec![unit(
+        "rustup",
+        "rustup",
+        StorageCategory::Installation,
+        "/a",
+        10 * GB,
+    )];
+    let r = report(0, &[]);
+    let flagged = reading(
+        vec![audit_row("/Users/x/Library", 100 * GB, 130 * GB, true)],
+        meta(Some(200 * GB), Some(150 * GB), NOW - 60),
+    );
+    let h = headline_of(&units, &r, &flagged, ScopeKind::Current);
+    let text = h.render_text(NOW);
+    assert!(
+        text.contains("  FLAG: walk spot audit disagrees: see swamp report --view disk"),
+        "{text}"
+    );
+    assert_eq!(
+        h.to_json()["audit_warning"],
+        "FLAG: walk spot audit disagrees: see swamp report --view disk"
+    );
+    assert_eq!(h.to_json()["disk"]["audit"]["flag"], true);
+    // Inside the tolerance: audited, said so, no warning.
+    let fine = reading(
+        vec![audit_row(
+            "/Users/x/Library",
+            100 * GB,
+            100 * GB + 1000,
+            false,
+        )],
+        meta(Some(200 * GB), Some(150 * GB), NOW - 60),
+    );
+    let h = headline_of(&units, &r, &fine, ScopeKind::Current);
+    let text = h.render_text(NOW);
+    assert!(!text.contains("spot audit disagrees"), "{text}");
+    assert!(
+        text.contains("Walk spot-audited: 1 folder, max difference 0.0%"),
+        "{text}"
+    );
+    assert!(h.to_json()["audit_warning"].is_null());
+}
+
+// ---------------------------------------------------------------------
 // Scope statements
 // ---------------------------------------------------------------------
 
@@ -941,7 +1014,7 @@ fn an_explicit_root_and_a_previous_scope_are_stated() {
         ),
         "{text}"
     );
-    assert_eq!(prev.to_json(NOW)["previous_scope_roots"], 3);
+    assert_eq!(prev.to_json()["previous_scope_roots"], 3);
 }
 
 // ---------------------------------------------------------------------
@@ -956,7 +1029,7 @@ fn text_and_json_carry_the_same_numbers() {
     let r = report(30 * GB, &[("/h/src/tmp/t1", GB), ("/h/src/tmp/t2", GB)]);
     let ledger = known_ledger(200 * GB, &units, 30 * GB, NOW - 3 * 3600);
     let h = headline_of(&units, &r, &ledger, ScopeKind::Current);
-    let j = h.to_json(NOW);
+    let j = h.to_json();
     let text = h.render_text(NOW);
     assert_eq!(j["line"].as_str().unwrap(), text.lines().next().unwrap());
     assert_eq!(j["developer_bytes"], 60 * GB);
@@ -983,10 +1056,13 @@ fn text_and_json_carry_the_same_numbers() {
             .unwrap();
         assert!(line.contains(&human), "{line} vs {human}");
     }
-    assert_eq!(
-        j["ages"]["text"].as_str().unwrap(),
-        "observed 4 min ago; disk ledger measured 3 h ago"
-    );
+    // The text says the ages; the JSON keeps the times, so two reads of
+    // one store are identical however far apart they run.
+    assert!(text.contains("observed 4 min ago; disk ledger measured 3 h ago"));
+    assert_eq!(j["measured_at"]["observed_at"], r.observed_at);
+    assert_eq!(j["measured_at"]["ledger_measured_at"], NOW - 3 * 3600);
+    assert!(j.get("ages").is_none());
+    assert_eq!(h.to_json(), h.to_json());
 }
 
 /// Tempting wrong patch: sums use `+` on stored u64s, which panics in a
@@ -1023,7 +1099,7 @@ fn huge_stored_values_neither_panic_nor_wrap() {
         h.flags
     );
     let _ = h.render_text(NOW);
-    let _ = h.to_json(NOW);
+    let _ = h.to_json();
     let facts = ManagerFacts::default();
     let view = build_reclaim(&ReclaimInput {
         units: &units,
@@ -1052,7 +1128,7 @@ fn building_and_rendering_the_headline_does_no_work() {
     let (_, work) = swamp_core::work_counters::measured(|| {
         let h = headline_of(&units, &r, &ledger, ScopeKind::Current);
         let _ = h.render_text(NOW);
-        let _ = h.to_json(NOW);
+        let _ = h.to_json();
         let _ = h.line_tiers();
     });
     assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
@@ -1109,7 +1185,7 @@ fn no_state_of_the_headline_carries_a_verdict_word_or_an_em_dash() {
         ),
     ];
     for h in &states {
-        let blob = format!("{}\n{}", h.render_text(NOW), h.to_json(NOW));
+        let blob = format!("{}\n{}", h.render_text(NOW), h.to_json());
         let lower = blob.to_lowercase();
         for word in [
             "unused",
