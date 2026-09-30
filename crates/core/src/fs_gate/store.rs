@@ -241,6 +241,31 @@ impl StoreDir {
         super::continuity::try_lock(&self.0.join("volume-pass.lock"), true)
     }
 
+    /// Removes `volume_ledger*.parquet.corrupt-<stamp>` files whose stamp is
+    /// older than `max_age_secs` before `now`. Only those names.
+    pub fn remove_stale_quarantine(&self, now: u64, max_age_secs: u64) -> io::Result<usize> {
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&self.0)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some((base, stamp)) = name.rsplit_once(".corrupt-") else {
+                continue;
+            };
+            if !matches!(base, "volume_ledger.parquet" | "volume_ledger_meta.parquet") {
+                continue;
+            }
+            let Ok(stamp) = stamp.parse::<u64>() else {
+                continue;
+            };
+            if now.saturating_sub(stamp) > max_age_secs && entry.file_type()?.is_file() {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Moves a file swamp wrote inside this store aside as
     /// `<name>.corrupt-<stamp>` (never over an existing file), so a
     /// ledger that cannot be read stops blocking the next pass and is

@@ -917,7 +917,7 @@ swamp report --view disk --json --all    # every row
   `/opt`, `/private`, `/Applications`, `/Users` and `/System/Library`, with the
   five largest shown. Sizes are allocated bytes (`st_blocks`), `lstat` only: no
   file is opened, no symlink followed, no FIFO or socket touched. A file with
-  several hardlinks is counted once for the whole pass (a bounded set; past two
+  several hardlinks is counted once for the whole pass (a bounded set of about 68 MB; past two
   million linked files a link may be counted twice, and the run says so; a
   hardlink whose two folders were measured in different runs of a resumed pass
   is counted in each run).
@@ -935,18 +935,31 @@ swamp report --view disk --json --all    # every row
   dropped. swamp does not ask for Full Disk Access; the report only says it
   would change this. **Not measured yet this pass** lists, by name, the
   locations the cursor has not reached (an unfinished pass).
-- **Not measured (unreadable folders or not yet measured), estimated**: the Data
-  volume's own consumed bytes minus everything measured. It exists ONLY while
-  something is unreadable or not yet measured, it is an estimate and not a
-  measurement, and it is shown apart from the measured parts.
-- **Unattributed: allocation not explained by any measured part**: the residual.
-  Nothing absorbs it. It is what is left between the container's used bytes and
-  the parts above, signed (negative when clones or shared extents were counted
-  once per file), and the check is on it: when its size is more than 1% of the
-  container's used bytes the report prints a `FLAG` line, and the JSON has
-  `within_one_percent: false` and `residual_flag: true`. A walk that missed a
-  tenth of the disk therefore flags itself. On this Mac it is a few hundred MB
-  (APFS container overhead).
+- **Protected folders: not measured (N folders)**, with the sentence "the
+  unexplained part of the Data volume, up to X GB, may be inside them". X is the
+  Data volume's own consumed bytes minus everything measured. It is an
+  ESTIMATE, it exists only while something is unreadable or not yet measured, and
+  it is not part of any check.
+- **Unattributed: allocation not explained by any measured part (bookkeeping)**:
+  the parts, estimate included, minus the container's used bytes, signed
+  (negative when clones or shared extents were counted once per file). That the
+  parts add up (`bookkeeping_balanced`, within 1%) is arithmetic, not evidence:
+  the estimate is a leftover, so it can balance anything, and a `FLAG` prints only
+  when even that arithmetic fails. It says nothing about whether the walk is
+  right. `unexplained_bytes` in the JSON is the container's used bytes minus the
+  measured parts alone (protected folders included); on a Mac with protected
+  folders it is large, and that is not a claim about the walk either.
+- **Walk spot audit** is the check that can fail. Each pass, after the walk and
+  inside the budget, up to five readable folders measured this run (the largest
+  one always, the rest rotating by day number, never a folder with an
+  unreadable part) are measured again by a naive, independent method: a plain
+  recursive sum of `st_blocks * 512`, a hardlink once per audit, sharing only
+  the system calls with the walker. Each is compared with the ledger's row; a
+  difference beyond `max(1%, 4 MiB)` sets `audit_flag` and prints `FLAG: walk spot
+  audit disagrees on <path>: ledger X vs audit Y (Z%)`. Otherwise the report says
+  "walk spot-audited: 5 folders, max difference 0.3%". Audit time is part of the
+  budget; a spent budget skips it with a note. The results are stored as
+  `audit` rows in the ledger (no new columns).
 - **On other volumes**: a declared root on another volume is listed as
   "not part of this container" and never added to the internal disk's
   accounted bytes.
@@ -979,20 +992,26 @@ same way, with no size.
   Linux, a mount that shares the root filesystem, such as a btrfs subvolume at
   `/home`, is measured as a folder of its own rather than dropped.)
 - **Low priority, bounded, resumable.** Its threads run at background
-  priority, three at a time. One run measures for at most
-  `volume_pass_budget_secs` (default 120; values under 5 are raised to 5),
-  *including* the three system queries and the planning listing, then stops even
-  in the middle of a folder (a folder that did not finish leaves no row). When
-  those overheads alone eat more than half the budget the walk gets half a
-  budget of its own, so a run can take up to 1.5 budgets. Past 2 budgets the
-  pass stops waiting for a worker stuck in a system call, records that folder as
-  not measured, logs the path, releases its lock, and the next run continues.
+  priority, three at a time. One run is bounded by `volume_pass_budget_secs`
+  (default 120; values under 5 are raised to 5): the three system queries
+  (each killed after 20 s) and planning (limited to half a budget; a plan that
+  hits it is incomplete and the cycle is not called complete) come first, the
+  walk stops at the budget minus a slice kept for the spot audit (checked per
+  entry, so mid-folder: a folder that did not finish leaves no row), and when
+  those overheads leave the walk less than half a budget it gets half a budget
+  anyway. Past 2 budgets from the start of the run the pass stops waiting for a
+  worker stuck in a system call. The real bound is therefore 2 budgets plus the
+  system queries. A stuck folder is recorded as not measured, the path is
+  logged, the lock released, and the NEXT run tries it again; after three runs in
+  a row it is skipped until the next cycle (with the date) and that is logged once.
   The cursor is stored in the ledger: every row keeps its own measured time, and
   a partial pass shows a partial ledger with honest ages. A folder that fills a
   whole run by itself is measured as its children from then on. An unfinished
   pass continues at every observe whatever the interval says. Rows dated in the
-  future are not believed and are measured again; a ledger file that cannot be
-  read is moved aside as `*.corrupt-<time>` and the pass starts fresh.
+  future are not believed and are measured again. A ledger file that cannot be
+  parsed is moved aside as `*.corrupt-<time>` (removed after seven days) and the
+  pass starts fresh; a file that merely could not be read (an I/O error) is left
+  where it is and the pass is skipped.
 - **Skipped, with one line, when the disk-full guard trips** (`min_free_bytes`)
   or when the store's format marker is not this build's generation (older, or
   newer: this build never writes into a newer swamp's store).

@@ -46,6 +46,18 @@ pub const NOT_MEASURED_ESTIMATE_NAME: &str =
 
 /// A row that says a location has not been measured yet this cycle.
 pub const METHOD_PENDING: &str = "pending";
+/// Audit rows are keyed `spot audit: <folder>`, so they can never be
+/// mistaken for the folder's own row.
+pub const AUDIT_PREFIX: &str = "spot audit: ";
+/// A spot-audit row.
+pub const METHOD_AUDIT: &str = "spot audit: naive lstat sum";
+/// A folder that did not answer by the hard deadline.
+pub const METHOD_STUCK: &str = "stuck";
+/// A folder that was stuck three runs in a row: left until the next cycle.
+pub const METHOD_SKIPPED: &str = "skipped";
+/// Half a percent is not a tolerance: an audit difference is within
+/// `max(1%, 4 MiB)`.
+pub const AUDIT_TOLERANCE_BYTES: u64 = 4 << 20;
 
 /// A lossless `path` for a row: the path as text when it is UTF-8, and
 /// otherwise its lossy text plus the exact bytes in hex, so two names that
@@ -101,6 +113,9 @@ pub enum Category {
     /// A location on another volume (a declared root on an external
     /// disk): real bytes, but not on this container.
     External,
+    /// One folder of the spot audit (`bytes` = audited bytes, `entries` =
+    /// the ledger's bytes for it).
+    Audit,
 }
 
 impl Category {
@@ -115,6 +130,7 @@ impl Category {
             Category::Unreadable => "unreadable",
             Category::Mount => "mount",
             Category::External => "external",
+            Category::Audit => "audit",
         }
     }
 
@@ -129,6 +145,7 @@ impl Category {
             "unreadable" => Category::Unreadable,
             "mount" => Category::Mount,
             "external" => Category::External,
+            "audit" => Category::Audit,
             _ => return None,
         })
     }
@@ -414,6 +431,7 @@ pub struct Account {
     pub snapshots: Option<Row>,
     pub not_measured: NotMeasured,
     pub residual: Residual,
+    pub audit: SpotAudit,
     /// Mounted disk images: their bytes live in the image files counted
     /// where they are stored, so these are never added.
     pub mounted_views: Vec<Row>,
@@ -472,16 +490,52 @@ pub struct NotMeasured {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Residual {
     pub name: &'static str,
-    /// Container used minus every part above; negative when the parts
-    /// add up to more than the container holds (APFS clones and shared
-    /// extents are counted once per file). `None` without a container
-    /// figure.
+    /// Container used minus every part above, protected-folder estimate
+    /// included; negative when the parts add up to more than the container
+    /// holds (APFS clones and shared extents are counted once per file).
+    /// `None` without a container figure.
     pub bytes: Option<i64>,
     pub percent_of_used: Option<f64>,
-    /// `|residual|` is within 1% of the container's used bytes.
-    pub within_one_percent: Option<bool>,
-    /// The parts do not reconcile: `|residual|` is more than 1% of used.
+    /// BOOKKEEPING: the parts, with the estimate, add up to the container's
+    /// used bytes within 1%. This is arithmetic, not evidence about the
+    /// walk: the estimate is defined as a leftover, so it can balance
+    /// anything. The walk is checked by the spot audit.
+    pub bookkeeping_balanced: Option<bool>,
+    /// `bookkeeping_balanced` is false (kept under this name for readers of
+    /// the previous shape).
     pub residual_flag: bool,
+    /// Container used minus the MEASURED parts only (no estimate): what
+    /// the measurements do not explain, protected folders included. Not a
+    /// pass/fail claim about the walk.
+    pub unexplained_bytes: Option<i64>,
+    /// `|unexplained|` is within 1% of used (an unusual thing on a Mac
+    /// with protected folders; informational, never a claim about the
+    /// walk).
+    pub within_one_percent: Option<bool>,
+}
+
+/// One folder the pass measured twice: by the walk and by an independent
+/// naive audit.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditFolder {
+    pub path: String,
+    pub ledger_bytes: u64,
+    pub audited_bytes: u64,
+    pub difference: i64,
+    pub percent: f64,
+    /// The difference is outside `max(1%, 4 MiB)`.
+    pub outside_tolerance: bool,
+}
+
+/// The independent spot audit: the only check that can fail from the walk.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SpotAudit {
+    pub folders: Vec<AuditFolder>,
+    /// Why no folder was audited this pass (budget spent, nothing to
+    /// audit); `None` when it ran.
+    pub skipped: Option<String>,
+    pub max_difference_percent: f64,
+    pub audit_flag: bool,
 }
 
 fn sum_u64(values: impl Iterator<Item = u64>) -> u64 {
@@ -490,6 +544,46 @@ fn sum_u64(values: impl Iterator<Item = u64>) -> u64 {
 
 fn clamp_i64(v: i128) -> i64 {
     v.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn spot_audit(live: &[&Row]) -> SpotAudit {
+    let mut folders = Vec::new();
+    let mut skipped = None;
+    for r in live.iter().filter(|r| r.category == Category::Audit) {
+        match (r.bytes, r.entries) {
+            (Some(audited), Some(ledger)) => {
+                let diff = audited as i128 - ledger as i128;
+                let pct = if ledger == 0 {
+                    if audited == 0 { 0.0 } else { 100.0 }
+                } else {
+                    diff as f64 * 100.0 / ledger as f64
+                };
+                folders.push(AuditFolder {
+                    path: r
+                        .path
+                        .strip_prefix(AUDIT_PREFIX)
+                        .unwrap_or(&r.path)
+                        .to_string(),
+                    ledger_bytes: ledger,
+                    audited_bytes: audited,
+                    difference: clamp_i64(diff),
+                    percent: pct,
+                    outside_tolerance: r.exactness == Exactness::Estimated,
+                });
+            }
+            _ => skipped = Some(r.note.clone().unwrap_or_else(|| "not run".to_string())),
+        }
+    }
+    if folders.is_empty() && skipped.is_none() {
+        skipped = Some("not run this pass".to_string());
+    }
+    let max = folders.iter().map(|f| f.percent.abs()).fold(0.0, f64::max);
+    SpotAudit {
+        audit_flag: folders.iter().any(|f| f.outside_tolerance),
+        max_difference_percent: max,
+        folders,
+        skipped,
+    }
 }
 
 /// Rows and meta into the reading. Pure: no disk, no clock. Every sum
@@ -580,22 +674,30 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
     .iter()
     .map(|v| *v as u128)
     .sum();
-    let (residual_bytes, percent, within) = match meta.container_used {
-        Some(used) => {
-            let r: i128 = used as i128 - parts_sum as i128;
-            let pct = if used == 0 {
-                0.0
-            } else {
-                r as f64 * 100.0 / used as f64
-            };
-            (
-                Some(clamp_i64(r)),
-                Some(pct),
-                Some(r.unsigned_abs().saturating_mul(100) <= used as u128),
-            )
-        }
-        None => (None, None, None),
-    };
+    let measured_sum: u128 = [accounted.bytes, else_bytes, system_bytes, snapshot_bytes]
+        .iter()
+        .map(|v| *v as u128)
+        .sum();
+    let (residual_bytes, percent, balanced, unexplained, within_unexplained) =
+        match meta.container_used {
+            Some(used) => {
+                let r: i128 = used as i128 - parts_sum as i128;
+                let u: i128 = used as i128 - measured_sum as i128;
+                let pct = if used == 0 {
+                    0.0
+                } else {
+                    r as f64 * 100.0 / used as f64
+                };
+                (
+                    Some(clamp_i64(r)),
+                    Some(pct),
+                    Some(r.unsigned_abs().saturating_mul(100) <= used as u128),
+                    Some(clamp_i64(u)),
+                    Some(u.unsigned_abs().saturating_mul(100) <= used as u128),
+                )
+            }
+            None => (None, None, None, None, None),
+        };
 
     let mut notes: Vec<String> = Vec::new();
     for r in &live {
@@ -674,9 +776,12 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
             name: RESIDUAL_NAME,
             bytes: residual_bytes,
             percent_of_used: percent,
-            within_one_percent: within,
-            residual_flag: within == Some(false),
+            bookkeeping_balanced: balanced,
+            residual_flag: balanced == Some(false),
+            unexplained_bytes: unexplained,
+            within_one_percent: within_unexplained,
         },
+        audit: spot_audit(&live),
         mounted_views,
         external_volumes,
         notes,

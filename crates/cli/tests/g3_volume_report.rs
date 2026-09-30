@@ -172,7 +172,11 @@ fn view_disk_reads_the_stored_ledger_with_ages_and_the_named_residual() {
     // 40 GB used = 17 + 9 + 10 + estimate (30 - 26 = 4) + residual 0.
     assert_eq!(r["not_measured"]["estimate_bytes"], 4_000_000_000u64);
     assert_eq!(r["residual"]["bytes"], 0);
-    assert_eq!(r["residual"]["within_one_percent"], true);
+    assert_eq!(r["residual"]["bookkeeping_balanced"], true);
+    assert_eq!(
+        r["residual"]["within_one_percent"], false,
+        "the measured parts alone do not explain the Data volume"
+    );
 }
 
 #[test]

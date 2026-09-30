@@ -42,8 +42,9 @@
 
 use super::system::{self, SystemProbe};
 use super::{
-    Accounted, Category, Exactness, MAX_NAMED_ROWS, METHOD_EXPANDED, METHOD_OVER_BUDGET,
-    METHOD_PENDING, METHOD_WALK, MountKind, MountView, Row, accounted_rows, mount_row,
+    AUDIT_PREFIX, AUDIT_TOLERANCE_BYTES, Accounted, Category, Exactness, MAX_NAMED_ROWS,
+    METHOD_AUDIT, METHOD_EXPANDED, METHOD_OVER_BUDGET, METHOD_PENDING, METHOD_SKIPPED,
+    METHOD_STUCK, METHOD_WALK, MountKind, MountView, Row, accounted_rows, mount_row,
 };
 use crate::growth::VolumeMetaRow;
 use anyhow::Result;
@@ -67,6 +68,23 @@ pub const WORKERS: usize = 3;
 
 /// A budget of zero would never move the cursor: this is used instead.
 pub const MIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// A folder that is stuck this many runs in a row is skipped for the cycle.
+pub const MAX_STUCK_RUNS: u64 = 3;
+
+/// `YYYY-MM-DD` (UTC) of an epoch second.
+fn date_text(epoch: u64) -> String {
+    let z = (epoch / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
 
 // ---- the filesystem the pass reads ----------------------------------
 
@@ -170,32 +188,7 @@ impl VolumeFs for RealFs {
         let root_total = crate::fs_gate::fs_space::total_bytes(Path::new("/"));
         crate::fs_gate::sys::mount_points()
             .into_iter()
-            .filter(|m| {
-                // Not a place anyone looks for files: the system's own
-                // mounts and pseudo filesystems.
-                m.path != Path::new("/")
-                    && !m.path.starts_with("/System/Volumes/Data")
-                    && !m.path.starts_with("/System/Volumes/VM")
-                    && !m.path.starts_with("/System/Volumes/Preboot")
-                    && !m.path.starts_with("/System/Volumes/Update")
-                    && !m.path.starts_with("/System/Volumes/xarts")
-                    && !m.path.starts_with("/System/Volumes/iSCPreboot")
-                    && !m.path.starts_with("/System/Volumes/Hardware")
-                    && !m.path.starts_with("/dev")
-                    && !matches!(
-                        m.fs_type.as_str(),
-                        "devfs"
-                            | "procfs"
-                            | "proc"
-                            | "sysfs"
-                            | "tmpfs"
-                            | "devtmpfs"
-                            | "cgroup"
-                            | "cgroup2"
-                            | "overlay"
-                            | "squashfs"
-                    )
-            })
+            .filter(|m| keep_mount(&m.path, &m.fs_type, m.local))
             .map(|m| {
                 // Network, FUSE and automounter filesystems are decided
                 // from the mount table alone: their paths are never
@@ -229,6 +222,48 @@ impl VolumeFs for RealFs {
             })
             .collect()
     }
+}
+
+/// Whether a mount-table entry matters to the pass. Network, FUSE and
+/// automounter mounts are ALWAYS kept, wherever they are spelled (an
+/// `auto_home` at `/System/Volumes/Data/home` must be known so its path is
+/// never statted); the system's own local mounts and pseudo filesystems
+/// are not places anyone looks for files. Other mounts under the data
+/// volume are kept: they are mapped to their normal path, not dropped.
+pub fn keep_mount(path: &Path, fs_type: &str, local: bool) -> bool {
+    if !local || is_remote_fs(fs_type) {
+        return true;
+    }
+    const INTERNAL: [&str; 7] = [
+        "VM",
+        "Preboot",
+        "Update",
+        "xarts",
+        "iSCPreboot",
+        "Hardware",
+        "Data",
+    ];
+    let internal = path == Path::new("/")
+        || path.starts_with("/dev")
+        || INTERNAL.iter().any(|n| {
+            let p = Path::new("/System/Volumes").join(n);
+            // Only the volume itself, not what is mounted inside Data.
+            path == p || (*n != "Data" && path.starts_with(&p))
+        });
+    !internal
+        && !matches!(
+            fs_type,
+            "devfs"
+                | "procfs"
+                | "proc"
+                | "sysfs"
+                | "tmpfs"
+                | "devtmpfs"
+                | "cgroup"
+                | "cgroup2"
+                | "overlay"
+                | "squashfs"
+        )
 }
 
 /// Filesystem types that are never local storage this pass may touch.
@@ -321,6 +356,15 @@ impl Layout {
 /// spellings of one folder compare equal.
 pub fn logical_path(path: &Path, data_root: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
+    // APFS is case-insensitive by default: the data volume's mount point
+    // is recognised whatever the spelling. (Other folder names are not
+    // case-folded: the comparison with a walked path stays exact.)
+    const MAC_DATA: &str = "/system/volumes/data";
+    let lower = p.to_string_lossy().to_ascii_lowercase();
+    if lower == MAC_DATA || lower.starts_with("/system/volumes/data/") {
+        let tail = p.to_string_lossy()[MAC_DATA.len()..].to_string();
+        p = Path::new("/").join(tail.trim_start_matches('/'));
+    }
     for root in [Path::new("/System/Volumes/Data"), data_root] {
         if root != Path::new("/")
             && let Ok(rest) = p.strip_prefix(root)
@@ -407,6 +451,9 @@ pub struct Plan {
     pub notes: Vec<Row>,
     /// `expanded` markers this plan consulted (kept when the cycle ends).
     pub markers: Vec<String>,
+    /// Planning stopped at its time limit: the task list is incomplete, so
+    /// the cycle cannot be called complete.
+    pub truncated: bool,
 }
 
 struct PlanCtx<'a> {
@@ -417,6 +464,7 @@ struct PlanCtx<'a> {
     prev: &'a HashMap<String, Row>,
     data_dev: u64,
     now: u64,
+    deadline: Instant,
     plan: Plan,
 }
 
@@ -446,7 +494,17 @@ fn denied_note(e: &io::Error) -> String {
 }
 
 impl PlanCtx<'_> {
+    fn out_of_time(&mut self) -> bool {
+        if Instant::now() >= self.deadline {
+            self.plan.truncated = true;
+        }
+        self.plan.truncated
+    }
+
     fn plan_dir(&mut self, dir: &Path) {
+        if self.out_of_time() {
+            return;
+        }
         let entries = match self.fs.list(dir) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return,
@@ -480,7 +538,7 @@ impl PlanCtx<'_> {
     }
 
     fn plan_child(&mut self, path: &Path) {
-        if self.accounted.contains(path) {
+        if self.accounted.contains(path) || self.out_of_time() {
             return;
         }
         // The mount table is consulted first: a mount point is never
@@ -559,6 +617,7 @@ pub fn build_plan(
     accounted: &HashSet<PathBuf>,
     prev: &HashMap<String, Row>,
     now: u64,
+    deadline: Instant,
 ) -> Plan {
     let root = Path::new("/");
     let data_dev = fs.lstat(root).map(|s| s.dev).unwrap_or(0);
@@ -570,6 +629,7 @@ pub fn build_plan(
         prev,
         data_dev,
         now,
+        deadline,
         plan: Plan::default(),
     };
     ctx.plan_dir(root);
@@ -622,7 +682,7 @@ pub struct WalkShared {
     pub links_overflowed: AtomicBool,
 }
 
-/// Distinct multi-link files remembered per pass (about 32 MB).
+/// Distinct multi-link files remembered per pass (about 68 MB).
 pub const LINK_SET_CAP: usize = 2_000_000;
 
 impl WalkShared {
@@ -903,7 +963,13 @@ fn changed_note(m: &Measured) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-fn rows_for(mounts: &[MountView], finished: &Finished, budget: Duration, now: u64) -> Vec<Row> {
+fn rows_for(
+    mounts: &[MountView],
+    prev: &HashMap<String, Row>,
+    finished: &Finished,
+    budget: Duration,
+    now: u64,
+) -> Vec<Row> {
     let key = finished.task.key();
     let mut rows = Vec::new();
     match &finished.outcome {
@@ -985,20 +1051,38 @@ fn rows_for(mounts: &[MountView], finished: &Finished, budget: Duration, now: u6
             note: Some(why.clone()),
         }),
         Outcome::Gone => {}
-        Outcome::Stuck(at) => rows.push(Row {
-            path: key,
-            category: Category::Unreadable,
-            bytes: None,
-            overlap_bytes: 0,
-            entries: None,
-            unreadable: 1,
-            measured_at: now,
-            method: "stuck".to_string(),
-            exactness: Exactness::NotMeasured,
-            note: Some(format!(
-                "did not answer by the pass's hard deadline (stuck at {at}); not measured, tried again next cycle"
-            )),
-        }),
+        Outcome::Stuck(at) => {
+            // A stuck folder is retried by the next run; after three runs
+            // in a row it is left until the next cycle.
+            let times = prev
+                .get(&key)
+                .filter(|r| r.method == METHOD_STUCK)
+                .map(|r| r.unreadable)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let skipped = times >= MAX_STUCK_RUNS;
+            rows.push(Row {
+                path: key,
+                category: Category::Unreadable,
+                bytes: None,
+                overlap_bytes: 0,
+                entries: None,
+                unreadable: times,
+                measured_at: now,
+                method: if skipped { METHOD_SKIPPED } else { METHOD_STUCK }.to_string(),
+                exactness: Exactness::NotMeasured,
+                note: Some(if skipped {
+                    format!(
+                        "did not answer in {times} runs in a row (stuck at {at}); skipped until {} (the next cycle)",
+                        date_text(now.saturating_add(86_400))
+                    )
+                } else {
+                    format!(
+                        "did not answer by the pass's hard deadline (stuck at {at}); tried again next run"
+                    )
+                }),
+            });
+        }
         Outcome::Aborted => {
             // A task that was running from the start of the run and still
             // did not finish took the whole budget by itself.
@@ -1117,6 +1201,205 @@ fn is_walk_derived(r: &Row) -> bool {
     )
 }
 
+// ---- the spot audit -----------------------------------------------------
+
+/// How one audited folder came out.
+enum AuditSize {
+    Size(u64),
+    /// A folder inside could not be listed: never audited.
+    Unreadable,
+    OutOfTime,
+}
+
+/// A NAIVE, independent size of `root`: a plain recursive sum of
+/// `st_blocks * 512` over regular files, a hardlink once per audit, the
+/// same folders left out that the walk leaves out (accounted locations and
+/// mount points). Deliberately shares nothing with the walker but the
+/// syscalls (`list`, `lstat`): no worker pool, no shared hardlink set, no
+/// per-entry bookkeeping, so a bug in the walker's arithmetic is not
+/// repeated here.
+fn audit_size(fs: &dyn VolumeFs, shared: &WalkShared, root: &Path, deadline: Instant) -> AuditSize {
+    let mut total: u64 = 0;
+    let mut links: HashSet<(u64, u64)> = HashSet::new();
+    let mut todo: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        if Instant::now() >= deadline {
+            return AuditSize::OutOfTime;
+        }
+        let entries = match fs.list_until(&dir, deadline) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => return AuditSize::OutOfTime,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return AuditSize::Unreadable,
+        };
+        for e in entries {
+            if Instant::now() >= deadline {
+                return AuditSize::OutOfTime;
+            }
+            let p = dir.join(&e.name);
+            match e.kind {
+                Kind::Dir => {
+                    if !shared.prune.contains(&p) && !shared.mounts.contains_key(&p) {
+                        todo.push(p);
+                    }
+                }
+                Kind::File => {
+                    if let Ok(st) = fs.lstat(&p) {
+                        if st.nlink > 1 && !links.insert((st.dev, st.ino)) {
+                            continue;
+                        }
+                        total = total.saturating_add(st.blocks.saturating_mul(512));
+                    }
+                }
+                Kind::Symlink | Kind::Other => {}
+            }
+        }
+    }
+    AuditSize::Size(total)
+}
+
+/// Up to five readable folders measured this run, largest first, picked
+/// by the day number so the choice rotates from one day to the next.
+fn choose_audit(fresh: &[Row], now: u64) -> Vec<Row> {
+    let mut pool: Vec<&Row> = fresh
+        .iter()
+        .filter(|r| {
+            r.category == Category::Other
+                && r.method == METHOD_WALK
+                && r.exactness == Exactness::Exact
+                && r.unreadable == 0
+                && r.bytes.is_some_and(|b| b > 0)
+                && !r.path.ends_with(FILES_SUFFIX)
+        })
+        .collect();
+    pool.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.path.cmp(&b.path)));
+    pool.truncate(10);
+    let Some(largest) = pool.first() else {
+        return Vec::new();
+    };
+    // The largest folder is always audited; the rest of the five rotate
+    // with the day number.
+    let mut picked: Vec<Row> = vec![(*largest).clone()];
+    let rest = &pool[1..];
+    let seed = (now / 86_400) as usize;
+    let mut used: HashSet<usize> = HashSet::new();
+    let mut k = 0;
+    while picked.len() < 5 && !rest.is_empty() && k < rest.len() * 3 {
+        let i = (seed + k) % rest.len();
+        if used.insert(i) {
+            picked.push(rest[i].clone());
+        }
+        k += 1;
+    }
+    picked
+}
+
+fn audit_note_row(now: u64, why: &str) -> Row {
+    Row {
+        path: format!("{AUDIT_PREFIX}(none)"),
+        category: Category::Audit,
+        bytes: None,
+        overlap_bytes: 0,
+        entries: None,
+        unreadable: 0,
+        measured_at: now,
+        method: METHOD_AUDIT.to_string(),
+        exactness: Exactness::NotMeasured,
+        note: Some(why.to_string()),
+    }
+}
+
+/// Re-measures the chosen folders naively and compares them with the
+/// walk's rows. Runs on its own detached thread and is waited for only
+/// until `deadline`; time is the run's budget, so a spent budget skips it
+/// with a note.
+fn spot_audit_rows(
+    fs: Arc<dyn VolumeFs>,
+    shared: Arc<WalkShared>,
+    chosen: Vec<Row>,
+    deadline: Instant,
+    now: u64,
+) -> Vec<Row> {
+    if chosen.is_empty() {
+        return vec![audit_note_row(
+            now,
+            "no readable folder was measured this pass",
+        )];
+    }
+    if Instant::now() >= deadline {
+        return vec![audit_note_row(
+            now,
+            "the time budget was spent before the audit",
+        )];
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, AuditSize)>();
+    let folders: Vec<PathBuf> = chosen.iter().map(|r| PathBuf::from(&r.path)).collect();
+    let counters = crate::work_counters::current();
+    std::thread::spawn(move || {
+        crate::work_counters::install(counters);
+        crate::fs_gate::sys::lower_current_thread_priority();
+        for (i, f) in folders.iter().enumerate() {
+            let out = audit_size(&*fs, &shared, f, deadline);
+            let stop = matches!(out, AuditSize::OutOfTime);
+            if tx.send((i, out)).is_err() || stop {
+                break;
+            }
+        }
+    });
+    let mut rows = Vec::new();
+    let mut skipped: Option<String> = None;
+    let mut seen = 0usize;
+    while seen < chosen.len() {
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(50));
+        match rx.recv_timeout(wait) {
+            Ok((i, AuditSize::Size(audited))) => {
+                seen += 1;
+                let ledger = chosen[i].bytes.unwrap_or(0);
+                let tolerance = (ledger / 100).max(AUDIT_TOLERANCE_BYTES);
+                let diff = audited.abs_diff(ledger);
+                let outside = diff > tolerance;
+                let signed = audited as i128 - ledger as i128;
+                rows.push(Row {
+                    path: format!("{AUDIT_PREFIX}{}", chosen[i].path),
+                    category: Category::Audit,
+                    bytes: Some(audited),
+                    overlap_bytes: 0,
+                    entries: Some(ledger),
+                    unreadable: 0,
+                    measured_at: now,
+                    method: METHOD_AUDIT.to_string(),
+                    exactness: if outside {
+                        Exactness::Estimated
+                    } else {
+                        Exactness::Exact
+                    },
+                    note: Some(format!(
+                        "ledger {ledger} bytes, audit {audited} bytes, difference {signed}; tolerance {tolerance}"
+                    )),
+                });
+            }
+            Ok((_, AuditSize::Unreadable)) => {
+                seen += 1;
+                skipped.get_or_insert_with(|| {
+                    "a folder could not be listed by the audit and was not audited".to_string()
+                });
+            }
+            Ok((_, AuditSize::OutOfTime)) | Err(_) => {
+                skipped.get_or_insert_with(|| {
+                    "the time budget was spent; the remaining folders were not audited".to_string()
+                });
+                break;
+            }
+        }
+    }
+    if rows.is_empty() || skipped.is_some() {
+        rows.push(audit_note_row(now, skipped.as_deref().unwrap_or("not run")));
+    }
+    rows
+}
+
 /// Runs the pass once. Never runs on the TUI or report path: the caller
 /// is `swamp observe`.
 pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
@@ -1134,8 +1417,20 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
         ));
     };
     let mut notes: Vec<String> = Vec::new();
+    // Quarantined ledgers older than a week are removed.
+    let _ = crate::growth::remove_stale_quarantined_ledgers(inputs.store_dir, now);
     let (stored, prev_meta) = match crate::growth::read_volume_ledger(inputs.store_dir) {
         Ok(read) => read,
+        // A failed read (EIO, EMFILE, a permission error) says nothing about
+        // the file: the pass is skipped and nothing is moved.
+        Err(e)
+            if e.chain()
+                .any(|c| c.downcast_ref::<std::io::Error>().is_some()) =>
+        {
+            return Ok(PassOutcome::Skipped(format!(
+                "volume pass skipped: the ledger could not be read ({e}); a read error, not a damaged file, so nothing was moved"
+            )));
+        }
         Err(e) => {
             // A ledger that cannot be read must not wedge every later
             // pass: it is moved aside and the pass starts fresh.
@@ -1227,6 +1522,7 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
         .iter()
         .map(|r| (r.path.clone(), r.clone()))
         .collect();
+    // Planning has its own limit: half a budget.
     let plan = build_plan(
         &*mapped,
         inputs.layout,
@@ -1234,7 +1530,14 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
         &accounted_set,
         &by_key,
         now,
+        Instant::now() + budget / 2,
     );
+    if plan.truncated {
+        notes.push(
+            "planning stopped at its time limit (half a budget); the cycle is not complete"
+                .to_string(),
+        );
+    }
 
     let pending: Vec<Task> = plan
         .tasks
@@ -1244,6 +1547,7 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
                 r.measured_at < cycle_started_at
                     || r.method == METHOD_EXPANDED
                     || r.method == METHOD_PENDING
+                    || r.method == METHOD_STUCK
             })
         })
         .cloned()
@@ -1252,10 +1556,12 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
     // The budget covers the whole run, the system queries and the plan
     // included; only when they alone eat more than half of it does the
     // walk get half a budget of its own, so a tiny budget still moves
-    // the cursor (a run can then take up to 1.5 budgets). Past twice the
+    // the cursor (the run is bounded by twice the budget plus the system queries). Past twice the
     // budget the pass stops waiting for a worker stuck in a system call.
     let t0 = Instant::now();
-    let deadline = (started + budget).max(t0 + budget / 2);
+    // The last slice of the budget is kept for the spot audit.
+    let audit_reserve = (budget / 8).min(Duration::from_secs(10));
+    let deadline = (started + budget - audit_reserve).max(t0 + budget / 2);
     let hard_deadline = deadline.max(started + budget * 2);
     let shared = Arc::new(WalkShared {
         prune: accounted_set.clone(),
@@ -1282,16 +1588,21 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
             "more than {LINK_SET_CAP} hardlinked files: past that a hardlink may be counted twice"
         ));
     }
-    let budget_used_ms = started.elapsed().as_millis() as u64;
 
     let mut new_rows: Vec<Row> = Vec::new();
     let mut replaced_dirs: Vec<PathBuf> = Vec::new();
     let mut replaced_keys: HashSet<String> = HashSet::new();
     let mut measured = 0usize;
     for f in &finished {
-        let rows = rows_for(&mounts, f, budget, now);
+        let rows = rows_for(&mounts, &by_key, f, budget, now);
         match &f.outcome {
-            Outcome::Done(_) | Outcome::Unreadable(_) | Outcome::Gone | Outcome::Stuck(_) => {
+            Outcome::Stuck(_) => {
+                replaced_keys.insert(f.task.key());
+                if rows.iter().any(|r| r.method == METHOD_SKIPPED) {
+                    notes.push(format!("{} did not answer in {MAX_STUCK_RUNS} runs in a row: skipped until the next cycle", f.task.key()));
+                }
+            }
+            Outcome::Done(_) | Outcome::Unreadable(_) | Outcome::Gone => {
                 measured += 1;
                 replaced_keys.insert(f.task.key());
                 if !f.task.files_only {
@@ -1306,6 +1617,16 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
         }
         new_rows.extend(rows);
     }
+
+    // The independent spot audit: after the walk, inside the budget.
+    let audit_rows = spot_audit_rows(
+        mapped.clone(),
+        shared.clone(),
+        choose_audit(&new_rows, now),
+        started + budget,
+        now,
+    );
+    let budget_used_ms = started.elapsed().as_millis() as u64;
 
     // Keep what this run did not redo.
     let mut merged: Vec<Row> = prev_rows
@@ -1324,6 +1645,7 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
             if replaced_keys.contains(&r.path)
                 || r.method == METHOD_LISTING
                 || r.method == METHOD_PENDING
+                || r.category == Category::Audit
             {
                 return false;
             }
@@ -1352,6 +1674,7 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
             .map(|m| mount_row(m, now)),
     );
     merged.extend(facts.rows.clone());
+    merged.extend(audit_rows);
     merged.extend(plan.notes.clone());
 
     let fresh = |rows: &[Row]| -> HashSet<String> {
@@ -1361,11 +1684,12 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
                 r.measured_at >= cycle_started_at
                     && r.method != METHOD_EXPANDED
                     && r.method != METHOD_PENDING
+                    && r.method != METHOD_STUCK
             })
             .map(|r| r.path.clone())
             .collect()
     };
-    let complete = {
+    let complete = !plan.truncated && {
         let fresh = fresh(&merged);
         plan.tasks.iter().all(|t| fresh.contains(&t.key()))
     };
