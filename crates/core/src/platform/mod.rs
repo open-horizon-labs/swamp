@@ -456,8 +456,9 @@ pub const CAPABILITIES: &[Capability] = &[
         macos: Support::Supported,
         linux: Support::Supported,
         note: "macOS runs a bounded lsof; Linux reads procfs (fds, cwd, exe, maps) of this \
-               user's processes. Anything that cannot be read is Unknown, which every \
-               destructive sink refuses on -- never 'nothing is open'.",
+               user's processes. Anything that cannot be read is Unknown -- never 'nothing is \
+               open': a Trash move names it as a warning on the confirm, and tool-managed \
+               removal (no Trash) names it as a warning and re-checks it at `Y`.",
     },
     Capability {
         id: "atime-reliability",

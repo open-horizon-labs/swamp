@@ -743,3 +743,114 @@ fn a_nested_unit_with_no_cleanup_rule_plans_as_its_exact_path_with_the_reason() 
     let err = swamp_core::actions::propose(&report, None, &[gone], "t").unwrap_err();
     assert!(err.to_string().contains("gone"), "{err}");
 }
+
+// ---------------------------------------------------------------------
+// AI-tool storage: the person's plan and the agent-facing plan differ.
+// ---------------------------------------------------------------------
+
+fn agent_unit(
+    category: swamp_core::agents::AgentCategory,
+    action: swamp_core::agents::AgentActionCapability,
+    protected: bool,
+    reason: Option<&str>,
+    path: &Path,
+) -> swamp_core::agents::AgentUnit {
+    swamp_core::agents::AgentUnit {
+        tool_id: "claude-code".into(),
+        tool_name: "Claude Code".into(),
+        tool_home: path.parent().unwrap().to_path_buf(),
+        category,
+        id: swamp_core::agents::unit_id("claude-code", category, "u"),
+        relative_path: "u".into(),
+        path: path.to_path_buf(),
+        members: Vec::new(),
+        bytes: 10,
+        hardlinked: false,
+        complete: true,
+        growth_bytes: None,
+        regrowth_count: 0,
+        observed_at: NOW,
+        mtime_max: NOW,
+        protected,
+        protect_reason: reason.map(str::to_string),
+        project_link: swamp_core::agents::ProjectLinkState::NotApplicable,
+        action,
+        note: None,
+        evidence: Vec::new(),
+    }
+}
+
+/// Tempting wrong patch: the person's plan keeps the agent-facing refusals
+/// (kept by default, no rule, database file), or the agent-facing plan
+/// loses them. For a person each is a warning; for an AI tool each still
+/// refuses (the parity difference the maintainer was told about). The
+/// person's own `swamp protect` mark refuses in both.
+#[test]
+fn the_persons_agent_plan_warns_where_the_agent_plan_refuses() {
+    use swamp_core::actions::{propose_agents, propose_agents_for_human};
+    use swamp_core::agents::{AgentActionCapability as Act, AgentCategory as Cat};
+    let f = fx();
+    let cfg = f.home.join("settings.json");
+    let scratch = f.home.join("sidecar.db-wal");
+    let wt = f.home.join("worktrees");
+    std::fs::write(&cfg, b"{}").unwrap();
+    std::fs::write(&scratch, b"x").unwrap();
+    make_dir(&wt);
+    let units = [
+        agent_unit(
+            Cat::ProtectedConfig,
+            Act::None,
+            true,
+            Some("global settings"),
+            &cfg,
+        ),
+        agent_unit(
+            Cat::ProtectedDatabases,
+            Act::CacheOrLogTrash,
+            false,
+            None,
+            &scratch,
+        ),
+        agent_unit(Cat::ManagedWorktrees, Act::None, false, None, &wt),
+    ];
+    for u in &units {
+        let p = std::slice::from_ref(&u.path);
+        assert!(
+            propose_agents(std::slice::from_ref(u), p, "ai").is_err(),
+            "{}: an AI tool's plan keeps its refusals",
+            u.path.display()
+        );
+        let plan = propose_agents_for_human(std::slice::from_ref(u), p, "me")
+            .unwrap_or_else(|e| panic!("{}: {e}", u.path.display()));
+        assert_eq!(plan[0].path(), u.path.as_path());
+    }
+    let w = |i: usize| {
+        propose_agents_for_human(
+            std::slice::from_ref(&units[i]),
+            &[units[i].path.clone()],
+            "me",
+        )
+        .unwrap()[0]
+            .warnings()
+            .join("\n")
+    };
+    assert!(w(0).contains("swamp keeps this by default"), "{}", w(0));
+    assert!(w(1).contains("database file"), "{}", w(1));
+    assert!(w(2).contains("real linked git worktree"), "{}", w(2));
+    // A reason that names the person's own mark refuses, even here.
+    let mine = agent_unit(
+        Cat::Caches,
+        Act::CacheOrLogTrash,
+        true,
+        Some("/x is kept by `swamp protect`"),
+        &wt,
+    );
+    let err =
+        propose_agents_for_human(std::slice::from_ref(&mine), &[wt.clone()], "me").unwrap_err();
+    assert!(err.to_string().contains("protected by you"), "{err}");
+    // And a config FILE moves to Trash (the cache move took folders only).
+    let dest = swamp_core::actions::trash_agent_cache(&cfg, &f.trash, 1)
+        .unwrap()
+        .0;
+    assert!(dest.exists() && !cfg.exists());
+}

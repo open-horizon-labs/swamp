@@ -1620,14 +1620,15 @@ fn node_and_gradle_family_group_frames() {
             .find(|r| r.label == "Build outputs")
             .expect("the Gradle outputs group");
         assert!(outputs.expandable && outputs.collapsed_children == Some(1));
-        // Marking a group is refused as inspection-only, and nothing is
-        // marked.
+        // Marking a group header no cleanup rule covers is a category of
+        // paths, not a path: it says so and points at the items inside;
+        // nothing is marked.
         app.mark_row(outputs);
         assert!(app.marked.is_empty());
         assert!(
             app.refusal
                 .as_ref()
-                .is_some_and(|(m, _)| m.contains("Inspection-only")),
+                .is_some_and(|(m, _)| m.contains("Category total: pick one of the items")),
             "{:?}",
             app.refusal
         );
@@ -1660,7 +1661,10 @@ fn node_and_gradle_family_group_frames() {
             classes.cleanup_summary
         );
         assert!(
-            classes.signals.iter().any(|s| s == "inspection only"),
+            classes
+                .signals
+                .iter()
+                .any(|s| s == "no cleanup rule; Space still moves this exact path to Trash"),
             "{:?}",
             classes.signals
         );
@@ -1671,8 +1675,8 @@ fn node_and_gradle_family_group_frames() {
         assert!(
             pnpm.signals
                 .iter()
-                .any(|s| s.starts_with("selective cleanup unsupported")),
-            "a shared store says what it cannot do, separately from what it is: {:?}",
+                .any(|s| s.starts_with("no cleanup rule (")),
+            "a shared store says what no rule covers, separately from what it is: {:?}",
             pnpm.signals
         );
         check(

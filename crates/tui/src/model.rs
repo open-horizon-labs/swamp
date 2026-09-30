@@ -1033,6 +1033,11 @@ fn family_tree_children_of(
         if !f.complete {
             signals.push("measurement incomplete".into());
         }
+        // A group header that no cleanup rule covers is a category of
+        // paths, not a path: Space says so and points at the items inside.
+        if actionable == 0 {
+            signals.push("category".into());
+        }
         row.signals = signals;
         rows.push(row);
         if open {

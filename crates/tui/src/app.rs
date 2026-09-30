@@ -2715,7 +2715,9 @@ impl App {
         worker.store_dir = self.store_dir.clone();
         worker.store_interiors = self.store_interiors.clone();
         worker.agent_units = self.agent_units.clone();
-        *worker.reclaim_cache.borrow_mut() = Some(self.reclaim_view());
+        if matches!(self.view, ViewKind::Reclaim | ViewKind::External) {
+            *worker.reclaim_cache.borrow_mut() = Some(self.reclaim_view());
+        }
         worker.review_cancel = Some(cancel.clone());
         worker.review_progress = Some(tx.clone());
         self.operation = Some(Operation {
@@ -5186,6 +5188,64 @@ mod tests {
             lines.iter().any(|l| l.starts_with("Last run or opened:")),
             "{lines:?}"
         );
+    }
+
+    /// Tempting wrong patch: a warning (here: the protect list could not
+    /// be read, and swamp has no record of use) blocks the move, or the
+    /// move happens with no confirm. The warning is on the confirm, Enter's
+    /// own path (`start_delete`) moves exactly what was marked to Trash,
+    /// writes one ledger row that names the way back, and the result says
+    /// space is freed only when Trash is emptied.
+    #[test]
+    fn a_warned_reclaim_mark_moves_on_enter_and_says_trash_frees_nothing_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let folder = root.join("Caches");
+        std::fs::create_dir_all(folder.join("x")).unwrap();
+        std::fs::write(folder.join("x/f"), b"12345").unwrap();
+        let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
+        report.projects.clear();
+        let mut app = App::new_multi_root(report, vec!["/roots/a".into()]);
+        app.set_external_units(vec![drilled_unit(folder.to_str().unwrap(), vec![])]);
+        // A store whose protect list cannot be read: a warning, not a block.
+        let store = root.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(swamp_core::protection::protect_path(&store), b"not parquet").unwrap();
+        app.store_dir = Some(store.clone());
+        app.set_view(ViewKind::Reclaim);
+        app.selected = 0;
+        app.mark_selected();
+        assert_eq!(app.marked.len(), 1, "{:?}", app.refusal_active());
+        let summary = app.confirm_summary();
+        assert!(
+            summary.contains("could not read your protect list"),
+            "{summary}"
+        );
+        assert!(summary.contains("last used"), "{summary}");
+        assert!(folder.exists(), "marking moves nothing");
+        app.confirm_open = true;
+        app.start_delete(
+            swamp_core::fs_gate::StoreDir::at(&store).unwrap(),
+            root.join("Trash"),
+        );
+        wait_operation(&mut app);
+        assert!(!folder.exists(), "Enter moved what was marked");
+        let result = app.last_result.clone().unwrap();
+        assert!(
+            result.contains("Space is freed when Trash is emptied"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Sizes are from the last observation"),
+            "{result}"
+        );
+        let rows = swamp_core::ledger::Ledger::open(store.join("ledger.parquet"))
+            .unwrap()
+            .all()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "completed");
+        assert!(rows[0].recovery_location.as_ref().unwrap().exists());
     }
 
     /// Reviewer M2: the same bytes never appear twice under one row. The
