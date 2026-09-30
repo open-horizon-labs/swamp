@@ -269,6 +269,7 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::fs;
+    use std::time::Duration;
 
     fn read_rows(db: &Path) -> Option<HashMap<PathBuf, Option<PathBuf>>> {
         let cache = super::super::IdentificationCache::disabled();
