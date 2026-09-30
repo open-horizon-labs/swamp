@@ -10,7 +10,7 @@
 "                                                                                "
 "                                                                                "
 "┌ Plan · nothing has changed yet ──────────────────────────────────────────────┐"
-"│1 ready · none blocked                                                        │"
+"│Ready: 1 item (440.4MB) → Trash · none blocked                                │"
 "│  mole  440.4MB  1 item                                                       │"
 "│Includes: node_modules                                                        │"
 "│⚠ declared by 2 projects: mole, swamp                                         │"

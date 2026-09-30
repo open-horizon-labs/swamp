@@ -46,7 +46,7 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "┌ Plan · nothing has changed yet ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
-"│1 ready · none blocked                                                                                                                                                                                │"
+"│Ready: 1 item (4.2MB) → Trash · none blocked                                                                                                                                                          │"
 "│  other  4.2MB  1 item                                                                                                                                                                                │"
 "│Includes: fixture-session.jsonl                                                                                                                                                                       │"
 "│⚠ agent-storage unit (sessions, tool Claude Code)                                                                                                                                                     │"

@@ -1326,6 +1326,7 @@ mod tests {
         app.confirm_open = true;
         let s = buffer_text(&app, 100, 30);
         assert!(s.contains("Ready: 43 items"), "{s}");
+        assert!(!s.contains("none blocked"), "{s}");
         assert!(s.contains("Blocked: 1 (d to see why)"), "{s}");
         assert!(s.contains("Ready, by project:"), "{s}");
         assert!(s.contains("node_modules (40), .build (3)"), "{s}");

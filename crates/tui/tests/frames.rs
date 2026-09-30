@@ -1689,7 +1689,8 @@ fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
     for w in [50u16, 80, 120] {
         let f = capture(&app, w, 24);
         assert!(f.contains("Enter confirm · Esc back"), "w={w}\n{f}");
-        assert!(f.contains("1 ready · 2 blocked"), "w={w}\n{f}");
+        assert!(f.contains("Ready: 1 item"), "w={w}\n{f}");
+        assert!(f.contains("Blocked: 2 (d to see why)"), "w={w}\n{f}");
         assert!(f.contains("Move 1 item"), "w={w}\n{f}");
     }
     swamp_tui::handle_key(&mut app, KeyCode::Char('d'));

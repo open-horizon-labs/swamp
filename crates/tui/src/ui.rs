@@ -398,30 +398,27 @@ fn fit_lines(
     cap: usize,
     more: &dyn Fn(usize) -> String,
 ) -> Vec<(String, Color)> {
+    let rows: Vec<usize> = lines.iter().map(|(l, _)| wrapped_rows(l, width)).collect();
+    if rows.iter().sum::<usize>() <= cap {
+        return lines.to_vec();
+    }
+    // Something is left out, so one row is kept for saying how much. Lines
+    // stay whole and in order; a line too tall for what is left is skipped
+    // and a shorter one after it takes the space, so the sheet is full.
+    let room = cap.saturating_sub(1);
     let mut used = 0usize;
     let mut fit: Vec<(String, Color)> = Vec::new();
-    for (i, (l, c)) in lines.iter().enumerate() {
-        let rows = wrapped_rows(l, width);
-        let left = lines.len() - i - 1;
-        // Keep one row for the "+N more" line when something is left over.
-        let reserve = usize::from(left > 0);
-        if used + rows + reserve > cap && !fit.is_empty() {
-            // Rows are left but not enough for the whole line: fill them
-            // with its start rather than leaving them empty.
-            let room = cap.saturating_sub(used + reserve);
-            if room > 0 {
-                let cells = (room * width).saturating_sub(room);
-                fit.push((clip_end(l, cells), *c));
-                if left > 0 {
-                    fit.push((more(left), Color::Yellow));
-                }
-            } else {
-                fit.push((more(left + 1), Color::Yellow));
-            }
-            return fit;
+    let mut left_out = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        if used + rows[i] <= room || fit.is_empty() {
+            used += rows[i];
+            fit.push(line.clone());
+        } else {
+            left_out += 1;
         }
-        used += rows;
-        fit.push((l.clone(), *c));
+    }
+    if left_out > 0 {
+        fit.push((more(left_out), Color::Yellow));
     }
     fit
 }
@@ -477,38 +474,39 @@ fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
         .map(|u| u.bytes)
         .sum();
     let trash_items = app.marked.values().filter(|u| u.docker.is_none()).count();
+    let none_blocked = if blocked == 0 { " · none blocked" } else { "" };
     if trash_items > 0 {
         out.push((
             format!(
-                "Ready: {} ({}) → Trash",
+                "Ready: {} ({}) → Trash{none_blocked}",
                 items(trash_items),
                 human_bytes(trash_bytes)
             ),
             Color::Reset,
         ));
     } else {
-        out.push((format!("Ready: {}", items(ready)), Color::Reset));
+        out.push((
+            format!("Ready: {}{none_blocked}", items(ready)),
+            Color::Reset,
+        ));
     }
-    match app.blocked.first() {
-        None => out.push(("Blocked: none".to_string(), Color::Reset)),
-        Some(first) => {
-            let more = app
-                .blocked
-                .iter()
-                .filter(|b| b.reason != first.reason)
-                .map(|b| &b.reason)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            let more = if more > 0 {
-                format!(" (+{more} more reasons)")
-            } else {
-                String::new()
-            };
-            out.push((
-                format!("Blocked: {blocked} (d to see why): {}{more}", first.reason),
-                Color::Red,
-            ));
-        }
+    if let Some(first) = app.blocked.first() {
+        let more = app
+            .blocked
+            .iter()
+            .filter(|b| b.reason != first.reason)
+            .map(|b| &b.reason)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let more = if more > 0 {
+            format!(" (+{more} more reasons)")
+        } else {
+            String::new()
+        };
+        out.push((
+            format!("Blocked: {blocked} (d to see why): {}{more}", first.reason),
+            Color::Red,
+        ));
     }
     let in_use = app
         .marked
@@ -526,7 +524,11 @@ fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
     }
     let by_project = project_breakdown(app);
     if !by_project.is_empty() {
-        out.push(("Ready, by project:".to_string(), Color::Reset));
+        // Under a blocked line the rows need their own heading, or they
+        // read as the blocked ones.
+        if blocked > 0 {
+            out.push(("Ready, by project:".to_string(), Color::Reset));
+        }
         out.extend(by_project);
     }
     out.extend(rest[irreversible..].iter().map(yellow));
