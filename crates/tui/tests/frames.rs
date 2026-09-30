@@ -2875,3 +2875,49 @@ fn reclaim_strings_carry_no_verdict_words_and_no_em_dashes() {
         );
     }
 }
+
+/// Adversarial (auditor): the Reclaim view, closed and open, draws at
+/// tiny and narrow sizes without panicking, and at 40/50 columns its
+/// footer keeps a key hint and the heading row matches External's.
+#[test]
+fn adv_reclaim_view_survives_tiny_and_narrow_screens() {
+    use crossterm::event::KeyCode;
+    for (w, h) in [(0u16, 0u16), (1, 1), (2, 2), (10, 3), (40, 12), (50, 16)] {
+        let mut app = reclaim_app(false);
+        app.width = w;
+        draw_only(&app, w, h);
+        if let Some(at) = app
+            .rows()
+            .iter()
+            .position(|r| r.label.contains(".rustup/toolchains"))
+        {
+            app.selected = at;
+            swamp_tui::handle_key(&mut app, KeyCode::Enter);
+            draw_only(&app, w, h);
+            swamp_tui::handle_key(&mut app, KeyCode::Right);
+            draw_only(&app, w, h);
+        }
+    }
+    for (w, h) in [(40u16, 12u16), (50, 16)] {
+        let mut app = reclaim_app(false);
+        app.width = w;
+        let r = capture(&app, w, h);
+        app.set_view(ViewKind::External);
+        let e = capture(&app, w, h);
+        assert_eq!(
+            line_of(&r, h as usize - 1).is_empty(),
+            false,
+            "w={w} footer empty\n{r}"
+        );
+        assert_eq!(
+            line_of(&r, 0),
+            line_of(&e, 0),
+            "w={w} heading differs\n{r}\n{e}"
+        );
+    }
+}
+
+fn draw_only(app: &App, w: u16, h: u16) {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| ui::draw(f, app)).unwrap();
+}
