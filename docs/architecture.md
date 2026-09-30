@@ -107,6 +107,50 @@ Multi-root comparisons retain each root's coverage and use the common available 
 
 History records sizes and metadata. It cannot restore files, prove which process wrote them, or establish that a file has not been used.
 
+## Volume ledger
+
+The report is about scope. The volume ledger (#169, #170) is about the disk:
+it answers "where did the space go" for the whole APFS container, including
+what no path reaches, and says what it did not measure.
+
+- **A measurement, not a view.** `volume_ledger.parquet` (one row per location:
+  path, category, allocated bytes or null, overlap bytes, entry count,
+  unreadable count, `measured_at`, method, exactness, note) and
+  `volume_ledger_meta.parquet` (one row: when the run finished, the cursor, the
+  budget and what it used, the `statfs` container snapshot and `diskutil`'s Data
+  volume figure) are new files. No existing table changed and the store-format
+  marker did not move, so an older swamp ignores them and a format reset leaves
+  them. Bytes are null exactly when a row is `not_measured`.
+- **One pass, only in `observe`.** `volume_ledger::pass::run` follows a successful
+  observation (`swamp observe`, scheduled or `--volume`), under the single-flight
+  observe lock and without the writer lock, which it takes for the two writes
+  only. It copies the observation's own unit and root totals (nothing measured
+  twice; units are disjoint by construction, except an agent home's view of its
+  own unit and mounted disk images, which are subtracted as overlap), plans a
+  coarse walk of the data volume outside them, and measures at background priority
+  with a bounded pool under a time budget. The cursor is
+  `cycle_started_at`: a location is pending until its row is at least that new.
+- **Walk the data volume from its own mount point.** On macOS `/System/Volumes/Data`
+  holds exactly the data-side of `/System` (`/System/Library/AssetsV2`) and `/usr`
+  (`/usr/local`); the sealed system volume is never listed and is the System line
+  from `diskutil`. `st_dev` cannot tell them apart (every path under `/` reports one
+  device), so a device test would either walk the sealed volume or skip
+  `AssetsV2`. Rows keep logical paths (`/System/Library/AssetsV2`); `Mapped` is the
+  only place the mount point exists.
+- **System volumes and snapshots** come from three read-only spawns
+  (`diskutil apfs list -plist`, `diskutil info -plist /System/Volumes/Data`,
+  `tmutil listlocalsnapshots /`), allow-listed in `fs_gate::spawn` (fixed argv,
+  kill on timeout, counted). A missing program, a timeout, a permission error or an
+  unreadable answer is a note on a not-measured row, never a zero.
+- **The identity is computed at read time** (`volume_ledger::account`), not stored:
+  accounted + everything else + system volumes + the not-measured estimate (the
+  Data volume's consumed bytes minus what was measured) + a signed, named residual
+  equals the container's used bytes. Purgeable space, mounted images, another
+  volume of the container and network shares are listed and never added.
+- **Reading never works.** `report --view disk`, the `disk` object of
+  `report --json` and any other reader call `volume_ledger::read_account`: two
+  Parquet reads, no listing, no stat, no spawn (the work counters assert it).
+
 ## Enrichment and freshness
 
 Git facts add dirty state, unpushed commits, branch information, and activity context. GitHub enrichment adds cached PR and merge information when available. Docker supplies its own object identities and accounting. These facts have different sources and refresh costs from filesystem measurements.

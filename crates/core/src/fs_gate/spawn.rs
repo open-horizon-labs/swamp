@@ -67,6 +67,14 @@ pub enum Program {
     /// (`crate::systemd_user::linger`); enabling lingering is never
     /// done by swamp.
     Loginctl,
+    /// The volume ledger's read-only APFS queries (`diskutil apfs list
+    /// -plist`, `diskutil info -plist /System/Volumes/Data`): the
+    /// container's volumes and the Data volume's own figures. Never a
+    /// verb that changes a disk.
+    Diskutil,
+    /// `tmutil listlocalsnapshots /`: names of the local snapshots
+    /// (read-only; deleting one is not a shape).
+    Tmutil,
 }
 
 impl Program {
@@ -88,6 +96,8 @@ impl Program {
         Program::Defaults,
         Program::Systemctl,
         Program::Loginctl,
+        Program::Diskutil,
+        Program::Tmutil,
     ];
 
     /// The executable name looked up on `PATH`.
@@ -108,6 +118,8 @@ impl Program {
             Program::Defaults => "defaults",
             Program::Systemctl => "systemctl",
             Program::Loginctl => "loginctl",
+            Program::Diskutil => "diskutil",
+            Program::Tmutil => "tmutil",
         }
     }
 
@@ -293,6 +305,12 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             Lit("--property=Linger"),
             Lit("--value"),
         ]],
+        Program::Diskutil => &[
+            &[Lit("apfs"), Lit("list"), Lit("-plist")],
+            // The Data volume only: fixed, never a caller's path.
+            &[Lit("info"), Lit("-plist"), Lit("/System/Volumes/Data")],
+        ],
+        Program::Tmutil => &[&[Lit("listlocalsnapshots"), Lit("/")]],
     }
 }
 
@@ -825,6 +843,22 @@ mod tests {
                 vec!["api", "graphql", "-f", "query=mutation { x }"],
             ),
             (Program::Gh, vec!["api", "repos/x/y", "-X", "DELETE"]),
+            // Volume-ledger programs: only the two read-only queries each.
+            // Tempting wrong patch: `diskutil` and `tmutil` allowed with
+            // any arguments because "they only read".
+            (
+                Program::Diskutil,
+                vec!["eraseVolume", "APFS", "x", "disk3s5"],
+            ),
+            (Program::Diskutil, vec!["apfs", "deleteVolume", "disk3s5"]),
+            (Program::Diskutil, vec!["apfs", "list"]),
+            (Program::Diskutil, vec!["info", "-plist", "/"]),
+            (Program::Diskutil, vec!["info", "-plist", "disk3s5"]),
+            (Program::Diskutil, vec!["apfs", "list", "-plist", "-o"]),
+            (Program::Tmutil, vec!["deletelocalsnapshots", "2026-01-01"]),
+            (Program::Tmutil, vec!["delete", "/"]),
+            (Program::Tmutil, vec!["listlocalsnapshots", "/Users"]),
+            (Program::Tmutil, vec!["thinlocalsnapshots", "/", "1", "4"]),
         ] {
             let (r, counted) = crate::work_counters::measured(|| {
                 run(program, args.clone(), Duration::from_secs(5))
@@ -881,6 +915,12 @@ mod tests {
             (Program::Kill, vec!["-0", "123"]),
             (Program::Id, vec!["-u"]),
             (Program::Df, vec!["-k", "/"]),
+            (Program::Diskutil, vec!["apfs", "list", "-plist"]),
+            (
+                Program::Diskutil,
+                vec!["info", "-plist", "/System/Volumes/Data"],
+            ),
+            (Program::Tmutil, vec!["listlocalsnapshots", "/"]),
         ] {
             let words: Vec<OsString> = args.iter().map(OsString::from).collect();
             assert!(permitted(program, &words).is_ok(), "{program:?} {args:?}");

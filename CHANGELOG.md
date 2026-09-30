@@ -126,6 +126,49 @@ observations, not general performance guarantees. See the README for current use
   observation that way; `R` or the next scheduled `observe` builds the new one. `swamp ui`
   scans on its own only when the store holds no observation at all.
 - **Declared roots are in the TUI header and help and in `report --json`** (`declared_roots`).
+- **`swamp report --view disk` says where the whole disk went.** Until now `report`
+  headlined 16 GB under `~/src` while `df` said 443 GB used. `swamp observe --volume`
+  (or any scheduled `observe` when the last pass is older than
+  `volume_pass_interval_hours`, default 24) now measures the rest of the data volume
+  once and stores it in a new ledger (`volume_ledger.parquet` and a meta file), and
+  `report --view disk` (and a `disk` object in `report --json`) reads it back with the
+  time each row was measured, never walking, statting or running anything. On this
+  Mac: container 494.4 GB, 443.1 GB used = catalog and declared locations 197.4 GB
+  (counted once) + everything else 132.4 GB (330 folders, top five shown: Library
+  31.6, AssetsV2 27.8, /private/tmp 14.7, /private/var 11.6, ~/.local 7.4) + system
+  volumes 46.6 GB + "not measured, estimated by elimination" 66.6 GB + a named
+  residual "unattributed: APFS accounting, TCC-blocked, clones" of +160 MB (0.04%).
+  Measured against `du` on the same disk: /Applications 24.27 GB (du 24.27), /opt
+  25.31 (25.31), /Library 14.45 (14.45), /System/Library/AssetsV2 27.81 (27.80),
+  /private 60.22 (60.12), home 161.8 (163.7; `du` counts a hardlink once across the
+  whole home, the pass once per folder).
+- **A folder swamp cannot read is `not measured`, never zero.** 981 folders here
+  (Photos, Mail, Containers, Group Containers, `/private/var/db`, the Spotlight
+  index, ...) are listed by name (the first 200 in `--json`) with the exact count.
+  swamp does not ask for Full Disk Access; the report says what it would change.
+- **`df`'s "used" is explained.** The System line lists System (14.1 GB), Preboot
+  (21.8), Recovery (3.1), Update (1.2), VM (6.4) from `diskutil apfs list`, as
+  separate volumes that share the container's free space; purgeable space and
+  local snapshots (three here: names only, `tmutil` reports no sizes) appear when
+  `diskutil` and `tmutil` say so. A missing or failing `diskutil`/`tmutil` is a note
+  on a "not measured" row, never a 0 B line. The three queries are new allow-listed,
+  read-only, counted spawns.
+- **Nothing is counted twice.** The simulator runtime volumes mounted under
+  `/Library/Developer/CoreSimulator/Volumes` (43.6 GB) are views of the image files
+  in `/System/Library/AssetsV2`: the images are counted once, where they are stored,
+  and the mounts are listed as "not added" notes. `/System` is not skipped as sealed:
+  the pass walks the data volume from its own mount point, where `/System` holds
+  exactly the 27.8 GB of runtime images (every path under `/` reports one device, so
+  a device test cannot tell sealed from data).
+- **The pass respects its budget and resumes.** It measures at background priority,
+  three folders at a time, for at most `volume_pass_budget_secs` (default 120, the
+  system queries and planning included), then stops even mid-folder and continues at
+  the next `observe`; each row keeps its own time. Here a warm pass takes about 30-40
+  s and an 8-second budget stopped at 8.0-8.1 s five runs in a row. A second pass over
+  an unchanged disk gives the same bytes but is not faster (no event replay for the
+  whole disk yet). It is new files only: no existing table changed, the store-format
+  marker did not move, an older swamp ignores them, and the writer lock is held for the
+  two small writes only.
 
 ## v0.7.5
 

@@ -773,6 +773,92 @@ status rows. The project tree's own Tree view also shows the collapsed
 "Agent storage (linked)" summary row (informational; marking a specific
 unit still happens in the Agents view).
 
+## Where the whole disk went (the volume ledger)
+
+`swamp report` answers for the roots and locations swamp knows. Everything
+else on the disk (and the parts of the disk no path reaches) is the volume
+ledger's job: one scheduled measurement, read back without touching the disk.
+
+```bash
+swamp observe --volume        # measure now (a plain scheduled observe does it when due)
+swamp report --view disk      # read it: never a walk, never a program run
+swamp report --view disk --json
+```
+
+`report --view disk` prints, each with the time it was measured:
+
+- **Disk**: the APFS container's total, used and free (one `statfs`). `df`'s
+  "used" is the whole container, not the Data volume.
+- **Accounted**: the catalog and declared locations, taken from the
+  observation that just ran (not walked again), counted once.
+- **Everything else**: a coarse measurement of the rest of the data volume,
+  one row per folder at depth 1 of `/` and depth 2 under your home, `/Library`,
+  `/opt`, `/private`, `/Applications`, `/Users` and `/System/Library`, with the
+  five largest shown. Sizes are allocated bytes (`st_blocks`), hardlinks once,
+  `lstat` only: no file is opened, no symlink followed, no FIFO or socket
+  touched, no other device entered.
+- **System volumes**: System, Preboot, Recovery, Update, VM and the like from
+  `diskutil apfs list`, with the sentence that they are separate volumes
+  sharing the container's free space. **Purgeable** space and local
+  **snapshots** (`tmutil listlocalsnapshots /`, names only: `tmutil` reports
+  no sizes) appear when `diskutil` and `tmutil` say so, and are never added
+  to the total (purgeable space is already inside the folders above).
+- **Not measured**: every folder that could not be read (macOS privacy-protected
+  folders such as Photos, Mail, Messages, Safari, Group Containers and
+  Containers), with the exact count and the first 200 names. Never zero, never
+  dropped. swamp does not ask for Full Disk Access; the report only says it
+  would change this.
+- **Not measured, estimated by elimination**: the Data volume's own consumed
+  bytes (`diskutil`) minus everything measured. It is an estimate, and says so.
+- **Unattributed: APFS accounting, TCC-blocked, clones**: whatever is left
+  between the container's used bytes and the parts above, signed. It is small
+  when the parts are right and negative when clones or shared extents were
+  counted once per file (APFS does not say per file which extents are shared).
+
+The parts add up to the container's used bytes by construction, with that one
+named residual, so nothing is silently dropped; the report says how far the
+residual is from the container's used bytes (the check is within 1%).
+
+Mounted disk images (the simulator runtime volumes under
+`/Library/Developer/CoreSimulator/Volumes`) are a *view* of the image files
+stored under `/System/Library/AssetsV2`: those image files are counted once,
+where they are stored, and the mounted volumes are listed as "not added"
+notes. Another volume of the same container and a network share are listed the
+same way, with no size.
+
+### How it runs
+
+- **Only in `swamp observe`.** Never on `swamp ui` open, never in `report`.
+  A plain `observe` runs it when the last complete pass is older than
+  `volume_pass_interval_hours` (default 24; `0` turns the automatic pass off).
+  `observe --volume` runs it now. It needs the configured scope: with explicit
+  roots the accounted part would be those roots only, so it is refused (and the
+  automatic pass does not run when `$HOME` is not the account's home directory,
+  as in a sandbox or a test fixture).
+- **Low priority, bounded, resumable.** Its threads run at background
+  priority, three at a time. One run measures for at most
+  `volume_pass_budget_secs` (default 120) *including* the three system
+  queries and the planning listing, then stops even in the middle of a folder
+  (a folder that did not finish leaves no row). The cursor is stored in the
+  ledger: the next `observe` continues, every row keeps its own measured time,
+  and a partial pass shows a partial ledger with honest ages. A folder that
+  fills a whole run by itself is measured as its children from then on. An
+  unfinished pass continues at every observe whatever the interval says.
+- **Skipped, with one line, when the disk-full guard trips** (`min_free_bytes`)
+  or when the store's format marker is not this build's generation.
+- **New files only.** The ledger is `volume_ledger.parquet` and
+  `volume_ledger_meta.parquet` in the store. No existing table changed, the
+  store-format marker did not move, and an older swamp ignores both files. A
+  format reset leaves them alone: the ledger is a measurement, not derived from
+  another table. The observation writer lock is taken only for the two small
+  writes, never while the pass walks.
+- **A second pass over an unchanged disk gives identical bytes but is not
+  faster.** There is no event replay for the whole disk (yet), so every pass
+  measures every row again; the budget bounds it instead.
+- **On Linux** the container is the filesystem under `/`, the mount table comes
+  from `/proc/self/mounts`, and there are no system-volume, purgeable or
+  snapshot lines (nothing to ask).
+
 ## Cleanup recommendations
 
 Age is a cleanup signal, not a proof requirement. Supported Cargo cleanup groups
@@ -834,6 +920,7 @@ swamp report ~/src --view docker   # also: BuildKit records per builder, in the 
 swamp report ~/src --view worktrees --filter 'merge-complete idle > 48h'
 swamp report ~/src --view unowned
 swamp report ~/src --view reconciliation --verify-du
+swamp report --view disk         # the whole-disk ledger; needs no root and no observation
 ```
 
 Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals.
@@ -1189,6 +1276,7 @@ contract: `skills/swamp/references/commands-and-json.md`.
 | `report <root> --view projects --json` | -- | Ranked project summaries |
 | `report <root> --view worktrees --json` | `--filter` | Worktree and GitHub facts |
 | `report <root> --view docker --json` | `--project`, `--unowned-only` | Docker objects and attribution |
+| `report --view disk --json` | -- | The stored volume ledger: container, accounted, everything else, system volumes, not measured, named residual |
 
 `report --json` is a pure read: it never records a new observation, never
 shells out, and never re-derives GitHub/Docker facts -- run `swamp
@@ -1228,6 +1316,8 @@ retention_days = 30
 large_file_min_bytes = 1048576
 observe_timeout_sec = 1800
 # min_free_bytes = 1073741824   # unset: the greater of 1 GiB and 1% of the volume; 0 disables
+volume_pass_interval_hours = 24 # a plain `observe` runs the volume pass when the last is older; 0 = only `observe --volume`
+volume_pass_budget_secs = 120   # one run of the volume pass measures for at most this long
 
 [scan]
 defaults = true
