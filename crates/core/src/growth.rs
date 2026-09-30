@@ -6064,6 +6064,9 @@ fn resize_interior(
             continue;
         }
         let measured = crate::walk::measure_directory(&abs).ok()?;
+        if measured.unmeasured_entries > 0 {
+            return None;
+        }
         let own = measured.allocated;
         let files = measured.files;
         let subdirs = measured.children.len() as u32;

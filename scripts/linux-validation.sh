@@ -103,7 +103,11 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("error
 say "cli_json: report --json parses (no_observation before the first observe)"
 "$bin" scope "$root" --json | python3 -c 'import json,sys; json.load(sys.stdin)' && say "cli_json: scope --json parses"
 
-observe() { "$bin" observe "$root" | grep '^observed_at='; }
+# Delayed allocation (#197): on ext4/XFS/overlayfs a file written a moment
+# ago reports a token st_blocks until writeback. Flush before every
+# measurement so an incremental walk and a later reference walk see the
+# same allocation; the equivalence check below is never loosened.
+observe() { sync; "$bin" observe "$root" | grep '^observed_at='; }
 timed() { local a b line; a=$(now_ms); line="$(observe)"; b=$(now_ms); echo "$((b - a)) $line"; }
 
 # --- initial full scan -----------------------------------------------
@@ -146,6 +150,7 @@ for r in $(seq "$REPS"); do
     say "one_subtree_mutation run=$r ms=${res%% *} mode=$(field "$res" mode) changed_dirs=$(field "$res" changed_dirs) walked_total=$(field "$res" walked_total)"
 done
 ref_store="$work/ref-store"
+sync
 ref="$(SWAMP_DIR="$ref_store" "$bin" observe "$root" --full | grep '^observed_at=')"
 [ "$(field "$res" walked_total)" = "$(field "$ref" walked_total)" ] &&
     say "equivalence: incremental walked_total $(field "$res" walked_total) == reference full walk $(field "$ref" walked_total)" ||

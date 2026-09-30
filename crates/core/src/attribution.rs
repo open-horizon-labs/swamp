@@ -247,10 +247,94 @@ pub(crate) fn is_shared_cache_name(name: &str) -> bool {
     SHARED_CACHE_NAMES.contains(&name)
 }
 
+/// A regular file written this recently may still be in the page cache
+/// with its blocks not yet assigned (delayed allocation, #197). Longer
+/// than the kernel's default dirty-data expiry (30 s) plus its writeback
+/// interval (5 s), with room for a slow disk.
+pub(crate) const PENDING_ALLOCATION_WINDOW_SECS: i64 = 120;
+
+/// The unit delayed allocation eventually assigns: one page / one
+/// filesystem block on every filesystem this crate supports.
+const ALLOCATION_UNIT: u64 = 4096;
+
+/// What `st_blocks` says about one file, and whether that is the number
+/// the file will keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Allocation {
+    /// Bytes to count for this file.
+    pub bytes: u64,
+    /// `bytes` is an estimate of the allocation writeback will assign
+    /// (the file is recent and the filesystem reports less than one
+    /// allocation unit for it), not the number `st_blocks` reported.
+    pub pending: bool,
+}
+
+/// Pure policy behind [`allocated_bytes`] (#197). On ext4, XFS, btrfs
+/// and overlayfs over them, a file whose data is still dirty reports a
+/// token `st_blocks` (measured on the homelab fleet: exactly 1 block,
+/// 512 bytes, for 5 KB and 20 KB files alike) until writeback; counted
+/// as-is, a fresh tree reads as near-empty and then "grows" by its whole
+/// size when flushed. So a *recent* regular file that has *some* blocks
+/// but fewer than one allocation unit, and a logical length above zero,
+/// is counted at its length rounded up to the unit and reported as
+/// `pending` (an estimate). Everything else is exact `st_blocks * 512`:
+/// zero blocks is an empty or fully sparse file (`truncate -s 64M`), and
+/// a file with a full unit or more already has its allocation. APFS and
+/// tmpfs assign a whole unit at write time, so they never take this
+/// branch.
+pub(crate) fn allocation_of(
+    is_file: bool,
+    size: u64,
+    blocks: u64,
+    mtime: i64,
+    now: i64,
+) -> Allocation {
+    let reported = blocks * 512;
+    let recent = now.saturating_sub(mtime) <= PENDING_ALLOCATION_WINDOW_SECS;
+    if is_file && recent && size > 0 && blocks > 0 && reported < ALLOCATION_UNIT {
+        let estimate = size.div_ceil(ALLOCATION_UNIT) * ALLOCATION_UNIT;
+        if estimate > reported {
+            return Allocation {
+                bytes: estimate,
+                pending: true,
+            };
+        }
+    }
+    Allocation {
+        bytes: reported,
+        pending: false,
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Allocated bytes for one file: `st_blocks * 512`, the actual space the
-/// file occupies on disk rather than its logical length.
+/// file occupies on disk rather than its logical length -- except a
+/// recent file whose allocation is still pending, which is counted at
+/// its eventual allocation and recorded in the work counters as
+/// estimated (see [`allocation_of`]).
 pub(crate) fn allocated_bytes(meta: &fs::Metadata) -> u64 {
-    meta.blocks() * 512
+    // Only a file under one unit can be pending: keep the clock read and
+    // the branch off the common path.
+    if meta.blocks() * 512 >= ALLOCATION_UNIT || meta.blocks() == 0 {
+        return meta.blocks() * 512;
+    }
+    let a = allocation_of(
+        meta.file_type().is_file(),
+        meta.size(),
+        meta.blocks(),
+        meta.mtime(),
+        now_secs(),
+    );
+    if a.pending {
+        crate::work_counters::record_pending_allocation(a.bytes - meta.blocks() * 512);
+    }
+    a.bytes
 }
 
 /// A worktree known to the attribution pass: its path (for nearest-match)
@@ -896,5 +980,112 @@ mod tests {
             assert_eq!(row.bytes, 0);
             assert_eq!(row.path_or_object, locked.display().to_string());
         }
+    }
+
+    // ---- #197: delayed allocation -----------------------------------
+    const NOW: i64 = 1_000_000;
+
+    /// Fleet values: a 20 KB file written seconds ago reports 1 block.
+    /// Wrong patch: keep `st_blocks * 512` (512 bytes, then 20 KB after
+    /// writeback: phantom growth).
+    #[test]
+    fn a_fresh_file_with_a_token_block_count_is_counted_at_its_eventual_allocation() {
+        let a = allocation_of(true, 20_480, 1, NOW - 3, NOW);
+        assert_eq!(
+            a,
+            Allocation {
+                bytes: 20_480,
+                pending: true
+            }
+        );
+        let small = allocation_of(true, 100, 1, NOW, NOW);
+        assert_eq!(
+            small,
+            Allocation {
+                bytes: 4096,
+                pending: true
+            }
+        );
+        // What writeback assigns for 5000 bytes is the same number.
+        assert_eq!(allocation_of(true, 5000, 1, NOW, NOW).bytes, 16 * 512);
+    }
+
+    /// Wrong patch: estimate regardless of age (a long-lived small file
+    /// on a 512-byte-block filesystem would be overstated forever).
+    #[test]
+    fn an_old_file_is_exact_whatever_its_block_count() {
+        let a = allocation_of(true, 20_480, 1, NOW - 10_000, NOW);
+        assert_eq!(
+            a,
+            Allocation {
+                bytes: 512,
+                pending: false
+            }
+        );
+    }
+
+    /// Wrong patch: compare blocks with size alone (a fresh sparse image
+    /// would be counted at its 64 MiB length).
+    #[test]
+    fn a_fresh_sparse_file_is_never_estimated_by_its_length() {
+        let holes_only = allocation_of(true, 64 << 20, 0, NOW, NOW);
+        assert_eq!(
+            holes_only,
+            Allocation {
+                bytes: 0,
+                pending: false
+            }
+        );
+        let one_block_written = allocation_of(true, 64 << 20, 8, NOW, NOW);
+        assert_eq!(
+            one_block_written,
+            Allocation {
+                bytes: 4096,
+                pending: false
+            }
+        );
+    }
+
+    /// APFS and tmpfs assign a whole unit at write time: no behavior
+    /// change there. Directories and non-files are never estimated.
+    #[test]
+    fn filesystems_that_allocate_at_write_time_are_unchanged() {
+        assert_eq!(
+            allocation_of(true, 100, 8, NOW, NOW),
+            Allocation {
+                bytes: 4096,
+                pending: false
+            }
+        );
+        assert_eq!(
+            allocation_of(true, 1 << 20, 2048, NOW, NOW),
+            Allocation {
+                bytes: 1 << 20,
+                pending: false
+            }
+        );
+        assert!(!allocation_of(false, 100, 1, NOW, NOW).pending);
+    }
+
+    /// On whatever filesystem this runs on (tmpfs, APFS, and the fleet's
+    /// overlayfs), a file written a moment ago is counted at no less
+    /// than its length rounded to a page, unsynced. Wrong patch: raw
+    /// `st_blocks`, which the fleet reports as 512 for this file.
+    #[test]
+    fn a_just_written_file_is_not_counted_near_zero() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("fresh.bin");
+        let mut x = 0x2545F491u32;
+        let data: Vec<u8> = (0..20_480)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        fs::write(&p, data).unwrap();
+        let bytes = allocated_bytes(&fs::symlink_metadata(&p).unwrap());
+        assert!(bytes >= 20_480, "counted {bytes}");
     }
 }

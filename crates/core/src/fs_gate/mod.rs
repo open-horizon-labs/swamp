@@ -70,6 +70,10 @@ pub fn current_uid() -> u32 {
 /// (`StoreDir::at`) is the store modules' capability.
 pub use store::StoreDir;
 
+/// Whether a per-entry error means the entry vanished (see
+/// [`sys::is_vanished_entry`]).
+pub use sys::is_vanished_entry;
+
 use std::io;
 use std::path::{Path, PathBuf};
 

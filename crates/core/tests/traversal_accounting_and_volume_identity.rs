@@ -29,6 +29,16 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use swamp_core::report::ArtifactKind;
 
+/// Flushes dirty data so `st_blocks` is the final allocation (#197): on
+/// ext4, XFS and overlayfs over them a freshly written file reports a
+/// token block count until writeback, so any test that compares the
+/// walker with `st_blocks` or `du` must settle the fixture first, and
+/// never compare an unflushed measurement with a later one.
+fn settle() {
+    let status = std::process::Command::new("sync").status();
+    assert!(status.is_ok_and(|s| s.success()), "sync must run");
+}
+
 /// Fills a fixture with every case that has ever made a size wrong.
 /// Returns the root plus the allocated bytes the *filesystem* says the
 /// files occupy, summed the way the walker is supposed to.
@@ -77,6 +87,7 @@ fn build(root: &Path) -> Fixture {
 
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut expected = 0u64;
+    settle();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for e in fs::read_dir(&dir).unwrap().flatten() {
@@ -214,6 +225,7 @@ fn a_hardlinked_file_is_counted_once_not_once_per_name() {
     let root = tmp.path().join("hardlinks");
     fs::create_dir_all(root.join("b")).unwrap();
     fs::write(root.join("original.bin"), vec![3u8; 1_048_576]).unwrap();
+    settle();
     let one = fs::symlink_metadata(root.join("original.bin"))
         .unwrap()
         .blocks()
@@ -242,6 +254,7 @@ fn a_symlink_loop_terminates_and_contributes_nothing() {
     let root = tmp.path().join("loops");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("real.bin"), vec![5u8; 4_096]).unwrap();
+    settle();
     let real = fs::symlink_metadata(root.join("real.bin"))
         .unwrap()
         .blocks()
@@ -269,6 +282,7 @@ fn a_symlink_to_a_directory_does_not_double_count_it() {
     let root = tmp.path().join("aliased");
     fs::create_dir_all(root.join("data")).unwrap();
     fs::write(root.join("data/x.bin"), vec![9u8; 2_097_152]).unwrap();
+    settle();
     let once = fs::symlink_metadata(root.join("data/x.bin"))
         .unwrap()
         .blocks()
@@ -291,6 +305,7 @@ fn a_file_that_vanishes_mid_walk_does_not_fail_the_measurement() {
     for i in 0..64 {
         fs::write(root.join(format!("{i}.bin")), vec![1u8; 4_096]).unwrap();
     }
+    settle();
     let doomed = root.join("32.bin");
 
     let handle = std::thread::spawn({
