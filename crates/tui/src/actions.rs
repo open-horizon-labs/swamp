@@ -65,6 +65,73 @@ pub struct WorktreeTerms {
     pub remote: Option<String>,
 }
 
+/// One ledger-recorded move: a `started` row BEFORE anything moves (a
+/// ledger that cannot take it means nothing moved), the move, then the
+/// final row in its place. A move that fails leaves a `failed:` row. When
+/// the move happened but the final row cannot be written (the ledger stayed
+/// locked), the error says so plainly: the item is gone and only the
+/// `started` row records what was about to happen.
+struct Moved<T> {
+    value: T,
+    recovery: Option<PathBuf>,
+    state: String,
+    facts: Vec<LedgerFact>,
+}
+
+fn run_recorded<T>(
+    unit: &MarkedUnit,
+    ledger: &Ledger,
+    verb: Verb,
+    actor: &str,
+    facts: Vec<LedgerFact>,
+    happened: &str,
+    mv: impl FnOnce() -> Result<Moved<T>>,
+) -> Result<T> {
+    let id = swamp_core::entities::new_id();
+    let entity = id_for(&unit.path.display().to_string());
+    let row = |outcome: String, recovery: Option<PathBuf>, state: &str, facts: Vec<LedgerFact>| {
+        ActionRecord {
+            id: id.clone(),
+            verb: verb.clone(),
+            entity_id: entity.clone(),
+            evidence: ledger_evidence(unit, facts),
+            grant_id: NO_GRANT.to_string(),
+            actor: actor.to_string(),
+            outcome,
+            recovery_location: recovery,
+            measured_free_space_delta: None,
+            observed_path_state: Some(state.to_string()),
+            recorded_at: now(),
+        }
+    };
+    if let Err(e) = ledger.append(&row("started".into(), None, "about to move", facts.clone()))
+        && !swamp_core::ledger::wrote_into_new_ledger(&e)
+    {
+        anyhow::bail!("swamp could not write its ledger ({e:#}), so nothing was moved or removed");
+    }
+    match mv() {
+        Err(e) => {
+            let _ = ledger.replace(&row(format!("failed:{e:#}"), None, "not moved", facts));
+            Err(e)
+        }
+        Ok(m) => {
+            let mut all = facts;
+            all.extend(m.facts);
+            ledger
+                .replace(&row("completed".into(), m.recovery, &m.state, all))
+                .map_err(|e| {
+                    // The ledger's own text ends "so nothing was written",
+                    // true of the row and false of the move: cut it.
+                    let why = format!("{e:#}").replace(", so nothing was written", "");
+                    anyhow::anyhow!(
+                        "{happened}, but the record could not be written ({why}); the `started` row in the ledger is all that records it"
+                    )
+                })?;
+            Ok(m.value)
+        }
+    }
+}
+
 /// Result of executing one marked unit, for the inline per-unit outcome.
 #[derive(Debug, Clone)]
 pub struct UnitResult {
@@ -103,23 +170,23 @@ fn execute_one(
             let group = u
                 .cargo_group()
                 .ok_or_else(|| anyhow::anyhow!("marked Cargo unit carries no group"))?;
-            let dest = swamp_core::actions::trash_cargo_group(group, trash_root)?;
-            ledger.append(&ActionRecord {
-                id: swamp_core::entities::new_id(),
-                verb: Verb::Delete,
-                entity_id: id_for(&unit.path.display().to_string()),
-                evidence: ledger_evidence(
-                    unit,
-                    vec![LedgerFact::new("cargo_group", format!("{group:?}"))],
-                ),
-                grant_id: NO_GRANT.to_string(),
-                actor: actor.into(),
-                outcome: "completed".into(),
-                recovery_location: Some(dest.clone()),
-                measured_free_space_delta: None,
-                observed_path_state: Some("trashed".into()),
-                recorded_at: now(),
-            })?;
+            run_recorded(
+                unit,
+                ledger,
+                Verb::Delete,
+                actor,
+                vec![LedgerFact::new("cargo_group", format!("{group:?}"))],
+                "the build output was moved to Trash",
+                || {
+                    let dest = swamp_core::actions::trash_cargo_group(group, trash_root)?;
+                    Ok(Moved {
+                        value: (),
+                        recovery: Some(dest),
+                        state: "trashed".into(),
+                        facts: Vec::new(),
+                    })
+                },
+            )?;
             Ok(Outcome {
                 unit_id: id_for(&unit.path.display().to_string()),
                 status: "completed".into(),
@@ -139,41 +206,41 @@ fn execute_one(
                 .agent_meta()
                 .ok_or_else(|| anyhow::anyhow!("marked agent unit carries no agent_meta"))?;
             let at = now();
-            let (dest, _bytes) = match &meta.session_members {
-                Some(members) => swamp_core::actions::trash_agent_session(
-                    meta, &unit.path, members, trash_root, at,
-                )
-                .map_err(|e| {
-                    if let Some(partial) =
-                        e.downcast_ref::<swamp_core::actions::PartialAgentRemoval>()
-                    {
-                        anyhow::anyhow!("{partial}")
-                    } else {
-                        e
-                    }
-                })?,
-                None => swamp_core::actions::trash_agent_cache(&unit.path, trash_root, at)?,
-            };
-            ledger.append(&ActionRecord {
-                id: swamp_core::entities::new_id(),
-                verb: Verb::Delete,
-                entity_id: id_for(&unit.path.display().to_string()),
-                evidence: ledger_evidence(
-                    unit,
-                    vec![
-                        LedgerFact::new("tool_id", &meta.tool_id),
-                        LedgerFact::new("category", format!("{:?}", meta.category)),
-                        LedgerFact::new("session_removal", meta.session_members.is_some()),
-                    ],
-                ),
-                grant_id: NO_GRANT.to_string(),
-                actor: actor.into(),
-                outcome: "completed".into(),
-                recovery_location: Some(dest),
-                measured_free_space_delta: None,
-                observed_path_state: Some("trashed".into()),
-                recorded_at: now(),
-            })?;
+            run_recorded(
+                unit,
+                ledger,
+                Verb::Delete,
+                actor,
+                vec![
+                    LedgerFact::new("tool_id", &meta.tool_id),
+                    LedgerFact::new("category", format!("{:?}", meta.category)),
+                    LedgerFact::new("session_removal", meta.session_members.is_some()),
+                ],
+                "the agent storage was moved to Trash",
+                || {
+                    let (dest, _bytes) = match &meta.session_members {
+                        Some(members) => swamp_core::actions::trash_agent_session(
+                            meta, &unit.path, members, trash_root, at,
+                        )
+                        .map_err(|e| {
+                            if let Some(partial) =
+                                e.downcast_ref::<swamp_core::actions::PartialAgentRemoval>()
+                            {
+                                anyhow::anyhow!("{partial}")
+                            } else {
+                                e
+                            }
+                        })?,
+                        None => swamp_core::actions::trash_agent_cache(&unit.path, trash_root, at)?,
+                    };
+                    Ok(Moved {
+                        value: (),
+                        recovery: Some(dest),
+                        state: "trashed".into(),
+                        facts: Vec::new(),
+                    })
+                },
+            )?;
             Ok(Outcome {
                 unit_id: id_for(&unit.path.display().to_string()),
                 status: "completed".into(),
@@ -255,27 +322,29 @@ fn remove_docker(
     ledger: &Ledger,
     actor: &str,
 ) -> Result<Outcome> {
-    swamp_core::docker::remove(target).map_err(|e| anyhow::anyhow!(e))?;
-    ledger.append(&ActionRecord {
-        id: swamp_core::entities::new_id(),
-        verb: Verb::Delete,
-        entity_id: id_for(&unit.path.display().to_string()),
-        evidence: ledger_evidence(
-            unit,
-            vec![
-                LedgerFact::new("docker", format!("{target:?}")),
-                LedgerFact::new("permanent", true),
-            ],
-        ),
-        grant_id: NO_GRANT.to_string(),
-        actor: actor.to_string(),
-        outcome: "completed".to_string(),
-        // The daemon has no Trash: there is nowhere to point at.
-        recovery_location: None,
-        measured_free_space_delta: None,
-        observed_path_state: Some("removed via docker".to_string()),
-        recorded_at: now(),
-    })?;
+    // Permanent: the `started` row is what survives if the final row
+    // cannot be written, so it goes first.
+    run_recorded(
+        unit,
+        ledger,
+        Verb::Delete,
+        actor,
+        vec![
+            LedgerFact::new("docker", format!("{target:?}")),
+            LedgerFact::new("permanent", true),
+        ],
+        "the Docker object was removed for good",
+        || {
+            swamp_core::docker::remove(target).map_err(|e| anyhow::anyhow!(e))?;
+            Ok(Moved {
+                value: (),
+                // The daemon has no Trash: there is nowhere to point at.
+                recovery: None,
+                state: "removed via docker".into(),
+                facts: Vec::new(),
+            })
+        },
+    )?;
     Ok(Outcome {
         unit_id: unit.path.display().to_string(),
         status: "completed".to_string(),
@@ -303,43 +372,46 @@ fn trash_path(
     if swamp_core::fs_gate::symlink_metadata(path).is_err() {
         anyhow::bail!("path no longer exists");
     }
-    let mut preserved_note = None;
-    if keep_executables {
-        let bin = unit.worktree_path.join("bin");
-        let kept = swamp_core::actions::preserve_executables(path, &bin)
-            .map_err(|e| anyhow::anyhow!("could not preserve executables: {e}"))?;
-        preserved_note = Some(
-            kept.iter()
-                .map(|k| k.to.display().to_string())
-                .collect::<Vec<_>>()
-                .join("; "),
-        );
-    }
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
-    let moved =
-        swamp_core::fs_gate::destroy::trash_move(path, trash_root, &format!("{name}-{}", now()))?;
-    debug_assert_eq!(
-        moved.anchor(),
-        path,
-        "the receipt names what was actually moved"
-    );
-    let mut evidence = ledger_evidence(unit, extra);
-    if let Some(preserved) = preserved_note {
-        evidence.push(LedgerFact::new("preserved", preserved));
-    }
-    ledger.append(&ActionRecord {
-        id: swamp_core::entities::new_id(),
+    let moved = run_recorded(
+        unit,
+        ledger,
         verb,
-        entity_id: id_for(&path.display().to_string()),
-        evidence,
-        grant_id: NO_GRANT.to_string(),
-        actor: actor.into(),
-        outcome: "completed".into(),
-        recovery_location: Some(moved.path().to_path_buf()),
-        measured_free_space_delta: None,
-        observed_path_state: Some("trashed".into()),
-        recorded_at: now(),
-    })?;
+        actor,
+        extra,
+        "the folder was moved to Trash",
+        || {
+            let mut facts = Vec::new();
+            if keep_executables {
+                let bin = unit.worktree_path.join("bin");
+                let kept = swamp_core::actions::preserve_executables(path, &bin)
+                    .map_err(|e| anyhow::anyhow!("could not preserve executables: {e}"))?;
+                facts.push(LedgerFact::new(
+                    "preserved",
+                    kept.iter()
+                        .map(|k| k.to.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+            let moved = swamp_core::fs_gate::destroy::trash_move(
+                path,
+                trash_root,
+                &format!("{name}-{}", now()),
+            )?;
+            debug_assert_eq!(
+                moved.anchor(),
+                path,
+                "the receipt names what was actually moved"
+            );
+            Ok(Moved {
+                recovery: Some(moved.path().to_path_buf()),
+                value: moved,
+                state: "trashed".into(),
+                facts,
+            })
+        },
+    )?;
     Ok((
         Outcome {
             unit_id: id_for(&path.display().to_string()),
@@ -774,5 +846,112 @@ mod tests {
         assert_eq!(results.len(), 1, "only the first unit ran: {results:?}");
         assert!(!a.exists(), "the first unit was moved");
         assert!(b.exists(), "the second unit was never reached");
+    }
+
+    fn locked_ledger_fixture() -> (tempfile::TempDir, swamp_core::ledger::Ledger, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = swamp_core::fs_gate::StoreDir::at(tmp.path()).unwrap();
+        let ledger = swamp_core::ledger::Ledger::resolved(&store);
+        let path = ledger.path();
+        (tmp, ledger, path)
+    }
+
+    /// Tempting wrong patch: the row is written AFTER the move, so a ledger
+    /// that stays locked leaves the folder gone with no record, and the
+    /// message reads as if nothing happened. The started row is written
+    /// first: with the ledger locked nothing moves, and the message says
+    /// nothing was moved.
+    #[test]
+    fn a_locked_ledger_stops_the_delete_before_anything_moves() {
+        swamp_core::fs_gate::store::set_ledger_lock_wait_ms(300);
+        let (tmp, ledger, lpath) = locked_ledger_fixture();
+        let target = tmp.path().join("cache");
+        std::fs::create_dir_all(&target).unwrap();
+        let u = unit(target.to_str().unwrap(), 5, None);
+        let held = swamp_core::fs_gate::StoreDir::lock_ledger_writes(&lpath).unwrap();
+        let res = execute_plan(
+            std::slice::from_ref(&u),
+            &ledger,
+            &tmp.path().join("trash"),
+            false,
+        );
+        drop(held);
+        swamp_core::fs_gate::store::set_ledger_lock_wait_ms(0);
+        let err = res[0].outcome.as_ref().unwrap_err();
+        assert!(err.contains("nothing was moved or removed"), "{err}");
+        assert!(target.exists(), "the folder did not move");
+    }
+
+    /// Tempting wrong patch: a move that happened but whose final row
+    /// cannot be written says "nothing was written". It says the item was
+    /// moved, names the started row, and the ledger keeps that started row.
+    #[test]
+    fn a_final_row_that_cannot_be_written_says_the_item_was_moved() {
+        swamp_core::fs_gate::store::set_ledger_lock_wait_ms(300);
+        let (tmp, ledger, lpath) = locked_ledger_fixture();
+        let target = tmp.path().join("cache");
+        std::fs::create_dir_all(&target).unwrap();
+        let u = unit(target.to_str().unwrap(), 5, None);
+        let mut other_process_holds = None;
+        let res = run_recorded(
+            &u,
+            &ledger,
+            Verb::Delete,
+            "human:tui",
+            Vec::new(),
+            "the folder was moved to Trash",
+            || {
+                // The move happens, then another swamp takes the ledger.
+                std::fs::remove_dir_all(&target).unwrap();
+                other_process_holds =
+                    Some(swamp_core::fs_gate::StoreDir::lock_ledger_writes(&lpath).unwrap());
+                Ok(Moved {
+                    value: (),
+                    recovery: None,
+                    state: "trashed".into(),
+                    facts: Vec::new(),
+                })
+            },
+        );
+        drop(other_process_holds);
+        swamp_core::fs_gate::store::set_ledger_lock_wait_ms(0);
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("was moved to Trash, but the record could not be written"),
+            "{err}"
+        );
+        assert!(!err.contains("nothing was written"), "{err}");
+        let rows = ledger.all().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "started");
+    }
+
+    /// Tempting wrong patch: a Docker removal (permanent) writes its row
+    /// only afterwards. The started row exists before the daemon is asked.
+    #[test]
+    fn the_started_row_exists_before_the_move_runs() {
+        let (tmp, ledger, _l) = locked_ledger_fixture();
+        let u = unit(tmp.path().join("x").to_str().unwrap(), 1, None);
+        let seen = std::cell::Cell::new(false);
+        let res: Result<()> = run_recorded(
+            &u,
+            &ledger,
+            Verb::Delete,
+            "human:tui",
+            Vec::new(),
+            "removed",
+            || {
+                let rows = ledger.all().unwrap();
+                seen.set(rows.len() == 1 && rows[0].outcome == "started");
+                return Err(anyhow::anyhow!("the daemon refused")) as Result<Moved<()>>;
+            },
+        );
+        assert!(res.is_err() && seen.get(), "the row was not there first");
+        let rows = ledger.all().unwrap();
+        assert!(
+            rows[0].outcome.starts_with("failed:the daemon refused"),
+            "{}",
+            rows[0].outcome
+        );
     }
 }

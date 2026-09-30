@@ -1663,8 +1663,9 @@ pub fn trash_reclaim(
         ))
         .map_err(|e| {
             format!(
-                "moved to Trash at {}, but the final ledger row could not be written ({e}); the started row stays",
-                dest.display()
+                "moved to Trash at {}, but the final ledger row could not be written ({}); the started row stays and is all that records it",
+                dest.display(),
+                format!("{e:#}").replace(", so nothing was written", "")
             )
         })?;
     Ok(dest)

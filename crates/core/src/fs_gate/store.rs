@@ -30,6 +30,29 @@ use serde::Serialize;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+/// How long a ledger write waits for the lock: ten seconds. Test builds
+/// (`testing` feature, compiled out of release) can shorten it.
+fn ledger_lock_wait() -> std::time::Duration {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        let ms = LEDGER_LOCK_WAIT_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    std::time::Duration::from_secs(10)
+}
+
+#[cfg(any(test, feature = "testing"))]
+static LEDGER_LOCK_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shortens the ledger lock wait for a test (milliseconds; 0 restores ten
+/// seconds). Test builds only.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_ledger_lock_wait_ms(ms: u64) {
+    LEDGER_LOCK_WAIT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A swamp state directory: every [`JsonFile`], [`TextFile`] and lock
 /// lives at a fixed name inside one.
 ///
@@ -136,7 +159,7 @@ impl StoreDir {
     /// stays locked is an error the caller reports (nothing is written).
     pub fn lock_ledger_writes(ledger: &Path) -> io::Result<super::continuity::FileLock> {
         let path = ledger.with_file_name("ledger.lock");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + ledger_lock_wait();
         loop {
             if let Some(lock) = super::continuity::try_lock(&path, true)? {
                 return Ok(lock);
