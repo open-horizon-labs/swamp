@@ -495,7 +495,9 @@ fn print_scope_coverage_note(coverage: &[swamp_core::coverage::RootCoverage]) {
     let mut named = Vec::new();
     for c in &incomplete {
         match &c.status {
-            RegionStatus::Partial { .. } | RegionStatus::Inaccessible { .. } => {
+            RegionStatus::Partial { .. }
+            | RegionStatus::Inaccessible { .. }
+            | RegionStatus::NotMeasured { .. } => {
                 named.push(format!("{} ({})", c.path.display(), c.status.label()))
             }
             RegionStatus::Missing => *counts.entry("missing").or_default() += 1,

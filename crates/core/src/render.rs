@@ -115,6 +115,7 @@ pub fn reason_label(reason: &UnownedReason) -> &'static str {
         UnownedReason::NoContainingRepo => "no-containing-repo",
         UnownedReason::SharedCache => "shared-cache",
         UnownedReason::PermissionDenied => "permission-denied",
+        UnownedReason::NotMeasured => "not-measured",
         UnownedReason::DockerNoJoin => "docker-no-join",
     }
 }

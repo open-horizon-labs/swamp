@@ -149,6 +149,12 @@ These checks are executable constraints, not an OS security boundary or proof th
 
 `scripts/check.sh` runs the routine checks. `scripts/check-full.sh` adds compile-fail cases, mutation sweeps, and the isolated cost test. Release CI runs the full tier on macOS and Linux and smoke-tests packaged binaries.
 
+## Stall watchdog and test hooks
+
+`crate::beacon` is the shared progress beacon (#190): walk directories, git signals, the ignore lens, external units, the Codex database read and every bounded content read enter it with a phase and a path; `swamp observe` stops a pass with no progress for `observe_stall_secs`, logs the phase and path, and quarantines the path for 24 hours (`stalled-paths.tsv`, stored coverage `not measured (stalled on <date>)`).
+
+One test hook exists in the production binary, because the end-to-end watchdog test needs the real `swamp` executable: with `SWAMP_TEST_MODE=1` **and** `SWAMP_TEST_PARK_DIR=<dir>`, a walk entering exactly `<dir>` parks without progressing. Without both variables it does nothing (they are read once per process).
+
 ## Limits of the current implementation
 
 - **Not a forensic inventory.** Folded aggregates trade exhaustive detail for practical observation. Use on-demand inspection when you need more.

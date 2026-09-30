@@ -572,29 +572,6 @@ impl EffectiveScope {
     /// disagreed about spelling before (external canonicalizes its
     /// candidates, agents does not), which meant one `exclude` entry
     /// could cover one family and not the other -- the re-review's P2.
-    /// Skips `path` as not measured for this pass because an earlier pass
-    /// was stopped on it (#190). A path that is itself a root becomes
-    /// `Unreadable` with `reason`; a path inside a root is pruned from
-    /// that root's walk. Returns whether any root was affected.
-    pub fn quarantine(&mut self, path: &Path, reason: &str) -> bool {
-        let mut hit = false;
-        for root in &mut self.roots {
-            if root.path == path {
-                root.status = RootStatus::Unreadable {
-                    reason: reason.to_string(),
-                };
-                hit = true;
-            } else if path.starts_with(&root.path) && root.status == RootStatus::Present {
-                self.pruned_subtrees.push(PruneNote {
-                    root: root.path.clone(),
-                    pattern: path.display().to_string(),
-                });
-                hit = true;
-            }
-        }
-        hit
-    }
-
     pub fn exclusion_for(&self, path: &Path) -> Option<String> {
         let candidate = comparable(path);
         for root in &self.roots {

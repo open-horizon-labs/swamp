@@ -54,7 +54,13 @@ pub fn history_block_for_scope(
     let mut roots = Vec::new();
     for region in coverage {
         let span = match region.status {
-            RegionStatus::Excluded | RegionStatus::DetectorOnly => continue,
+            // A not-measured path (#190) is a hole inside a root, not a root
+            // with its own history.
+            RegionStatus::Excluded
+            | RegionStatus::DetectorOnly
+            | RegionStatus::NotMeasured { .. } => {
+                continue;
+            }
             RegionStatus::Complete | RegionStatus::Partial { .. } => {
                 history_span_for_root(store_dir, &region.path, observed_at)
             }

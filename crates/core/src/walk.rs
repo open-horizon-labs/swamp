@@ -510,6 +510,32 @@ pub mod progress {
     }
 }
 
+/// Paths this process's walks do not list, with why (#190): the paths
+/// earlier `observe` passes were stopped on, set once by `observe` before
+/// it walks. A walk reaching one records it as not measured.
+static NOT_MEASURED: std::sync::RwLock<Vec<(PathBuf, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// Sets the paths this process's walks skip as not measured, each with its
+/// reason (`not measured (stalled on <date>)`).
+pub fn set_not_measured(paths: Vec<(PathBuf, String)>) {
+    *NOT_MEASURED.write().unwrap_or_else(|e| e.into_inner()) = paths;
+}
+
+/// The paths set by [`set_not_measured`], for coverage rows.
+pub fn not_measured() -> Vec<(PathBuf, String)> {
+    NOT_MEASURED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn not_measured_reason(path: &Path) -> Option<String> {
+    let list = NOT_MEASURED.read().unwrap_or_else(|e| e.into_inner());
+    list.iter()
+        .find(|(p, _)| path == p)
+        .map(|(_, why)| why.clone())
+}
+
 struct AttrShared {
     sharing: Option<Mutex<crate::sharing::Collector>>,
     seen_inodes: ShardedInodeSet,
@@ -951,17 +977,20 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
         return;
     }
     let _entered = crate::beacon::enter("walk", &path);
-    crate::beacon::test_park(&path);
 
-    // A dataless directory (file provider placeholder) is never listed:
-    // listing it would ask the provider to fetch it, which can block
-    // indefinitely (#190). It is recorded as not measured, the same row
-    // an unreadable directory gets, never silently dropped.
-    let dataless = crate::fs_gate::read::is_dataless(&meta);
-    let listed = if dataless {
-        Err(std::io::Error::other("dataless directory"))
-    } else {
-        crate::fs_gate::read_dir(&path)
+    // Not listed, recorded as not measured with why, never dropped:
+    // a path an earlier pass was stopped on (#190), or a dataless
+    // directory (file provider placeholder), which listing would fetch.
+    let skip = not_measured_reason(&path).or_else(|| {
+        crate::fs_gate::read::is_dataless(&meta)
+            .then(|| "a dataless file provider placeholder; not listed".to_string())
+    });
+    if skip.is_none() {
+        crate::beacon::test_park(&path);
+    }
+    let listed = match &skip {
+        Some(_) => Err(std::io::Error::other("not measured")),
+        None => crate::fs_gate::read_dir(&path),
     };
     let entries = match listed {
         Ok(e) => {
@@ -973,11 +1002,13 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 measurement: None,
                 path_or_object: path.display().to_string(),
                 bytes: 0,
-                reason: UnownedReason::PermissionDenied,
+                reason: if skip.is_some() {
+                    UnownedReason::NotMeasured
+                } else {
+                    UnownedReason::PermissionDenied
+                },
                 shared_bytes: None,
-                note: dataless.then(|| {
-                    "a dataless file provider placeholder; not listed, not measured".to_string()
-                }),
+                note: skip,
                 created_at: None,
                 containers: Vec::new(),
                 shared_with: Vec::new(),
@@ -1320,7 +1351,8 @@ fn process_size(
     let own_meta = crate::fs_gate::symlink_metadata(&path);
     let dataless = own_meta
         .as_ref()
-        .is_ok_and(crate::fs_gate::read::is_dataless);
+        .is_ok_and(crate::fs_gate::read::is_dataless)
+        || not_measured_reason(&path).is_some();
     let listed = if dataless {
         Err(std::io::Error::other("dataless directory"))
     } else {

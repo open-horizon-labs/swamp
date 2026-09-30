@@ -19,14 +19,12 @@ fn observe(
     store: &Path,
     home: &Path,
     logs: &Path,
-    root: &Path,
     park: &Path,
 ) -> (std::process::Output, Duration) {
     let t = Instant::now();
     swamp_core::work_counters::record_spawn();
     let out = Command::new(env!("CARGO_BIN_EXE_swamp"))
         .arg("observe")
-        .arg(root)
         .env("SWAMP_DIR", store)
         .env("HOME", home)
         .env("SWAMP_LOG_DIR", logs)
@@ -47,13 +45,13 @@ fn a_parked_pass_is_stopped_named_and_skipped_next_time() {
     for d in [&store, &home, &logs] {
         std::fs::create_dir_all(d).unwrap();
     }
-    std::fs::write(store.join("config.toml"), "observe_timeout_sec = 5\n").unwrap();
     let root = tmp.join("root");
+    config(&store, &root, "observe_timeout_sec = 5\n");
     let stuck = root.join("a/stuck");
     std::fs::create_dir_all(&stuck).unwrap();
     std::fs::write(root.join("a/f"), b"x").unwrap();
 
-    let (out, took) = observe(&store, &home, &logs, &root, &stuck);
+    let (out, took) = observe(&store, &home, &logs, &stuck);
     assert!(took < Duration::from_secs(30), "{took:?}");
     assert_eq!(
         out.status.code(),
@@ -61,14 +59,17 @@ fn a_parked_pass_is_stopped_named_and_skipped_next_time() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!store.join("observe.lock").exists(), "writer lock left behind");
+    assert!(
+        !store.join("observe.lock").exists(),
+        "writer lock left behind"
+    );
     let log = std::fs::read_to_string(logs.join("observe.log")).unwrap();
     assert!(
         log.contains(&format!("in walk at {}", stuck.display())),
         "log must name phase and path:\n{log}"
     );
 
-    let (out2, took2) = observe(&store, &home, &logs, &root, &stuck);
+    let (out2, took2) = observe(&store, &home, &logs, &stuck);
     let so = String::from_utf8_lossy(&out2.stdout);
     assert!(
         out2.status.success(),
@@ -78,4 +79,109 @@ fn a_parked_pass_is_stopped_named_and_skipped_next_time() {
     assert!(took2 < Duration::from_secs(5), "{took2:?}");
     assert!(so.contains("not measured (stalled on"), "{so}");
     assert!(!so.contains("another observation is running"), "{so}");
+
+    // Stored coverage says not measured, with the reason; never excluded.
+    // Tempting wrong patch: pruning it as a scope exclusion, which stores
+    // it as `excluded` (coverage-changes-are-not-storage-changes).
+    let (cov, unowned) = stored(&store, &home, &logs);
+    let row = cov
+        .iter()
+        .find(|c| c["path"] == stuck.display().to_string())
+        .unwrap_or_else(|| panic!("no coverage row for {stuck:?}: {cov:?}"));
+    assert_eq!(row["status"], "not-measured", "{row}");
+    assert!(
+        row["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("stalled on ")),
+        "{row}"
+    );
+    assert!(
+        unowned
+            .iter()
+            .any(|u| u.to_string().contains(&stuck.display().to_string())
+                && u["reason"] == "NotMeasured"),
+        "{unowned:?}"
+    );
+}
+
+fn stored(
+    store: &Path,
+    home: &Path,
+    logs: &Path,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    swamp_core::work_counters::record_spawn();
+    let out = Command::new(env!("CARGO_BIN_EXE_swamp"))
+        .args(["report", "--json"])
+        .env("SWAMP_DIR", store)
+        .env("HOME", home)
+        .env("SWAMP_LOG_DIR", logs)
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let arr = |k: &str| v[k].as_array().cloned().unwrap_or_default();
+    (arr("scope_coverage"), arr("unowned"))
+}
+
+/// The root is declared in config (not passed on the command line) so a
+/// plain `swamp report` reads the same scope back.
+fn config(store: &Path, root: &Path, extra: &str) {
+    std::fs::write(
+        store.join("config.toml"),
+        format!(
+            "{extra}[scan]\ndefaults = false\ninclude = [\"{}\"]\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+}
+
+fn mkfifo(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+}
+
+/// A repository git cannot safely open (a FIFO loose ref) is stored as
+/// not measured with the reason, not only printed. Tempting wrong patch:
+/// returning `None` from the open and letting the repo read as having no
+/// git signals, with no coverage fact at all.
+#[test]
+fn a_declined_repository_is_stored_as_not_measured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    let (store, home, logs) = (tmp.join("store"), tmp.join("home"), tmp.join("logs"));
+    for d in [&store, &home, &logs] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let root = tmp.join("root");
+    config(&store, &root, "");
+    let repo = root.join("proj");
+    std::fs::create_dir_all(repo.join(".git/refs/heads")).unwrap();
+    std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(
+        repo.join(".git/config"),
+        "[core]\n\trepositoryformatversion = 0\n",
+    )
+    .unwrap();
+    mkfifo(&repo.join(".git/refs/heads/main"));
+    let (out, took) = observe(&store, &home, &logs, &tmp.join("none"));
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (cov, _) = stored(&store, &home, &logs);
+    let row = cov
+        .iter()
+        .find(|c| c["path"] == repo.display().to_string())
+        .unwrap_or_else(|| panic!("no coverage row for the repo: {cov:?}"));
+    assert_eq!(row["status"], "not-measured", "{row}");
+    assert!(
+        row["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("git repository: ")),
+        "{row}"
+    );
 }

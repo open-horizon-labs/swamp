@@ -1585,6 +1585,7 @@ fn unowned_reason_to_str(reason: &UnownedReason) -> &'static str {
         UnownedReason::SharedCache => "SharedCache",
         UnownedReason::PermissionDenied => "PermissionDenied",
         UnownedReason::DockerNoJoin => "DockerNoJoin",
+        UnownedReason::NotMeasured => "NotMeasured",
     }
 }
 
@@ -1596,6 +1597,7 @@ fn unowned_reason_from_str(s: &str) -> UnownedReason {
         "SharedCache" => UnownedReason::SharedCache,
         "PermissionDenied" => UnownedReason::PermissionDenied,
         "DockerNoJoin" => UnownedReason::DockerNoJoin,
+        "NotMeasured" => UnownedReason::NotMeasured,
         _ => UnownedReason::NoContainingRepo,
     }
 }
@@ -1846,6 +1848,7 @@ fn region_status_tag(status: &crate::coverage::RegionStatus) -> &'static str {
         crate::coverage::RegionStatus::Missing => "missing",
         crate::coverage::RegionStatus::Inaccessible { .. } => "inaccessible",
         crate::coverage::RegionStatus::DetectorOnly => "detector_only",
+        crate::coverage::RegionStatus::NotMeasured { .. } => "not_measured",
     }
 }
 
@@ -1901,7 +1904,8 @@ pub fn write_coverage_table(
             status: region_status_tag(&c.status).to_string(),
             reason: match &c.status {
                 crate::coverage::RegionStatus::Partial { reason }
-                | crate::coverage::RegionStatus::Inaccessible { reason } => Some(reason.clone()),
+                | crate::coverage::RegionStatus::Inaccessible { reason }
+                | crate::coverage::RegionStatus::NotMeasured { reason } => Some(reason.clone()),
                 _ => None,
             },
             walked_total: c.status.was_observed().then_some(c.walked_total),
@@ -1996,6 +2000,9 @@ fn rebuild_coverage_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mu
                 reason: r.reason.clone().unwrap_or_default(),
             },
             "inaccessible" => crate::coverage::RegionStatus::Inaccessible {
+                reason: r.reason.clone().unwrap_or_default(),
+            },
+            "not_measured" => crate::coverage::RegionStatus::NotMeasured {
                 reason: r.reason.clone().unwrap_or_default(),
             },
             _ => crate::coverage::RegionStatus::Missing,

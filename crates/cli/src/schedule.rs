@@ -59,14 +59,14 @@ pub fn cmd_observe(
     // A path an earlier pass was stopped on is skipped as not measured
     // for a day, so one blocking path cannot fail every scheduled pass
     // (#190).
-    let mut scope = scope;
     let mut quarantine_notes = Vec::new();
+    let mut skipped = Vec::new();
     for (at, path) in schedule::quarantined(&store_dir, swamp_core::entities::now()) {
-        let reason = format!("not measured (stalled on {})", schedule::utc_date(at));
-        if scope.quarantine(&path, &reason) {
-            quarantine_notes.push(format!("{}: {reason}", path.display()));
-        }
+        let reason = format!("stalled on {}", schedule::utc_date(at));
+        quarantine_notes.push(format!("{}: not measured ({reason})", path.display()));
+        skipped.push((path, reason));
     }
+    swamp_core::walk::set_not_measured(skipped);
     let stall = Duration::from_secs(
         config
             .observe_stall_secs
