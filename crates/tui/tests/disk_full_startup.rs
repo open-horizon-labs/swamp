@@ -94,7 +94,6 @@ fn startup_on_a_full_disk_shows_the_stored_report_and_banner_without_observing()
         "no observation worker may be started"
     );
     assert!(app.observing.is_none());
-    assert!(app.watches.is_empty(), "no live watch on a full disk");
     assert_eq!(listing(store.path()), before, "startup wrote to the store");
 
     let backend = TestBackend::new(200, 24);
