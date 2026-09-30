@@ -175,8 +175,8 @@ impl RegularFile {
     }
 }
 
-/// This process's real uid, for a `loginctl show-user <uid>` argument
-/// (`systemd_user::linger`).
+/// This process's real uid (`fs_gate::current_uid`; also the
+/// `loginctl show-user <uid>` argument in `systemd_user::linger`).
 #[cfg(unix)]
 pub fn current_uid() -> u32 {
     // SAFETY: getuid cannot fail and reads no memory.

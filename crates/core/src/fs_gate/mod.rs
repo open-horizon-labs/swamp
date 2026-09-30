@@ -58,6 +58,13 @@ pub mod sys;
 pub mod systemd;
 pub mod terminal;
 
+/// This process's real uid, on every platform: for the per-user
+/// directory names a tool derives from it (`/private/tmp/claude-<uid>`)
+/// and for `loginctl show-user <uid>`.
+pub fn current_uid() -> u32 {
+    sys::current_uid()
+}
+
 /// A swamp state directory (see [`store::StoreDir`]). Named here so any
 /// module can hold or pass one; building one from a caller's path
 /// (`StoreDir::at`) is the store modules' capability.

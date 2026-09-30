@@ -129,7 +129,9 @@ impl Detector for ClaudeCodeScratchDetector {
             provenance: Provenance::BuiltinConvention,
             status: LocationStatus::Resolved,
             note: Some(
-                "Claude Code's per-user session scratch; macOS clears /private/tmp at boot"
+                "Claude Code's per-user session scratch; on the machine this was built on, every entry \
+                 under /private/tmp was newer than the last boot (swamp does not assume it is \
+                 cleared)"
                     .to_string(),
             ),
         }]

@@ -533,7 +533,7 @@ impl Environment {
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
             home,
-            uid: crate::fs_gate::systemd::current_uid(),
+            uid: crate::fs_gate::current_uid(),
             env: std::env::vars().collect(),
             platform: Platform::current(),
             runner: Arc::new(SystemCommandRunner),

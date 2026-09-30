@@ -373,7 +373,7 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         attribution_limits: &[
             "each store is one unit: nothing inside is identified or attributed to a project",
-            "the consequence text is the tool's own reinstall command; how long a removed store takes to come back is not measured",
+            "the consequence text is the tool's own reinstall command where one exists (ESP-IDF's install.sh, xcode-select --install); otherwise it is swamp's own statement, labelled as such (session scratch, the simulator support directories, developer disk images); how long a removed store takes to come back is not measured",
             "scratch is measured while a session may be writing to it; an open-file check is evidence, never proof",
         ],
         operation_granularity: "one whole store directory",

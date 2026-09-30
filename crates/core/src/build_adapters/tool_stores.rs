@@ -73,7 +73,8 @@ impl BuildAdapter for Adapter {
                 ArtifactRole::Intermediate,
                 "Claude Code's per-user session scratch directory",
                 "Claude Code's session scratch",
-                "session scratch; removing it during a session breaks that session",
+                "session scratch; removing it during a session breaks that session \
+                 (swamp's statement; Claude Code documents no such directory)",
                 "a running Claude Code session may be writing here",
             ),
             _ => return Vec::new(),
@@ -333,7 +334,9 @@ mod tests {
                     let c = BuildContainer::shared_store_of(adapter.id(), path, kind);
                     for u in adapter.identify(&c, &BuildCtx::new(1_000_000, &idx, &none, &cache)) {
                         seen += 1;
-                        let json = serde_json::to_string(&u).unwrap();
+                        // Debug, not serde_json: the repo gate keeps serializer calls out of
+                        // non-writer files, and every string field is in the Debug form.
+                        let json = format!("{u:?}");
                         check(&format!("{}/{kind:?}", adapter.id()), &json);
                         assert!(
                             !matches!(u.action, crate::artifact::NestedActionCapability::TrashPath),
@@ -400,6 +403,50 @@ mod tests {
                 .map(|a| a.id())
                 .collect();
             assert_eq!(owners.len(), 1, "{kind:?}: {owners:?}");
+        }
+    }
+
+    #[test]
+    fn no_unit_of_any_store_offers_an_action_and_the_adapter_claims_none() {
+        // Tempting wrong patch: flipping `actions_available` later, which
+        // would make an active session's scratch directory removable
+        // with nothing else objecting.
+        assert!(!Adapter.capabilities().actions_available);
+        assert!(Adapter.trash_roles().is_empty());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        for kind in Adapter.store_kinds() {
+            let dirs = vec![
+                FoldedDir {
+                    path: root.join("child"),
+                    allocated_total: 4096,
+                    mtime_max: 5,
+                    complete: true,
+                },
+                FoldedDir {
+                    path: root.clone(),
+                    allocated_total: 8192,
+                    mtime_max: 5,
+                    complete: true,
+                },
+            ];
+            let idx = FoldedIndex::from_dirs(dirs);
+            let none = EventCoverage::untrusted();
+            let cache = ContainerCache::disabled();
+            let c = BuildContainer::shared_store_of("tool-stores", root.clone(), *kind);
+            let units = Adapter.identify(&c, &BuildCtx::new(1_000_000, &idx, &none, &cache));
+            assert!(units.len() >= 2, "{kind:?}");
+            for u in units {
+                assert!(
+                    matches!(
+                        u.action,
+                        crate::artifact::NestedActionCapability::Unsupported { .. }
+                    ),
+                    "{kind:?}: {:?}",
+                    u.action
+                );
+            }
         }
     }
 }

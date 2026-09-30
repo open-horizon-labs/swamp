@@ -22,10 +22,13 @@ observations, not general performance guarantees. See the README for current use
   `Cryptex` and `Profiles`, `CommandLineTools` (reinstall with
   `xcode-select --install`), `DeveloperDiskImages`, `CoreDevice` and `DeviceKit`.
 - **Claude Code's session scratch is reported.** `/private/tmp/claude-<uid>` was
-  several GB here and unmeasured. It shows as one cache row, with a row per project
-  directory, saying that removing it during a session breaks that session. It is one
-  exact path; nothing else in `/private/tmp` is scanned. macOS clears `/private/tmp`
-  at boot, so this is transient by nature.
+  several GB here and unmeasured. It shows as a cache (rows per project directory
+  under "Caches & intermediates"), with swamp's own note that removing it during a session
+  breaks that session. It is one exact path; nothing else in `/private/tmp` is scanned.
+  Git worktrees that live inside it are counted under their projects, and the row says how
+  much. On this machine every entry there was newer than the last boot; swamp does not
+  assume it is cleared. The simulator runtime row is labelled as mounted size: runtimes
+  that are not mounted are not measured.
 
 ## v0.7.5
 
