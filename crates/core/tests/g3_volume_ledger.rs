@@ -61,6 +61,10 @@ struct FakeFs {
     stats: AtomicU64,
     /// Listing this real path blocks until `release` is set: a hung mount.
     block_on: Mutex<Option<PathBuf>>,
+    /// Report 70% of the blocks the FIRST time each file under this prefix
+    /// is statted: a walker that undercounts.
+    lie_once: Mutex<Option<PathBuf>>,
+    lied: Mutex<HashSet<PathBuf>>,
     release: std::sync::atomic::AtomicBool,
 }
 
@@ -212,6 +216,10 @@ impl FakeFs {
         *self.slow.lock().unwrap() = Some((PathBuf::from(self.lp(logical_prefix)), delay));
     }
 
+    fn undercount_first_look_under(&self, logical: &str) {
+        *self.lie_once.lock().unwrap() = Some(PathBuf::from(self.lp(logical)));
+    }
+
     fn block_forever_on(&self, logical: &str) {
         *self.block_on.lock().unwrap() = Some(PathBuf::from(self.lp(logical)));
     }
@@ -288,7 +296,17 @@ impl VolumeFs for FakeFs {
                 blocks: 0,
                 mtime: *mtime,
             }),
-            Some(Node::File(st)) => Ok(*st),
+            Some(Node::File(st)) => {
+                let mut st = *st;
+                let lie = self.lie_once.lock().unwrap().clone();
+                if let Some(prefix) = lie
+                    && path.starts_with(&prefix)
+                    && self.lied.lock().unwrap().insert(path.to_path_buf())
+                {
+                    st.blocks = st.blocks * 70 / 100;
+                }
+                Ok(st)
+            }
             None => Err(io::Error::from(io::ErrorKind::NotFound)),
         }
     }
@@ -828,9 +846,12 @@ fn what_could_not_be_read_is_an_estimate_by_elimination_and_the_parts_sum_within
     // volumes hold, so nothing is left over, and the identity is exact.
     assert_eq!(a.residual.bytes, Some(container_used as i64 - parts as i64));
     assert_eq!(a.residual.bytes, Some(0));
-    assert_eq!(a.residual.within_one_percent, Some(true));
+    assert_eq!(a.residual.bookkeeping_balanced, Some(true));
+    // The measured parts alone do NOT explain the Data volume: the protected
+    // folders' share is an estimate, never a passing check.
+    assert_eq!(a.residual.within_one_percent, Some(false));
     let text = render_disk_view(Some(&a), NOW);
-    assert!(text.contains("Not measured (unreadable folders or not yet measured), estimated"));
+    assert!(text.contains("Protected folders: not measured (2 folders)"));
     assert!(text.contains("an estimate"));
     // System volumes are separate volumes; the mounted image container
     // (disk9) is never one of them.
@@ -905,22 +926,34 @@ fn many_small_folders(fs: &FakeFs, n: usize) {
     }
 }
 
-fn comparable(rows: &[Row]) -> Vec<(String, Option<u64>, Option<u64>, String)> {
-    let mut v: Vec<_> = rows
+/// Totals per folder, whatever the granularity a run split it into (a
+/// folder that filled a whole run alone is measured as its parts, which
+/// sum to the same bytes and entries).
+fn comparable(rows: &[Row]) -> Vec<(String, Option<u64>, Option<u64>)> {
+    let mut by: std::collections::BTreeMap<String, (Option<u64>, Option<u64>)> = Default::default();
+    for r in rows
         .iter()
         .filter(|r| r.category == Category::Other || r.category == Category::Unreadable)
-        .filter(|r| r.method != "expanded")
-        .map(|r| {
-            (
-                r.path.clone(),
-                r.bytes,
-                r.entries,
-                r.exactness.as_str().to_string(),
-            )
-        })
-        .collect();
-    v.sort();
-    v
+        .filter(|r| r.method != "expanded" && r.method != "pending")
+    {
+        let key = r
+            .path
+            .strip_suffix("/(files directly here)")
+            .unwrap_or(&r.path)
+            .to_string();
+        let e = by.entry(key).or_insert((None, None));
+        e.0 = match (e.0, r.bytes) {
+            (None, b) => b,
+            (a, None) => a,
+            (Some(a), Some(b)) => Some(a + b),
+        };
+        e.1 = match (e.1, r.entries) {
+            (None, b) => b,
+            (a, None) => a,
+            (Some(a), Some(b)) => Some(a + b),
+        };
+    }
+    by.into_iter().map(|(k, (b, n))| (k, b, n)).collect()
 }
 
 #[test]
@@ -958,7 +991,12 @@ fn a_slow_filesystem_stops_at_the_budget_and_the_cursor_resumes_to_identical_tot
             None => cycle_start = Some(meta.cycle_started_at),
             Some(c) => assert_eq!(meta.cycle_started_at, c, "the cycle restarted"),
         }
-        sizes.push(slow.rows().len());
+        sizes.push(
+            slow.rows()
+                .iter()
+                .filter(|r| r.category != Category::Audit)
+                .count(),
+        );
         // The walk itself stopped at the budget (not counting the write).
         assert!(
             meta.budget_used_ms < budget.as_millis() as u64 + 1_000,
@@ -2141,4 +2179,242 @@ fn ver_a_negative_residual_is_flagged_and_huge_values_do_not_panic() {
     let a = account(&[mk("/a", u64::MAX), mk("/b", u64::MAX)], &meta);
     assert!(a.residual.residual_flag);
     assert_eq!(a.residual.bytes, Some(i64::MIN));
+}
+
+// ---- second review round: spot audit, stuck retry, mounts, planning ----------
+
+fn big_folder(fs: &FakeFs) {
+    for i in 0..4u64 {
+        fs.file(&format!("/Users/me/big/f{i}"), 25_000, 7_700 + i, 1);
+    }
+}
+
+#[test]
+fn a_walker_that_undercounts_one_folder_by_30_percent_is_flagged_by_the_spot_audit() {
+    // Tempting wrong patch: counting the parts adding up to the container
+    // as evidence about the walk. Every part is a leftover of the others,
+    // so only an independent re-measurement can disagree with the walk.
+    let s = Setup::new();
+    big_folder(&s.fs);
+    s.fs.undercount_first_look_under("/Users/me/big");
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    assert!(a.audit.audit_flag, "{:?}", a.audit);
+    let f = a
+        .audit
+        .folders
+        .iter()
+        .find(|f| f.path == "/Users/me/big")
+        .expect("the largest folder is audited");
+    assert_eq!(f.ledger_bytes, 70_000 * 512);
+    assert_eq!(f.audited_bytes, 100_000 * 512);
+    assert!(f.outside_tolerance && f.percent > 25.0);
+    let text = render_disk_view(Some(&a), NOW);
+    assert!(
+        text.contains("FLAG: walk spot audit disagrees on /Users/me/big: ledger"),
+        "{text}"
+    );
+    let json = swamp_core::volume_ledger::disk_json(Some(&a), NOW, None);
+    assert_eq!(json["audit"]["audit_flag"], true);
+}
+
+#[test]
+fn an_honest_walker_on_a_churning_tree_stays_inside_the_audit_tolerance() {
+    let s = Setup::new();
+    big_folder(&s.fs);
+    // A file lands after the walk listed the folder, before the audit does.
+    s.fs.after_listing("/Users/me/big", |fs| {
+        fs.file("/Users/me/big/late", 3, 9_999, 1)
+    });
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    assert!(!a.audit.audit_flag, "{:?}", a.audit);
+    assert!(!a.audit.folders.is_empty() && a.audit.folders.len() <= 5);
+    assert!(a.audit.folders.iter().any(|f| f.path == "/Users/me/big"));
+    let text = render_disk_view(Some(&a), NOW);
+    assert!(
+        text.contains("Walk spot-audited:") && text.contains("max difference"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_audit_never_takes_a_folder_with_unreadable_parts_and_is_deterministic_by_day() {
+    let s = Setup::new();
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    for f in &a.audit.folders {
+        assert!(
+            ![
+                "/Users/me/Library",
+                "/Users/me/Pictures",
+                "/Users/me/Library/Mail"
+            ]
+            .contains(&f.path.as_str()),
+            "an unreadable folder was audited: {}",
+            f.path
+        );
+    }
+    // The same day picks the same folders.
+    let first: Vec<String> = a.audit.folders.iter().map(|f| f.path.clone()).collect();
+    let again = s.run_at(NOW + 60, true, Duration::from_secs(60), Some(0));
+    assert!(ran(&again).complete);
+    let b = read_account(s.store.path()).unwrap().unwrap();
+    let second: Vec<String> = b.audit.folders.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn a_spent_budget_skips_the_audit_with_a_note_and_the_run_still_ends_on_time() {
+    let s = Setup::new();
+    big_folder(&s.fs);
+    // Once the walk has listed the folder, listing it again takes two seconds.
+    s.fs.after_listing("/Users/me/big", |fs| {
+        fs.slow_under("/Users/me/big", Duration::from_secs(2))
+    });
+    let t = Instant::now();
+    ran(&s.run_at(NOW, true, Duration::from_millis(600), Some(0)));
+    assert!(
+        t.elapsed() < Duration::from_millis(1_800),
+        "{:?}",
+        t.elapsed()
+    );
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    assert!(!a.audit.audit_flag);
+    assert!(
+        a.audit
+            .skipped
+            .as_deref()
+            .is_some_and(|n| n.contains("budget")),
+        "{:?}",
+        a.audit
+    );
+    assert!(render_disk_view(Some(&a), NOW).contains("Walk spot audit: not run"));
+}
+
+#[test]
+fn a_folder_stuck_three_runs_in_a_row_is_skipped_until_the_next_cycle_and_logged_once() {
+    // Tempting wrong patch: retrying a wedged folder forever (every run
+    // burns its budget on it) or counting it as measured after one try.
+    let s = Setup::new();
+    s.fs.block_forever_on("/Users/me/Downloads");
+    let mut logged = 0;
+    for i in 0..3u64 {
+        let out = s.run_at(NOW + i, true, Duration::from_millis(300), Some(0));
+        logged += ran(&out)
+            .notes
+            .iter()
+            .filter(|n| n.contains("skipped until the next cycle"))
+            .count();
+        let row = s.row("/Users/me/Downloads").expect("row");
+        if i < 2 {
+            assert_eq!(row.method, "stuck", "run {i}");
+        } else {
+            assert_eq!(row.method, "skipped");
+            assert!(row.note.as_deref().unwrap().contains("skipped until 20"));
+        }
+    }
+    assert_eq!(logged, 1, "said once, at the third run");
+    // Fresh now: the cycle can finish without it.
+    let done = s.run_at(NOW + 10, true, Duration::from_secs(30), Some(0));
+    assert!(ran(&done).complete);
+    s.fs.release.store(true, Ordering::SeqCst);
+}
+
+#[test]
+fn an_automount_spelled_through_the_data_volume_is_never_touched() {
+    // Tempting wrong patch: filtering the mount table by path before
+    // classifying it, so `auto_home` at /System/Volumes/Data/home is dropped
+    // and the walk statts it.
+    use swamp_core::volume_ledger::pass::keep_mount;
+    let d = Path::new("/System/Volumes/Data");
+    assert!(keep_mount(&d.join("home"), "autofs", true));
+    assert!(keep_mount(&d.join("home"), "autofs", false));
+    assert!(keep_mount(Path::new("/Volumes/x"), "smbfs", false));
+    assert!(
+        keep_mount(&d.join("Users/me/ext"), "apfs", true),
+        "kept, mapped to its normal path"
+    );
+    assert!(!keep_mount(d, "apfs", true));
+    assert!(!keep_mount(Path::new("/System/Volumes/VM"), "apfs", true));
+    assert!(!keep_mount(Path::new("/"), "apfs", true));
+    let s = Setup::new();
+    s.fs.mkdir("/Users/me/auto", 5);
+    let mut mounts = s.fs.mounts();
+    mounts.push(MountView {
+        path: PathBuf::from("/data/Users/me/auto"), // spelled through the data volume
+        kind: MountKind::Remote,
+        used: None,
+    });
+    s.fs.set_mounts(mounts);
+    ran(&s.pass());
+    assert_eq!(s.fs.touched_exactly("/Users/me/auto"), 0);
+}
+
+#[test]
+fn planning_has_a_time_limit_and_an_incomplete_plan_is_not_a_complete_cycle() {
+    // Tempting wrong patch: unbounded planning listings (a slow directory
+    // holds the run past its budget) or a truncated plan called complete.
+    let s = Setup::new();
+    s.fs.slow_under("/Users/me", Duration::from_millis(400));
+    let out = s.run_at(NOW, true, Duration::from_millis(400), Some(0));
+    let summary = ran(&out);
+    assert!(!summary.complete);
+    assert!(
+        summary.notes.iter().any(|n| n.contains("planning stopped")),
+        "{:?}",
+        summary.notes
+    );
+}
+
+#[test]
+fn a_ledger_that_cannot_be_read_because_of_io_is_left_alone_and_only_damage_moves_it_aside() {
+    // Tempting wrong patch: any read error means "corrupt": a transient
+    // EIO or EMFILE would throw away a good ledger.
+    use std::os::unix::fs::PermissionsExt;
+    let s = Setup::new();
+    ran(&s.pass());
+    let rows = s.store.path().join("volume_ledger.parquet");
+    std::fs::set_permissions(&rows, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable_anyway = std::fs::read(&rows).is_ok(); // running as root
+    let out = s.run_at(NOW + 5, true, Duration::from_secs(30), Some(0));
+    std::fs::set_permissions(&rows, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if readable_anyway {
+        return;
+    }
+    match out {
+        PassOutcome::Skipped(line) => assert!(line.contains("nothing was moved"), "{line}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(rows.exists());
+    assert!(!std::fs::read_dir(s.store.path()).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".corrupt-")
+    }));
+}
+
+#[test]
+fn quarantined_ledgers_older_than_a_week_are_removed_at_the_start_of_a_pass() {
+    let s = Setup::new();
+    let old = s.store.path().join(format!(
+        "volume_ledger.parquet.corrupt-{}",
+        NOW - 8 * 86_400
+    ));
+    let recent = s.store.path().join(format!(
+        "volume_ledger_meta.parquet.corrupt-{}",
+        NOW - 86_400
+    ));
+    let other = s.store.path().join("notes.corrupt-1");
+    for f in [&old, &recent, &other] {
+        std::fs::write(f, b"x").unwrap();
+    }
+    ran(&s.pass());
+    assert!(!old.exists(), "older than seven days");
+    assert!(recent.exists());
+    assert!(
+        other.exists(),
+        "only the ledger's own quarantine names are touched"
+    );
 }

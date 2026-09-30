@@ -140,15 +140,19 @@ observations, not general performance guarantees. See the README for current use
   estimated" 43.3 GB + a residual of +219 MB (0.05% of used).
   Measured against `du` on the same disk: /Applications 24.27 GB (du 24.27), /opt
   25.31 (25.31), /Library 14.45 (14.45), /System/Library/AssetsV2 27.81 (27.80),
-  /private 60.22 (60.12), home 163.1 by `du`, which cannot read the protected
-  folders (the ledger's home row differs by the OrbStack data image, 23 GB, that
-  the observation measures and `du` is refused).
-- **The check can fail.** The parts add up to the container's used bytes with one
-  residual, "unattributed: allocation not explained by any measured part", that
-  nothing absorbs; when it is more than 1% of used the report prints a `FLAG` line
-  (JSON `residual_flag`). The estimate for protected folders is shown apart, labelled
-  an estimate, and only while something is unreadable or not yet measured. Here the
-  residual is +219 MB (0.05%). Locations not yet measured are listed by name.
+  /private 60.22 (60.12), home: the ledger's figure exceeds `du`'s (163.1 GB); the difference is not fully
+  explained here (`du` cannot read some protected containers, so part of it may be the
+  OrbStack data image).
+- **The walk is spot-audited, and the sum is called what it is.** That the parts
+  add up to the container's used bytes is bookkeeping (the estimate for protected
+  folders is a leftover, so it balances anything), and the report says so
+  (`bookkeeping_balanced`). The check that can fail is new: each pass re-measures up
+  to five readable folders (the largest, plus a daily rotation) with an independent
+  naive sum and compares them with the ledger; a difference beyond max(1%, 4 MiB)
+  prints `FLAG: walk spot audit disagrees on <path>` (JSON `audit_flag`). The
+  protected-folder estimate is shown as "not measured (N folders); the unexplained
+  part of the Data volume, up to X GB, may be inside them (estimate)" and is not
+  part of any check.
 - **A folder swamp cannot read is `not measured`, never zero.** 981 folders here
   (Photos, Mail, Containers, Group Containers, `/private/var/db`, the Spotlight
   index, ...) are listed by name (the first 200 in `--json`) with the exact count.
@@ -170,10 +174,10 @@ observations, not general performance guarantees. See the README for current use
 - **The pass respects its budget and resumes.** It runs after the observation, under
   its own `volume-pass.lock`, and reads the mount table before touching any path (a
   network mount is never statted). It measures at background priority, three folders
-  at a time, for at most `volume_pass_budget_secs` (default 120, minimum 5, the system
-  queries and planning included; a run can take up to 1.5 budgets), then stops even
-  mid-folder and continues at the next `observe`; each row keeps its own time. Past
-  two budgets it stops waiting for a stuck path, logs it and lets the next run resume. Here a warm pass takes about 30-35
+  at a time, for at most `volume_pass_budget_secs` (default 120, minimum 5; the system queries and planning come first, planning limited
+  to half a budget), then stops even mid-folder and continues at the next `observe`; each
+  row keeps its own time. Past two budgets (plus the system queries) it stops waiting for
+  a stuck path, logs it and tries it again next run (skipped after three). Here a warm pass takes about 30-35
   s and an 8-second budget stopped at 8.0-8.1 s five runs in a row. A second pass over
   an unchanged disk gives the same bytes but is not faster (no event replay for the
   whole disk yet). It is new files only: no existing table changed, the store-format

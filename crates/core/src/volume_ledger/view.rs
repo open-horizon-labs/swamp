@@ -128,25 +128,56 @@ pub fn render_text(a: &Account, now: u64) -> String {
     }
     if let Some(est) = a.not_measured.estimate_bytes {
         out.push_str(&format!(
-            "{}: {} (the Data volume's own size minus everything measured above; an estimate, not a measurement)\n",
-            capitalize(a.not_measured.estimate_name),
+            "Protected folders: not measured ({} folders); the unexplained part of the Data volume, up to {}, may be inside them (an estimate, not part of any check)\n",
+            a.not_measured.count,
             human(est)
         ));
     }
     match (a.residual.bytes, a.residual.percent_of_used) {
         (Some(b), Some(p)) => {
             out.push_str(&format!(
-                "{}: {} ({p:+.2}% of used)\n",
+                "{} (bookkeeping): {} ({p:+.2}% of used)\n",
                 capitalize(a.residual.name),
                 signed(b)
             ));
             if a.residual.residual_flag {
                 out.push_str(
-                    "FLAG: the parts do not add up to the container's used bytes (unattributed is outside the 1% tolerance); a measurement above may be missing or wrong\n",
+                    "FLAG: the parts do not add up to the container's used bytes (the bookkeeping is outside the 1% tolerance); a measurement above may be missing or wrong\n",
                 );
             }
         }
         _ => out.push_str(&format!("{}: not computed\n", capitalize(a.residual.name))),
+    }
+    if a.audit.folders.is_empty() {
+        out.push_str(&format!(
+            "Walk spot audit: not run ({})\n",
+            a.audit.skipped.as_deref().unwrap_or("no reason recorded")
+        ));
+    } else {
+        out.push_str(&format!(
+            "Walk spot-audited: {} folders, max difference {:.1}%\n",
+            a.audit.folders.len(),
+            a.audit.max_difference_percent
+        ));
+        for f in &a.audit.folders {
+            if f.outside_tolerance {
+                out.push_str(&format!(
+                    "FLAG: walk spot audit disagrees on {}: ledger {} vs audit {} ({:+.1}%)\n",
+                    f.path,
+                    human(f.ledger_bytes),
+                    human(f.audited_bytes),
+                    f.percent
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  audited {}: ledger {} vs audit {} ({:+.2}%)\n",
+                    f.path,
+                    human(f.ledger_bytes),
+                    human(f.audited_bytes),
+                    f.percent
+                ));
+            }
+        }
     }
     if !a.external_volumes.is_empty() {
         out.push_str("On other volumes (not part of this container, not added):\n");
@@ -246,8 +277,16 @@ pub fn to_json(a: &Account, now: u64, limit: Option<usize>) -> serde_json::Value
             "name": a.residual.name,
             "bytes": a.residual.bytes,
             "percent_of_used": a.residual.percent_of_used,
-            "within_one_percent": a.residual.within_one_percent,
+            "bookkeeping_balanced": a.residual.bookkeeping_balanced,
             "residual_flag": a.residual.residual_flag,
+            "unexplained_bytes": a.residual.unexplained_bytes,
+            "within_one_percent": a.residual.within_one_percent,
+        },
+        "audit": {
+            "folders": a.audit.folders,
+            "skipped": a.audit.skipped,
+            "max_difference_percent": a.audit.max_difference_percent,
+            "audit_flag": a.audit.audit_flag,
         },
         "external_volumes": a.external_volumes.iter().map(|r| row_json(r, now)).collect::<Vec<_>>(),
         "mounted_views": a.mounted_views.iter().map(|r| row_json(r, now)).collect::<Vec<_>>(),

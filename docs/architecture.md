@@ -142,15 +142,18 @@ what no path reaches, and says what it did not measure.
   `tmutil listlocalsnapshots /`), allow-listed in `fs_gate::spawn` (fixed argv,
   kill on timeout, counted). A missing program, a timeout, a permission error or an
   unreadable answer is a note on a not-measured row, never a zero.
-- **The identity is computed at read time** (`volume_ledger::account`), not stored:
-  accounted + everything else + system volumes + the not-measured estimate (the
-  Data volume's consumed bytes minus what was measured) + a signed, named residual
-  equals the container's used bytes. The estimate exists only while something is
-  unreadable or not yet measured, and nothing absorbs the residual: it is flagged
-  (`residual_flag`) when it exceeds 1% of used, so a walk that missed part of the
-  disk cannot pass. Purgeable space, mounted images, another volume of the
-  container, locations on other volumes and network shares are listed and never
-  added.
+- **The bookkeeping is computed at read time** (`volume_ledger::account`), not
+  stored: accounted + everything else + system volumes + the protected-folder
+  estimate (the Data volume's consumed bytes minus what was measured, only while
+  something is unreadable or pending) + a signed, named residual equals the
+  container's used bytes. That is bookkeeping (`bookkeeping_balanced`), not
+  evidence about the walk: the estimate is a leftover, so it balances anything.
+  The check that can fail is the **spot audit**: up to five folders measured this
+  run are re-measured by an independent naive sum and compared; a difference
+  beyond `max(1%, 4 MiB)` sets `audit_flag`. Audit results are ordinary
+  `audit`-category ledger rows. Purgeable space, mounted images, another
+  volume of the container, locations on other volumes and network shares are
+  listed and never added.
 - **Decoupled and bounded.** The pass runs after the observation and its lock,
   under `volume-pass.lock`. The mount table is read before any path is touched
   (network, FUSE and automounter mounts are never statted or entered); workers are
