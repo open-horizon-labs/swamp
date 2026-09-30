@@ -414,7 +414,14 @@ fn fixture_report() -> Report {
     }
 }
 
+/// The instant every frame is drawn at: the fixtures' `observed_at`
+/// (1_726_000_000) plus 749.5 days. Frozen, so a frame's "observed N d
+/// ago" is the same on every day the suite runs (it used to roll from
+/// 749 d to 750 d and fail every frame).
+const FRAME_NOW: u64 = 1_790_756_800;
+
 fn capture(app: &App, w: u16, h: u16) -> String {
+    swamp_core::entities::test_clock::freeze(FRAME_NOW);
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| ui::draw(f, app)).unwrap();
@@ -3011,4 +3018,43 @@ fn adv_reclaim_view_survives_tiny_and_narrow_screens() {
 fn draw_only(app: &App, w: u16, h: u16) {
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| ui::draw(f, app)).unwrap();
+}
+
+/// Guard for the class of failure that broke every frame on a day
+/// rollover: frames are drawn at [`FRAME_NOW`], never at the wall clock.
+/// Draws the same scenes with the wall clock moved by a day and by 400
+/// days and requires identical frames. Tempting wrong patch: freezing the
+/// clock in some tests only, or regenerating the fixtures on the day they
+/// fail, which only moves the failure to the next rollover.
+#[test]
+fn frames_do_not_depend_on_the_wall_clock() {
+    let app = App::new(fixture_report(), "/Users/dev/src".into());
+    let base = capture(&app, 200, 60);
+    for shift in [86_400_i64, 400 * 86_400] {
+        swamp_core::entities::test_clock::shift_wall(shift);
+        let shifted = capture(&app, 200, 60);
+        swamp_core::entities::test_clock::shift_wall(0);
+        assert_eq!(
+            base, shifted,
+            "a frame changed when the wall clock moved {shift}s"
+        );
+    }
+    // And nothing in the TUI reads the wall clock around `entities::now`.
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+    let mut stack = vec![std::path::PathBuf::from(src)];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let text = std::fs::read_to_string(&p).unwrap();
+                assert!(
+                    !text.contains("SystemTime::now"),
+                    "{} reads the wall clock directly; use swamp_core::entities::now",
+                    p.display()
+                );
+            }
+        }
+    }
 }

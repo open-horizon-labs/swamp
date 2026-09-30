@@ -120,11 +120,47 @@ pub struct Observation {
     pub coverage_bytes: u64,
 }
 
+/// Unix seconds now: every age a surface prints is computed from this.
+/// Under the `testing` feature a test may freeze it
+/// ([`test_clock::freeze`]) or shift the wall clock it falls back to
+/// ([`test_clock::shift_wall`]), so rendered text (frame fixtures) never
+/// depends on the day the suite runs.
 pub fn now() -> u64 {
-    std::time::SystemTime::now()
+    #[cfg(feature = "testing")]
+    {
+        let frozen = test_clock::FROZEN.load(std::sync::atomic::Ordering::Relaxed);
+        if frozen != 0 {
+            return frozen;
+        }
+    }
+    let wall = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_secs();
+    #[cfg(feature = "testing")]
+    let wall =
+        wall.saturating_add_signed(test_clock::SHIFT.load(std::sync::atomic::Ordering::Relaxed));
+    wall
+}
+
+/// Test-only control of [`now`] (testing feature; never in a shipped
+/// build). Process-wide, so a test binary sets it once for all its tests.
+#[cfg(feature = "testing")]
+pub mod test_clock {
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    pub(super) static FROZEN: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SHIFT: AtomicI64 = AtomicI64::new(0);
+
+    /// Makes [`super::now`] return `at` (0 unfreezes).
+    pub fn freeze(at: u64) {
+        FROZEN.store(at, Ordering::Relaxed);
+    }
+
+    /// Moves the wall clock [`super::now`] reads when not frozen by
+    /// `secs`, to prove that frozen output does not depend on it.
+    pub fn shift_wall(secs: i64) {
+        SHIFT.store(secs, Ordering::Relaxed);
+    }
 }
 pub fn id_for(value: &str) -> String {
     blake3::hash(value.as_bytes()).to_hex().to_string()
