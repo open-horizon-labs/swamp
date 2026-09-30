@@ -305,11 +305,18 @@ fn discover_one(
     if excluded.iter().any(|e| dir == e || dir.starts_with(e)) {
         return;
     }
+    let _entered = in_flight::enter(dir);
     crate::work_counters::record_files_statted(1);
     let Ok(meta) = crate::fs_gate::symlink_metadata(dir) else {
         return;
     };
     if meta.dev() != device || meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    // Listing a dataless directory asks its file provider to fetch it,
+    // which can wait on the network indefinitely (#190). Discovery skips
+    // it; attribution records it as not measured.
+    if crate::fs_gate::read::is_dataless(&meta) {
         return;
     }
 
@@ -500,6 +507,51 @@ pub mod progress {
             DIRS.load(Ordering::Relaxed),
             ACTIVE.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// The directories walk-pool workers are inside right now, with when
+/// each was entered, so a watchdog can name the path a stalled pass is
+/// stuck on (#190: a worker parked in one blocking `open(2)` while every
+/// other worker idled at 0% CPU, and nothing said where).
+pub mod in_flight {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static JOBS: Mutex<Option<HashMap<u64, (PathBuf, Instant)>>> = Mutex::new(None);
+
+    /// Held while one directory is processed; dropping it leaves.
+    pub(crate) struct Entered(u64);
+
+    pub(crate) fn enter(path: &Path) -> Entered {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        JOBS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(id, (path.to_path_buf(), Instant::now()));
+        Entered(id)
+    }
+
+    impl Drop for Entered {
+        fn drop(&mut self) {
+            if let Some(jobs) = JOBS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                jobs.remove(&self.0);
+            }
+        }
+    }
+
+    /// The directory a worker has been inside the longest, and for how
+    /// long. `None` when no walk is in a directory.
+    pub fn oldest() -> Option<(PathBuf, Duration)> {
+        let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.as_ref()?
+            .values()
+            .min_by_key(|(_, at)| *at)
+            .map(|(p, at)| (p.clone(), at.elapsed()))
     }
 }
 
@@ -943,8 +995,19 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     if !meta.is_dir() {
         return;
     }
+    let _entered = in_flight::enter(&path);
 
-    let entries = match crate::fs_gate::read_dir(&path) {
+    // A dataless directory (file provider placeholder) is never listed:
+    // listing it would ask the provider to fetch it, which can block
+    // indefinitely (#190). It is recorded as not measured, the same row
+    // an unreadable directory gets, never silently dropped.
+    let dataless = crate::fs_gate::read::is_dataless(&meta);
+    let listed = if dataless {
+        Err(std::io::Error::other("dataless directory"))
+    } else {
+        crate::fs_gate::read_dir(&path)
+    };
+    let entries = match listed {
         Ok(e) => {
             crate::work_counters::record_dir_listed();
             e
@@ -956,7 +1019,9 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 bytes: 0,
                 reason: UnownedReason::PermissionDenied,
                 shared_bytes: None,
-                note: None,
+                note: dataless.then(|| {
+                    "a dataless file provider placeholder; not listed, not measured".to_string()
+                }),
                 created_at: None,
                 containers: Vec::new(),
                 shared_with: Vec::new(),
@@ -1286,7 +1351,17 @@ fn process_size(
         finish_size_job(group, shared);
         return;
     }
-    let Ok(entries) = crate::fs_gate::read_dir(&path) else {
+    let _entered = in_flight::enter(&path);
+    // Dataless placeholder: not listed, so not fetched (#190); counted as
+    // an unreadable directory (incomplete), never as an empty one.
+    let dataless = crate::fs_gate::symlink_metadata(&path)
+        .is_ok_and(|m| crate::fs_gate::read::is_dataless(&m));
+    let listed = if dataless {
+        Err(std::io::Error::other("dataless directory"))
+    } else {
+        crate::fs_gate::read_dir(&path)
+    };
+    let Ok(entries) = listed else {
         // The unit is still sized best-effort, but the directory that
         // could not be listed is recorded as an *incomplete* row rather
         // than silently absent: without it every ancestor's rollup said
@@ -2459,6 +2534,178 @@ mod pool_stress {
         stop.store(true, Ordering::Relaxed);
         for b in burners {
             let _ = b.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod blocking_kind_tests {
+    //! #190: a cold observe sat at 0% CPU with one walk worker parked in
+    //! `open(2)` on a FIFO (`git::read_origin_url` via `bounded_read`) and
+    //! every other worker idle in `Pool::next`. Each test that could hang
+    //! runs on its own thread with a deadline, so a regression fails
+    //! instead of wedging the test binary.
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(secs))
+            .expect("blocked on a FIFO: a blocking file kind was opened (#190)")
+    }
+
+    /// Tempting wrong patch: `O_NONBLOCK` alone. The FIFO then opens and
+    /// reads as zero bytes, so a FIFO `config` parses as an empty file
+    /// instead of being refused; this asserts an error.
+    /// Tempting wrong patch 2: refusing anything `lstat` does not call a
+    /// regular file. That also refuses a symlinked manifest, which must
+    /// still be read.
+    #[test]
+    fn bounded_reads_refuse_fifos_and_still_follow_symlinks_to_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("config");
+        mkfifo(&fifo);
+        let link = tmp.path().join("link-to-fifo");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let real = tmp.path().join("real");
+        std::fs::write(&real, "x").unwrap();
+        let good = tmp.path().join("link-to-real");
+        std::os::unix::fs::symlink(&real, &good).unwrap();
+        let (a, b, c) = within(10, move || {
+            use crate::fs_gate::read::{BoundedCap, bounded_read, bounded_scan_header};
+            (
+                bounded_read(&fifo, BoundedCap::POINTER).is_err(),
+                bounded_scan_header(&link, BoundedCap::HEADER, &mut |_| {
+                    crate::fs_gate::read::Scan::More
+                })
+                .is_err(),
+                bounded_read(&good, BoundedCap::POINTER).map(|r| r.bytes),
+            )
+        });
+        assert!(
+            a && b,
+            "a FIFO read must be refused, not waited on or read empty"
+        );
+        assert_eq!(c.unwrap(), b"x");
+    }
+
+    /// The deterministic #190 regression: before the fix this never
+    /// returned (one worker in `__open` on `.git/config`, the rest in
+    /// `Pool::next`). Tempting wrong patch: guarding only `.git/config`
+    /// in `read_origin_url`; the FIFO `HEAD` and the FIFO `.git` pointer
+    /// here then still hang `Repo::open` (gix opens them itself).
+    #[test]
+    fn discovery_and_repo_open_finish_over_fifo_git_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let repo = root.join("proj");
+        std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(repo.join(".git/refs")).unwrap();
+        mkfifo(&repo.join(".git/config"));
+        mkfifo(&repo.join(".git/HEAD"));
+        let wt = root.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        mkfifo(&wt.join(".git"));
+        for i in 0..50 {
+            std::fs::create_dir_all(root.join(format!("d{i}/e"))).unwrap();
+        }
+        let (found, opened_repo, opened_wt) = within(20, move || {
+            let found = discover_parallel_excluding(&root, &[]).unwrap().len();
+            (
+                found,
+                crate::fs_gate::git::Repo::open(&repo).is_some(),
+                crate::fs_gate::git::Repo::open(&wt).is_some(),
+            )
+        });
+        assert!(found <= 1);
+        assert!(!opened_repo && !opened_wt);
+    }
+
+    /// Pool starvation: one job blocked indefinitely must not stop the
+    /// other jobs from running, and `in_flight::oldest` must name the
+    /// blocked directory so the observe watchdog can log it and release
+    /// the writer lock. Tempting wrong patch: tracking in-flight paths
+    /// per pool with no global view; the watchdog, on another thread,
+    /// then has nothing to report.
+    #[test]
+    fn a_blocked_job_starves_nothing_and_is_named_by_in_flight() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (done_tx, done_rx) = mpsc::channel::<usize>();
+        let blocked = PathBuf::from("/nonexistent/swamp-190/blocked");
+        let blocked2 = blocked.clone();
+        let handle = std::thread::spawn(move || {
+            let pool: Arc<Pool<usize>> = Arc::new(Pool::new());
+            for i in 0..200 {
+                pool.push(i);
+            }
+            let done = AtomicUsize::new(0);
+            pool.drain(4, |i| {
+                if i == 0 {
+                    let _e = in_flight::enter(&blocked2);
+                    release_rx.lock().unwrap().recv().unwrap();
+                } else if done.fetch_add(1, Ordering::SeqCst) + 1 == 199 {
+                    done_tx.send(199).unwrap();
+                }
+            });
+        });
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)).unwrap(), 199);
+        let (path, _) = in_flight::oldest().expect("the blocked directory is in flight");
+        assert_eq!(path, blocked);
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+        assert!(in_flight::oldest().is_none_or(|(p, _)| p != blocked));
+    }
+
+    /// Stress: many cold discoveries + attributions over a tree seeded
+    /// with FIFOs, sockets-by-name and FIFO git files, under CPU load.
+    /// Before the fix, the first iteration hung. Ignored in CI (seconds
+    /// of CPU burn); run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn stress_many_walks_over_blocking_kinds_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for i in 0..20 {
+            let p = root.join(format!("p{i}"));
+            std::fs::create_dir_all(p.join(".git/refs")).unwrap();
+            std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+            mkfifo(&p.join(".git/config"));
+            mkfifo(&p.join("package.json"));
+            mkfifo(&p.join("node_modules/x/fifo"));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let burners: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let r = root.clone();
+        within(120, move || {
+            for _ in 0..100 {
+                let found = discover_parallel_excluding(&r, &[]).unwrap();
+                let wts: Vec<(&Path, &str)> = Vec::new();
+                let _ = attribute_parallel_carrying(&r, &wts, 0, u64::MAX, HashMap::new(), &[]);
+                assert!(found.len() <= 20);
+            }
+        });
+        stop.store(true, Ordering::Relaxed);
+        for b in burners {
+            b.join().unwrap();
         }
     }
 }

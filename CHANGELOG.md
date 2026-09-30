@@ -5,6 +5,14 @@ observations, not general performance guarantees. See the README for current use
 
 ## v0.8.0
 
+- **A FIFO in a git checkout no longer hangs `swamp observe` forever.** A FIFO
+  named `.git/config`, `.git/HEAD` or `.git` parked one walk worker in
+  `open(2)` while the rest idled at 0% CPU, holding the writer lock; the
+  same pass now finishes in about 2 s. Content reads open non-blocking and
+  read regular files only; dataless iCloud/CloudStorage placeholders are
+  neither opened nor listed (reported as not measured). A walk stuck 300 s
+  in one directory now stops, releases the lock, and logs the path, instead
+  of holding the lock for the full 30-minute `observe_timeout_sec`.
 - **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
   8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
   `dist/` (downloaded archives) and `python_env/` as separate rows, each with what

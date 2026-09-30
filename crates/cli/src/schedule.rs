@@ -84,7 +84,7 @@ pub fn cmd_observe(
         let _ = tx.send(res);
     });
 
-    match rx.recv_timeout(timeout) {
+    match wait_for_observation(&rx, start, timeout) {
         Ok(Ok(observation)) => {
             let wall_ms = start.elapsed().as_millis() as u64;
             let now = swamp_core::entities::now();
@@ -168,7 +168,7 @@ pub fn cmd_observe(
             eprintln!("observe failed: {e}");
             std::process::exit(1);
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
+        Err(Waited::TimedOut(stuck)) => {
             let wall_ms = start.elapsed().as_millis() as u64;
             let now = swamp_core::entities::now();
             let outcome = RunOutcome {
@@ -177,18 +177,81 @@ pub fn cmd_observe(
                 walked_total: 0,
                 projects: 0,
                 mode: "full".to_string(),
-                outcome: "timeout".to_string(),
+                outcome: timeout_outcome(stuck.as_ref()),
             };
             append_log(&log_file(), &outcome)?;
             let _ = write_last_run(&store_dir, &outcome);
+            // Released before exiting so the next observation (and the
+            // TUI's first-run scan) is not left waiting on a pass that is
+            // parked in one blocking filesystem call (#190).
             drop(lock);
-            eprintln!("observe timed out after {}s", config.observe_timeout_sec);
+            eprintln!(
+                "observe stopped after {}s: {}",
+                wall_ms / 1000,
+                outcome.outcome
+            );
             std::process::exit(1);
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
+        Err(Waited::Died) => {
             drop(lock);
             bail!("observe worker thread died without reporting a result");
         }
+    }
+}
+
+/// A walk that has sat in one directory this long is stuck in a blocking
+/// filesystem call, not slow: the slowest single directory measured on
+/// the maintainer's machine lists in well under a second. The pass is
+/// abandoned (lock released, path logged) instead of holding the writer
+/// lock for the rest of `observe_timeout_sec` (#190).
+const DIRECTORY_STALL: Duration = Duration::from_secs(300);
+
+/// How a wait for the observation thread ended without a result.
+enum Waited {
+    /// Past `observe_timeout_sec`, or one directory past
+    /// [`DIRECTORY_STALL`]; carries the directory the walk was inside
+    /// longest, if any, and for how long.
+    TimedOut(Option<(PathBuf, Duration)>),
+    Died,
+}
+
+fn wait_for_observation<T>(
+    rx: &mpsc::Receiver<T>,
+    start: Instant,
+    timeout: Duration,
+) -> std::result::Result<T, Waited> {
+    wait_with(rx, start, timeout, DIRECTORY_STALL, Duration::from_secs(5))
+}
+
+fn wait_with<T>(
+    rx: &mpsc::Receiver<T>,
+    start: Instant,
+    timeout: Duration,
+    stall: Duration,
+    tick: Duration,
+) -> std::result::Result<T, Waited> {
+    loop {
+        let left = timeout.saturating_sub(start.elapsed());
+        match rx.recv_timeout(left.min(tick)) {
+            Ok(v) => return Ok(v),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Waited::Died),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let oldest = swamp_core::walk::in_flight::oldest();
+                let stalled = oldest.as_ref().is_some_and(|(_, d)| *d >= stall);
+                if stalled || start.elapsed() >= timeout {
+                    return Err(Waited::TimedOut(oldest));
+                }
+            }
+        }
+    }
+}
+
+/// The log's outcome for a stopped pass: which directory it was stuck
+/// in, when the walk was inside one.
+fn timeout_outcome(stuck: Option<&(PathBuf, Duration)>) -> String {
+    match stuck {
+        Some((path, d)) => format!("timeout(stuck {}s in {})", d.as_secs(), path.display()),
+        None => "timeout".to_string(),
     }
 }
 
@@ -218,4 +281,50 @@ pub fn cmd_schedule(
     let message = schedule::status(&store_dir)?;
     safe_print!("{message}");
     Ok(())
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    /// A pass whose result never comes back is stopped by the overall
+    /// timeout; the channel's sender is kept alive so this is a timeout,
+    /// not a dead worker. Tempting wrong patch: a single
+    /// `recv_timeout(timeout)`, which cannot notice a stalled directory
+    /// before the full `observe_timeout_sec` (30 minutes) runs out.
+    #[test]
+    fn a_silent_pass_times_out_and_a_stalled_directory_stops_it_early() {
+        let (_tx, rx) = mpsc::channel::<()>();
+        let start = Instant::now();
+        let got = wait_with(
+            &rx,
+            start,
+            Duration::from_millis(200),
+            Duration::from_secs(3600),
+            Duration::from_millis(20),
+        );
+        assert!(matches!(got, Err(Waited::TimedOut(_))));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert_eq!(timeout_outcome(None), "timeout");
+        let named = timeout_outcome(Some(&(
+            PathBuf::from("/x/Caches"),
+            Duration::from_secs(301),
+        )));
+        assert_eq!(named, "timeout(stuck 301s in /x/Caches)");
+    }
+
+    /// docs/usage.md states the stall bound and the log line; keep both
+    /// in step with the code.
+    #[test]
+    fn usage_doc_states_the_directory_stall_bound() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/usage.md"),
+        )
+        .unwrap();
+        assert!(doc.contains(&format!(
+            "one directory for {} seconds",
+            DIRECTORY_STALL.as_secs()
+        )));
+        assert!(doc.contains("timeout(stuck <N>s in <path>)"));
+    }
 }

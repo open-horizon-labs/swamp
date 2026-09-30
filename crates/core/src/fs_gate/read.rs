@@ -82,9 +82,77 @@ impl BoundedBytes {
     }
 }
 
-/// Reads at most `cap` bytes from the start of `path`.
+/// macOS `SF_DATALESS` (`sys/stat.h`): the file's contents live with a
+/// file provider (iCloud Drive, a CloudStorage domain) and opening it
+/// asks the provider to download them first.
+#[cfg(target_os = "macos")]
+const SF_DATALESS: u32 = 0x4000_0000;
+
+/// Whether `meta` describes a dataless placeholder (always false off
+/// macOS).
+pub(crate) fn is_dataless(meta: &std::fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt as _;
+        meta.st_flags() & SF_DATALESS != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// True when `path` exists but opening it for reading could block: it is
+/// not a regular file (a FIFO, socket, device) or it is a dataless
+/// placeholder. For callers that hand a path to a library which opens it
+/// itself (gix), so they can decline before that open (#190).
+pub(crate) fn would_block_on_open(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => (!m.is_file() && !m.is_dir()) || is_dataless(&m),
+        Err(_) => false,
+    }
+}
+
+/// Why a content read was refused before `open(2)` could block (#190).
+fn refused(path: &Path, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{} is {what}; not read", path.display()),
+    )
+}
+
+/// Opens `path` for a content read without ever blocking in `open(2)`.
+///
+/// `File::open` on a FIFO waits until some other process opens the write
+/// end, which may be never: one `.git/config` FIFO parked a discovery
+/// worker in `__open` for good while every other worker idled in
+/// `Pool::next` at 0% CPU (#190). A dataless file provider placeholder
+/// blocks the same way while the provider downloads it. So: refuse a
+/// dataless file before opening it, open with `O_NONBLOCK` (a FIFO then
+/// opens at once instead of waiting for a writer), and refuse anything
+/// that `fstat` does not call a regular file. Symlinks are still followed,
+/// as before: a symlinked manifest is read, a symlink to a FIFO is not.
+fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if std::fs::metadata(path).is_ok_and(|m| is_dataless(&m)) {
+        return Err(refused(path, "a dataless file provider placeholder"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(refused(path, "not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Reads at most `cap` bytes from the start of `path`. Only a regular
+/// file is read: a FIFO, socket, device or dataless placeholder is an
+/// error, never a wait (see [`open_regular`]).
 pub fn bounded_read(path: impl AsRef<Path>, cap: BoundedCap) -> io::Result<BoundedBytes> {
-    let file = std::fs::File::open(path.as_ref())?;
+    let file = open_regular(path.as_ref())?;
     // The length the `fstat` reports tells a complete file from a
     // truncated one without reading a byte past the cap.
     let len = file.metadata()?.len();
@@ -161,7 +229,7 @@ pub fn bounded_scan_header(
     cap: BoundedCap,
     scan: &mut dyn FnMut(u8) -> Scan,
 ) -> io::Result<ScanOutcome> {
-    let mut file = std::fs::File::open(path.as_ref())?;
+    let mut file = open_regular(path.as_ref())?;
     let mut byte = [0u8; 1];
     let mut bytes_read = 0usize;
     let mut done = false;

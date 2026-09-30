@@ -1090,6 +1090,18 @@ disabled_detectors = []
 enabled_detectors = []
 ```
 
+### Stuck observations
+
+`observe_timeout_sec` bounds a whole `swamp observe`. Separately, when the
+walk has sat inside one directory for 300 seconds, the pass is stopped:
+the writer lock is released, and `observe.log` records
+`timeout(stuck <N>s in <path>)` naming that directory, so the next
+observation is not left waiting behind it. Files the walk or git reads
+open are never opened when they could block: a FIFO, socket or device is
+skipped, and a dataless file provider placeholder (an iCloud Drive or
+CloudStorage item whose contents are not downloaded) is neither opened
+nor listed; such a directory is reported as not measured.
+
 ### Full-disk guard
 
 Before any walking, `swamp observe` does one `statfs` on the volume that

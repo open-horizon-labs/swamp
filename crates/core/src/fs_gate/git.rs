@@ -21,6 +21,41 @@ use gix::bstr::ByteSlice;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// The files `gix::open` reads on its way in, relative to a git dir.
+const OPEN_READS: &[&str] = &["HEAD", "config", "commondir", "index", "packed-refs"];
+
+/// False when a file `gix::open` would read could block that open
+/// forever: a FIFO/socket/device, or a dataless placeholder (#190).
+/// `gix` opens them itself with a plain blocking `open(2)`, so the check
+/// has to happen before the call. Covers the `.git` pointer file, the git
+/// dir it names, and a linked worktree's `commondir`.
+fn safe_to_open(dir: &Path) -> bool {
+    use super::read::{BoundedCap, bounded_string, would_block_on_open};
+    let dot_git = dir.join(".git");
+    if would_block_on_open(&dot_git) {
+        return false;
+    }
+    let git_dir = match super::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_file() => match bounded_string(&dot_git, BoundedCap::POINTER) {
+            Ok(text) => match text.trim().strip_prefix("gitdir:") {
+                Some(p) => dir.join(p.trim()),
+                None => return true,
+            },
+            Err(_) => return false,
+        },
+        Ok(_) => dot_git,
+        // A bare/git dir passed directly.
+        Err(_) => dir.to_path_buf(),
+    };
+    let mut dirs = vec![git_dir.clone()];
+    if let Ok(common) = bounded_string(git_dir.join("commondir"), BoundedCap::POINTER) {
+        dirs.push(git_dir.join(common.trim()));
+    }
+    !dirs
+        .iter()
+        .any(|d| OPEN_READS.iter().any(|f| would_block_on_open(&d.join(f))))
+}
+
 /// An opened repository. Opaque: the queries below are all it answers.
 pub struct Repo(gix::Repository);
 
@@ -38,6 +73,9 @@ pub enum Unpushed {
 impl Repo {
     /// Opens the repository at (or containing) `dir`.
     pub fn open(dir: &Path) -> Option<Repo> {
+        if !safe_to_open(dir) {
+            return None;
+        }
         gix::open(dir).ok().map(Repo)
     }
 
@@ -142,6 +180,9 @@ pub struct IgnoreLens {
 impl IgnoreLens {
     /// Opens the checkout at `root`. `None` when it is not a repository.
     pub fn open(root: &Path) -> Option<Self> {
+        if !safe_to_open(root) {
+            return None;
+        }
         let repo = gix::open(root).ok()?;
         let snapshot = repo.index_or_empty().ok()?;
         let index: gix::index::State = (**snapshot).clone().into();
