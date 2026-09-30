@@ -51,6 +51,27 @@ fn sdk_root(env: &Environment) -> (PathBuf, Provenance) {
     )
 }
 
+/// `..` and `.` resolved without touching the filesystem, so that
+/// "inside the SDK root" is decided on where a path points, not on how
+/// it is spelled (`<sdk>/../elsewhere/ndk` starts with the SDK's
+/// components and is not inside it).
+fn lexically_normalized(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 pub struct AndroidDetector;
 
 impl Detector for AndroidDetector {
@@ -110,8 +131,8 @@ impl Detector for AndroidDetector {
             let Some(v) = env.env_var(var).filter(|v| !v.is_empty()) else {
                 continue;
             };
-            let ndk = PathBuf::from(v);
-            let already_proposed = ndk.starts_with(&sdk)
+            let ndk = lexically_normalized(&PathBuf::from(v));
+            let already_proposed = ndk.starts_with(lexically_normalized(&sdk))
                 || out.iter().any(|l| l.path.as_deref() == Some(ndk.as_path()));
             if already_proposed {
                 continue;
@@ -341,5 +362,31 @@ mod tests {
                 .any(|l| l.path.as_ref().is_some_and(|p| p.ends_with("ndk")))
         );
         assert!(got.iter().all(|l| l.status == LocationStatus::Resolved));
+    }
+
+    #[test]
+    fn a_dotdot_that_stays_inside_the_sdk_is_still_not_counted_twice() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "ANDROID_NDK_HOME".to_string(),
+            "/Users/dev/Library/Android/sdk/cmake/../ndk/26.1".to_string(),
+        );
+        let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
+        let got = paths(&AndroidDetector.detect(&env));
+        assert!(got.iter().all(|p| !p.to_string_lossy().contains("26.1")));
+    }
+
+    #[test]
+    fn a_dotdot_that_leaves_the_sdk_is_measured_at_its_normalized_path() {
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "ANDROID_NDK_HOME".to_string(),
+            "/Users/dev/Library/Android/sdk/../ndk-outside/26.1".to_string(),
+        );
+        let env = Environment::fixture(PathBuf::from("/Users/dev"), env_vars, Platform::MacOS);
+        let got = paths(&AndroidDetector.detect(&env));
+        assert!(got.contains(&PathBuf::from(
+            "/Users/dev/Library/Android/ndk-outside/26.1"
+        )));
     }
 }

@@ -512,7 +512,15 @@ fn identify_sdk_packages(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nest
     // A folder that is not one of the SDK's package folders is an NDK
     // that `ANDROID_NDK_HOME`/`ANDROID_NDK_ROOT` names outside the SDK
     // root: one package, named by its version directory, not a list.
-    let is_package_folder = SDK_PACKAGE_FOLDERS.contains(&category.as_str());
+    // Decided by what the directory is, not by its name: an SDK package
+    // folder holds packages, each with its own `source.properties`,
+    // while an NDK named by the environment is itself one package and
+    // has `source.properties` at its root -- even when it is called
+    // `ndk`.
+    let is_package_folder = SDK_PACKAGE_FOLDERS.contains(&category.as_str())
+        && ctx
+            .manifest(&container.path.join("source.properties"))
+            .is_none();
     let mut units = vec![
         NestedUnitBuilder::container_root(container, ctx, ArtifactRole::Installation)
             .supported_with_reason(if is_package_folder {
@@ -522,7 +530,7 @@ fn identify_sdk_packages(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nest
             })
             .membership(Membership::Unknown)
             .consequence(
-                "reinstall with `sdkmanager` (or Android Studio's SDK Manager) -- a download",
+                "reinstall with `sdkmanager` (or Android Studio's SDK Manager): a download",
             )
             .no_action_because("SDK packages are shared by every Android project on this machine")
             .build(),
@@ -539,7 +547,7 @@ fn identify_sdk_packages(container: &BuildContainer, ctx: &BuildCtx) -> Vec<Nest
             dir,
             format!("`{category}/{label}` is an installed SDK package"),
             format!(
-                "reinstall `{category};{}` with sdkmanager -- a download",
+                "reinstall `{category};{}` with sdkmanager: a download",
                 label.replace('/', ";")
             ),
         )
