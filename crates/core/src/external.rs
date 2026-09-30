@@ -1033,6 +1033,10 @@ pub fn observe_external(
         crate::build_stores::save_units(dir, &this_pass, carried, observed_at);
     }
 
+    let overlap_marks: HashMap<String, (u32, u64)> = swamp_dir
+        .map(crate::growth::read_overlap_marks)
+        .unwrap_or_default();
+    let mut overlap_marks_next: HashMap<String, (u32, u64)> = overlap_marks.clone();
     for (
         key,
         MeasuredUnit {
@@ -1050,7 +1054,27 @@ pub fn observe_external(
         },
     ) in meta_by_key
     {
-        let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
+        let (mut growth_bytes, regrowth_count) =
+            annotations.get(&key).copied().unwrap_or((None, 0));
+        // A worktree registered or unregistered inside this unit moves its
+        // bytes with nothing on disk changing: not growth. Growth is not
+        // shown while the change is still inside the growth window.
+        let overlap_now = overlap.map_or(0u32, |(n, _)| n as u32);
+        let changed_at = match overlap_marks.get(&key) {
+            Some((count, at)) if *count != overlap_now => observed_at,
+            Some((_, at)) => *at,
+            None => 0,
+        };
+        overlap_marks_next.insert(key.clone(), (overlap_now, changed_at));
+        let mut coverage_note = None;
+        if changed_at > 0 && changed_at.saturating_add(since_secs) > observed_at {
+            growth_bytes = None;
+            coverage_note = Some(
+                "worktrees inside this unit changed what it counts: a coverage change, so \
+                 growth is not shown until it is out of the growth window"
+                    .to_string(),
+            );
+        }
         let consumers = consumers_by_key.get(&key).cloned().unwrap_or_default();
         let mut evidence = consumers_evidence(&consumers);
         // Activity (#54): the folded walk's own newest-child mtime for
@@ -1062,7 +1086,7 @@ pub fn observe_external(
             observed_at,
             crate::entities::now(),
         ));
-        let found = crate::last_used::probe(&path, &last_use_sources, observed_at);
+        let found = crate::last_used::probe(&path, &last_use_sources, crate::entities::now());
         units.push(ExternalUnit {
             detector_id,
             detector_name,
@@ -1078,7 +1102,7 @@ pub fn observe_external(
             consumers,
             // The overlap is two numbers now; the sentence is rendered
             // from them (`ExternalUnit::overlap_note`).
-            note: None,
+            note: coverage_note,
             evidence,
             bytes_counted_elsewhere: overlap.map_or(0, |(_, b)| b),
             overlap_count: overlap.map_or(0, |(n, _)| n as u32),
@@ -1088,6 +1112,13 @@ pub fn observe_external(
                 bytes,
             ),
         });
+    }
+    if let Some(dir) = swamp_dir
+        && observe
+    {
+        // A cache that fails to write means no memory of the change: the
+        // next pass may show growth once, the slow answer, never a crash.
+        let _ = crate::growth::write_overlap_marks(dir, &overlap_marks_next);
     }
     for key in &protected_keys {
         // A protected (inaccessible-this-pass) unit still needs to be
@@ -1136,7 +1167,7 @@ pub fn observe_external(
                 ),
             };
             let sources = sources_by_key.get(key).cloned().unwrap_or_default();
-            let found = crate::last_used::probe(&path_buf, &sources, observed_at);
+            let found = crate::last_used::probe(&path_buf, &sources, crate::entities::now());
             let unit_id =
                 crate::growth::external_unit_table_id(&detector_id, &category_s, &path_buf);
             // Rows must sum to the total the unit shows. The rows of this

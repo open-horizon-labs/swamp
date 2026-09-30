@@ -155,17 +155,14 @@ impl NoRecordWhy {
     }
 }
 
-/// A record dated after now (plus a day of clock slack) is not a fact. A
-/// value that only makes sense as milliseconds (a Cargo tracker written
-/// with them) is converted; anything else in the future is refused.
+/// A record dated after now (plus a day of clock slack) is not a fact: a
+/// tracker written in milliseconds reads as the year 58,000, a plist
+/// copied from a machine with a wrong clock as 2099. It is set aside with
+/// its reason, never stated, and never "corrected" by guessing a unit.
 fn plausible(ts: u64, now: u64) -> Result<u64, NoRecordWhy> {
     const SLACK: u64 = 86_400;
-    // 2001-09-09 in seconds is 1e9; below the year 2000 in ms is not ms.
-    const MS_FLOOR: u64 = 946_684_800;
     if ts <= now.saturating_add(SLACK) {
         Ok(ts)
-    } else if ts / 1000 >= MS_FLOOR && ts / 1000 <= now.saturating_add(SLACK) {
-        Ok(ts / 1000)
     } else {
         Err(NoRecordWhy::FutureDate)
     }
@@ -614,6 +611,34 @@ mod tests {
         assert!(got.describe(1_790_000_000).ends_with("no record"));
         // A zero timestamp is "not recorded", not 1970.
         assert_eq!(resolve(Some(("x", 0)), Some(0)), LastUsed::default());
+    }
+
+    #[test]
+    fn a_date_after_now_is_set_aside_with_its_reason_never_a_fact() {
+        let now = 1_790_000_000;
+        // Milliseconds read as seconds, and a wrong-clock 2099.
+        for bad in [1_788_000_000_000u64, 4_070_908_800] {
+            let got = resolve_at(Some(("cargo-global-cache", bad)), None, now);
+            assert_eq!(got.at, None);
+            assert_eq!(got.why_none, Some(NoRecordWhy::FutureDate));
+            assert_eq!(
+                got.describe(now),
+                "Last run or opened: no record (ignored: date in the future)"
+            );
+            // The reason survives the store.
+            let back = LastUsed::from_columns(None, Some(&got.source_column()), None);
+            assert_eq!(back.why_none, Some(NoRecordWhy::FutureDate));
+        }
+        // A valid access time is used, and a bad record does not hide it.
+        let with_atime = resolve_at(Some(("x", 4_070_908_800)), Some(1_700_000_000), now);
+        assert_eq!(with_atime.source, LastUsedSource::FileAtime);
+        // A day of skew is tolerated.
+        assert!(resolve_at(Some(("x", now + 3_600)), None, now).at.is_some());
+        let limit = LastUsed::probe_limit_reached();
+        assert_eq!(
+            limit.describe(now),
+            "Last run or opened: no record (probe limit reached)"
+        );
     }
 
     #[test]

@@ -776,7 +776,10 @@ fn structured_overlap_fields_survive_the_store_and_sum_with_the_parent() {
     let unit = unit_ending(&units, "toolchains");
     assert_eq!(unit.overlap_count, 1);
     assert_eq!(unit.bytes_counted_elsewhere, 200_000);
-    assert_eq!(unit.note, None);
+    // The registration is a coverage change, said as one; the overlap itself
+    // is data, not that text.
+    assert!(unit.note.as_deref().unwrap().contains("coverage change"));
+    assert_eq!(unit.growth_bytes, None);
     assert!(unit.bytes < whole_bytes);
     assert!(
         unit.overlap_note()

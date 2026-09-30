@@ -374,6 +374,7 @@ fn clean_external_generation(dir: &Path) -> io::Result<()> {
     remove_known_file(&dir.join("current.parquet"))?;
     let volume_stamps = dir.join("volume_stamps.parquet");
     remove_known_file(&volume_stamps)?;
+    remove_known_file(&dir.join("overlap_marks.parquet"))?;
     let deltas = dir.join("deltas");
     if std::fs::symlink_metadata(&deltas).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
         clean_delta_generation(&deltas)?;

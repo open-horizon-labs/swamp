@@ -7151,6 +7151,36 @@ pub(crate) fn external_row_key(
     format!("{detector_id}\u{1}{category}\u{1}{device}\u{1}{path}")
 }
 
+fn overlap_marks_path(swamp_dir: &Path) -> PathBuf {
+    external_dir(swamp_dir).join("overlap_marks.parquet")
+}
+
+/// `key -> (worktrees subtracted last pass, when that count last changed)`.
+pub(crate) fn read_overlap_marks(swamp_dir: &Path) -> HashMap<String, (u32, u64)> {
+    columns::read_overlap_mark_rows(&overlap_marks_path(swamp_dir))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.key, (r.count, r.changed_at)))
+        .collect()
+}
+
+pub(crate) fn write_overlap_marks(
+    swamp_dir: &Path,
+    marks: &HashMap<String, (u32, u64)>,
+) -> Result<()> {
+    store::StoreDir::at(&external_dir(swamp_dir))?.create()?;
+    let mut rows: Vec<columns::StoredOverlapMarkRow> = marks
+        .iter()
+        .map(|(k, (count, changed_at))| columns::StoredOverlapMarkRow {
+            key: k.clone(),
+            count: *count,
+            changed_at: *changed_at,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+    columns::write_overlap_mark_rows(&overlap_marks_path(swamp_dir), &rows)
+}
+
 fn external_dir(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("external")
 }

@@ -4577,6 +4577,20 @@ table! {
 }
 
 table! {
+    /// `<store>/external/overlap_marks.parquet`: per external-unit key, how
+    /// many project worktrees the last observation subtracted from it and
+    /// when that number last changed. Registering or unregistering a
+    /// worktree inside a unit moves the unit's bytes without any storage
+    /// changing: a coverage change, so growth is not shown across it
+    /// (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    StoredOverlapMarkRow, write_overlap_mark_rows, read_overlap_mark_rows {
+        key: String,
+        count: u32,
+        changed_at: u64,
+    }
+}
+
+table! {
     /// `<store>/unit_meta.parquet` (#176, #185): what an external unit
     /// carries beyond the v0.7.5 `external_units.parquet` columns -- its
     /// last-used fact and the structured overlap. A sibling table, keyed by

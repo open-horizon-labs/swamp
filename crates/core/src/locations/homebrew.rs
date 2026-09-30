@@ -153,6 +153,19 @@ impl Detector for HomebrewDevToolsDetector {
         Some(HOMEBREW_DETECTOR_ID)
     }
 
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        // One unit per allowlisted formula (`Cellar/<formula>`): its
+        // `<version>/bin/*` are the key files. The legacy whole-Cellar
+        // detector declares the same layout one level up.
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &[],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 2 },
+        }]
+    }
+
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let mut out = Vec::new();
         for (prefix, provenance) in prefixes(env) {
