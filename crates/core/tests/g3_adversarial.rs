@@ -912,3 +912,15 @@ fn adv_plist_edge_cases_are_notes_not_numbers_or_panics() {
     assert_eq!(c.volumes.len(), 13);
     assert_eq!(c.volumes.iter().filter(|v| v.in_use.is_none()).count(), 1);
 }
+
+/// Helper for the v0.7.5 survival check: writes a ledger into $ADV_LEDGER_OUT.
+#[test]
+#[ignore]
+fn adv_emit_ledger_for_compat_check() {
+    let s = Setup::new();
+    ran(&s.pass());
+    let out = PathBuf::from(std::env::var("ADV_LEDGER_OUT").unwrap());
+    for f in ["volume_ledger.parquet", "volume_ledger_meta.parquet"] {
+        std::fs::copy(s.store.path().join(f), out.join(f)).unwrap();
+    }
+}
