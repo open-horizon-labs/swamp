@@ -2465,6 +2465,163 @@ fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
     row
 }
 
+/// Folders a Disk view lists under "Everything else" before counting the
+/// rest in one row.
+const DISK_FOLDERS_SHOWN: usize = 30;
+
+/// The Disk view: the parts of the stored volume ledger, as rows. Accounted
+/// developer locations, everything else (measured, not developer storage),
+/// the system volumes, what could not be read (never a size) and the
+/// unexplained remainder. Pure over the stored reading: opening the view
+/// lists nothing, stats nothing and starts no process. Empty when there is
+/// no usable ledger: the empty state then says why (`ui::empty_state`).
+pub fn disk_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<Row> {
+    use swamp_core::volume_ledger::{Category, LedgerReading};
+    let LedgerReading::Measured(a) = ledger else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    let age = |at: u64| swamp_core::volume_ledger::age_text(at, swamp_core::entities::now());
+    let mut accounted = Row::leaf(
+        0,
+        format!(
+            "Accounted: declared roots and catalog units ({})",
+            a.accounted.locations
+        ),
+        a.accounted.bytes,
+        None,
+    );
+    accounted.allocated = true;
+    accounted.signals = vec![format!("measured {}", age(a.measured_at))];
+    accounted.detail_lines = vec![
+        "The developer storage headline is this, less the remainder of a location after its developer tooling, and less mounted disk images.".to_string(),
+    ];
+    rows.push(accounted);
+
+    let mut elsewhere: Vec<&swamp_core::volume_ledger::Row> = a
+        .rows
+        .iter()
+        .filter(|r| r.category == Category::Other && r.bytes.is_some())
+        .collect();
+    elsewhere.sort_by(|x, y| y.bytes.cmp(&x.bytes).then(x.path.cmp(&y.path)));
+    let mut else_row = Row::leaf(
+        0,
+        format!(
+            "Everything else (not developer storage): {} folders",
+            a.everything_else.folders
+        ),
+        a.everything_else.bytes,
+        None,
+    );
+    else_row.allocated = true;
+    rows.push(else_row);
+    let shown = elsewhere.len().min(DISK_FOLDERS_SHOWN);
+    for (i, r) in elsewhere.iter().take(shown).enumerate() {
+        let mut c = Row::leaf(1, r.path.clone(), r.bytes.unwrap_or(0), None);
+        c.rail = if i + 1 == shown && elsewhere.len() == shown {
+            "└─ ".into()
+        } else {
+            "├─ ".into()
+        };
+        c.allocated = true;
+        c.signals = vec![
+            r.exactness.as_str().replace('_', " "),
+            format!("measured {}", age(r.measured_at)),
+        ];
+        rows.push(c);
+    }
+    if elsewhere.len() > shown {
+        let rest: u64 = elsewhere[shown..]
+            .iter()
+            .fold(0u64, |acc, r| acc.saturating_add(r.bytes.unwrap_or(0)));
+        let mut c = Row::leaf(
+            1,
+            format!("and {} more folders", elsewhere.len() - shown),
+            rest,
+            None,
+        );
+        c.rail = "└─ ".into();
+        c.allocated = true;
+        rows.push(c);
+    }
+
+    let mut system = Row::leaf(
+        0,
+        "System volumes (they share the container's free space)".to_string(),
+        a.system_volumes.bytes,
+        None,
+    );
+    system.allocated = true;
+    rows.push(system);
+    let n = a.system_volumes.volumes.len();
+    for (i, v) in a.system_volumes.volumes.iter().enumerate() {
+        let mut c = Row::leaf(1, v.path.clone(), v.bytes.unwrap_or(0), None);
+        c.rail = if i + 1 == n {
+            "└─ ".into()
+        } else {
+            "├─ ".into()
+        };
+        c.allocated = true;
+        c.signals = vec![v.exactness.as_str().replace('_', " ")];
+        rows.push(c);
+    }
+
+    let mut nm = Row::leaf(
+        0,
+        format!(
+            "Not measured: {} directories could not be read",
+            a.not_measured.count
+        ),
+        0,
+        None,
+    );
+    nm.size_text = Some("unmeasured".to_string());
+    nm.detail_lines = vec![swamp_core::volume_ledger::FDA_NOTE.to_string()];
+    rows.push(nm);
+    let names = a.not_measured.names.len().min(DISK_FOLDERS_SHOWN);
+    for (i, name) in a.not_measured.names.iter().take(names).enumerate() {
+        let mut c = Row::leaf(1, name.clone(), 0, None);
+        c.size_text = Some("unmeasured".to_string());
+        c.rail = if i + 1 == names && a.not_measured.count <= names {
+            "└─ ".into()
+        } else {
+            "├─ ".into()
+        };
+        rows.push(c);
+    }
+    if a.not_measured.count > names {
+        let mut c = Row::leaf(
+            1,
+            format!(
+                "and {} more (swamp report --view disk)",
+                a.not_measured.count - names
+            ),
+            0,
+            None,
+        );
+        c.size_text = Some("unmeasured".to_string());
+        c.rail = "└─ ".into();
+        rows.push(c);
+    }
+    if let Some(est) = a.not_measured.estimate_bytes {
+        let mut e = Row::leaf(
+            0,
+            "Estimate for what could not be read (an estimate, not a measurement)".to_string(),
+            est,
+            None,
+        );
+        e.detail_lines =
+            vec!["The Data volume's own size minus everything measured above.".to_string()];
+        rows.push(e);
+    }
+    if let Some(r) = a.residual.bytes {
+        let mut e = Row::leaf(0, a.residual.name.to_string(), r.unsigned_abs(), None);
+        e.size_text = Some(swamp_core::render::human_bytes_signed(r));
+        rows.push(e);
+    }
+    rows
+}
+
 /// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped
 /// tool → category via the label text (a flat list, same shape as
 /// `unowned_rows`/`external_rows_with`; a real tool → category → unit tree is

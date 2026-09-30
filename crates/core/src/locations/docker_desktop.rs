@@ -46,6 +46,10 @@ impl Detector for DockerDesktopDetector {
         "Docker Desktop / OrbStack host backing storage"
     }
 
+    fn headline_group(&self) -> Option<super::HeadlineGroup> {
+        Some(super::HeadlineGroup::Containers)
+    }
+
     fn platforms(&self) -> &'static [Platform] {
         &[Platform::MacOS]
     }

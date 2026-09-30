@@ -85,6 +85,11 @@ pub enum ViewKind {
     /// used, who is known to need it and which removal path exists.
     /// Read-only and built from stored facts: opening it scans nothing.
     Reclaim,
+    /// Where the whole disk went (#169, #170): the stored volume ledger's
+    /// parts (accounted, everything else, system volumes, what could not
+    /// be read). Read-only and built from the stored ledger: opening it
+    /// scans nothing.
+    Disk,
     /// Agent-tool storage (#91/#92/#100): read-only, one row per
     /// `AgentUnit`. See `model::agent_rows`'s doc comment for why
     /// marking is not wired up in this chunk.
@@ -92,27 +97,76 @@ pub enum ViewKind {
 }
 
 impl ViewKind {
-    /// `'0'` is not a view digit here: it is already the global "clear
-    /// filter" key (see `crate::handle_key_mod`), so `ViewKind::Reclaim`
-    /// and `ViewKind::Agents` have no dedicated digit and are reached
-    /// only by cycling with `v`
-    /// (`ViewKind::next`) -- documented, not a silent omission.
-    pub fn from_digit(d: char) -> Option<Self> {
-        Some(match d {
-            '1' => ViewKind::Projects,
-            '2' => ViewKind::Tree,
-            '3' => ViewKind::Builds,
-            '4' => ViewKind::Deps,
-            '5' => ViewKind::Docker,
-            '6' => ViewKind::Kinds,
-            '7' => ViewKind::Unowned,
-            '8' => ViewKind::Types,
-            '9' => ViewKind::External,
-            _ => return None,
-        })
+    /// The one key that opens this view directly. Digits for the first
+    /// nine (`0` is the global "clear filter" key, so the digits stop at
+    /// 9); a letter that is free in every mode for the rest: `c` for
+    /// reClaim, `D` for Disk, `I` for the AI tools' storage. The strip,
+    /// the legend, `?` help and the handler all read this one table, and
+    /// a test pins that no key is bound twice.
+    pub fn key(self) -> char {
+        match self {
+            ViewKind::Projects => '1',
+            ViewKind::Tree => '2',
+            ViewKind::Builds => '3',
+            ViewKind::Deps => '4',
+            ViewKind::Docker => '5',
+            ViewKind::Kinds => '6',
+            ViewKind::Unowned => '7',
+            ViewKind::Types => '8',
+            ViewKind::External => '9',
+            ViewKind::Reclaim => 'c',
+            ViewKind::Disk => 'D',
+            ViewKind::Agents => 'I',
+        }
     }
+
+    /// The view a key opens, if any.
+    pub fn from_key(k: char) -> Option<Self> {
+        Self::ALL.iter().copied().find(|v| v.key() == k)
+    }
+
+    /// The name on the view strip and in `?` help.
+    pub fn title(self) -> &'static str {
+        match self {
+            ViewKind::Projects => "Projects",
+            ViewKind::Tree => "Tree",
+            ViewKind::Builds => "Builds",
+            ViewKind::Deps => "Deps",
+            ViewKind::Docker => "Docker",
+            ViewKind::Kinds => "Kinds",
+            ViewKind::Unowned => "Unowned",
+            ViewKind::Types => "Types",
+            ViewKind::External => "External",
+            ViewKind::Reclaim => "Reclaim",
+            ViewKind::Disk => "Disk",
+            ViewKind::Agents => "Agents",
+        }
+    }
+
+    /// One line on what the view shows, for `?` help.
+    pub fn describe(self) -> &'static str {
+        match self {
+            ViewKind::Projects => "one row per project: size, growth, what can be rebuilt",
+            ViewKind::Tree => "a project's worktrees and their folders",
+            ViewKind::Builds => "build output across projects, by kind",
+            ViewKind::Deps => "dependency folders across projects",
+            ViewKind::Docker => "Docker images, volumes and build cache",
+            ViewKind::Kinds => "storage grouped by kind of folder",
+            ViewKind::Unowned => "storage that belongs to no project",
+            ViewKind::Types => "storage grouped by ecosystem",
+            ViewKind::External => "toolchains, caches and stores outside any project",
+            ViewKind::Reclaim => {
+                "regenerable developer storage by unit: what getting it back costs, last used"
+            }
+            ViewKind::Disk => {
+                "where the whole disk went: accounted, everything else, system volumes, not measured"
+            }
+            ViewKind::Agents => "AI coding tools' sessions, caches and logs",
+        }
+    }
+
     /// Every view, in the order `v` walks them.
-    pub const ALL: [ViewKind; 11] = [
+    pub const ALL: [ViewKind; 12] = [
         ViewKind::Projects,
         ViewKind::Tree,
         ViewKind::Builds,
@@ -123,6 +177,7 @@ impl ViewKind {
         ViewKind::Types,
         ViewKind::External,
         ViewKind::Reclaim,
+        ViewKind::Disk,
         ViewKind::Agents,
     ];
 
@@ -142,7 +197,8 @@ impl ViewKind {
             ViewKind::Unowned => ViewKind::Types,
             ViewKind::Types => ViewKind::External,
             ViewKind::External => ViewKind::Reclaim,
-            ViewKind::Reclaim => ViewKind::Agents,
+            ViewKind::Reclaim => ViewKind::Disk,
+            ViewKind::Disk => ViewKind::Agents,
             ViewKind::Agents => ViewKind::Projects,
         }
     }
@@ -158,6 +214,7 @@ impl ViewKind {
             ViewKind::Types => "types",
             ViewKind::External => "external",
             ViewKind::Reclaim => "reclaim",
+            ViewKind::Disk => "disk",
             ViewKind::Agents => "agents",
         }
     }
@@ -195,19 +252,25 @@ enum LockPollMsg {
     Holder(Option<swamp_core::schedule::LockHolder>),
     /// The holder finished: the store's newest observation, read off the
     /// event thread.
-    Reloaded(Box<swamp_core::report::ReportSnapshot>),
+    Reloaded(
+        Box<swamp_core::report::ReportSnapshot>,
+        Box<swamp_core::volume_ledger::LedgerReading>,
+    ),
 }
 
 /// A reload waiting for the confirm or check to end.
 enum HeldReload {
     Fresh(Box<RefreshedObservation>),
-    Snapshot(Box<swamp_core::report::ReportSnapshot>),
+    Snapshot(
+        Box<swamp_core::report::ReportSnapshot>,
+        Box<swamp_core::volume_ledger::LedgerReading>,
+    ),
 }
 
 const REFRESH_WAITS: &str = "A check is running; press R after it finishes";
 
 /// The smallest terminal that shows the permanent-removal line of a plan.
-pub const CONFIRM_MIN_ROWS: u16 = 8;
+pub const CONFIRM_MIN_ROWS: u16 = 9;
 pub const CONFIRM_MIN_COLS: u16 = 40;
 
 type PendingObservation = anyhow::Result<RefreshedObservation>;
@@ -457,6 +520,15 @@ pub struct App {
     /// (`swamp_core::manager_facts`), read from the store with the rest of
     /// the snapshot. The TUI never asks a manager anything itself.
     pub manager_facts: swamp_core::manager_facts::ManagerFacts,
+    /// What the stored disk ledger says (`swamp observe --volume` writes
+    /// it), read with the stored snapshot: two small Parquet reads, never
+    /// a directory read. The headline's percent and its "everything
+    /// else", "system volumes" and "not measured" lines come from it.
+    pub ledger: swamp_core::volume_ledger::LedgerReading,
+    /// The person has already opened Reclaim or Disk (stored in
+    /// `ui_state.json`), so the first-run pointer to them is not shown.
+    /// `true` for a fixture app; `finish_startup` sets it from the store.
+    pub views_seen: bool,
     /// The Reclaim view built from the stored facts above, kept until one
     /// of them changes: building it joins every unit to its interior.
     reclaim_cache: std::cell::RefCell<Option<std::sync::Arc<swamp_core::reclaim::ReclaimView>>>,
@@ -573,6 +645,11 @@ pub struct UiState {
     pub reverse: bool,
     #[serde(default)]
     pub keep_executables: bool,
+    /// The person has opened Reclaim or Disk once: the "New: press c for
+    /// Reclaim" line is not shown again. Additive: an older swamp ignores
+    /// the key and keeps its own.
+    #[serde(default)]
+    pub views_seen: bool,
 }
 
 pub fn load_ui_state(store: &std::path::Path) -> UiState {
@@ -700,6 +777,8 @@ impl App {
             declared_lines: Vec::new(),
             declared_roots: Vec::new(),
             manager_facts: swamp_core::manager_facts::ManagerFacts::default(),
+            ledger: swamp_core::volume_ledger::LedgerReading::NotMeasured,
+            views_seen: true,
             reclaim_cache: std::cell::RefCell::new(None),
             scope: None,
         }
@@ -723,6 +802,31 @@ impl App {
     pub fn set_manager_facts(&mut self, facts: swamp_core::manager_facts::ManagerFacts) {
         self.manager_facts = facts;
         self.reclaim_cache.borrow_mut().take();
+    }
+
+    /// Sets what the stored disk ledger says.
+    pub fn set_ledger(&mut self, ledger: swamp_core::volume_ledger::LedgerReading) {
+        self.ledger = ledger;
+    }
+
+    /// The developer-storage headline over the stored facts this app
+    /// holds: a pure function of them (`swamp_core::headline::build`),
+    /// so drawing it lists nothing, stats nothing and starts no process.
+    pub fn headline(&self) -> swamp_core::headline::Headline {
+        use swamp_core::headline::ScopeKind;
+        let explicit = self.scope.as_ref().is_some_and(|s| s.explicit);
+        swamp_core::headline::build(&swamp_core::headline::Input {
+            units: &self.external_units,
+            report: &self.report,
+            ledger: &self.ledger,
+            scope: match (explicit, self.previous_scope_roots) {
+                (true, _) => ScopeKind::ExplicitRoot,
+                (false, Some(roots)) => ScopeKind::Previous { roots },
+                (false, None) => ScopeKind::Current,
+            },
+            observed_at: self.report.observed_at,
+            now: swamp_core::entities::now(),
+        })
     }
 
     /// The Reclaim view over the stored facts this app holds. A pure
@@ -937,8 +1041,13 @@ impl App {
         self.drop_marks_missing_from_report();
     }
 
-    fn install_snapshot(&mut self, snap: swamp_core::report::ReportSnapshot) {
+    fn install_snapshot(
+        &mut self,
+        snap: swamp_core::report::ReportSnapshot,
+        ledger: swamp_core::volume_ledger::LedgerReading,
+    ) {
         self.has_index = true;
+        self.set_ledger(ledger);
         self.replace_report(snap.report);
         self.set_external_units(snap.external_units);
         self.set_store_interiors(snap.store_interiors);
@@ -962,8 +1071,8 @@ impl App {
                 self.drop_marks_missing_from_report();
                 true
             }
-            Some(HeldReload::Snapshot(snap)) => {
-                self.install_snapshot(*snap);
+            Some(HeldReload::Snapshot(snap, ledger)) => {
+                self.install_snapshot(*snap, *ledger);
                 true
             }
             None => false,
@@ -1098,6 +1207,9 @@ impl App {
                 return model::reclaim_rows(&self.reclaim_view(), &self.collapsed);
             }
             ViewKind::Agents => model::agent_rows(&self.agent_units),
+            // Parts of one disk, largest meaning first as the ledger
+            // orders them: sort never reorders them.
+            ViewKind::Disk => return model::disk_rows(&self.ledger),
         };
         model::apply_sort(&mut rows, self.sort, self.reverse);
         rows
@@ -1137,6 +1249,12 @@ impl App {
         }
         self.view_cursor.insert(self.view, self.selected);
         self.view = v;
+        // Opening either of the two views the first-run hint points at
+        // ends the hint, for good.
+        if matches!(v, ViewKind::Reclaim | ViewKind::Disk) && !self.views_seen {
+            self.views_seen = true;
+            self.persist_ui_state();
+        }
         let len = self.rows().len();
         self.selected = self
             .view_cursor
@@ -1293,6 +1411,7 @@ impl App {
             sort: sort_to_str(self.sort).to_string(),
             reverse: self.reverse,
             keep_executables: self.keep_executables,
+            views_seen: self.views_seen,
         };
         if self.ui_state_tx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel::<UiStateMsg>();
@@ -3017,7 +3136,12 @@ impl App {
                 if prev.is_some()
                     && now_holder.is_none()
                     && let Ok(snap) = swamp_core::report::report_scope_from_store(&scope, &store)
-                    && tx.send(LockPollMsg::Reloaded(Box::new(snap))).is_err()
+                    && tx
+                        .send(LockPollMsg::Reloaded(
+                            Box::new(snap),
+                            Box::new(swamp_core::volume_ledger::read_reading(&store)),
+                        ))
+                        .is_err()
                 {
                     return;
                 }
@@ -3040,17 +3164,17 @@ impl App {
         for m in msgs {
             match m {
                 LockPollMsg::Holder(h) => self.external_observer = h,
-                LockPollMsg::Reloaded(snap) => {
+                LockPollMsg::Reloaded(snap, ledger) => {
                     // Our own observation in flight will replace this
                     // report anyway.
                     if self.pending.is_some() {
                         continue;
                     }
                     if self.reload_must_wait() {
-                        self.held_reload = Some(HeldReload::Snapshot(snap));
+                        self.held_reload = Some(HeldReload::Snapshot(snap, ledger));
                         continue;
                     }
-                    self.install_snapshot(*snap);
+                    self.install_snapshot(*snap, *ledger);
                 }
             }
         }
@@ -4030,14 +4154,16 @@ mod tests {
     #[test]
     fn view_cycles_and_digit_keys() {
         assert_eq!(ViewKind::Projects.next(), ViewKind::Tree);
-        assert_eq!(ViewKind::from_digit('3'), Some(ViewKind::Builds));
-        assert_eq!(ViewKind::from_digit('6'), Some(ViewKind::Kinds));
-        assert_eq!(ViewKind::from_digit('8'), Some(ViewKind::Types));
-        assert_eq!(ViewKind::from_digit('9'), Some(ViewKind::External));
-        // '0' is reserved for "clear filter" (crate::handle_key_mod);
-        // Reclaim and Agents have no dedicated digit and must not silently
-        // claim '0'.
-        assert_eq!(ViewKind::from_digit('0'), None);
+        assert_eq!(ViewKind::from_key('3'), Some(ViewKind::Builds));
+        assert_eq!(ViewKind::from_key('6'), Some(ViewKind::Kinds));
+        assert_eq!(ViewKind::from_key('8'), Some(ViewKind::Types));
+        assert_eq!(ViewKind::from_key('9'), Some(ViewKind::External));
+        // '0' is reserved for "clear filter" (crate::handle_key_mod); no
+        // view claims it. Reclaim, Disk and Agents have letter keys.
+        assert_eq!(ViewKind::from_key('c'), Some(ViewKind::Reclaim));
+        assert_eq!(ViewKind::from_key('D'), Some(ViewKind::Disk));
+        assert_eq!(ViewKind::from_key('I'), Some(ViewKind::Agents));
+        assert_eq!(ViewKind::from_key('0'), None);
         // Full cycle returns to Projects, matching the CLI's view order:
         // worktrees(Projects)/tree/builds/deps/docker/kinds/unowned/
         // types/external/reclaim/agents.
@@ -4662,7 +4788,7 @@ mod tests {
             state: swamp_core::roots::DeclaredState::Missing,
         }]);
         helped.toggle_help();
-        assert!(paint(&helped, 100, 60).contains("Declared source roots"));
+        assert!(paint(&helped, 100, 100).contains("Declared source roots"));
     }
 
     // ---- v0.7.5 adversarial fixes ----

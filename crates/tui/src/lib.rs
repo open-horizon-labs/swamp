@@ -193,8 +193,10 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
         KeyCode::Char('v') => app.set_view(app.view.next()),
-        KeyCode::Char(d @ '1'..='9') => {
-            if let Some(v) = ViewKind::from_digit(d) {
+        // Every view has one direct key (`ViewKind::key`): the digits, and
+        // `c`, `D` and `I` for the ones past nine.
+        KeyCode::Char(k) if ViewKind::from_key(k).is_some() => {
+            if let Some(v) = ViewKind::from_key(k) {
                 app.set_view(v);
             }
         }
@@ -294,6 +296,7 @@ fn stored_multi_root_app(
     app.set_store_interiors(snapshot.store_interiors);
     app.set_agent_units(snapshot.agent_units);
     app.set_manager_facts(snapshot.manager_facts);
+    app.set_ledger(swamp_core::volume_ledger::read_reading(store));
     app.scope = Some(scope.clone());
     app.observed_label = "from last observation".into();
     app.disk_banner = banner;
@@ -355,6 +358,7 @@ pub fn run(root: &Path) -> Result<()> {
             a.set_store_interiors(snapshot.store_interiors);
             a.set_agent_units(snapshot.agent_units);
             a.set_manager_facts(snapshot.manager_facts);
+            a.set_ledger(swamp_core::volume_ledger::read_reading(&store));
             a.disk_banner = banner.clone();
             a
         }
@@ -552,6 +556,9 @@ fn finish_startup(
     }
     app.reverse = saved.reverse;
     app.keep_executables = saved.keep_executables;
+    // A store that has never shown the new views shows the pointer to them
+    // once; the flag is written when either is opened.
+    app.views_seen = saved.views_seen;
 }
 
 fn run_terminal_loop(mut guard: term::TerminalGuard, app: &mut App) -> Result<()> {
@@ -1408,7 +1415,7 @@ mod tests {
             },
         ];
         app.confirm_open = true;
-        let s = buffer_text(&app, 60, 10);
+        let s = buffer_text(&app, 60, 11);
         let blank_inside = s
             .lines()
             .filter(|r| {

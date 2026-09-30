@@ -44,6 +44,13 @@ pub const RESIDUAL_NAME: &str = "unattributed: allocation not explained by any m
 pub const NOT_MEASURED_ESTIMATE_NAME: &str =
     "not measured (unreadable folders or not yet measured), estimated";
 
+/// The words that say part of an accounted location is a mounted disk
+/// image. Written by [`accounted_rows`] and read back by
+/// [`Account::mounted_image_overlaps`]: one constant, so the two cannot
+/// drift apart.
+pub const MOUNTED_IMAGES_NOTE: &str =
+    "mounted disk images, views of image files counted where they are stored";
+
 /// A row that says a location has not been measured yet this cycle.
 pub const METHOD_PENDING: &str = "pending";
 
@@ -367,7 +374,7 @@ pub fn accounted_rows(list: &[Accounted], mounts: &[MountView]) -> Vec<Row> {
             if views > 0 {
                 overlap = views;
                 notes.push(format!(
-                    "{} of it is mounted disk images, views of image files counted where they are stored",
+                    "{} of it is {MOUNTED_IMAGES_NOTE}",
                     crate::render::human_bytes_pub(views)
                 ));
             }
@@ -682,6 +689,66 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
         notes,
         rows: rows.to_vec(),
     }
+}
+
+impl Account {
+    /// For each accounted catalog location, the bytes of it that are
+    /// mounted disk images: views of image files that are stored (and
+    /// counted) somewhere else, so the location's own disk cost is its
+    /// bytes minus these. Keyed by the location's path text. An agent
+    /// tool's home (a finer view of a folder counted whole elsewhere) is
+    /// a different kind of overlap and is not in this map.
+    pub fn mounted_image_overlaps(&self) -> std::collections::HashMap<&str, u64> {
+        let mut out: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for r in &self.rows {
+            if r.category == Category::Catalog
+                && r.overlap_bytes > 0
+                && r.note
+                    .as_deref()
+                    .is_some_and(|n| n.contains(MOUNTED_IMAGES_NOTE))
+            {
+                let e = out.entry(r.path.as_str()).or_insert(0);
+                *e = (*e).max(r.overlap_bytes);
+            }
+        }
+        out
+    }
+}
+
+/// What the stored ledger says, or why it says nothing. A reader that
+/// wants a percent of used bytes gets one only from `Measured`.
+#[derive(Debug, Clone)]
+pub enum LedgerReading {
+    /// No pass has written a ledger.
+    NotMeasured,
+    /// The ledger files exist but cannot be read (damaged, or not a
+    /// ledger); the text says why.
+    Unreadable(String),
+    /// Some stored rows are of a kind this build does not know: a newer
+    /// swamp wrote them. Nothing is guessed from a partial reading.
+    Newer {
+        unknown_rows: usize,
+    },
+    Measured(Box<Account>),
+}
+
+/// The stored ledger as a [`LedgerReading`]. Two small Parquet reads; no
+/// listing, no stat, no spawn.
+pub fn read_reading(swamp_dir: &std::path::Path) -> LedgerReading {
+    let (stored, meta) = match crate::growth::read_volume_ledger(swamp_dir) {
+        Ok(x) => x,
+        Err(e) => return LedgerReading::Unreadable(format!("{e:#}")),
+    };
+    let Some(meta) = meta else {
+        return LedgerReading::NotMeasured;
+    };
+    let rows: Vec<Row> = stored.iter().filter_map(Row::from_stored).collect();
+    if rows.len() < stored.len() {
+        return LedgerReading::Newer {
+            unknown_rows: stored.len() - rows.len(),
+        };
+    }
+    LedgerReading::Measured(Box::new(account(&rows, &meta)))
 }
 
 /// The stored ledger as a reading. `Ok(None)` when no pass ever wrote

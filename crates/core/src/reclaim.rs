@@ -368,6 +368,11 @@ pub struct Totals {
     pub held_bytes: u64,
     pub not_regenerable_bytes: u64,
     pub not_established_bytes: u64,
+    /// Bytes of the rows that are the remainder of a location after its
+    /// developer units (Homebrew's "other", selected by
+    /// `Detector::remainder_of`): listed here, never counted as developer
+    /// storage. Part of `bytes`, and of the four classes above.
+    pub remainder_bytes: u64,
     pub per_kind: Vec<KindTotal>,
     pub scope_statement: String,
 }
@@ -1069,17 +1074,22 @@ fn totals_of(rows: &[ReclaimRow], scope: &ScopeStatement) -> Totals {
         held_bytes: 0,
         not_regenerable_bytes: 0,
         not_established_bytes: 0,
+        remainder_bytes: 0,
         per_kind: Vec::new(),
         scope_statement: scope.statement.clone(),
     };
     let mut kinds: BTreeMap<String, KindTotal> = BTreeMap::new();
     for r in rows {
-        t.bytes += r.bytes;
-        t.regenerable_bytes += r.regenerable_bytes;
-        t.held_bytes += r.held_bytes;
+        t.bytes = t.bytes.saturating_add(r.bytes);
+        t.regenerable_bytes = t.regenerable_bytes.saturating_add(r.regenerable_bytes);
+        t.held_bytes = t.held_bytes.saturating_add(r.held_bytes);
         match r.regeneration.class {
-            RegenClass::NotRegenerable => t.not_regenerable_bytes += r.bytes,
-            RegenClass::NotEstablished => t.not_established_bytes += r.bytes,
+            RegenClass::NotRegenerable => {
+                t.not_regenerable_bytes = t.not_regenerable_bytes.saturating_add(r.bytes)
+            }
+            RegenClass::NotEstablished => {
+                t.not_established_bytes = t.not_established_bytes.saturating_add(r.bytes)
+            }
             RegenClass::Download | RegenClass::Rebuild => {}
         }
         let k = kinds.entry(r.kind.clone()).or_insert_with(|| KindTotal {
@@ -1089,13 +1099,29 @@ fn totals_of(rows: &[ReclaimRow], scope: &ScopeStatement) -> Totals {
             regenerable_bytes: 0,
         });
         k.count += 1;
-        k.bytes += r.bytes;
-        k.regenerable_bytes += r.regenerable_bytes;
+        k.bytes = k.bytes.saturating_add(r.bytes);
+        k.regenerable_bytes = k.regenerable_bytes.saturating_add(r.regenerable_bytes);
     }
     let mut per_kind: Vec<KindTotal> = kinds.into_values().collect();
     per_kind.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.kind.cmp(&b.kind)));
     t.per_kind = per_kind;
     t
+}
+
+/// The bytes of the units that are the remainder of a location (selected
+/// by the detector's own declaration, never by its id).
+fn remainder_bytes(units: &[ExternalUnit]) -> u64 {
+    let registry = Registry::with_builtins();
+    units
+        .iter()
+        .filter(|u| {
+            registry
+                .detectors()
+                .iter()
+                .find(|d| d.id() == u.detector_id)
+                .is_some_and(|d| d.remainder_of().is_some())
+        })
+        .fold(0u64, |a, u| a.saturating_add(u.bytes))
 }
 
 fn coverage_notes(input: &ReclaimInput<'_>, managed: &HashMap<usize, ManagerDecl>) -> Vec<String> {
@@ -1151,7 +1177,8 @@ pub fn build(input: &ReclaimInput<'_>) -> ReclaimView {
     // Largest first; ties by path, so two runs over the same facts print
     // the same order.
     rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
-    let totals = totals_of(&rows, &scope);
+    let mut totals = totals_of(&rows, &scope);
+    totals.remainder_bytes = remainder_bytes(input.units);
     let mut notes = coverage_notes(input, &managed);
     notes.extend(unjoined_notes(input, &managed, &rows));
     ReclaimView {

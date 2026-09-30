@@ -35,6 +35,10 @@ impl Detector for RooCodeDetector {
         "Roo Code"
     }
 
+    fn headline_group(&self) -> Option<super::HeadlineGroup> {
+        Some(super::HeadlineGroup::AgentStorage)
+    }
+
     fn platforms(&self) -> &'static [Platform] {
         &[Platform::MacOS]
     }
