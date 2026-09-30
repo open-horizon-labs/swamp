@@ -28,11 +28,23 @@ name: CI
 # push still gets this workflow (fast tier + the Linux archive smoke) so
 # ordinary iteration stays quick without losing the deep coverage
 # entirely -- that just moves off the push path.
+#
+# ON DEMAND (2026-09-30): a pull-request push no longer starts this workflow.
+# Ask for it when you want it: `gh workflow run ci.yml --ref <branch>` (the run
+# attaches to the branch head, so the PR shows it), or add the `ci` label to a
+# PR (remove and re-add to run again). Pushes to main and to integration/**
+# and stack/** branches still run it, and `release.yml`'s gate is unchanged
+# (it waits for this workflow on the tagged commit). Runner selection:
+# macOS already runs on the homelab (LOCAL_MACOS_CI_ENABLED); the Linux jobs
+# do the same when LOCAL_LINUX_CI_ENABLED is 'true' (an Ubuntu 24.04 x86_64
+# runner labelled self-hosted, Linux, X64, linux-x86_64: see CONTRIBUTING.md),
+# otherwise they use GitHub's hosted ubuntu-24.04.
 
 on:
   push:
     branches: ['main', 'integration/**', 'stack/**']
   pull_request:
+    types: [labeled]
   workflow_dispatch:
 
 permissions:
@@ -52,7 +64,8 @@ env:
 jobs:
   linux-x86_64:
     name: Linux x86_64 (Ubuntu 24.04)
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","Linux","X64","linux-x86_64"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -66,6 +79,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cargo cache
+        if: vars.LOCAL_LINUX_CI_ENABLED != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-linux-x86_64
@@ -152,7 +166,8 @@ jobs:
 
   linux-x86_64-package:
     name: Linux x86_64 release archive, smoke and validation (Ubuntu 24.04)
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","Linux","X64","linux-x86_64"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -162,6 +177,7 @@ jobs:
           targets: x86_64-unknown-linux-gnu
 
       - name: Cargo cache
+        if: vars.LOCAL_LINUX_CI_ENABLED != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-linux-x86_64-release
@@ -201,6 +217,7 @@ jobs:
   linux-newer-smoke:
     name: Linux x86_64 archive on the newest hosted Ubuntu (test-only)
     needs: linux-x86_64-package
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -232,6 +249,7 @@ jobs:
 
   macos-arm64:
     name: macOS arm64
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
     runs-on: ${{ vars.LOCAL_MACOS_CI_ENABLED == 'true' && fromJSON('["self-hosted","macOS","ARM64","macos-arm64"]') || 'macos-latest' }}
     steps:
       - uses: actions/checkout@v5
