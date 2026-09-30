@@ -237,7 +237,14 @@ pub fn age_signals(rows: &[Signal], raw: &RawSignals, elapsed: u64) -> (Vec<Sign
     (rows, raw)
 }
 
+/// Repositories this process declined to open with git, and why (#190):
+/// reported by `swamp observe` as not measured.
+pub fn declined_repositories() -> Vec<(std::path::PathBuf, &'static str)> {
+    crate::fs_gate::git::declined()
+}
+
 pub fn compute_signals_raw(dir: &Path, observed_at: u64) -> (Vec<Signal>, RawSignals) {
+    let _step = crate::beacon::enter("git signals", dir);
     let Some(repo) = Repo::open(dir) else {
         let unknown = SignalValue::Unknown.render();
         let idle_v = idle_for(dir, observed_at, None);

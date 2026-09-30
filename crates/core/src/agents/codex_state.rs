@@ -204,12 +204,23 @@ fn read_session_rows(
     db_path: &Path,
     ctx: &IdentifyCtx,
 ) -> Option<HashMap<PathBuf, Option<PathBuf>>> {
+    let _step = crate::beacon::enter("agent units", db_path);
     // Reject non-SQLite files before SQLite gets a chance to initialize or
     // resize a WAL shared-memory sidecar beside a damaged/renamed file.
     // This is the 16-byte SQLite file signature, not transcript content.
     let signature = ctx.read_header(db_path, 16)?;
     if signature.as_bytes() != b"SQLite format 3\0" {
         return None;
+    }
+    // SQLite opens its `-wal`/`-shm`/`-journal` sidecars itself with a
+    // blocking open; one that is not a regular file (a FIFO) would park
+    // this read (#190), so any such sidecar declines the database.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = db_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        if ctx.stat(Path::new(&sidecar)).is_ok_and(|m| !m.is_file()) {
+            return None;
+        }
     }
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let connection = Connection::open_with_flags(db_path, flags).ok()?;
@@ -285,6 +296,33 @@ mod tests {
         let cache = super::super::IdentificationCache::disabled();
         let ctx = IdentifyCtx::new(1, &cache);
         read_session_rows(db, &ctx)
+    }
+
+    /// #190: SQLite opens `-wal`/`-shm` itself with a blocking open, so a
+    /// FIFO sidecar would park the read. Tempting wrong patch: checking
+    /// only the main database file's header.
+    #[test]
+    fn a_fifo_wal_sidecar_declines_the_database_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state_5.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE threads (id TEXT);")
+            .unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let side = dir.path().join(format!("state_5.sqlite{suffix}"));
+            let _ = fs::remove_file(&side);
+            let c = std::ffi::CString::new(side.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_rows(&db).is_none());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("parked on a FIFO sidecar")
+        );
     }
 
     #[test]

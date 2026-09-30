@@ -405,11 +405,18 @@ fn discover_one(
     if excluded.iter().any(|e| dir == e || dir.starts_with(e)) {
         return;
     }
+    let _entered = crate::beacon::enter("walk", dir);
     crate::work_counters::record_files_statted(1);
     let Ok(meta) = crate::fs_gate::symlink_metadata(dir) else {
         return;
     };
     if meta.dev() != device || meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    // Listing a dataless directory asks its file provider to fetch it,
+    // which can wait on the network indefinitely (#190). Discovery skips
+    // it; attribution records it as not measured.
+    if crate::fs_gate::read::is_dataless(&meta) {
         return;
     }
 
@@ -601,6 +608,32 @@ pub mod progress {
             ACTIVE.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Paths this process's walks do not list, with why (#190): the paths
+/// earlier `observe` passes were stopped on, set once by `observe` before
+/// it walks. A walk reaching one records it as not measured.
+static NOT_MEASURED: std::sync::RwLock<Vec<(PathBuf, String)>> = std::sync::RwLock::new(Vec::new());
+
+/// Sets the paths this process's walks skip as not measured, each with its
+/// reason (`not measured (stalled on <date>)`).
+pub fn set_not_measured(paths: Vec<(PathBuf, String)>) {
+    *NOT_MEASURED.write().unwrap_or_else(|e| e.into_inner()) = paths;
+}
+
+/// The paths set by [`set_not_measured`], for coverage rows.
+pub fn not_measured() -> Vec<(PathBuf, String)> {
+    NOT_MEASURED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn not_measured_reason(path: &Path) -> Option<String> {
+    let list = NOT_MEASURED.read().unwrap_or_else(|e| e.into_inner());
+    list.iter()
+        .find(|(p, _)| path == p)
+        .map(|(_, why)| why.clone())
 }
 
 struct AttrShared {
@@ -1043,8 +1076,23 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     if !meta.is_dir() {
         return;
     }
+    let _entered = crate::beacon::enter("walk", &path);
 
-    let entries = match crate::fs_gate::read_dir(&path) {
+    // Not listed, recorded as not measured with why, never dropped:
+    // a path an earlier pass was stopped on (#190), or a dataless
+    // directory (file provider placeholder), which listing would fetch.
+    let skip = not_measured_reason(&path).or_else(|| {
+        crate::fs_gate::read::is_dataless(&meta)
+            .then(|| "a dataless file provider placeholder; not listed".to_string())
+    });
+    if skip.is_none() {
+        crate::beacon::test_park(&path);
+    }
+    let listed = match &skip {
+        Some(_) => Err(std::io::Error::other("not measured")),
+        None => crate::fs_gate::read_dir(&path),
+    };
+    let entries = match listed {
         Ok(e) => {
             crate::work_counters::record_dir_listed();
             e
@@ -1054,9 +1102,13 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 measurement: None,
                 path_or_object: path.display().to_string(),
                 bytes: 0,
-                reason: UnownedReason::PermissionDenied,
+                reason: if skip.is_some() {
+                    UnownedReason::NotMeasured
+                } else {
+                    UnownedReason::PermissionDenied
+                },
                 shared_bytes: None,
-                note: None,
+                note: skip,
                 created_at: None,
                 containers: Vec::new(),
                 shared_with: Vec::new(),
@@ -1085,7 +1137,10 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
     // that must win over a fabricated zero.
     let mut dir_mtime_max: i64 = meta.mtime();
 
-    for entry in entries.flatten() {
+    for (i, entry) in entries.flatten().enumerate() {
+        if i % 1024 == 1023 {
+            crate::beacon::beat();
+        }
         let Ok(ft) = entry.file_type() else { continue };
         let child_path = entry.path();
         if ft.is_symlink() {
@@ -1386,7 +1441,25 @@ fn process_size(
         finish_size_job(group, shared);
         return;
     }
-    let Ok(entries) = crate::fs_gate::read_dir(&path) else {
+    let _entered = crate::beacon::enter("walk", &path);
+    // Dataless placeholder: not listed, so not fetched (#190); counted as
+    // an unreadable directory (incomplete), never as an empty one.
+    // The directory's own `lstat`, taken before listing so a dataless
+    // placeholder is known before `read_dir` could fetch it; reused below
+    // for the stamp and mtime, so it costs no extra call.
+    crate::work_counters::record_files_statted(1);
+    let own_meta = crate::fs_gate::symlink_metadata(&path);
+    let dataless = own_meta
+        .as_ref()
+        .is_ok_and(crate::fs_gate::read::is_dataless)
+        || not_measured_reason(&path).is_some();
+    let listed = if dataless {
+        Err(std::io::Error::other("dataless directory"))
+    } else {
+        crate::beacon::test_park(&path);
+        crate::fs_gate::read_dir(&path)
+    };
+    let Ok(entries) = listed else {
         // The unit is still sized best-effort, but the directory that
         // could not be listed is recorded as an *incomplete* row rather
         // than silently absent: without it every ancestor's rollup said
@@ -1425,8 +1498,6 @@ fn process_size(
     let mut file_count: u32 = 0;
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
-    crate::work_counters::record_files_statted(1);
-    let own_meta = crate::fs_gate::symlink_metadata(&path);
     if shared.stamp_dirs
         && let Ok(m) = own_meta.as_ref()
     {
@@ -1437,7 +1508,10 @@ fn process_size(
         });
     }
     let mut dir_mtime_max: i64 = own_meta.map(|m| m.mtime()).unwrap_or(0);
-    for entry in entries {
+    for (i, entry) in entries.enumerate() {
+        if i % 1024 == 1023 {
+            crate::beacon::beat();
+        }
         let Ok(entry) = entry else {
             shared.incomplete.store(true, Ordering::Relaxed);
             continue;
@@ -2022,6 +2096,7 @@ pub fn resize_artifact_stamped(
     excluded: &[PathBuf],
     stamp_dirs: bool,
 ) -> (ArtifactRow, Vec<DirRollup>, Vec<DirStamp>, bool) {
+    let _step = crate::beacon::enter("external unit", root_path);
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
     // took ~1.8 s serially; on the pool it takes what the full walk
@@ -2584,6 +2659,180 @@ mod pool_stress {
         stop.store(true, Ordering::Relaxed);
         for b in burners {
             let _ = b.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod blocking_kind_tests {
+    //! #190: a cold observe sat at 0% CPU with one walk worker parked in
+    //! `open(2)` on a FIFO (`git::read_origin_url` via `bounded_read`) and
+    //! every other worker idle in `Pool::next`. Each test that could hang
+    //! runs on its own thread with a deadline, so a regression fails
+    //! instead of wedging the test binary.
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn mkfifo(path: &Path) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    }
+
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(secs))
+            .expect("blocked on a FIFO: a blocking file kind was opened (#190)")
+    }
+
+    /// Tempting wrong patch: `O_NONBLOCK` alone. The FIFO then opens and
+    /// reads as zero bytes, so a FIFO `config` parses as an empty file
+    /// instead of being refused; this asserts an error.
+    /// Tempting wrong patch 2: refusing anything `lstat` does not call a
+    /// regular file. That also refuses a symlinked manifest, which must
+    /// still be read.
+    #[test]
+    fn bounded_reads_refuse_fifos_and_still_follow_symlinks_to_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("config");
+        mkfifo(&fifo);
+        let link = tmp.path().join("link-to-fifo");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        let real = tmp.path().join("real");
+        std::fs::write(&real, "x").unwrap();
+        let good = tmp.path().join("link-to-real");
+        std::os::unix::fs::symlink(&real, &good).unwrap();
+        let (a, b, c) = within(10, move || {
+            use crate::fs_gate::read::{BoundedCap, bounded_read, bounded_scan_header};
+            (
+                bounded_read(&fifo, BoundedCap::POINTER).is_err(),
+                bounded_scan_header(&link, BoundedCap::HEADER, &mut |_| {
+                    crate::fs_gate::read::Scan::More
+                })
+                .is_err(),
+                bounded_read(&good, BoundedCap::POINTER).map(|r| r.bytes),
+            )
+        });
+        assert!(
+            a && b,
+            "a FIFO read must be refused, not waited on or read empty"
+        );
+        assert_eq!(c.unwrap(), b"x");
+    }
+
+    /// The deterministic #190 regression: before the fix this never
+    /// returned (one worker in `__open` on `.git/config`, the rest in
+    /// `Pool::next`). Tempting wrong patch: guarding only `.git/config`
+    /// in `read_origin_url`; the FIFO `HEAD` and the FIFO `.git` pointer
+    /// here then still hang `Repo::open` (gix opens them itself).
+    #[test]
+    fn discovery_and_repo_open_finish_over_fifo_git_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let repo = root.join("proj");
+        std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(repo.join(".git/refs")).unwrap();
+        mkfifo(&repo.join(".git/config"));
+        mkfifo(&repo.join(".git/HEAD"));
+        let wt = root.join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        mkfifo(&wt.join(".git"));
+        for i in 0..50 {
+            std::fs::create_dir_all(root.join(format!("d{i}/e"))).unwrap();
+        }
+        let (found, opened_repo, opened_wt) = within(20, move || {
+            let found = discover_parallel_excluding(&root, &[]).unwrap().len();
+            (
+                found,
+                crate::fs_gate::git::Repo::open(&repo).is_some(),
+                crate::fs_gate::git::Repo::open(&wt).is_some(),
+            )
+        });
+        assert!(found <= 1);
+        assert!(!opened_repo && !opened_wt);
+    }
+
+    /// Pool starvation: one job blocked indefinitely must not stop the
+    /// other jobs from running, and `beacon::stuck` must name the
+    /// blocked directory so the observe watchdog can log it and release
+    /// the writer lock. Tempting wrong patch: tracking in-flight paths
+    /// per pool with no global view; the watchdog, on another thread,
+    /// then has nothing to report.
+    #[test]
+    fn a_blocked_job_starves_nothing_and_is_named_by_in_flight() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (done_tx, done_rx) = mpsc::channel::<usize>();
+        let blocked = PathBuf::from("/nonexistent/swamp-190/blocked");
+        let blocked2 = blocked.clone();
+        let handle = std::thread::spawn(move || {
+            let pool: Arc<Pool<usize>> = Arc::new(Pool::new());
+            for i in 0..200 {
+                pool.push(i);
+            }
+            let done = AtomicUsize::new(0);
+            pool.drain(4, |i| {
+                if i == 0 {
+                    let _e = crate::beacon::enter("walk", &blocked2);
+                    release_rx.lock().unwrap().recv().unwrap();
+                } else if done.fetch_add(1, Ordering::SeqCst) + 1 == 199 {
+                    done_tx.send(199).unwrap();
+                }
+            });
+        });
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)).unwrap(), 199);
+        assert!(
+            crate::beacon::running().contains(&("walk", blocked.clone())),
+            "the blocked directory is in flight"
+        );
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+        assert!(!crate::beacon::running().iter().any(|(_, p)| *p == blocked));
+    }
+
+    /// Stress: many cold discoveries + attributions over a tree seeded
+    /// with FIFOs, sockets-by-name and FIFO git files, under CPU load.
+    /// Before the fix, the first iteration hung. Ignored in CI (seconds
+    /// of CPU burn); run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn stress_many_walks_over_blocking_kinds_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        for i in 0..20 {
+            let p = root.join(format!("p{i}"));
+            std::fs::create_dir_all(p.join(".git/refs")).unwrap();
+            std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+            mkfifo(&p.join(".git/config"));
+            mkfifo(&p.join("package.json"));
+            mkfifo(&p.join("node_modules/x/fifo"));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let burners: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect();
+        let r = root.clone();
+        within(120, move || {
+            for _ in 0..100 {
+                let found = discover_parallel_excluding(&r, &[]).unwrap();
+                let wts: Vec<(&Path, &str)> = Vec::new();
+                let _ = attribute_parallel_carrying(&r, &wts, 0, u64::MAX, HashMap::new(), &[]);
+                assert!(found.len() <= 20);
+            }
+        });
+        stop.store(true, Ordering::Relaxed);
+        for b in burners {
+            b.join().unwrap();
         }
     }
 }

@@ -51,6 +51,11 @@ pub enum RegionStatus {
     /// only says the *ordinary project walk* skipped it, never that it
     /// went unmeasured (#R13 item B).
     DetectorOnly,
+    /// A path this pass deliberately did not measure, with why: an
+    /// earlier pass was stopped on it (`not measured (stalled on <date>)`),
+    /// or git could not safely open the repository (#190). Not observed;
+    /// never treated as deleted, never as zero.
+    NotMeasured { reason: String },
 }
 
 impl RegionStatus {
@@ -61,6 +66,7 @@ impl RegionStatus {
             RegionStatus::Excluded => "excluded".to_string(),
             RegionStatus::Missing => "missing".to_string(),
             RegionStatus::Inaccessible { reason } => format!("inaccessible ({reason})"),
+            RegionStatus::NotMeasured { reason } => format!("not measured ({reason})"),
             RegionStatus::DetectorOnly => {
                 "detector location (measured as an external unit, not scanned for projects)"
                     .to_string()
@@ -194,6 +200,9 @@ impl RootCoverage {
     }
     pub fn inaccessible(path: PathBuf, reason: String) -> Self {
         Self::unwalked(path, RegionStatus::Inaccessible { reason })
+    }
+    pub fn not_measured(path: PathBuf, reason: String) -> Self {
+        Self::unwalked(path, RegionStatus::NotMeasured { reason })
     }
     pub fn detector_only(path: PathBuf) -> Self {
         Self::unwalked(path, RegionStatus::DetectorOnly)

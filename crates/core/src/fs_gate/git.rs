@@ -21,6 +21,157 @@ use gix::bstr::ByteSlice;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+/// Entries the pre-open sweep of one git dir may lstat before the repo
+/// is declined as not measured (#190). Loose objects and packs are not
+/// counted: they are skipped, never opened by the queries swamp asks.
+const SWEEP_CAP: usize = 50_000;
+
+/// Repositories declined by the pre-open sweep in this process, with the
+/// reason: reported as not measured by `swamp observe`.
+static DECLINED: std::sync::Mutex<Vec<(std::path::PathBuf, &'static str)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The repositories this process declined to open, and why.
+pub fn declined() -> Vec<(std::path::PathBuf, &'static str)> {
+    DECLINED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn decline(dir: &Path, why: &'static str) -> bool {
+    let mut d = DECLINED.lock().unwrap_or_else(|e| e.into_inner());
+    if !d.iter().any(|(p, _)| p == dir) {
+        d.push((dir.to_path_buf(), why));
+    }
+    false
+}
+
+/// A path that, followed through symlinks, is a FIFO or a device, or is
+/// a dataless placeholder: opening it can block. A socket (git's
+/// fsmonitor keeps one in `.git`) or a dangling symlink cannot.
+fn blocks(path: &Path) -> bool {
+    super::read::would_block_on_open(path)
+}
+
+/// False when some file gix could open for this repository could block
+/// that open forever (#190). gix opens loose refs, reflogs, `info/exclude`,
+/// `objects/info/alternates`, `config.worktree` and more with a plain
+/// blocking `open(2)`, and which ones depends on the query, so instead of
+/// naming them the whole git dir (and a linked worktree's common dir) is
+/// swept once with `lstat`, skipping loose objects and packs, and the
+/// repository is declined if any entry could block or the sweep passes
+/// [`SWEEP_CAP`] entries.
+fn safe_to_open(dir: &Path) -> bool {
+    use super::read::{BoundedCap, bounded_string};
+    let dot_git = dir.join(".git");
+    if blocks(&dot_git) {
+        return decline(dir, "its .git is not a regular file or directory");
+    }
+    let git_dir = match super::symlink_metadata(&dot_git) {
+        Ok(m) if m.is_file() => match bounded_string(&dot_git, BoundedCap::POINTER) {
+            Ok(text) => match text.trim().strip_prefix("gitdir:") {
+                Some(p) => dir.join(p.trim()),
+                None => return true,
+            },
+            Err(_) => return decline(dir, "its .git pointer could not be read"),
+        },
+        Ok(_) => dot_git,
+        // A bare/git dir passed directly.
+        Err(_) => dir.to_path_buf(),
+    };
+    let mut dirs = vec![git_dir.clone()];
+    if blocks(&git_dir.join("commondir")) {
+        return decline(dir, "a file in its git dir could block a read");
+    }
+    if let Ok(common) = bounded_string(git_dir.join("commondir"), BoundedCap::POINTER) {
+        dirs.push(git_dir.join(common.trim()));
+    }
+    let mut seen = 0usize;
+    for d in &dirs {
+        match sweep(d, d, &mut seen) {
+            Sweep::Clean => {}
+            Sweep::Blocking => {
+                return decline(dir, "a file in its git dir could block a read");
+            }
+            Sweep::TooLarge => {
+                return decline(
+                    dir,
+                    "its git dir has more entries than the pre-open check reads",
+                );
+            }
+        }
+    }
+    true
+}
+
+enum Sweep {
+    Clean,
+    Blocking,
+    TooLarge,
+}
+
+fn sweep(top: &Path, dir: &Path, seen: &mut usize) -> Sweep {
+    let Ok(entries) = super::read_dir(dir) else {
+        return Sweep::Clean;
+    };
+    for entry in entries.flatten() {
+        *seen += 1;
+        if *seen > SWEEP_CAP {
+            return Sweep::TooLarge;
+        }
+        let path = entry.path();
+        if dir == top.join("objects") {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let loose = name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit());
+            if loose || name == "pack" {
+                continue;
+            }
+        }
+        crate::work_counters::record_git_dir_entries(1);
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() {
+            match sweep(top, &path, seen) {
+                Sweep::Clean => {}
+                other => return other,
+            }
+        } else if blocks(&path) {
+            return Sweep::Blocking;
+        }
+    }
+    Sweep::Clean
+}
+
+/// Whether the global/system git config and ignore files gix reads on
+/// every open are safe to open; checked once per process. When one could
+/// block, repositories are opened isolated (no global or system config).
+fn global_config_safe() -> bool {
+    static SAFE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SAFE.get_or_init(|| {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let xdg = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".config")));
+        let mut files = vec![std::path::PathBuf::from("/etc/gitconfig")];
+        if let Some(h) = &home {
+            files.push(h.join(".gitconfig"));
+        }
+        if let Some(x) = &xdg {
+            files.push(x.join("git/config"));
+            files.push(x.join("git/ignore"));
+        }
+        !files.iter().any(|f| blocks(f))
+    })
+}
+
+fn gix_open(dir: &Path) -> Option<gix::Repository> {
+    if global_config_safe() {
+        gix::open(dir).ok()
+    } else {
+        gix::open_opts(dir, gix::open::Options::isolated()).ok()
+    }
+}
+
 /// An opened repository. Opaque: the queries below are all it answers.
 pub struct Repo(gix::Repository);
 
@@ -38,7 +189,10 @@ pub enum Unpushed {
 impl Repo {
     /// Opens the repository at (or containing) `dir`.
     pub fn open(dir: &Path) -> Option<Repo> {
-        gix::open(dir).ok().map(Repo)
+        if !safe_to_open(dir) {
+            return None;
+        }
+        gix_open(dir).map(Repo)
     }
 
     /// HEAD's commit time in seconds, `None` on an unborn HEAD or an
@@ -142,7 +296,10 @@ pub struct IgnoreLens {
 impl IgnoreLens {
     /// Opens the checkout at `root`. `None` when it is not a repository.
     pub fn open(root: &Path) -> Option<Self> {
-        let repo = gix::open(root).ok()?;
+        if !safe_to_open(root) {
+            return None;
+        }
+        let repo = gix_open(root)?;
         let snapshot = repo.index_or_empty().ok()?;
         let index: gix::index::State = (**snapshot).clone().into();
         Some(Self {
@@ -177,6 +334,26 @@ impl IgnoreLens {
                 .is_some_and(|e| !e.is_empty())
             {
                 return TrackState::Tracked;
+            }
+        }
+        // gix reads each `.gitignore` from the checkout root down to the
+        // entry with a blocking open; one that could block makes the
+        // answer unknown rather than a wait (#190).
+        if let Some(root) = self.repo.workdir() {
+            let dirs = if is_dir {
+                rel_trimmed
+            } else {
+                rel_trimmed.rsplit_once('/').map_or("", |(d, _)| d)
+            };
+            let mut at = root.to_path_buf();
+            if blocks(&at.join(".gitignore")) {
+                return TrackState::Unknown;
+            }
+            for part in dirs.split('/').filter(|p| !p.is_empty()) {
+                at.push(part);
+                if blocks(&at.join(".gitignore")) {
+                    return TrackState::Unknown;
+                }
             }
         }
         let mut cached = self.stack.borrow_mut();

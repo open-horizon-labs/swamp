@@ -55,6 +55,7 @@ pub struct Counters {
     spawns: AtomicU64,
     pending_files: AtomicU64,
     pending_bytes: AtomicU64,
+    git_dir_entries: AtomicU64,
 }
 
 impl Counters {
@@ -70,6 +71,7 @@ impl Counters {
             subprocess_spawns: self.spawns.load(Ordering::Relaxed),
             pending_allocation_files: self.pending_files.load(Ordering::Relaxed),
             pending_allocation_bytes: self.pending_bytes.load(Ordering::Relaxed),
+            git_dir_entries_checked: self.git_dir_entries.load(Ordering::Relaxed),
         }
     }
 }
@@ -85,6 +87,7 @@ static GLOBAL: Counters = Counters {
     spawns: AtomicU64::new(0),
     pending_files: AtomicU64::new(0),
     pending_bytes: AtomicU64::new(0),
+    git_dir_entries: AtomicU64::new(0),
 };
 
 thread_local! {
@@ -151,6 +154,11 @@ pub struct WorkCounters {
     /// rounded up to 4 KiB minus what `st_blocks` reported.
     #[serde(default)]
     pub pending_allocation_bytes: u64,
+    /// Entries of a repository's git dir `lstat`ed before gix may open it
+    /// (#190). Counted apart from `dirs_listed`/`files_statted`, which
+    /// measure the user's tree: this is a fixed per-repository check
+    /// (loose objects and packs are skipped), not a traversal.
+    pub git_dir_entries_checked: u64,
 }
 
 pub fn record_dir_listed() {
@@ -196,6 +204,11 @@ pub fn record_pending_allocation(may_still_grow_by: u64) {
     add(|c| &c.pending_bytes, may_still_grow_by);
 }
 
+/// `n` git-dir entries checked before a gix open (#190).
+pub fn record_git_dir_entries(n: u64) {
+    add(|c| &c.git_dir_entries, n);
+}
+
 /// The process-global counters. Sees every thread; a caller that wants
 /// an exact number either serializes itself or uses [`measured`].
 pub fn snapshot() -> WorkCounters {
@@ -229,6 +242,7 @@ pub fn reset() {
         &GLOBAL.spawns,
         &GLOBAL.pending_files,
         &GLOBAL.pending_bytes,
+        &GLOBAL.git_dir_entries,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -264,6 +278,9 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         pending_allocation_bytes: now
             .pending_allocation_bytes
             .saturating_sub(before.pending_allocation_bytes),
+        git_dir_entries_checked: now
+            .git_dir_entries_checked
+            .saturating_sub(before.git_dir_entries_checked),
     }
 }
 

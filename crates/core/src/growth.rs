@@ -50,6 +50,11 @@ pub const DEFAULT_SINCE: &str = "24h";
 pub const DEFAULT_LARGE_FILE_MIN_BYTES: u64 = 1024 * 1024;
 /// Default watchdog budget for one `observe` invocation.
 pub const DEFAULT_OBSERVE_TIMEOUT_SEC: u64 = crate::schedule::DEFAULT_OBSERVE_TIMEOUT_SECS;
+/// Default `observe_stall_secs` (#190).
+pub const DEFAULT_OBSERVE_STALL_SECS: u64 = 300;
+/// Floor for `observe_stall_secs`: below this a slow disk under load
+/// could be mistaken for a stall.
+pub const MIN_OBSERVE_STALL_SECS: u64 = 30;
 /// Delta files beyond this count trigger compaction into a single file.
 const COMPACTION_THRESHOLD: usize = 20;
 
@@ -75,6 +80,11 @@ pub struct GrowthConfig {
     pub large_file_min_bytes: u64,
     /// Watchdog budget for one `observe` invocation (item 3 of #31).
     pub observe_timeout_sec: u64,
+    /// Seconds with no progress anywhere in an `observe` pass (no walk
+    /// directory entered or left, no pipeline step started) before the
+    /// pass is stopped, its lock released and the stuck path logged
+    /// (#190). Read with a floor of [`MIN_OBSERVE_STALL_SECS`].
+    pub observe_stall_secs: u64,
     /// Minimum free bytes on the store's volume below which `observe`
     /// (and the TUI's refresh) refuse to run. `None` = the greater of
     /// 1 GiB and 1% of the volume; `Some(0)` disables the check.
@@ -91,6 +101,7 @@ impl Default for GrowthConfig {
             since: DEFAULT_SINCE.to_string(),
             large_file_min_bytes: DEFAULT_LARGE_FILE_MIN_BYTES,
             observe_timeout_sec: DEFAULT_OBSERVE_TIMEOUT_SEC,
+            observe_stall_secs: DEFAULT_OBSERVE_STALL_SECS,
             min_free_bytes: None,
             scan: crate::scope::ScanConfig::default(),
         }
@@ -112,6 +123,9 @@ retention_days = {}\n\
 large_file_min_bytes = {}\n\
 # Watchdog budget for one `observe` run, in seconds.\n\
 observe_timeout_sec = {}\n\
+# Stop `observe` when nothing has progressed for this many seconds (minimum 30);\n\
+# the log names the phase and path it was stuck at.\n\
+observe_stall_secs = {}\n\
 # Abort `observe` (exit 3) and skip the TUI refresh when the store's volume has less\n\
 # than this many bytes free. Default (unset): the greater of 1 GiB and 1% of the volume.\n\
 # 0 disables the check.\n\
@@ -121,6 +135,7 @@ observe_timeout_sec = {}\n\
             self.retention_days,
             self.large_file_min_bytes,
             self.observe_timeout_sec,
+            self.observe_stall_secs,
             match self.min_free_bytes {
                 Some(n) => format!("min_free_bytes = {n}\n"),
                 None => "# min_free_bytes = 1073741824\n".to_string(),
@@ -143,6 +158,7 @@ struct RawConfig {
     retention_days: u64,
     large_file_min_bytes: u64,
     observe_timeout_sec: u64,
+    observe_stall_secs: u64,
     min_free_bytes: Option<u64>,
     scan: crate::scope::ScanConfig,
 }
@@ -155,6 +171,7 @@ impl Default for RawConfig {
             retention_days: d.retention_days,
             large_file_min_bytes: d.large_file_min_bytes,
             observe_timeout_sec: d.observe_timeout_sec,
+            observe_stall_secs: d.observe_stall_secs,
             min_free_bytes: d.min_free_bytes,
             scan: d.scan,
         }
@@ -168,6 +185,7 @@ impl From<RawConfig> for GrowthConfig {
             retention_days: r.retention_days,
             large_file_min_bytes: r.large_file_min_bytes,
             observe_timeout_sec: r.observe_timeout_sec,
+            observe_stall_secs: r.observe_stall_secs,
             min_free_bytes: r.min_free_bytes,
             scan: r.scan,
         }
@@ -1567,6 +1585,7 @@ fn unowned_reason_to_str(reason: &UnownedReason) -> &'static str {
         UnownedReason::SharedCache => "SharedCache",
         UnownedReason::PermissionDenied => "PermissionDenied",
         UnownedReason::DockerNoJoin => "DockerNoJoin",
+        UnownedReason::NotMeasured => "NotMeasured",
     }
 }
 
@@ -1578,6 +1597,7 @@ fn unowned_reason_from_str(s: &str) -> UnownedReason {
         "SharedCache" => UnownedReason::SharedCache,
         "PermissionDenied" => UnownedReason::PermissionDenied,
         "DockerNoJoin" => UnownedReason::DockerNoJoin,
+        "NotMeasured" => UnownedReason::NotMeasured,
         _ => UnownedReason::NoContainingRepo,
     }
 }
@@ -1828,6 +1848,7 @@ fn region_status_tag(status: &crate::coverage::RegionStatus) -> &'static str {
         crate::coverage::RegionStatus::Missing => "missing",
         crate::coverage::RegionStatus::Inaccessible { .. } => "inaccessible",
         crate::coverage::RegionStatus::DetectorOnly => "detector_only",
+        crate::coverage::RegionStatus::NotMeasured { .. } => "not_measured",
     }
 }
 
@@ -1883,7 +1904,8 @@ pub fn write_coverage_table(
             status: region_status_tag(&c.status).to_string(),
             reason: match &c.status {
                 crate::coverage::RegionStatus::Partial { reason }
-                | crate::coverage::RegionStatus::Inaccessible { reason } => Some(reason.clone()),
+                | crate::coverage::RegionStatus::Inaccessible { reason }
+                | crate::coverage::RegionStatus::NotMeasured { reason } => Some(reason.clone()),
                 _ => None,
             },
             walked_total: c.status.was_observed().then_some(c.walked_total),
@@ -1978,6 +2000,9 @@ fn rebuild_coverage_from_tables(swamp_dir: &Path, scope_key: &str, snapshot: &mu
                 reason: r.reason.clone().unwrap_or_default(),
             },
             "inaccessible" => crate::coverage::RegionStatus::Inaccessible {
+                reason: r.reason.clone().unwrap_or_default(),
+            },
+            "not_measured" => crate::coverage::RegionStatus::NotMeasured {
                 reason: r.reason.clone().unwrap_or_default(),
             },
             _ => crate::coverage::RegionStatus::Missing,

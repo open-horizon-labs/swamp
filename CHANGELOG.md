@@ -12,6 +12,23 @@ observations, not general performance guarantees. See the README for current use
   with the most they can still add. Entries
   that vanish mid-walk are skipped; other per-entry errors mark only that entry as
   not measured. Closes #196, #197.
+- **A FIFO in a git checkout no longer hangs `swamp observe` forever.** A FIFO
+  named `.git/config`, `.git/HEAD` or `.git` parked one walk worker in
+  `open(2)` while the rest idled at 0% CPU, holding the writer lock; the
+  same pass now finishes in about 2 s. A FIFO or device is refused by
+  `stat` alone, never opened (which would wake a program waiting to write
+  to it). A repository whose git directory holds one (loose refs, reflogs,
+  `info/exclude`, alternates), a FIFO `.gitignore`, a FIFO Codex database
+  sidecar, or a FIFO global git config no longer parks the pass either.
+  Dataless iCloud/CloudStorage placeholders are neither opened nor listed
+  (reported as not measured).
+- **A stalled observation stops, says where, and is not repeated.** New
+  `observe_stall_secs` (default 300, minimum 30): when no step has made
+  progress for that long, `observe` stops, releases the writer lock and logs
+  `timeout(stuck <N>s in <phase> at <path>)`, instead of holding the lock for
+  the full 30-minute `observe_timeout_sec`. That path is skipped as
+  `not measured (stalled on <date>)` for 24 hours, so one blocking path cannot
+  fail every scheduled pass.
 - **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
   8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
   `dist/` (downloaded archives) and `python_env/` as separate rows, each with what

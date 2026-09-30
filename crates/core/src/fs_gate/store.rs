@@ -817,6 +817,10 @@ pub enum TextFile<'a> {
     /// derived table, so a store reset leaves it alone (like
     /// `ui_state.json`).
     Onboarded { store: &'a StoreDir },
+    /// `<store>/stalled-paths.tsv`: paths an `observe` pass was stopped
+    /// on (#190), one `<unix secs>\t<path>` per line, skipped as not
+    /// measured for a day. Not a derived table: a store reset keeps it.
+    Stalled { store: &'a StoreDir },
 }
 
 impl TextFile<'_> {
@@ -825,6 +829,7 @@ impl TextFile<'_> {
             TextFile::Config { store } => Ok(store.0.join("config.toml")),
             TextFile::LaunchAgent => launch_agent_plist(),
             TextFile::Onboarded { store } => Ok(store.0.join("first-run-asked")),
+            TextFile::Stalled { store } => Ok(store.0.join("stalled-paths.tsv")),
         }
     }
 }

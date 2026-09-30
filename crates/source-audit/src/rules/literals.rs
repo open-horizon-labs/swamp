@@ -434,10 +434,17 @@ const INFERENCE_SOURCES: &[(&str, &str)] = &[
 /// Needles that name a file an AI-tool adapter legitimately measures as
 /// that tool's own storage (never as a source of roots), with the modules
 /// that may say so. A reviewed exception, added here in the open.
-const REVIEWED_ADAPTER_FILES: &[(&str, &[&[&str]])] = &[(
-    "state.vscdb",
-    &[&["agents", "vscode_family"], &["agents", "matrix"]],
-)];
+///
+/// `.gitconfig` in `fs_gate::git` (#190): the global git config is only
+/// `stat`ed, never read, to decide whether gix may open it without
+/// blocking; nothing is inferred from it.
+const REVIEWED_ADAPTER_FILES: &[(&str, &[&[&str]])] = &[
+    (
+        "state.vscdb",
+        &[&["agents", "vscode_family"], &["agents", "matrix"]],
+    ),
+    (".gitconfig", &[&["fs_gate", "git"]]),
+];
 
 pub fn no_root_inference_sources(ws: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();

@@ -61,6 +61,7 @@ pub fn untracked_content(
     limit: usize,
     max_entries: usize,
 ) -> Vec<(std::path::PathBuf, u64)> {
+    let _step = crate::beacon::enter("ignore lens", root);
     let Some(lens) = IgnoreLens::open(root) else {
         return Vec::new();
     };
@@ -173,6 +174,7 @@ pub fn split_dirs_by_track(
     files: &[crate::report::FileRow],
     artifact_rels: &std::collections::HashSet<String>,
 ) -> Option<TrackSplit> {
+    let _step = crate::beacon::enter("ignore lens", wt_root);
     let lens = IgnoreLens::open(wt_root)?;
     // Parents before children, so an ignored directory can hand its
     // state down instead of every descendant re-asking.

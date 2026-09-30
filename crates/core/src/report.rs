@@ -107,6 +107,10 @@ pub enum UnownedReason {
     /// `org.opencontainers.image.source` matching a project's git remote.
     /// Name similarity to a project is never evidence.
     DockerNoJoin,
+    /// Deliberately not listed this pass, `note` says why: a dataless
+    /// file provider placeholder (listing it would fetch it), or a path an
+    /// earlier pass was stopped on (#190). Bytes 0, never a measurement.
+    NotMeasured,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2384,6 +2388,24 @@ pub fn report_scope_with_parts_covered(
                 per_root.insert(path.clone(), r.clone());
                 merge_root_report_into(&mut merged, r);
             }
+        }
+    }
+    // Paths deliberately left unmeasured this pass are coverage facts in
+    // the stored coverage, never exclusions and never silently dropped
+    // (#190): a path an earlier pass was stopped on, and a repository git
+    // could not safely open.
+    for (path, reason) in crate::walk::not_measured() {
+        coverage.push(RootCoverage::not_measured(path, reason));
+    }
+    for (path, why) in crate::signals::declined_repositories() {
+        if !coverage
+            .iter()
+            .any(|c| c.path == path && !c.status.was_observed())
+        {
+            coverage.push(RootCoverage::not_measured(
+                path,
+                format!("git repository: {why}"),
+            ));
         }
     }
     Ok((merged, coverage, per_root, events))
