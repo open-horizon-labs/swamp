@@ -720,11 +720,10 @@ start no process. It asks only `brew autoremove --dry-run`, `brew list --formula
 --installed-on-request`, `mise prune --dry-run` and `mise ls --global --json`,
 and reads rustup's `settings.toml`. Each command is an allow-listed shape in the
 spawn layer, counted, killed after 20 seconds (the pass after 45). The program is
-found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`,
-`~/.cargo/bin`), never through `PATH`; the child's environment is built from scratch
+found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, and for mise `~/.local/bin`, `~/.cargo/bin` when `HOME` is absolute), never through `PATH`; a candidate must be an executable regular file (a symlink such as Homebrew's is followed) owned by root or you and not group or world writable, else the next is tried; the child's environment is built from scratch
 (only `HOME`, a fixed `PATH`, colour, pager and Homebrew auto-update/analytics/cleanup
-off, and `MISE_GLOBAL_CONFIG_FILE` when you set it); and it runs from `/`, so a project
-directory cannot change what mise lists. Output over 1 MiB is refused. Every quote shows
+off, and, for mise only, the directory settings the mise detector honors and mise itself reads: `MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`, `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, so the probe describes the store the unit measures); and it runs from `/`, so a project
+directory cannot change what mise lists. Output over 1 MiB is refused. A hold (a default, a global tool, an install on request) read more than a day before the listing is `unknown` and held out, and one read hours before says so. Every quote shows
 when it was recorded and says `older than this listing` when a later observation did not
 run the pass; a quote naming one version of a tool says so. A missing
 binary, a time-out, a non-zero exit or output that is not the expected shape is

@@ -14,8 +14,11 @@
 //!   environment and gets only: a `PATH` of the program's own directory
 //!   plus `/usr/bin:/bin`, `HOME`, `NO_COLOR=1`, `LC_ALL=C`, pagers off and
 //!   Homebrew's auto-update, analytics, cleanup and hints off. The one
-//!   variable passed through is `MISE_GLOBAL_CONFIG_FILE` for mise (a
-//!   person's deliberate choice of global configuration). Nothing else of
+//!   variables passed through are mise's own directory settings
+//!   (`MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`,
+//!   `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
+//!   `XDG_CACHE_HOME`): the same ones the mise detector honors, so the
+//!   probe describes the store the unit measures. Nothing else of
 //!   `HOMEBREW_*`, `MISE_*` or `RUSTUP_*` in swamp's own environment
 //!   reaches the child.
 //! * **A fixed working directory** (`/`): a manager that resolves local
@@ -62,12 +65,19 @@ fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
             PathBuf::from("/usr/local/bin/brew"),
             PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"),
         ],
-        Program::Mise => vec![
-            PathBuf::from("/opt/homebrew/bin/mise"),
-            PathBuf::from("/usr/local/bin/mise"),
-            home.join(".local/bin/mise"),
-            home.join(".cargo/bin/mise"),
-        ],
+        Program::Mise => {
+            let mut c = vec![
+                PathBuf::from("/opt/homebrew/bin/mise"),
+                PathBuf::from("/usr/local/bin/mise"),
+            ];
+            // A relative HOME would name these against the working
+            // directory, which is whatever checkout swamp was started in.
+            if home.is_absolute() {
+                c.push(home.join(".local/bin/mise"));
+                c.push(home.join(".cargo/bin/mise"));
+            }
+            c
+        }
         _ => Vec::new(),
     }
 }
@@ -93,9 +103,40 @@ fn test_override(_program: Program) -> Option<Option<PathBuf>> {
     None
 }
 
-fn is_file(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+/// Whether `path` may be run: symlinks are followed (Homebrew's
+/// `bin/mise` is a link into the Cellar), and the real file must be a
+/// regular executable owned by root or the current user that neither the
+/// group nor the world can write.
+fn usable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(m) = std::fs::metadata(&real) else {
+        return false;
+    };
+    m.is_file()
+        && m.mode() & 0o111 != 0
+        && m.mode() & 0o022 == 0
+        && (m.uid() == 0 || m.uid() == super::current_uid())
 }
+
+/// The first of `candidates` that [`usable`] accepts: one that is not
+/// executable, or not trustworthy, falls through to the next.
+fn first_usable(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|c| usable(c))
+}
+
+/// The only variables of swamp's own environment a mise child sees.
+const MISE_PASSTHROUGH: [&str; 7] = [
+    "MISE_DATA_DIR",
+    "MISE_CONFIG_DIR",
+    "MISE_CACHE_DIR",
+    "MISE_GLOBAL_CONFIG_FILE",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+];
 
 /// The environment a migrated program's child gets.
 fn scrubbed_env(program: Program, exe: &Path, home: &str) -> Vec<(String, String)> {
@@ -119,11 +160,18 @@ fn scrubbed_env(program: Program, exe: &Path, home: &str) -> Vec<(String, String
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
-    if program == Program::Mise
-        && let Some(v) = std::env::var_os("MISE_GLOBAL_CONFIG_FILE")
-        && let Some(v) = v.to_str()
-    {
-        env.push(("MISE_GLOBAL_CONFIG_FILE".to_string(), v.to_string()));
+    if program == Program::Mise {
+        // Exactly what the mise detector honors to find the store, plus the
+        // XDG directories mise itself reads (checked with mise under
+        // `env -i`): the probe must describe the store the unit measures.
+        for name in MISE_PASSTHROUGH {
+            if let Some(v) = std::env::var_os(name)
+                && let Some(v) = v.to_str()
+                && !v.is_empty()
+            {
+                env.push((name.to_string(), v.to_string()));
+            }
+        }
     }
     env
 }
@@ -137,9 +185,7 @@ pub fn plan(program: Program) -> io::Result<Plan> {
     let home = std::env::var("HOME").unwrap_or_default();
     let exe = match test_override(program) {
         Some(found) => found,
-        None => candidates(program, Path::new(&home))
-            .into_iter()
-            .find(|c| is_file(c)),
+        None => first_usable(candidates(program, Path::new(&home))),
     };
     let Some(exe) = exe else {
         return Err(io::Error::new(
@@ -186,5 +232,41 @@ mod tests {
         }
         assert!(env.contains(&("PATH".into(), "/opt/homebrew/bin:/usr/bin:/bin".into())));
         assert!(!names.iter().any(|k| k.starts_with("MISE_")));
+    }
+
+    #[test]
+    fn a_relative_home_yields_no_home_candidates() {
+        for home in ["", "relative/home"] {
+            let c = candidates(Program::Mise, Path::new(home));
+            assert!(c.iter().all(|p| p.is_absolute()), "{c:?}");
+            assert_eq!(c.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_candidate_that_cannot_run_falls_through_to_the_next() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, mode: u32| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p
+        };
+        let not_exec = mk("a", 0o644);
+        let writable = mk("b", 0o777);
+        let good = mk("c", 0o755);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        assert_eq!(
+            first_usable(vec![not_exec.clone(), writable.clone(), good.clone()]),
+            Some(good.clone())
+        );
+        assert_eq!(first_usable(vec![not_exec, writable]), None);
+        assert_eq!(
+            first_usable(vec![dir.path().join("missing"), link.clone()]),
+            Some(link),
+            "a symlink to a trustworthy executable is followed"
+        );
     }
 }
