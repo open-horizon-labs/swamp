@@ -12,6 +12,30 @@
 //! cache. A permission gap on the system-wide runtime volumes is
 //! reported explicitly through ordinary scope resolution (`RootStatus::
 //! Unreadable`), never silently treated as "not present".
+//!
+//! # The system-wide siblings, and who owns the simulator bytes
+//!
+//! Beside `Volumes/` the system-wide `/Library/Developer/CoreSimulator`
+//! also holds `Caches/` (`cache`) and `Images/`, `Cryptex/`, `Profiles/`
+//! (`local-state`: how the runtimes are mounted and which device types
+//! exist). Each is measured as its own unit.
+//!
+//! The mounted runtime volumes under `Volumes/` are backed by disk
+//! images under `/System/Library/AssetsV2`, and `/System` is firmlinked
+//! onto the data volume, so the same runtime is reachable by two paths.
+//! **`Volumes/` owns it and `AssetsV2` is never proposed**: `Volumes/`
+//! is the path Xcode and `simctl` present, the one this catalog has
+//! always reported and keyed history on, and the one the runtime
+//! adapter identifies (`iOS_23F77`) by name; `AssetsV2` is an
+//! OS-managed system location holding every kind of MobileAsset, not
+//! only simulators. The two numbers differ (measured on the reporter's
+//! machine: about 39.9 GB through `Volumes/`, about 24.9 GB of `.dmg`
+//! files in `AssetsV2`, because a mounted image is measured by the
+//! files inside it) and are never summed.
+//! `crate::locations::tests::the_simulator_runtimes_are_counted_through_one_path`
+//! fails if both paths are ever proposed.
+
+use std::path::PathBuf;
 
 use super::{
     BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
@@ -62,12 +86,20 @@ impl Detector for CoreSimulatorDetector {
                     suffix: &[],
                 },
             },
+            BuildStoreDecl {
+                kind: BuildStoreKind::SimulatorSystemSupport,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::LocalState,
+                    suffix: &[],
+                },
+            },
         ]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
         let base = env.home.join("Library/Developer/CoreSimulator");
-        vec![
+        let system = PathBuf::from("/Library/Developer/CoreSimulator");
+        let mut out = vec![
             ProposedLocation {
                 detector_id: CORE_SIMULATOR_DETECTOR_ID.to_string(),
                 path: Some(base.join("Devices")),
@@ -100,9 +132,7 @@ impl Detector for CoreSimulatorDetector {
             },
             ProposedLocation {
                 detector_id: CORE_SIMULATOR_DETECTOR_ID.to_string(),
-                path: Some(std::path::PathBuf::from(
-                    "/Library/Developer/CoreSimulator/Volumes",
-                )),
+                path: Some(system.join("Volumes")),
                 category: StorageCategory::Installation,
                 provenance: Provenance::BuiltinConvention,
                 status: LocationStatus::Resolved,
@@ -112,7 +142,36 @@ impl Detector for CoreSimulatorDetector {
                         .to_string(),
                 ),
             },
-        ]
+            ProposedLocation {
+                detector_id: CORE_SIMULATOR_DETECTOR_ID.to_string(),
+                path: Some(system.join("Caches")),
+                category: StorageCategory::Cache,
+                provenance: Provenance::BuiltinConvention,
+                status: LocationStatus::Resolved,
+                note: Some("CoreSimulator's own cache, system-wide".to_string()),
+            },
+        ];
+        for (folder, note) in [
+            (
+                "Images",
+                "simulator runtime disk-image bookkeeping (images.plist, mount points), system-wide",
+            ),
+            (
+                "Cryptex",
+                "simulator runtime cryptex images and caches, system-wide",
+            ),
+            ("Profiles", "simulator device-type profiles, system-wide"),
+        ] {
+            out.push(ProposedLocation {
+                detector_id: CORE_SIMULATOR_DETECTOR_ID.to_string(),
+                path: Some(system.join(folder)),
+                category: StorageCategory::LocalState,
+                provenance: Provenance::BuiltinConvention,
+                status: LocationStatus::Resolved,
+                note: Some(note.to_string()),
+            });
+        }
+        out
     }
 }
 
@@ -120,7 +179,6 @@ impl Detector for CoreSimulatorDetector {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[test]
     fn convention_paths() {
@@ -160,5 +218,44 @@ mod tests {
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = CoreSimulatorDetector.detect(&env);
         assert!(got.iter().all(|l| l.status == LocationStatus::Resolved));
+    }
+
+    #[test]
+    fn system_wide_siblings_are_proposed_with_their_own_kinds() {
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        let got = CoreSimulatorDetector.detect(&env);
+        let kind_of = |p: &str| {
+            got.iter()
+                .find(|l| l.path == Some(PathBuf::from(p)))
+                .unwrap_or_else(|| panic!("{p} is not proposed"))
+                .category
+        };
+        assert_eq!(
+            kind_of("/Library/Developer/CoreSimulator/Caches"),
+            StorageCategory::Cache
+        );
+        for folder in ["Images", "Cryptex", "Profiles"] {
+            assert_eq!(
+                kind_of(&format!("/Library/Developer/CoreSimulator/{folder}")),
+                StorageCategory::LocalState
+            );
+        }
+        assert_eq!(
+            kind_of("/Library/Developer/CoreSimulator/Volumes"),
+            StorageCategory::Installation
+        );
+    }
+
+    #[test]
+    fn asset_images_are_never_proposed_because_volumes_owns_the_runtimes() {
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        assert!(CoreSimulatorDetector.detect(&env).iter().all(|l| {
+            !l.path
+                .as_ref()
+                .unwrap()
+                .starts_with("/System/Library/AssetsV2")
+        }));
     }
 }

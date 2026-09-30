@@ -295,10 +295,11 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
         }
     }
 
-    // Three detectors genuinely do this, and all three are correct to:
-    // Homebrew's prefixes, ruby-install's `/opt/rubies` and
-    // CoreSimulator's system-wide runtime volumes are machine-wide
-    // conventions, not per-user paths, so no `HOME` can relocate them.
+    // Five detectors genuinely do this, and all are correct to:
+    // Homebrew's prefixes, ruby-install's `/opt/rubies`,
+    // CoreSimulator's and Xcode's system-wide `/Library/Developer`
+    // directories and Claude Code's `/private/tmp/claude-<uid>` scratch
+    // are machine-wide conventions, not per-user paths, so no `HOME` can relocate them.
     // They are listed here by name so the *number* of detectors that can
     // reach outside a fixture stays a reviewed decision instead of
     // something a byte total discovers by accident.
@@ -308,6 +309,17 @@ fn a_detector_that_escapes_the_fixture_home_is_named_here_not_discovered_by_a_by
     // developer's real storage.
     let known: &[(&str, &str)] = &[
         ("core-simulator", "/Library/Developer/CoreSimulator/Volumes"),
+        ("core-simulator", "/Library/Developer/CoreSimulator/Caches"),
+        ("core-simulator", "/Library/Developer/CoreSimulator/Images"),
+        ("core-simulator", "/Library/Developer/CoreSimulator/Cryptex"),
+        (
+            "core-simulator",
+            "/Library/Developer/CoreSimulator/Profiles",
+        ),
+        ("xcode-system", "/Library/Developer/CommandLineTools"),
+        ("xcode-system", "/Library/Developer/DeveloperDiskImages"),
+        ("xcode-system", "/Library/Developer/CoreDevice"),
+        ("xcode-system", "/Library/Developer/DeviceKit"),
         ("homebrew", "/opt/homebrew"),
         ("homebrew", "/usr/local"),
         ("homebrew", "/opt/homebrew/Cellar"),

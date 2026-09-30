@@ -79,6 +79,9 @@ impl BuildAdapter for Adapter {
             BuildStoreKind::SimulatorDevices,
             BuildStoreKind::SimulatorRuntimes,
             BuildStoreKind::SimulatorCaches,
+            BuildStoreKind::SimulatorSystemSupport,
+            BuildStoreKind::XcodeCommandLineTools,
+            BuildStoreKind::XcodeDeveloperDiskImages,
         ]
     }
 
@@ -127,6 +130,29 @@ impl BuildAdapter for Adapter {
             Some(BuildStoreKind::SimulatorRuntimes) => return identify_runtimes(container, ctx),
             Some(BuildStoreKind::SimulatorCaches) => {
                 return identify_simulator_caches(container, ctx);
+            }
+            Some(BuildStoreKind::SimulatorSystemSupport) => {
+                return identify_simulator_system_support(container, ctx);
+            }
+            Some(BuildStoreKind::XcodeCommandLineTools) => {
+                return identify_system_directory(
+                    container,
+                    ctx,
+                    "the Command Line Tools for Xcode, system-wide",
+                    "reinstall with `xcode-select --install`",
+                    "the Command Line Tools are shared by every build on this machine",
+                );
+            }
+            Some(BuildStoreKind::XcodeDeveloperDiskImages) => {
+                return identify_system_directory(
+                    container,
+                    ctx,
+                    "developer disk images Xcode uses to develop on connected devices",
+                    "Xcode is the tool that installs these; a device's disk image is downloaded \
+                     through Xcode again when that device is next prepared for development \
+                     (swamp has not verified this on every Xcode version)",
+                    "disk images are shared by every project and device",
+                );
             }
             Some(BuildStoreKind::XcodeDerivedData) => return identify_derived_data(container, ctx),
             _ => {}
@@ -915,6 +941,62 @@ fn identify_simulator_caches(container: &BuildContainer, ctx: &BuildCtx) -> Vec<
     units
 }
 
+/// The system-wide CoreSimulator support directories, named by what
+/// each holds. The runtime bytes are `Volumes/`'s, not these.
+fn identify_simulator_system_support(
+    container: &BuildContainer,
+    ctx: &BuildCtx,
+) -> Vec<NestedArtifact> {
+    let what = match name_of(&container.path) {
+        "Images" => "the system-wide simulator runtime disk-image bookkeeping",
+        "Cryptex" => "the system-wide simulator runtime cryptex images and caches",
+        "Profiles" => "the system-wide simulator device-type profiles",
+        _ => "a system-wide CoreSimulator support directory",
+    };
+    identify_system_directory(
+        container,
+        ctx,
+        what,
+        "simulators that depend on it may not start until their runtimes are reinstalled \
+         (Xcode > Settings > Components); swamp has not verified what else recreates it",
+        "simulator runtimes and devices depend on this directory",
+    )
+}
+
+/// A system-wide directory that is one installation: its own row, and
+/// one unit per directory directly inside it, each with the same
+/// consequence (the rows a report prints).
+fn identify_system_directory(
+    container: &BuildContainer,
+    ctx: &BuildCtx,
+    what: &str,
+    consequence: &str,
+    no_action: &str,
+) -> Vec<NestedArtifact> {
+    let mut units = vec![
+        NestedUnitBuilder::container_root(container, ctx, ArtifactRole::Installation)
+            .supported_with_reason(what)
+            .membership(Membership::Unknown)
+            .consequence(consequence)
+            .no_action_because(no_action)
+            .build(),
+    ];
+    for child in ctx.folded().children(&container.path) {
+        units.push(
+            NestedUnitBuilder::known_dir(
+                container,
+                ArtifactRole::Installation,
+                child,
+                format!("`{}` is part of {what}", name_of(&child.path)),
+                consequence,
+            )
+            .no_action_because(no_action)
+            .build(),
+        );
+    }
+    units
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,5 +1328,50 @@ mod tests {
             f.coverage.supported,
             "partial metadata: still a DerivedData folder, still inspectable"
         );
+    }
+
+    #[test]
+    fn system_wide_directories_are_installations_with_their_own_consequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (kind, folder, child, needle) in [
+            (
+                BuildStoreKind::XcodeCommandLineTools,
+                "CommandLineTools",
+                "SDKs",
+                "xcode-select --install",
+            ),
+            (
+                BuildStoreKind::XcodeDeveloperDiskImages,
+                "DeveloperDiskImages",
+                "iOS_DDI",
+                "through Xcode",
+            ),
+            (
+                BuildStoreKind::SimulatorSystemSupport,
+                "Cryptex",
+                "Images",
+                "Components",
+            ),
+        ] {
+            let root = tmp.path().join(folder);
+            fs::create_dir_all(root.join(child)).unwrap();
+            let units = run(
+                &BuildContainer::shared_store_of("xcode-swift", root.clone(), kind),
+                &index_of(&root, 5),
+            );
+            assert_eq!(units.len(), 2, "{kind:?}: the root and its one child");
+            for u in &units {
+                assert_eq!(u.role, ArtifactRole::Installation);
+                assert!(
+                    u.consequence.clone().unwrap().contains(needle),
+                    "{kind:?}: {:?}",
+                    u.consequence
+                );
+                assert!(matches!(
+                    u.action,
+                    crate::artifact::NestedActionCapability::Unsupported { .. }
+                ));
+            }
+        }
     }
 }

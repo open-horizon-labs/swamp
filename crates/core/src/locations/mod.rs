@@ -770,6 +770,13 @@ pub enum BuildStoreKind {
     EspressifTools,
     /// ESP-IDF's `python_env/` (per-version Python virtual environments).
     EspressifPythonEnv,
+    /// `/Library/Developer/CommandLineTools`.
+    XcodeCommandLineTools,
+    /// `/Library/Developer/DeveloperDiskImages`.
+    XcodeDeveloperDiskImages,
+    /// The system-wide CoreSimulator support directories
+    /// (`Images`, `Cryptex`, `Profiles`).
+    SimulatorSystemSupport,
     /// A BuildKit build cache, answered by the Docker daemon rather than
     /// measured on disk.
     BuildKitCache,
@@ -803,6 +810,9 @@ impl BuildStoreKind {
             Self::EspressifDist => "espressif-dist",
             Self::EspressifTools => "espressif-tools",
             Self::EspressifPythonEnv => "espressif-python-env",
+            Self::XcodeCommandLineTools => "xcode-command-line-tools",
+            Self::XcodeDeveloperDiskImages => "xcode-developer-disk-images",
+            Self::SimulatorSystemSupport => "simulator-system-support",
             Self::BuildKitCache => "buildkit-cache",
         }
     }
@@ -840,6 +850,9 @@ impl BuildStoreKind {
         Self::EspressifDist,
         Self::EspressifTools,
         Self::EspressifPythonEnv,
+        Self::XcodeCommandLineTools,
+        Self::XcodeDeveloperDiskImages,
+        Self::SimulatorSystemSupport,
         Self::BuildKitCache,
     ];
 }
@@ -1076,6 +1089,7 @@ impl Registry {
                 Box::new(go::GoDetector),
                 Box::new(pip::PipDetector),
                 Box::new(xcode::XcodeDetector),
+                Box::new(xcode::XcodeSystemDetector),
                 Box::new(core_simulator::CoreSimulatorDetector),
                 Box::new(android::AndroidDetector),
                 Box::new(espressif::EspressifDetector),
@@ -1137,6 +1151,63 @@ impl Default for Registry {
 
 #[cfg(test)]
 mod tests {
+    /// The simulator runtimes are reachable by two paths: the mounted
+    /// volumes under `/Library/Developer/CoreSimulator/Volumes` and the
+    /// disk images under `/System/Library/AssetsV2` that back them
+    /// (`/System` is firmlinked onto the data volume). `Volumes/` owns
+    /// them (see `core_simulator`'s module docs); this fails the moment
+    /// any detector, on any platform, proposes an `AssetsV2` path -- or
+    /// proposes `Volumes/` twice -- because the same runtime would then
+    /// be measured, and summed, twice.
+    #[test]
+    fn the_simulator_runtimes_are_counted_through_one_path() {
+        use super::*;
+        let assets = [
+            "/System/Library/AssetsV2",
+            "/System/Volumes/Data/System/Library/AssetsV2",
+            "/private/var/db/AssetsV2",
+        ];
+        let volumes = std::path::Path::new("/Library/Developer/CoreSimulator/Volumes");
+        let registry = Registry::with_builtins();
+        for platform in [Platform::MacOS, Platform::Linux] {
+            let env = Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), platform);
+            let permitted = permitted::PermittedDetectors::from_config(
+                &crate::scope::ScanConfig::default(),
+                &registry,
+            );
+            let proposed: Vec<(String, PathBuf)> = registry
+                .resolve(&env, &permitted)
+                .into_iter()
+                .flat_map(|(id, locs)| {
+                    locs.into_iter()
+                        .filter_map(move |l| l.path.map(|p| (id.clone(), p)))
+                })
+                .collect();
+            for (id, path) in &proposed {
+                for asset in assets {
+                    assert!(
+                        !path.starts_with(asset) && !std::path::Path::new(asset).starts_with(path),
+                        "{id} proposes {} which overlaps {asset}: the runtime images would be \
+                         counted there and again through Volumes/",
+                        path.display()
+                    );
+                }
+            }
+            let volumes_owners: Vec<&String> = proposed
+                .iter()
+                .filter(|(_, p)| p.starts_with(volumes) || volumes.starts_with(p))
+                .map(|(id, _)| id)
+                .collect();
+            assert!(
+                volumes_owners.len() <= 1,
+                "Volumes/ (or an ancestor/descendant) is proposed more than once: {volumes_owners:?}"
+            );
+            if platform == Platform::MacOS {
+                assert_eq!(volumes_owners, vec![&"core-simulator".to_string()]);
+            }
+        }
+    }
+
     #[test]
     fn a_listing_past_its_cap_says_it_was_truncated() {
         let dir = tempfile::tempdir().unwrap();

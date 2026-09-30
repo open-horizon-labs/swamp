@@ -317,7 +317,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "a project-local DerivedData or -derivedDataPath folder",
             "SwiftPM .build/{<triple>/<debug or release>,checkouts,repositories,artifacts,.lock}",
             "Archives/<date>/*.xcarchive with Info.plist; iOS/watchOS DeviceSupport/<version (build)>",
-            "CoreSimulator Devices/<UDID>/device.plist, Profiles/Runtimes/*.simruntime, Caches",
+            "CoreSimulator Devices/<UDID>/device.plist, Profiles/Runtimes/*.simruntime, Caches; system-wide /Library/Developer/{CommandLineTools,DeveloperDiskImages} and CoreSimulator/{Images,Cryptex,Profiles} as one unit each",
         ],
         attribution_limits: &[
             "the source project is read from info.plist's WorkspacePath; a folder without one \

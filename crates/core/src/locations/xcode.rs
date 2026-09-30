@@ -184,6 +184,92 @@ impl Detector for XcodeDetector {
     }
 }
 
+pub const XCODE_SYSTEM_DETECTOR_ID: &str = "xcode-system";
+
+/// The machine-wide half of `/Library/Developer`, beside the
+/// CoreSimulator directory `crate::locations::core_simulator` owns:
+/// `CommandLineTools/` (`installation`), `DeveloperDiskImages/`
+/// (`installation`), and `CoreDevice/` and `DeviceKit/`
+/// (`unclassified`: no documented statement of how they are recreated,
+/// so none is made). `PrivateFrameworks/` and the loose files are not
+/// measured; they are the named remainder of a `du` of
+/// `/Library/Developer`. These are system paths no `HOME` relocates, so
+/// a permission gap surfaces as an unreadable root, never as absence.
+pub struct XcodeSystemDetector;
+
+impl Detector for XcodeSystemDetector {
+    fn id(&self) -> &'static str {
+        XCODE_SYSTEM_DETECTOR_ID
+    }
+
+    fn name(&self) -> &'static str {
+        "Xcode (system-wide)"
+    }
+
+    fn platforms(&self) -> &'static [Platform] {
+        &[Platform::MacOS]
+    }
+
+    fn version_note(&self) -> &'static str {
+        "/Library/Developer layout, current stable (CommandLineTools, DeveloperDiskImages, CoreDevice, DeviceKit)"
+    }
+
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[
+            BuildStoreDecl {
+                kind: BuildStoreKind::XcodeCommandLineTools,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Installation,
+                    suffix: &["CommandLineTools"],
+                },
+            },
+            BuildStoreDecl {
+                kind: BuildStoreKind::XcodeDeveloperDiskImages,
+                anchor: StoreAnchor::Categorized {
+                    category: StorageCategory::Installation,
+                    suffix: &["DeveloperDiskImages"],
+                },
+            },
+        ]
+    }
+
+    fn detect(&self, _env: &Environment) -> Vec<ProposedLocation> {
+        let base = std::path::Path::new("/Library/Developer");
+        [
+            (
+                "CommandLineTools",
+                StorageCategory::Installation,
+                "the Command Line Tools for Xcode (compilers, SDKs), system-wide",
+            ),
+            (
+                "DeveloperDiskImages",
+                StorageCategory::Installation,
+                "developer disk images for connected devices, system-wide",
+            ),
+            (
+                "CoreDevice",
+                StorageCategory::Unclassified,
+                "device-management support files (CandidateDDIs), system-wide",
+            ),
+            (
+                "DeviceKit",
+                StorageCategory::Unclassified,
+                "device-management support files, system-wide",
+            ),
+        ]
+        .into_iter()
+        .map(|(folder, category, note)| ProposedLocation {
+            detector_id: XCODE_SYSTEM_DETECTOR_ID.to_string(),
+            path: Some(base.join(folder)),
+            category,
+            provenance: Provenance::BuiltinConvention,
+            status: LocationStatus::Resolved,
+            note: Some(note.to_string()),
+        })
+        .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +356,60 @@ mod tests {
             Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
         let got = XcodeDetector.detect(&env);
         assert!(got.iter().all(|l| l.status == LocationStatus::Resolved));
+    }
+
+    #[test]
+    fn system_wide_locations_carry_their_kinds() {
+        let env =
+            Environment::fixture(PathBuf::from("/Users/dev"), HashMap::new(), Platform::MacOS);
+        let got = XcodeSystemDetector.detect(&env);
+        let kinds: Vec<(String, StorageCategory)> = got
+            .iter()
+            .map(|l| (l.path.as_ref().unwrap().display().to_string(), l.category))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    "/Library/Developer/CommandLineTools".to_string(),
+                    StorageCategory::Installation
+                ),
+                (
+                    "/Library/Developer/DeveloperDiskImages".to_string(),
+                    StorageCategory::Installation
+                ),
+                (
+                    "/Library/Developer/CoreDevice".to_string(),
+                    StorageCategory::Unclassified
+                ),
+                (
+                    "/Library/Developer/DeviceKit".to_string(),
+                    StorageCategory::Unclassified
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn system_wide_locations_are_not_relocated_by_home() {
+        let a = XcodeSystemDetector.detect(&Environment::fixture(
+            PathBuf::from("/Users/a"),
+            HashMap::new(),
+            Platform::MacOS,
+        ));
+        let b = XcodeSystemDetector.detect(&Environment::fixture(
+            PathBuf::from("/Users/b"),
+            HashMap::new(),
+            Platform::MacOS,
+        ));
+        assert_eq!(
+            a.iter().map(|l| l.path.clone()).collect::<Vec<_>>(),
+            b.iter().map(|l| l.path.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn system_wide_detector_is_macos_only() {
+        assert_eq!(XcodeSystemDetector.platforms(), &[Platform::MacOS]);
     }
 }
