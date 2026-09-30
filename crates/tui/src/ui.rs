@@ -406,7 +406,18 @@ fn fit_lines(
         // Keep one row for the "+N more" line when something is left over.
         let reserve = usize::from(left > 0);
         if used + rows + reserve > cap && !fit.is_empty() {
-            fit.push((more(left + 1), Color::Yellow));
+            // Rows are left but not enough for the whole line. A count or
+            // a reason is worth its start (it leads with the fact); a
+            // warning is never cut mid-sentence, it is counted instead.
+            let room = cap.saturating_sub(used + reserve);
+            if room > 0 && !l.starts_with('⚠') {
+                fit.push((clip_end(l, (room * width).saturating_sub(room)), *c));
+                if left > 0 {
+                    fit.push((more(left), Color::Yellow));
+                }
+            } else {
+                fit.push((more(left + 1), Color::Yellow));
+            }
             return fit;
         }
         used += rows;

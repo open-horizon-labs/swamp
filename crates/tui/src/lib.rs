@@ -1372,4 +1372,35 @@ mod tests {
             "swamp ui needs an interactive terminal; use swamp report for text"
         );
     }
+
+    #[test]
+    fn a_plan_with_a_long_blocked_line_leaves_no_blank_row_at_60x10() {
+        let mut app = App::new(empty_report(), "/root".into());
+        for i in 0..5 {
+            let path = format!("/root/p{i}/node_modules");
+            app.marked.insert(path.clone(), unit(&path, 1 << 20, false));
+        }
+        app.blocked = vec![
+            app::BlockedItem {
+                name: "x".into(),
+                reason: "nothing reclaimable in this project".into(),
+                next: "n".into(),
+            },
+            app::BlockedItem {
+                name: "y".into(),
+                reason: "in use".into(),
+                next: "n".into(),
+            },
+        ];
+        app.confirm_open = true;
+        let s = buffer_text(&app, 60, 10);
+        let blank_inside = s
+            .lines()
+            .filter(|r| {
+                r.starts_with("\"│") && r.trim_matches('"').trim_matches('│').trim().is_empty()
+            })
+            .count();
+        assert!(s.contains("Blocked: 2"), "{s}");
+        assert_eq!(blank_inside, 0, "{s}");
+    }
 }
