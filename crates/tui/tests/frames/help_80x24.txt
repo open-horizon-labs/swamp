@@ -1,4 +1,4 @@
-"┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-22 of 108 ──────────────┐"
+"┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-22 of 109 ──────────────┐"
 "│Keys                                                                          │"
 "│  ↑ ↓        move the cursor                                                  │"
 "│  PgUp PgDn  move a screenful · Home and End jump to the first and last row   │"

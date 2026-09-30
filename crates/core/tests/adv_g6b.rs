@@ -69,7 +69,7 @@ fn move_it(f: &Fx, p: &Path) -> Result<PathBuf, String> {
         &r.reviewed,
         &facts(&t, r.warnings),
         Some(&f.store),
-        &ledger(&f),
+        &ledger(f),
         &f.trash,
     )
 }
