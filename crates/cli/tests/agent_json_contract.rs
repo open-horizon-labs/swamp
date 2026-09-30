@@ -19,6 +19,10 @@ fn bin() -> PathBuf {
 }
 
 fn run(store: &Path, args: &[&str]) -> Output {
+    if args.first() == Some(&"observe") {
+        // #197: every observe reads fixture files written just before it.
+        swamp_core::fs_gate::settle::settle();
+    }
     Command::new(bin())
         .args(args)
         .env("SWAMP_DIR", store)
@@ -32,8 +36,6 @@ fn run(store: &Path, args: &[&str]) -> Output {
 /// `extra_args` lets a caller set e.g. `--full`; the root is always
 /// named explicitly, matching the `report` calls these fixtures make.
 fn observe(store: &Path, root: &Path, extra_args: &[&str]) {
-    // #197: settle fixture writes before they are measured.
-    swamp_core::fs_gate::settle::settle();
     let mut args = vec!["observe", root.to_str().unwrap()];
     args.extend_from_slice(extra_args);
     let out = run(store, &args);
