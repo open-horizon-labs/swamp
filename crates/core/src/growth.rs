@@ -3757,11 +3757,12 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
             .collect();
     // Sibling tables a swamp that predates them never wrote: absent or
     // unreadable is "no last-used, no drilldown", never an error.
-    let meta: Vec<columns::StoredUnitMetaRow> = columns::read_unit_meta_rows(&unit_meta_path(swamp_dir))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.scope_key == scope_key)
-        .collect();
+    let meta: Vec<columns::StoredUnitMetaRow> =
+        columns::read_unit_meta_rows(&unit_meta_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
     Some(StoredUnitTables {
         meta,
         external,

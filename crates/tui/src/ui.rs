@@ -1204,11 +1204,14 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         );
         let bytes = format!(
             "{:>10}",
-            format!(
-                "{}{}",
-                human_bytes(row.bytes),
-                if row.allocated { "*" } else { "" }
-            )
+            match &row.size_text {
+                Some(text) => text.clone(),
+                None => format!(
+                    "{}{}",
+                    human_bytes(row.bytes),
+                    if row.allocated { "*" } else { "" }
+                ),
+            }
         );
         let growth = format!(
             "{:>10}",

@@ -1803,6 +1803,13 @@ pub fn render_view_external_with(
         let inside: Vec<crate::artifact::NestedArtifact> = interiors
             .iter()
             .filter(|i| i.present && i.path.starts_with(&u.path))
+            // Another unit's interior (go-build under Library/Caches) is
+            // listed once, under that unit.
+            .filter(|i| {
+                !sorted.iter().any(|o| {
+                    o.path != u.path && o.path.starts_with(&u.path) && i.path.starts_with(&o.path)
+                })
+            })
             .cloned()
             .collect();
         if let Some((_, section)) = render_container_section(&inside, observed_at, "    ") {
@@ -1846,6 +1853,9 @@ pub fn describe_unit_child(child: &crate::drilldown::UnitChild, now: u64) -> Str
         ChildKind::Adjustment => {
             "adjustment: hardlinked files are counted once in this unit's total".to_string()
         }
+        ChildKind::NotRemeasured => {
+            "not re-measured this pass: the unit keeps its last complete total".to_string()
+        }
         ChildKind::Entry => {
             let mut text = child.name.clone();
             match child.measure {
@@ -1874,7 +1884,10 @@ pub fn describe_unit_child(child: &crate::drilldown::UnitChild, now: u64) -> Str
 pub fn unit_child_size(child: &crate::drilldown::UnitChild) -> String {
     match (child.bytes, child.kind) {
         (None, _) => "not measured".to_string(),
-        (Some(b), crate::drilldown::ChildKind::Adjustment) => human_bytes_signed(b),
+        (
+            Some(b),
+            crate::drilldown::ChildKind::Adjustment | crate::drilldown::ChildKind::NotRemeasured,
+        ) => human_bytes_signed(b),
         (Some(b), _) if child.measure == crate::drilldown::ChildMeasure::Partial => {
             format!(">={}", human_bytes(b.max(0) as u64))
         }

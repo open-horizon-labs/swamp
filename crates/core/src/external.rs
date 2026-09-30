@@ -1083,7 +1083,10 @@ pub fn observe_external(
             bytes_counted_elsewhere: overlap.map_or(0, |(_, b)| b),
             overlap_count: overlap.map_or(0, |(n, _)| n as u32),
             last_used: found.last_used,
-            children: crate::last_used::with_child_last_used(children, &found.children),
+            children: crate::drilldown::reconciled(
+                crate::last_used::with_child_last_used(children, &found.children),
+                bytes,
+            ),
         });
     }
     for key in &protected_keys {
@@ -1136,11 +1139,22 @@ pub fn observe_external(
             let found = crate::last_used::probe(&path_buf, &sources, observed_at);
             let unit_id =
                 crate::growth::external_unit_table_id(&detector_id, &category_s, &path_buf);
-            let children = lower_children
-                .remove(key)
-                .filter(|c| !c.is_empty())
-                .or_else(|| previous_children.get(&unit_id).cloned())
-                .unwrap_or_default();
+            // Rows must sum to the total the unit shows. The rows of this
+            // pass sum to this pass's lower bound; the stored rows sum to
+            // the last complete measurement. Pair each with its own total,
+            // and let `reconciled` name any remaining gap.
+            let fresh = lower_children.remove(key).filter(|c| !c.is_empty());
+            let stored = previous_children.get(&unit_id).cloned();
+            let children = match (&last, bound) {
+                (Some(last), Some(b)) if b.bytes > last.0 => fresh.or(stored),
+                (Some(last), _) => stored
+                    .clone()
+                    .filter(|c| crate::drilldown::rows_total(c) == last.0 as i64)
+                    .or(fresh)
+                    .or(stored),
+                _ => fresh.or(stored),
+            }
+            .unwrap_or_default();
             units.push(ExternalUnit {
                 detector_id: detector_id.clone(),
                 // The authorized scope already told us this detector's
@@ -1164,7 +1178,10 @@ pub fn observe_external(
                 bytes_counted_elsewhere: 0,
                 overlap_count: 0,
                 last_used: found.last_used,
-                children: crate::last_used::with_child_last_used(children, &found.children),
+                children: crate::drilldown::reconciled(
+                    crate::last_used::with_child_last_used(children, &found.children),
+                    bytes,
+                ),
             });
         }
     }

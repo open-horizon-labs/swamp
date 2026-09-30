@@ -184,22 +184,25 @@ pub(crate) fn resolve_at(
     now: u64,
 ) -> LastUsed {
     let mut why = None;
-    let atime = atime.filter(|t| *t > 0).and_then(|t| match plausible(t, now) {
-        Ok(t) => Some(t),
-        Err(w) => {
-            why = Some(w);
-            None
-        }
-    });
-    let native = tool_native
-        .filter(|(_, t)| *t > 0)
-        .and_then(|(name, t)| match plausible(t, now) {
-            Ok(t) => Some((name, t)),
+    let atime = atime
+        .filter(|t| *t > 0)
+        .and_then(|t| match plausible(t, now) {
+            Ok(t) => Some(t),
             Err(w) => {
                 why = Some(w);
                 None
             }
         });
+    let native =
+        tool_native
+            .filter(|(_, t)| *t > 0)
+            .and_then(|(name, t)| match plausible(t, now) {
+                Ok(t) => Some((name, t)),
+                Err(w) => {
+                    why = Some(w);
+                    None
+                }
+            });
     match native {
         Some((name, at)) => LastUsed {
             at: Some(at),
@@ -228,7 +231,9 @@ impl LastUsed {
     /// reason a consulted source was set aside.
     pub fn from_columns(at: Option<u64>, source: Option<&str>, atime: Option<u64>) -> LastUsed {
         let label = source.unwrap_or("none");
-        let why_none = label.strip_prefix("none:").and_then(NoRecordWhy::from_label);
+        let why_none = label
+            .strip_prefix("none:")
+            .and_then(NoRecordWhy::from_label);
         let source = LastUsedSource::from_label(label);
         match (&source, at) {
             (LastUsedSource::None, _) | (_, None) => LastUsed {
@@ -449,7 +454,7 @@ pub(crate) fn cargo_global_cache_newest(cargo_home: &Path, table: CargoCacheTabl
     ) else {
         return CargoRead::Unavailable(".global-cache could not be read");
     };
-    let Some(connection) = crate::sqlite_ro::open_read_only(&db, &header.bytes) else {
+    let Some(connection) = crate::sqlite_ro::open_immutable(&db, &header.bytes) else {
         return CargoRead::Unavailable(".global-cache is not an openable SQLite database");
     };
     let name = cargo_table_name(table);
@@ -785,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn a_locked_tracker_is_unavailable_without_waiting_and_is_never_written() {
+    fn a_locked_tracker_is_read_without_waiting_or_locking_and_is_never_written() {
         let home = cargo_home_with_tracker(&[("registry_src", 5_000)]);
         let db_path = home.path().join(".global-cache");
         let before = std::fs::read(&db_path).unwrap();
@@ -798,7 +803,12 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "a lock is a refusal, not a wait"
         );
-        assert!(matches!(read, CargoRead::Unavailable(_)), "{read:?}");
+        // Immutable mode takes no lock, so a writer's lock is not even seen:
+        // the committed value, or a refusal if the read was torn; never a wait.
+        assert!(
+            matches!(read, CargoRead::Unavailable(_) | CargoRead::Newest(5_000)),
+            "{read:?}"
+        );
         holder.execute_batch("ROLLBACK").unwrap();
         drop(holder);
         // Read-only: the file's bytes are identical and no journal or WAL

@@ -34,6 +34,41 @@ pub(crate) fn open_read_only(db_path: &Path, header: &[u8]) -> Option<Connection
     Some(connection)
 }
 
+/// Opens `db_path` so that it provably creates no file and takes no lock:
+/// SQLite's `immutable=1` read-only URI mode never looks for a journal, a
+/// WAL or a shared-memory file, so a WAL-mode database another tool owns
+/// gets no `-shm`/`-wal` sidecar from us. The price is that a change still
+/// in that tool's WAL is not seen and that a read racing its checkpoint
+/// can be torn; a torn read is an error from the query, which callers
+/// report as "not available right now".
+pub(crate) fn open_immutable(db_path: &Path, header: &[u8]) -> Option<Connection> {
+    if header != SIGNATURE {
+        return None;
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_URI;
+    let connection = Connection::open_with_flags(uri_for(db_path)?, flags).ok()?;
+    connection.busy_timeout(BUSY_TIMEOUT).ok()?;
+    Some(connection)
+}
+
+/// `file:<percent-encoded path>?mode=ro&immutable=1`.
+fn uri_for(path: &Path) -> Option<String> {
+    let text = path.to_str()?;
+    let mut out = String::from("file:");
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out.push_str("?mode=ro&immutable=1");
+    Some(out)
+}
+
 /// The column names of `table`, or `None` when it does not exist or
 /// cannot be described. A reader checks the columns it selects before it
 /// selects them, so a tool's schema change is a refusal, not an error

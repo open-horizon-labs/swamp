@@ -41,6 +41,10 @@ pub enum ChildKind {
     /// A signed correction so the rows still sum to the unit's total
     /// (a hardlinked file counted once, not once per parent).
     Adjustment,
+    /// The unit keeps its last complete total but this pass produced rows
+    /// for a different (partial) measurement: what is not covered by the
+    /// listed rows, so the rows still sum to the total shown.
+    NotRemeasured,
 }
 
 impl ChildKind {
@@ -49,6 +53,7 @@ impl ChildKind {
             Self::Entry => "entry",
             Self::Remainder => "remainder",
             Self::Adjustment => "adjustment",
+            Self::NotRemeasured => "not_remeasured",
         }
     }
 
@@ -57,6 +62,7 @@ impl ChildKind {
             "entry" => Self::Entry,
             "remainder" => Self::Remainder,
             "adjustment" => Self::Adjustment,
+            "not_remeasured" => Self::NotRemeasured,
             _ => return None,
         })
     }
@@ -124,6 +130,22 @@ impl UnitChild {
             last_used: LastUsed::default(),
         }
     }
+}
+
+/// Makes `children` sum to `shown`, the total the unit displays. A unit
+/// that keeps its last complete measurement through an incomplete pass, a
+/// child deleted while the walk ran, or rows replayed for a total that
+/// moved, would otherwise show rows that disagree with the number beside
+/// them. The difference is a named row, never a silent gap.
+pub(crate) fn reconciled(mut children: Vec<UnitChild>, shown: u64) -> Vec<UnitChild> {
+    if children.is_empty() {
+        return children;
+    }
+    let gap = shown as i64 - rows_total(&children);
+    if gap != 0 {
+        children.push(UnitChild::row(ChildKind::NotRemeasured, gap));
+    }
+    children
 }
 
 /// Whether a unit's walk should keep its per-directory rows so a
@@ -271,6 +293,20 @@ mod tests {
             complete,
             growth_bytes: None,
         }
+    }
+
+    #[test]
+    fn rows_that_disagree_with_the_shown_total_get_a_named_gap_row() {
+        let unit = Path::new("/u");
+        let dirs = vec![row("", 0, 0, 1, true), row("a", 100, 1, 0, true)];
+        let rows = children_of(unit, dirs, 100, 15);
+        assert_eq!(reconciled(rows.clone(), 100), rows, "already adding up");
+        let short = reconciled(rows.clone(), 250);
+        assert_eq!(rows_total(&short), 250);
+        assert_eq!(short.last().unwrap().kind, ChildKind::NotRemeasured);
+        let long = reconciled(rows, 40);
+        assert_eq!(rows_total(&long), 40);
+        assert!(reconciled(Vec::new(), 7).is_empty());
     }
 
     #[test]

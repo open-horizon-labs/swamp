@@ -729,12 +729,17 @@ fn an_older_marker_still_resets_and_keeps_human_files() {
     assert!(report_scope_from_store(&fx.scope, &fx.store).is_err());
     observe(&fx.scope, &fx.store);
     assert_eq!(fs::read_to_string(&marker).unwrap(), "2\n");
-    assert_eq!(fs::read(fx.store.join("config.toml")).unwrap(), b"# keep me\n");
+    assert_eq!(
+        fs::read(fx.store.join("config.toml")).unwrap(),
+        b"# keep me\n"
+    );
     assert_eq!(fs::read(&ledger).unwrap(), b"ledger state");
     assert_eq!(fs::read(&asked).unwrap(), b"asked\n");
     let snapshot = report_scope_from_store(&fx.scope, &fx.store).unwrap();
     assert_eq!(
-        unit_ending(&snapshot.external_units, "toolchains").last_used.at,
+        unit_ending(&snapshot.external_units, "toolchains")
+            .last_used
+            .at,
         Some(OLD as u64)
     );
 }

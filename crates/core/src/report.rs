@@ -3643,7 +3643,11 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
     }
 
     let meta_by_unit: std::collections::HashMap<&str, &crate::growth::columns::StoredUnitMetaRow> =
-        tables.meta.iter().map(|m| (m.unit_id.as_str(), m)).collect();
+        tables
+            .meta
+            .iter()
+            .map(|m| (m.unit_id.as_str(), m))
+            .collect();
     snapshot.external_units = tables
         .external
         .iter()
