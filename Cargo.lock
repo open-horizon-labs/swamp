@@ -2771,6 +2771,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "toml_edit",
  "trash",
  "uuid",
  "walkdir",

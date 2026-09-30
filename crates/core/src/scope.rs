@@ -132,17 +132,19 @@ impl ScanConfig {
 # scope: only `include` plus detectors not named in `disabled_detectors`.\n\
 defaults = {}\n\
 # Extra roots always in scope, e.g. [\"~/code\", \"/Volumes/data/src\"].\n\
+# Prefer `swamp config add-root <path>`: it validates and keeps this file.\n\
 include = {}\n\
 # Roots (or root prefixes) pruned from scope; always wins over defaults,\n\
 # detectors, and include, e.g. [\"~/src/scratch\"].\n\
 exclude = {}\n\
 # Detector IDs to turn off without excluding a path another enabled\n\
-# root already reaches, e.g. [\"homebrew\"]. `swamp scope --json` lists ids.\n\
+# root already reaches, e.g. [\"homebrew-other\"]. `swamp scope --json` lists ids.\n\
 disabled_detectors = {}\n\
 # Detector IDs explicitly turned on: under defaults = false (explicit-only\n\
 # scope), the only way any detector runs at all; under defaults = true,\n\
 # the way to turn on a detector that is off by default on its own (a\n\
-# system-wide install tree, e.g. \"homebrew\" -- `swamp scope` marks these\n\
+# system-wide install tree, e.g. \"homebrew\" for Cellar and Caskroom whole --\n\
+# `swamp scope` marks these\n\
 # `disabled (default off)`). With defaults = false and neither list set,\n\
 # no detector runs at all and the scope is `include` plus explicit roots.\n\
 enabled_detectors = {}\n",
@@ -819,6 +821,15 @@ fn lexically_normalize(p: &Path) -> PathBuf {
 
 fn normalize(home: &Path, raw: &str) -> PathBuf {
     lexically_normalize(&expand_tilde(home, raw))
+}
+
+/// A configured path entry as scope resolution reads it: `~` expanded,
+/// `.`/`..` and trailing slashes removed lexically, no filesystem access.
+/// The one spelling `crate::roots` also uses to compare a declared root
+/// with the entries already in `[scan] include`, so `add-root` and the
+/// resolver can never disagree about whether two entries are one root.
+pub fn configured_path(home: &Path, raw: &str) -> PathBuf {
+    normalize(home, raw)
 }
 
 fn normalize_path(home: &Path, p: &Path) -> PathBuf {

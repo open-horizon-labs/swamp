@@ -3718,42 +3718,9 @@ fn rebuild_evidence_from_tables(store_dir: &Path, key: &str, snapshot: &mut Repo
     }
 }
 
-/// R18a-3b: no JSON cell anywhere holds a `Report` -- this assembles the
-/// whole thing from typed tables, starting from an empty [`ReportSnapshot`]
-/// and running every `rebuild_*_from_tables` function in the same order
-/// as before (each one either fills in its own fields or is a no-op, so
-/// running them against an empty starting value is exactly as safe as
-/// running them against a stored one). "Has this scope ever been
-/// observed" is answered by `growth::scope_observed_at`
-/// (`summary.parquet` having a row for `key`), not by `projects.parquet`
-/// having one: a scope with genuinely zero discovered projects (external
-/// / agent units only, no git checkouts) still gets a `summary.parquet`
-/// row every full observe, but never gets a `projects.parquet` row at
-/// all, which would make "zero projects" indistinguishable from "never
-/// observed" -- and would leave `observed_at` at its default too, since
-/// that timestamp would otherwise only ever come from a `projects.parquet`
-/// row.
-pub fn report_scope_from_store(
-    scope: &crate::scope::EffectiveScope,
-    store_dir: &Path,
-) -> std::result::Result<ReportSnapshot, NoObservation> {
-    // Do not parse caches from an incompatible generation. The observer
-    // owns reset + rescan; report remains a pure read and reports no snapshot.
-    if !crate::fs_gate::store::StoreDir::at(store_dir)
-        .and_then(|store| store.has_current_format())
-        .unwrap_or(false)
-    {
-        return Err(NoObservation {
-            scope_description: describe_scope_for_error(scope),
-        });
-    }
-    let key = scope_snapshot_key(scope);
-    let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) else {
-        return Err(NoObservation {
-            scope_description: describe_scope_for_error(scope),
-        });
-    };
-    let mut snapshot = ReportSnapshot {
+/// A snapshot with nothing in it, for the table rebuilds to fill.
+fn empty_snapshot(observed_at: u64, store_dir: &Path) -> ReportSnapshot {
+    ReportSnapshot {
         observed_at,
         report: Report {
             observed_at,
@@ -3789,7 +3756,69 @@ pub fn report_scope_from_store(
         external_units: Vec::new(),
         agent_units: Vec::new(),
         store_interiors: Vec::new(),
+    }
+}
+
+/// The per-root coverage rows the last observation of `scope` stored:
+/// one small table read, no walk, no other table. Empty when `scope` has
+/// never been observed, which callers show as "not measured", never as
+/// zero bytes. This is what lets `swamp scope` and `swamp report` state
+/// what a declared root held at the last observation.
+pub fn stored_root_coverage(
+    scope: &crate::scope::EffectiveScope,
+    store_dir: &Path,
+) -> Vec<crate::coverage::RootCoverage> {
+    if !crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false)
+    {
+        return Vec::new();
+    }
+    let key = scope_snapshot_key(scope);
+    let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) else {
+        return Vec::new();
     };
+    let mut snapshot = empty_snapshot(observed_at, store_dir);
+    crate::growth::rebuild_coverage_and_notes_from_tables(store_dir, &key, &mut snapshot);
+    snapshot.coverage
+}
+
+/// R18a-3b: no JSON cell anywhere holds a `Report` -- this assembles the
+/// whole thing from typed tables, starting from an empty [`ReportSnapshot`]
+/// and running every `rebuild_*_from_tables` function in the same order
+/// as before (each one either fills in its own fields or is a no-op, so
+/// running them against an empty starting value is exactly as safe as
+/// running them against a stored one). "Has this scope ever been
+/// observed" is answered by `growth::scope_observed_at`
+/// (`summary.parquet` having a row for `key`), not by `projects.parquet`
+/// having one: a scope with genuinely zero discovered projects (external
+/// / agent units only, no git checkouts) still gets a `summary.parquet`
+/// row every full observe, but never gets a `projects.parquet` row at
+/// all, which would make "zero projects" indistinguishable from "never
+/// observed" -- and would leave `observed_at` at its default too, since
+/// that timestamp would otherwise only ever come from a `projects.parquet`
+/// row.
+pub fn report_scope_from_store(
+    scope: &crate::scope::EffectiveScope,
+    store_dir: &Path,
+) -> std::result::Result<ReportSnapshot, NoObservation> {
+    // Do not parse caches from an incompatible generation. The observer
+    // owns reset + rescan; report remains a pure read and reports no snapshot.
+    if !crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_current_format())
+        .unwrap_or(false)
+    {
+        return Err(NoObservation {
+            scope_description: describe_scope_for_error(scope),
+        });
+    }
+    let key = scope_snapshot_key(scope);
+    let Some(observed_at) = crate::growth::scope_observed_at(store_dir, &key) else {
+        return Err(NoObservation {
+            scope_description: describe_scope_for_error(scope),
+        });
+    };
+    let mut snapshot = empty_snapshot(observed_at, store_dir);
     crate::growth::rebuild_coverage_and_notes_from_tables(store_dir, &key, &mut snapshot);
     rebuild_projects_from_tables(scope, store_dir, &key, &mut snapshot);
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);

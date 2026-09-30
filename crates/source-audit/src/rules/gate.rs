@@ -137,6 +137,8 @@ const STORE_MODULES: &[(Krate, &[&str])] = &[
     (Krate::Core, &["assoc_store"]),
     (Krate::Core, &["github"]),
     (Krate::Core, &["agents"]),
+    // Edits the user's `[scan] include` in `config.toml` in place.
+    (Krate::Core, &["roots"]),
     (Krate::Tui, &["app"]),
     (Krate::Cli, &[]),
 ];

@@ -97,6 +97,21 @@ impl StoreDir {
         }
     }
 
+    /// Serializes read-modify-write edits of `config.toml` (`swamp config
+    /// add-root` / `remove-root`, the first-run answer) so two of them
+    /// racing never lose one's change. Blocks until held; the lock is
+    /// advisory and held only for the edit, never for an observation.
+    pub fn lock_config_edits(&self) -> io::Result<super::continuity::FileLock> {
+        self.create()?;
+        let path = self.0.join("config.lock");
+        loop {
+            if let Some(lock) = super::continuity::try_lock(&path, true)? {
+                return Ok(lock);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Whether derived tables belong to the current store generation.
     /// The marker read is bounded and never follows links or blocks on a FIFO.
     pub fn has_current_format(&self) -> io::Result<bool> {
@@ -780,7 +795,9 @@ pub fn read_json_bytes(file: JsonFile<'_>) -> io::Result<Option<Vec<u8>>> {
 /// Every non-JSON text file swamp writes.
 #[derive(Debug, Clone, Copy)]
 pub enum TextFile<'a> {
-    /// `<store>/config.toml`, written only by `swamp config init`.
+    /// `<store>/config.toml`, written by `swamp config init`, and edited in
+    /// place (under [`StoreDir::lock_config_edits`]) by `swamp config
+    /// add-root` / `remove-root` and the first-run answer.
     Config { store: &'a StoreDir },
     /// The scheduled refresh's LaunchAgent plist, where
     /// [`launch_agent_plist`] resolves it.

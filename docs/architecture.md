@@ -33,7 +33,7 @@ Even a fresh hardlink-deduplicated total is not guaranteed reclaimable space. Ot
 
 One scope resolver supplies observation, reporting, scheduling, and the TUI. It combines built-in roots, enabled detector locations, and configured additions/exclusions. Explicit roots replace the default root selection; exclusions still apply.
 
-Detectors find locations and explain their provenance. They do not independently authorize traversal or removal. Homebrew detection is disabled by default and can be enabled explicitly. `swamp scope` exposes the catalog and each resolved location's status.
+Detectors find locations and explain their provenance. They do not independently authorize traversal or removal. Homebrew is split: developer tooling (an allowlist in `docs/locations.md`) is on by default as units of its own, everything else under the prefix is one `Homebrew (other)` unit, and the full detector can be enabled explicitly. Source roots are declared by the user (`swamp config add-root`), never inferred from history, editor recents, git configuration or Spotlight. `swamp scope` exposes the catalog and each resolved location's status.
 
 Roots are normalized and overlapping traversal is avoided. Canonical paths and symlink aliases are considered when applying exclusions. A multi-root report describes the scope it actually covers, rather than borrowing the name of one constituent root.
 
