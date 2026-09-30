@@ -1285,7 +1285,7 @@ fn choose_audit(fresh: &[Row], now: u64) -> Vec<Row> {
     let mut used: HashSet<usize> = HashSet::new();
     let mut k = 0;
     while picked.len() < 5 && !rest.is_empty() && k < rest.len() * 3 {
-        let i = (seed + k * 3) % rest.len();
+        let i = (seed + k) % rest.len();
         if used.insert(i) {
             picked.push(rest[i].clone());
         }

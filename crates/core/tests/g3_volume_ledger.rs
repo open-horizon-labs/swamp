@@ -2418,3 +2418,30 @@ fn quarantined_ledgers_older_than_a_week_are_removed_at_the_start_of_a_pass() {
         "only the ledger's own quarantine names are touched"
     );
 }
+
+#[test]
+fn the_audit_picks_five_distinct_folders_when_there_are_enough_and_rotates_by_day() {
+    // Tempting wrong patch: a stride that shares a factor with the pool
+    // size, which cycles through three folders and audits four.
+    let s = Setup::new();
+    for i in 0..12u64 {
+        s.fs.file(
+            &format!("/Users/me/q{i:02}/f"),
+            2_000 + i * 10,
+            6_000 + i,
+            1,
+        );
+    }
+    ran(&s.pass());
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    let day1: Vec<String> = a.audit.folders.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(day1.len(), 5, "{day1:?}");
+    let distinct: HashSet<&String> = day1.iter().collect();
+    assert_eq!(distinct.len(), 5);
+    ran(&s.run_at(NOW + 86_400, true, Duration::from_secs(60), Some(0)));
+    let b = read_account(s.store.path()).unwrap().unwrap();
+    let day2: Vec<String> = b.audit.folders.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(day2.len(), 5);
+    assert_eq!(day1[0], day2[0], "the largest is always audited");
+    assert_ne!(day1, day2, "the rest rotate with the day");
+}
