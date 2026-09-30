@@ -26,16 +26,16 @@ observations, not general performance guarantees. See the README for current use
 - **BREAKING (TUI keys): views are nested in three sections.** In 0.7.x the digits `1`-`9`
   selected views; now `1` Projects, `2` Tools, `3` Disk select *sections*, `Tab` /
   `Shift-Tab` move between them, and `v` cycles the views inside the current one
-  (Projects: Projects, Tree, Builds, Deps, Types, Kinds, Docker, Unowned; Tools: Reclaim,
+  (Projects: Projects, Tree, Builds, Deps, Types, Kinds, Unowned; Tools: Reclaim, Docker,
   External, Agents; Disk: Summary, Not measured). Digits 4-9 are unbound. A row under the
   headline names the sections (current one in reverse video) and the view line reads
-  `view: Tools › Reclaim (1 of 3 · v next)`. Disk is new: Summary is the stored volume
+  `view: Tools › Reclaim (1 of 4 · v next)`. Disk is new: Summary is the stored volume
   ledger as rows, Not measured lists the unreadable and not-yet-measured folders. The
   legend is `Tab section  v view  / filter  R refresh  ⌫ delete ...`; `?` help lists every
-  section and view. The headline block points at Reclaim and Disk (`Tab to Tools`, `3`),
+  section and view. The headline block points at Reclaim and Disk (`2 for Tools`, `3`),
   and a store that has never opened Tools or Disk shows one line saying so until it does
   (`ui_state.json` `views_seen`). The block is four rows plus the strip, so on a 24-row
-  screen the table has 14 rows where it had 19.
+  screen the table area (its heading included) is 14 rows where it was 19.
 - **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
   unit of developer storage, largest first, with what getting it back costs in the
   tool's own words, when it was last used and from what record, who is known to

@@ -2,9 +2,9 @@
 "Developer storage: 10.9GB across 2 projects                                                                                                                                                             "
 "projects 10.9GB                                                                                                                                                                                         "
 "disk ledger: not measured yet; run swamp observe --volume · observed 749 d ago                                                                                                                          "
-"Reclaim: 0B regenerable across 0 units (Tab to Tools) · Disk: not measured; run swamp observe --volume (3)                                                                                              "
+"Reclaim: 0B regenerable across 0 units (2 for Tools) · Disk: not measured; run swamp observe --volume (3)                                                                                               "
 "1 Projects  2 Tools  3 Disk · Tab section                                                                                                                                                               "
-"view: Projects › Projects (1 of 8 · v next) · filter: growth > 100MB in 7d                                                                                                                              "
+"view: Projects › Projects (1 of 7 · v next) · filter: growth > 100MB in 7d                                                                                                                              "
 "Name                                                                                                              Size     Change Change bar    Cleanup / facts                                         "
 "mole  🔨                                                                                                         2.6GB     +1.3GB       │█████▌                                                         " Hidden by multi-width symbols: [(7, " ")]
 "swamp  🐳 🔨                                                                                                     8.1GB     +2.6GB       │██████                                                         " Hidden by multi-width symbols: [(8, " "), (11, " ")]
@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"Tab section  v view  / filter  R refresh  ⌫ delete  Space mark  A mark all  ↑↓ move  →/← in/out  g/s/n/t/a sort  ? help  q quit                                                                         "
+"Tab section  v view  / filter  R refresh  ⌫ delete  Space mark  A mark all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                              "

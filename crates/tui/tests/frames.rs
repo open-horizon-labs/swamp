@@ -1139,7 +1139,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     let before = capture(&app, 200, 60);
     assert!(before.contains("1 Projects"), "{before}");
     assert!(
-        before.contains("view: Projects › Projects (1 of 8 · v next)"),
+        before.contains("view: Projects › Projects (1 of 7 · v next)"),
         "{before}"
     );
     assert!(before.contains("filter: none"), "{before}");
@@ -2295,7 +2295,7 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
     assert_eq!(app.view, ViewKind::Builds);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("view: Projects › Builds of mole (3 of 8"), "{f}");
+    assert!(f.contains("view: Projects › Builds of mole (3 of 7"), "{f}");
     app.set_view(ViewKind::Tree);
     assert_eq!(app.selected, at, "the tree cursor came back");
     // Esc to projects and back to the same project row.
@@ -2796,7 +2796,8 @@ fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
             footer_of(&app)
         };
         for v in ViewKind::ALL {
-            if v == ViewKind::Reclaim {
+            // Reclaim and the two Disk views mark nothing: no delete keys.
+            if matches!(v, ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps) {
                 continue;
             }
             app.set_view(v);

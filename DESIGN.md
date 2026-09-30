@@ -106,7 +106,7 @@ pointer row until Tools or Disk is opened once, and is remembered in
 Under the block is the section strip: one row naming the three sections (`1
 Projects  2 Tools  3 Disk`), the current one in reverse video (an attribute,
 never a color, so `NO_COLOR` and light themes keep it). The line below it names
-the view: `view: Tools › Reclaim (1 of 3 · v next)`, then the filter and sort.
+the view: `view: Tools › Reclaim (1 of 4 · v next)`, then the filter and sort.
 The only keys that move between views are `Tab`/`Shift-Tab` (sections), `v` (views
 inside a section, wrapping) and `1` `2` `3` (a section); the legend shows `Tab
 section  v view` and never a key per view. Every modal keeps its own keys first,

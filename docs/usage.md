@@ -533,7 +533,7 @@ it fetches or rebuilds it again the next time it is needed. The
 double-count, but the two bases (a walked root vs. a detector-resolved
 location) are different enough that summing them would be misleading.
 
-The TUI has a dedicated, read-only External view (`v`/`9`): the same
+The TUI has a dedicated, read-only External view (Tools section: `2`, then `v`): the same
 one-row-per-unit facts as `--view external`, never markable -- act on
 what it shows with the manager's own tools, not swamp.
 
@@ -896,12 +896,12 @@ current section (wrapping). Nothing else opens a view.
 
 | Section | Views (first is the default) |
 |---|---|
-| 1 Projects | Projects, Tree, Builds, Deps, Types, Kinds, Docker, Unowned |
-| 2 Tools | Reclaim, External, Agents |
+| 1 Projects | Projects, Tree, Builds, Deps, Types, Kinds, Unowned |
+| 2 Tools | Reclaim, Docker, External, Agents |
 | 3 Disk | Summary (the stored volume ledger's parts), Not measured (unreadable and not-yet-measured folders, the largest measured folders outside developer storage) |
 
 A row under the headline names the three sections with the current one in reverse
-video; the line below it names the view (`view: Tools › Reclaim (1 of 3 · v next)`).
+video; the line below it names the view (`view: Tools › Reclaim (1 of 4 · v next)`).
 `?` help lists every section and view with a line on each. **Changed in 0.8.0:** in
 0.7.x the digits `1`-`9` selected views; now `1`-`3` select sections and the old
 digits are unbound.

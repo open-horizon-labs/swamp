@@ -215,7 +215,7 @@ fn no_row_moves_between_states_or_views_at_any_width() {
                         "strip: {ctx}"
                     );
                     // The view line, then the body.
-                    assert!(f[2 + hr].starts_with("view: "), "view line: {ctx}");
+                    assert!(f[2 + hr].contains("filter:"), "view line: {ctx}");
                     let body = &f[3 + hr];
                     if !a.rows().is_empty() {
                         assert!(body.starts_with("Name"), "heading at the same row: {ctx}");
@@ -280,7 +280,7 @@ fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
     // The pointers name the views and the keys; at 80 columns they take
     // their shorter form.
     assert!(
-        f[4].contains("Reclaim: 3.0GB regenerable, 3 units (Tab)"),
+        f[4].contains("Reclaim: 3.0GB regenerable, 3 units (2)"),
         "{}",
         f[4]
     );
@@ -288,7 +288,7 @@ fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
     // Wide enough, they spell the key out.
     let wide = frame(&a, 120, 30);
     assert!(
-        wide[4].contains("Reclaim: 3.0GB regenerable across 3 units (Tab to Tools)"),
+        wide[4].contains("Reclaim: 3.0GB regenerable across 3 units (2 for Tools)"),
         "{}",
         wide[4]
     );
@@ -447,16 +447,16 @@ fn the_view_line_names_the_sub_view_and_v_wraps_inside_the_section() {
         let f = frame(&a, w, 24);
         let line = &f[2 + ui::headline_rows(24) as usize];
         assert!(
-            line.starts_with("view: Tools › Reclaim (1 of 3"),
+            line.contains("Tools › Reclaim (1 of 4") || (w < 80 && line.contains("Reclaim")),
             "{w}: {line}"
         );
-        for _ in 0..3 {
+        for _ in 0..4 {
             swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
         }
         assert_eq!(a.view, ViewKind::Reclaim, "wrapped");
         let line = frame(&a, w, 24)[2 + ui::headline_rows(24) as usize].clone();
         assert!(
-            line.starts_with("view: Tools › Reclaim (1 of 3"),
+            line.contains("Tools › Reclaim (1 of 4") || (w < 80 && line.contains("Reclaim")),
             "{w}: {line}"
         );
     }
@@ -465,10 +465,7 @@ fn the_view_line_names_the_sub_view_and_v_wraps_inside_the_section() {
     swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
     assert_eq!(a.view, ViewKind::DiskGaps);
     let line = frame(&a, 80, 24)[2 + ui::headline_rows(24) as usize].clone();
-    assert!(
-        line.starts_with("view: Disk › Not measured (2 of 2"),
-        "{line}"
-    );
+    assert!(line.contains("Disk › Not measured (2 of 2"), "{line}");
 }
 
 // ---------------------------------------------------------------------
@@ -685,11 +682,7 @@ fn the_first_run_line_hides_after_tools_or_disk_is_opened_and_stays_hidden() {
     assert!(a.views_seen);
     let f = frame(&a, 80, 24);
     assert!(!f[4].starts_with("New:"), "{}", f[4]);
-    assert!(
-        f[4].contains("Reclaim:") && f[4].contains("(Tab"),
-        "{}",
-        f[4]
-    );
+    assert!(f[4].contains("Reclaim:") && f[4].contains("(2"), "{}", f[4]);
     a.flush_ui_state();
     let raw = std::fs::read_to_string(dir.path().join("ui_state.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -733,7 +726,7 @@ fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
         .lines()
         .find(|l| l.contains("/Users/x/Pictures"))
         .expect("named");
-    assert!(pic.contains("unmeasured") && !pic.contains("0B"), "{pic}");
+    assert!(pic.contains("not read") && !pic.contains("0B"), "{pic}");
     a.set_view(ViewKind::DiskGaps);
     let f = frame(&a, 120, 30).join("\n");
     assert!(f.contains("Could not be read: 1 directory"), "{f}");
@@ -741,7 +734,7 @@ fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
         .lines()
         .find(|l| l.contains("/Users/x/Pictures"))
         .expect("named");
-    assert!(pic.contains("unmeasured") && !pic.contains("0B"), "{pic}");
+    assert!(pic.contains("not read") && !pic.contains("0B"), "{pic}");
     assert!(
         f.contains("Largest measured folders outside developer storage"),
         "{f}"
@@ -822,4 +815,49 @@ fn view_keys_are_text_while_typing_in_the_filter_and_the_picker() {
         swamp_tui::handle_key(&mut a, k);
         assert_eq!(a.view, ViewKind::Projects);
     }
+}
+
+/// Tempting wrong patch: a narrow screen cuts the view line at the edge, so
+/// the active filter (which hides rows) is the part that vanishes. The view
+/// part shortens first; the filter is always on screen.
+#[test]
+fn an_active_filter_is_always_visible_on_the_view_line() {
+    for w in [40u16, 50, 80, 120] {
+        for v in ViewKind::ALL {
+            let mut a = app();
+            a.set_view(v);
+            a.filter_text = "growth > 100MB in 7d".into();
+            let f = frame(&a, w, 24);
+            let line = &f[2 + ui::headline_rows(24) as usize];
+            assert!(
+                line.contains("filter: growth > 100MB in 7d"),
+                "{w} {v:?}: {line}"
+            );
+        }
+    }
+}
+
+/// The pointer names the jump key, which works from every section (Tab
+/// from Tools goes to Disk, not back to Tools).
+#[test]
+fn the_reclaim_pointer_names_the_jump_key_not_tab() {
+    let mut a = app();
+    for w in [40u16, 80, 120] {
+        for v in [ViewKind::Projects, ViewKind::Reclaim, ViewKind::Disk] {
+            a.set_view(v);
+            let l = frame(&a, w, 24)[4].clone();
+            assert!(
+                l.contains("Reclaim") && !l.contains("Tab"),
+                "{w} {v:?}: {l}"
+            );
+            assert!(l.contains("(2") || w < 40, "{l}");
+        }
+    }
+    // Disk views hide the keys they cannot use.
+    a.set_view(ViewKind::Disk);
+    let last = frame(&a, 120, 24).pop().unwrap();
+    assert!(
+        !last.contains("⌫ delete") && !last.contains("Space mark"),
+        "{last}"
+    );
 }

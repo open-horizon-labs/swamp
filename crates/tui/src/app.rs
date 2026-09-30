@@ -107,10 +107,14 @@ impl Section {
                 ViewKind::Deps,
                 ViewKind::Types,
                 ViewKind::Kinds,
-                ViewKind::Docker,
                 ViewKind::Unowned,
             ],
-            Section::Tools => &[ViewKind::Reclaim, ViewKind::External, ViewKind::Agents],
+            Section::Tools => &[
+                ViewKind::Reclaim,
+                ViewKind::Docker,
+                ViewKind::External,
+                ViewKind::Agents,
+            ],
             Section::Disk => &[ViewKind::Disk, ViewKind::DiskGaps],
         }
     }
@@ -187,9 +191,10 @@ impl ViewKind {
             | ViewKind::Deps
             | ViewKind::Types
             | ViewKind::Kinds
-            | ViewKind::Docker
             | ViewKind::Unowned => Section::Projects,
-            ViewKind::Reclaim | ViewKind::External | ViewKind::Agents => Section::Tools,
+            ViewKind::Reclaim | ViewKind::Docker | ViewKind::External | ViewKind::Agents => {
+                Section::Tools
+            }
             ViewKind::Disk | ViewKind::DiskGaps => Section::Disk,
         }
     }
@@ -247,9 +252,9 @@ impl ViewKind {
         ViewKind::Deps,
         ViewKind::Types,
         ViewKind::Kinds,
-        ViewKind::Docker,
         ViewKind::Unowned,
         ViewKind::Reclaim,
+        ViewKind::Docker,
         ViewKind::External,
         ViewKind::Agents,
         ViewKind::Disk,
@@ -4281,8 +4286,9 @@ mod tests {
             }
             assert_eq!(v, s.default_view());
         }
-        assert_eq!(ViewKind::Docker.next(), ViewKind::Unowned);
+        assert_eq!(ViewKind::Kinds.next(), ViewKind::Unowned);
         assert_eq!(ViewKind::Unowned.next(), ViewKind::Projects);
+        assert_eq!(ViewKind::Reclaim.next(), ViewKind::Docker);
         assert_eq!(ViewKind::Agents.next(), ViewKind::Reclaim);
         assert_eq!(Section::Disk.next(), Section::Projects);
         assert_eq!(Section::Projects.prev(), Section::Disk);

@@ -344,7 +344,7 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
 fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
-    const BASE: [&str; 11] = [
+    const BASE: [&str; 12] = [
         "Tab section",
         "v view",
         "/ filter",
@@ -355,6 +355,7 @@ fn footer_legend(width: usize, blocked: bool, markable: bool) -> String {
         "↑↓ move",
         "→/← in/out",
         "g/s/n/t/a sort",
+        "r reverse",
         "? help",
     ];
     const TAIL: &str = "q quit";
@@ -854,7 +855,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
         footer_legend(
             size.width as usize,
             !app.blocked.is_empty(),
-            app.view != crate::app::ViewKind::Reclaim,
+            !matches!(
+                app.view,
+                crate::app::ViewKind::Reclaim
+                    | crate::app::ViewKind::Disk
+                    | crate::app::ViewKind::DiskGaps
+            ),
         )
     };
     frame.render_widget(Paragraph::new(footer_text), chunks[6]);
@@ -1141,17 +1147,17 @@ fn pointer_line(
             let regen = human_bytes(view.totals.regenerable_bytes);
             vec![
                 format!(
-                    "Reclaim: {regen} regenerable across {n} unit{} (Tab to Tools)",
+                    "Reclaim: {regen} regenerable across {n} unit{} (2 for Tools)",
                     if n == 1 { "" } else { "s" }
                 ),
                 format!(
-                    "Reclaim: {regen} regenerable, {n} unit{} (Tab)",
+                    "Reclaim: {regen} regenerable, {n} unit{} (2)",
                     if n == 1 { "" } else { "s" }
                 ),
-                "Reclaim (Tab to Tools)".to_string(),
+                "Reclaim (2)".to_string(),
             ]
         }
-        None => vec!["Reclaim (Tab to Tools)".to_string()],
+        None => vec!["Reclaim (2)".to_string()],
     };
     let disk: Vec<String> = match h.map(|h| &h.disk) {
         Some(Disk::Measured(m)) => {
@@ -1362,7 +1368,7 @@ fn draw_view_strip(frame: &mut Frame, app: &App, area: Rect) {
 
 /// `filter: growth > 100MB in 7d · sort: size ↑`: what narrows and orders
 /// the rows.
-fn filter_clause(app: &App) -> String {
+fn filter_clause(app: &App, width: usize) -> String {
     let sort_name = match app.sort {
         crate::model::Sort::Growth => Some("growth"),
         crate::model::Sort::Size => Some("size"),
@@ -1390,13 +1396,25 @@ fn filter_clause(app: &App) -> String {
     } else {
         " · Esc: projects"
     };
-    format!(
-        "view: {} › {}{of} ({} of {} · v next{esc}) · filter: {filter}{sort}",
-        app.view.section().title(),
-        app.view.title(),
-        app.view.position(),
-        app.view.section().views().len(),
-    )
+    let filt = format!("filter: {filter}{sort}");
+    let (sec, view) = (app.view.section().title(), app.view.title());
+    let (pos, n) = (app.view.position(), app.view.section().views().len());
+    // The filter hides rows, so it is never the part that is cut: the view
+    // part shortens first (the counts, then the section), and only a filter
+    // wider than the line itself is clipped.
+    let tiers = [
+        format!("view: {sec} › {view}{of} ({pos} of {n} · v next{esc})"),
+        format!("view: {sec} › {view}{of} ({pos} of {n})"),
+        format!("{sec} › {view}{of}"),
+        format!("{view}{of}"),
+    ];
+    let dw = crate::model::display_width;
+    for t in &tiers {
+        if dw(t) + 3 + dw(&filt) <= width {
+            return format!("{t} · {filt}");
+        }
+    }
+    clip_end(&filt, width)
 }
 
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
@@ -1408,7 +1426,7 @@ fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
         };
         Line::from(format!("filter › {}▏  {hint}", app.filter_text))
     } else {
-        Line::from(filter_clause(app))
+        Line::from(filter_clause(app, area.width as usize))
     };
     frame.render_widget(Paragraph::new(line), area);
     if let Some(err) = &app.filter_error {
@@ -2038,7 +2056,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "Tab",
-        "next section (Projects, Tools, Disk); Shift-Tab goes back. In the filter, Tab completes as before",
+        "next section (Projects, Tools, Disk); Shift-Tab goes back. In the : filter editor Tab completes as before; the / picker ignores it",
     );
     entry(
         &mut out,

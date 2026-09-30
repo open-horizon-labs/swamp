@@ -2584,13 +2584,13 @@ pub fn disk_rows(
         0,
         None,
     );
-    nm.size_text = Some("unmeasured".to_string());
+    nm.size_text = Some("not read".to_string());
     nm.detail_lines = vec![swamp_core::volume_ledger::FDA_NOTE.to_string()];
     rows.push(nm);
     let names = a.not_measured.names.len().min(DISK_FOLDERS_SHOWN);
     for (i, name) in a.not_measured.names.iter().take(names).enumerate() {
         let mut c = Row::leaf(1, name.clone(), 0, None);
-        c.size_text = Some("unmeasured".to_string());
+        c.size_text = Some("not read".to_string());
         c.rail = if i + 1 == names && a.not_measured.count <= names {
             "└─ ".into()
         } else {
@@ -2608,7 +2608,7 @@ pub fn disk_rows(
             0,
             None,
         );
-        c.size_text = Some("unmeasured".to_string());
+        c.size_text = Some("not read".to_string());
         c.rail = "└─ ".into();
         rows.push(c);
     }
@@ -2727,7 +2727,7 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
             }
         ),
         &a.not_measured.names,
-        "unmeasured",
+        "not read",
         a.not_measured
             .count
             .saturating_sub(a.not_measured.names.len()),
