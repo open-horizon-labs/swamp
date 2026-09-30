@@ -990,4 +990,39 @@ mod tests {
         assert_eq!(units.len(), 1, "toolchains/ is not an SDK package");
         assert_eq!(units[0].path, ndk);
     }
+    /// Adversarial (audit/v080-g0). Tempting wrong patch: decide "SDK
+    /// package folder vs outside NDK" by the container's *name*. An NDK
+    /// that `ANDROID_NDK_HOME=/opt/ndk` names (one NDK, with its own
+    /// `source.properties` at the top) is called `ndk`, so it is read as
+    /// the SDK's `ndk/` list and its `toolchains/`, `prebuilt/` folders
+    /// are reported as fake `ndk;toolchains` packages.
+    #[test]
+    fn audit_an_outside_ndk_named_ndk_is_one_package_not_a_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ndk = tmp.path().join("opt/ndk");
+        put(
+            &ndk.join("source.properties"),
+            "Pkg.Revision=26.1.10909125\n",
+        );
+        put(&ndk.join("toolchains/llvm/x"), "x");
+        put(&ndk.join("prebuilt/y"), "y");
+        let c = BuildContainer::shared_store_of(
+            "android",
+            ndk.clone(),
+            BuildStoreKind::AndroidSdkPackages,
+        );
+        let units = run(&c, &index_of(&ndk, 5));
+        let fake: Vec<String> = units
+            .iter()
+            .filter_map(|u| u.consequence.clone())
+            .filter(|t| t.contains("ndk;toolchains") || t.contains("ndk;prebuilt"))
+            .collect();
+        assert!(fake.is_empty(), "fake NDK packages: {fake:?}");
+        assert_eq!(
+            units.len(),
+            1,
+            "{:?}",
+            units.iter().map(|u| &u.path).collect::<Vec<_>>()
+        );
+    }
 }
