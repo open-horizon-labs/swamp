@@ -133,15 +133,22 @@ observations, not general performance guarantees. See the README for current use
   once and stores it in a new ledger (`volume_ledger.parquet` and a meta file), and
   `report --view disk` (and a `disk` object in `report --json`) reads it back with the
   time each row was measured, never walking, statting or running anything. On this
-  Mac: container 494.4 GB, 443.1 GB used = catalog and declared locations 197.4 GB
-  (counted once) + everything else 132.4 GB (330 folders, top five shown: Library
-  31.6, AssetsV2 27.8, /private/tmp 14.7, /private/var 11.6, ~/.local 7.4) + system
-  volumes 46.6 GB + "not measured, estimated by elimination" 66.6 GB + a named
-  residual "unattributed: APFS accounting, TCC-blocked, clones" of +160 MB (0.04%).
+  Mac: container 494.4 GB, 427.2 GB used = catalog and declared locations 204.6 GB
+  (counted once) + everything else 132.5 GB (330 folders, top five shown: Library
+  31.7, AssetsV2 27.8, /private/tmp 14.7, /private/var 11.6, ~/.local 7.4) + system
+  volumes 46.6 GB + "not measured (unreadable folders or not yet measured),
+  estimated" 43.3 GB + a residual of +219 MB (0.05% of used).
   Measured against `du` on the same disk: /Applications 24.27 GB (du 24.27), /opt
   25.31 (25.31), /Library 14.45 (14.45), /System/Library/AssetsV2 27.81 (27.80),
-  /private 60.22 (60.12), home 161.8 (163.7; `du` counts a hardlink once across the
-  whole home, the pass once per folder).
+  /private 60.22 (60.12), home 163.1 by `du`, which cannot read the protected
+  folders (the ledger's home row differs by the OrbStack data image, 23 GB, that
+  the observation measures and `du` is refused).
+- **The check can fail.** The parts add up to the container's used bytes with one
+  residual, "unattributed: allocation not explained by any measured part", that
+  nothing absorbs; when it is more than 1% of used the report prints a `FLAG` line
+  (JSON `residual_flag`). The estimate for protected folders is shown apart, labelled
+  an estimate, and only while something is unreadable or not yet measured. Here the
+  residual is +219 MB (0.05%). Locations not yet measured are listed by name.
 - **A folder swamp cannot read is `not measured`, never zero.** 981 folders here
   (Photos, Mail, Containers, Group Containers, `/private/var/db`, the Spotlight
   index, ...) are listed by name (the first 200 in `--json`) with the exact count.
@@ -160,10 +167,13 @@ observations, not general performance guarantees. See the README for current use
   the pass walks the data volume from its own mount point, where `/System` holds
   exactly the 27.8 GB of runtime images (every path under `/` reports one device, so
   a device test cannot tell sealed from data).
-- **The pass respects its budget and resumes.** It measures at background priority,
-  three folders at a time, for at most `volume_pass_budget_secs` (default 120, the
-  system queries and planning included), then stops even mid-folder and continues at
-  the next `observe`; each row keeps its own time. Here a warm pass takes about 30-40
+- **The pass respects its budget and resumes.** It runs after the observation, under
+  its own `volume-pass.lock`, and reads the mount table before touching any path (a
+  network mount is never statted). It measures at background priority, three folders
+  at a time, for at most `volume_pass_budget_secs` (default 120, minimum 5, the system
+  queries and planning included; a run can take up to 1.5 budgets), then stops even
+  mid-folder and continues at the next `observe`; each row keeps its own time. Past
+  two budgets it stops waiting for a stuck path, logs it and lets the next run resume. Here a warm pass takes about 30-35
   s and an 8-second budget stopped at 8.0-8.1 s five runs in a row. A second pass over
   an unchanged disk gives the same bytes but is not faster (no event replay for the
   whole disk yet). It is new files only: no existing table changed, the store-format

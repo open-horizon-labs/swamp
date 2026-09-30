@@ -145,9 +145,20 @@ what no path reaches, and says what it did not measure.
 - **The identity is computed at read time** (`volume_ledger::account`), not stored:
   accounted + everything else + system volumes + the not-measured estimate (the
   Data volume's consumed bytes minus what was measured) + a signed, named residual
-  equals the container's used bytes. Purgeable space, mounted images, another
-  volume of the container and network shares are listed and never added.
-- **Reading never works.** `report --view disk`, the `disk` object of
+  equals the container's used bytes. The estimate exists only while something is
+  unreadable or not yet measured, and nothing absorbs the residual: it is flagged
+  (`residual_flag`) when it exceeds 1% of used, so a walk that missed part of the
+  disk cannot pass. Purgeable space, mounted images, another volume of the
+  container, locations on other volumes and network shares are listed and never
+  added.
+- **Decoupled and bounded.** The pass runs after the observation and its lock,
+  under `volume-pass.lock`. The mount table is read before any path is touched
+  (network, FUSE and automounter mounts are never statted or entered); workers are
+  detached and the pass stops waiting at twice its budget, records the stuck path
+  as not measured and lets the next run resume from the cursor. A local heartbeat
+  (the last path each worker touched) names the stuck path; unifying it with the
+  shared stall beacon in PR #191 is a follow-up.
+- **Reading never walks.** `report --view disk`, the `disk` object of
   `report --json` and any other reader call `volume_ledger::read_account`: two
   Parquet reads, no listing, no stat, no spawn (the work counters assert it).
 
