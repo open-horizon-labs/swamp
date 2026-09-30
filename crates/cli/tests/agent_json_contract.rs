@@ -32,6 +32,8 @@ fn run(store: &Path, args: &[&str]) -> Output {
 /// `extra_args` lets a caller set e.g. `--full`; the root is always
 /// named explicitly, matching the `report` calls these fixtures make.
 fn observe(store: &Path, root: &Path, extra_args: &[&str]) {
+    // #197: settle fixture writes before they are measured.
+    swamp_core::fs_gate::settle::settle();
     let mut args = vec!["observe", root.to_str().unwrap()];
     args.extend_from_slice(extra_args);
     let out = run(store, &args);

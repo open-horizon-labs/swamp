@@ -2358,6 +2358,8 @@ mod registry_reach_tests {
         AttributionResult,
         Vec<crate::coverage::RegistryReach>,
     ) {
+        // #197: fixtures are settled before every measurement.
+        crate::fs_gate::settle::settle();
         discover_and_attribute(&crate::bus::Stage::for_tests(), root, 1, 1 << 40, &[], &[]).unwrap()
     }
 

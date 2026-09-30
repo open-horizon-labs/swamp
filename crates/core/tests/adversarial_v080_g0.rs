@@ -37,6 +37,7 @@ fn put(path: &Path, bytes: usize) {
 }
 
 fn measure(env: &Environment, ids: &[&str]) -> Vec<ExternalUnit> {
+    swamp_core::fs_gate::settle::settle();
     let registry = Registry::with_builtins();
     let scope = resolve_effective_scope(env, &only(ids), &[], &registry, 1);
     let store = tempfile::tempdir().unwrap();

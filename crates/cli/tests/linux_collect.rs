@@ -56,6 +56,8 @@ fn wait_for_checkpoint(store: &Path, root: &Path, pid: u32) {
 
 /// `swamp observe <root>`'s machine-readable line.
 fn observe(root: &Path, store: &Path, home: &Path, full: bool) -> String {
+    // #197: settle fixture writes before they are measured.
+    swamp_core::fs_gate::settle::settle();
     let mut cmd = Command::new(bin());
     cmd.arg("observe").arg(root);
     if full {

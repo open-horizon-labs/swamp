@@ -52,6 +52,8 @@ pub mod inotify;
 // only `occupancy::probe_paths`'s call into it is Linux-only.
 pub mod procfs;
 pub mod read;
+#[cfg(any(test, feature = "testing"))]
+pub mod settle;
 pub mod spawn;
 pub mod store;
 pub mod sys;

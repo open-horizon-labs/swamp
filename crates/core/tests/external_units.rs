@@ -71,6 +71,7 @@ fn external_only_root_is_measured_as_one_unit() {
     let scope = resolve_effective_scope(&env, &only_cargo_home_config(), &[], &registry, 1);
 
     let store = tempfile::tempdir().unwrap();
+    swamp_core::fs_gate::settle::settle();
     let units = discover_and_measure(
         &scope,
         Some(store.path()),

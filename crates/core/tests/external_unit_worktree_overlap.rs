@@ -33,6 +33,7 @@ fn du_bytes(p: &Path) -> u64 {
 }
 
 fn measure(scratch: &Path, home: &Path, wts: &[NestedWorktree]) -> ExternalUnit {
+    swamp_core::fs_gate::settle::settle();
     let mut env_vars: HashMap<String, String> = HashMap::new();
     env_vars.insert("CARGO_HOME".into(), scratch.display().to_string());
     let env = Environment::fixture(home.to_path_buf(), env_vars, Platform::MacOS);

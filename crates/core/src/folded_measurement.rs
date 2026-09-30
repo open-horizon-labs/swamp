@@ -818,6 +818,7 @@ mod tests {
         };
         testing::set(&sealed, stamp);
 
+        crate::fs_gate::settle::settle();
         // First pass: everything is walked, the sealed part is stamped.
         let (first, counted) = crate::work_counters::measured(|| {
             measure(
@@ -862,6 +863,7 @@ mod tests {
             },
         );
         std::fs::write(sealed.join("a/b/more"), vec![b'w'; 2048]).unwrap();
+        crate::fs_gate::settle::settle();
         let (third, counted) = crate::work_counters::measured(|| {
             measure(
                 Some(store.path()),
@@ -897,6 +899,7 @@ mod tests {
         std::fs::write(unit.join("a/b/f"), vec![b'x'; 4096]).unwrap();
         std::fs::write(unit.join("a/g"), vec![b'y'; 4096]).unwrap();
 
+        crate::fs_gate::settle::settle();
         let none = EventCoverage::untrusted();
         let first = measure(Some(store.path()), &unit, &[], 1_000, &none);
         assert!(first.bytes >= 8192, "{}", first.bytes);
@@ -945,6 +948,7 @@ mod tests {
         );
 
         std::fs::write(unit.join("a/b/new"), vec![b'z'; 4096]).unwrap();
+        crate::fs_gate::settle::settle();
         let (third, cost) = crate::work_counters::measured(|| {
             measure(Some(store.path()), &unit, &[], 4_000, &noisy)
         });

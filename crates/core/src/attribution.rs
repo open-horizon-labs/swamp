@@ -798,6 +798,7 @@ mod tests {
         touch(&repo.join("Gemfile"), 16);
         touch(&repo.join("vendor/bundle/gems/installed.rb"), 4096);
         touch(&repo.join("vendor/handwritten/license.txt"), 2048);
+        crate::fs_gate::settle::settle();
 
         let result = attribute(tmp.path(), &[(repo.as_path(), "ruby-wt")], 0);
         let rows = result.artifacts_by_worktree.get("ruby-wt").unwrap();
@@ -936,6 +937,7 @@ mod tests {
         let root = tmp.path();
         touch(&root.join("cache/.cargo-registry/a"), 4096);
         touch(&root.join("cache/.cargo-registry/b"), 4096);
+        crate::fs_gate::settle::settle();
 
         let worktrees: [(&Path, &str); 0] = [];
         let result = attribute(root, &worktrees, 0);

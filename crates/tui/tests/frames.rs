@@ -30,6 +30,8 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
         std::fs::create_dir_all(target.join(format!("debug/incremental/group-{index:02}")))
             .unwrap();
     }
+    // #197: the inspection below reads exact allocated bytes.
+    swamp_core::fs_gate::settle::settle();
     let mut report = fixture_report();
     report.projects.truncate(1);
     report.root = root.clone();

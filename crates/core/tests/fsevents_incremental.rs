@@ -119,7 +119,8 @@ fn touching_one_artifact_resizes_only_that_row_and_matches_a_full_walk() {
 
     // Touch one file inside node_modules: same directory, different
     // content, so only that artifact's byte total should move.
-    fs::write(fx.node_modules.join("touched.bin"), vec![b't'; 4096]).expect("write touch probe");
+    fixture::write_settled(fx.node_modules.join("touched.bin"), vec![b't'; 4096])
+        .expect("write touch probe");
 
     // Second observation: canned source reports exactly node_modules as
     // changed.
@@ -231,10 +232,10 @@ fn deep_change_inside_a_folded_artifact_resizes_from_interior_rows_and_matches_a
     // Deep structure inside node_modules before the first (full) walk.
     let deep = fx.node_modules.join("pkg/lib/sub");
     fs::create_dir_all(&deep).unwrap();
-    fs::write(deep.join("old.bin"), vec![b'o'; 8192]).unwrap();
+    fixture::write_settled(deep.join("old.bin"), vec![b'o'; 8192]).unwrap();
     let doomed = fx.node_modules.join("pkg/doomed");
     fs::create_dir_all(&doomed).unwrap();
-    fs::write(doomed.join("x.bin"), vec![b'x'; 16384]).unwrap();
+    fixture::write_settled(doomed.join("x.bin"), vec![b'x'; 16384]).unwrap();
 
     let first = report_full_mode_with_source(
         &fx.root,
@@ -286,10 +287,10 @@ fn deep_change_inside_a_folded_artifact_resizes_from_interior_rows_and_matches_a
 
     // Three kinds of change, three levels down: a write, a new subtree,
     // a deleted subtree.
-    fs::write(deep.join("new.bin"), vec![b'n'; 40960]).unwrap();
+    fixture::write_settled(deep.join("new.bin"), vec![b'n'; 40960]).unwrap();
     let fresh = fx.node_modules.join("pkg/lib/fresh/deeper");
     fs::create_dir_all(&fresh).unwrap();
-    fs::write(fresh.join("f.bin"), vec![b'f'; 12288]).unwrap();
+    fixture::write_settled(fresh.join("f.bin"), vec![b'f'; 12288]).unwrap();
     fs::remove_dir_all(&doomed).unwrap();
 
     // FSEvents names the directories whose listings changed (and, by our
@@ -408,7 +409,7 @@ fn new_nested_repo_is_discovered_incrementally() {
     };
     run_git(&["init", "-q", "-b", "main"]);
     run_git(&["config", "commit.gpgsign", "false"]);
-    fs::write(new_repo.join("README.md"), b"new nested repo\n").expect("write README");
+    fixture::write_settled(new_repo.join("README.md"), b"new nested repo\n").expect("write README");
     run_git(&["add", "README.md"]);
     run_git(&["commit", "-q", "-m", "initial commit"]);
 
@@ -584,7 +585,7 @@ fn report_cache_failure_does_not_advance_the_replay_checkpoint() {
     fs::remove_file(&cache).unwrap();
     let blocker = cache.clone();
     fs::create_dir(&blocker).unwrap();
-    fs::write(blocker.join("occupied"), b"x").unwrap();
+    fixture::write_settled(blocker.join("occupied"), b"x").unwrap();
     let source = CannedSource(incremental_plan(vec![], 77));
     let result = report_full_mode_with_source(
         &fx.root,
@@ -677,7 +678,7 @@ fn switching_roots_preserves_history_and_alias_replay_namespace() {
     )
     .expect("child observation");
 
-    fs::write(
+    fixture::write_settled(
         fx.node_modules.join("alias-replay-probe"),
         vec![b'x'; 1024 * 1024],
     )
@@ -836,6 +837,7 @@ fn nested_linked_worktree_artifacts_are_not_double_counted_on_incremental_rewalk
         linked_paths.push(wt);
     }
 
+    swamp_core::fs_gate::settle::settle();
     let store = tempfile::tempdir().expect("tmp store");
 
     let first = report_full_mode_with_source(
@@ -864,7 +866,7 @@ fn nested_linked_worktree_artifacts_are_not_double_counted_on_incremental_rewalk
     // artifact root forces the "rewalk this whole worktree" branch
     // (`attribute_one_worktree`), which is exactly what folded a nested
     // linked worktree's bytes into the outer worktree before the fix.
-    fs::write(root.join("touched.txt"), vec![b't'; 4096]).expect("write touch probe");
+    fixture::write_settled(root.join("touched.txt"), vec![b't'; 4096]).expect("write touch probe");
 
     let source = CannedSource(incremental_plan(vec![root.clone()], 1));
     let incremental = report_full_mode_with_source(
@@ -978,6 +980,7 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
         fs::write(&a, vec![b'h'; 64 * 1024]).expect("write shared");
         fs::hard_link(&a, target.join(format!("shared-{i}.bin"))).expect("hard link");
     }
+    swamp_core::fs_gate::settle::settle();
 
     let first = report_full_mode_with_source(
         &fx.root,
@@ -996,7 +999,7 @@ fn hardlinks_shared_across_rows_are_not_recharged_on_incremental_resize() {
 
     // Touch inside target/ (the row whose shared inodes may belong to
     // node_modules in the full walk's accounting).
-    fs::write(target.join("touched.bin"), vec![b't'; 8192]).expect("touch probe");
+    fixture::write_settled(target.join("touched.bin"), vec![b't'; 8192]).expect("touch probe");
 
     let source = CannedSource(incremental_plan(vec![target.clone()], 1));
     let second = report_full_mode_with_source(
@@ -1185,7 +1188,7 @@ fn docker_rows_stay_out_of_walked_total_and_are_not_duplicated_on_incremental() 
         "fixture must join at least one Docker object"
     );
 
-    fs::write(fx.node_modules.join("touched.bin"), vec![b't'; 4096]).expect("touch");
+    fixture::write_settled(fx.node_modules.join("touched.bin"), vec![b't'; 4096]).expect("touch");
     let source = CannedSource(incremental_plan(vec![fx.node_modules.clone()], 1));
     let second = report_full_mode_with_source(
         &fx.root,

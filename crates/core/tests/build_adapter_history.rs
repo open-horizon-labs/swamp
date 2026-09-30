@@ -81,6 +81,8 @@ fn observe_excluding(
     force_full: bool,
     excluded: &[PathBuf],
 ) -> swamp_core::Report {
+    // #197: every fixture change is settled before it is measured.
+    swamp_core::fs_gate::settle::settle();
     // `docker_in_scope: false`: these fixtures assert exact
     // `containers_identified`/`containers_reused` counts for adapters
     // that have nothing to do with Docker. `report_full_mode_with_source`

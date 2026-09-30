@@ -387,6 +387,11 @@ pub fn build(tmp: &Path) -> Fixture {
     )
     .expect("write docker fixture");
 
+    // #197: on a filesystem that reports allocation late, a fixture just
+    // written reads as a token size per file; every consumer measures it
+    // next, so the wait happens once, here.
+    swamp_core::fs_gate::settle::settle();
+
     Fixture {
         root: tmp.to_path_buf(),
         checkout,
@@ -411,4 +416,14 @@ pub fn build(tmp: &Path) -> Fixture {
         compose_file,
         compose_project_name,
     }
+}
+
+/// `fs::write`, then wait until the data is reflected in `st_blocks`
+/// (see `swamp_core::fs_gate::settle`): for a fixture change that a test
+/// measures next and asserts exact allocated bytes for.
+#[allow(dead_code)]
+pub fn write_settled(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    fs::write(path, data)?;
+    swamp_core::fs_gate::settle::settle();
+    Ok(())
 }

@@ -49,6 +49,7 @@ fn init_repo(dir: &Path) {
 }
 
 fn observe(root: &Path, store: &Path) -> swamp_core::Report {
+    swamp_core::fs_gate::settle::settle();
     swamp_core::report::report_full_mode_scoped(
         root,
         None,

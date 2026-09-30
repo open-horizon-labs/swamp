@@ -103,11 +103,26 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("error
 say "cli_json: report --json parses (no_observation before the first observe)"
 "$bin" scope "$root" --json | python3 -c 'import json,sys; json.load(sys.stdin)' && say "cli_json: scope --json parses"
 
-# Delayed allocation (#197): on ext4/XFS/overlayfs a file written a moment
-# ago reports a token st_blocks until writeback. Flush before every
-# measurement so an incremental walk and a later reference walk see the
-# same allocation; the equivalence check below is never loosened.
-observe() { sync; "$bin" observe "$root" | grep '^observed_at='; }
+# Delayed allocation (#197): on ext4/XFS/ZFS-backed overlayfs a file written
+# a moment ago reports a token st_blocks until the filesystem commits it
+# (1 to 5 s on the fleet, and neither fsync nor sync shortens it). Before
+# every measurement wait, bounded, until a fresh probe file reports its real
+# allocation: commits are ordered, so everything written before it is
+# visible too. The equivalence check below is never loosened, and a global
+# `sync` (minutes on the shared host) is not used.
+settle() {
+    local probe="$work/.settle-probe" i blocks
+    head -c 65536 /dev/urandom > "$probe"
+    for i in $(seq 75); do
+        blocks=$(stat -c %b "$probe")
+        [ "$blocks" -ge 64 ] && { rm -f "$probe"; return 0; }
+        sleep 0.2
+    done
+    rm -f "$probe"
+    echo "settle: st_blocks did not catch up within 15 s" >&2
+    exit 1
+}
+observe() { settle; "$bin" observe "$root" | grep '^observed_at='; }
 timed() { local a b line; a=$(now_ms); line="$(observe)"; b=$(now_ms); echo "$((b - a)) $line"; }
 
 # --- initial full scan -----------------------------------------------
@@ -150,7 +165,7 @@ for r in $(seq "$REPS"); do
     say "one_subtree_mutation run=$r ms=${res%% *} mode=$(field "$res" mode) changed_dirs=$(field "$res" changed_dirs) walked_total=$(field "$res" walked_total)"
 done
 ref_store="$work/ref-store"
-sync
+settle
 ref="$(SWAMP_DIR="$ref_store" "$bin" observe "$root" --full | grep '^observed_at=')"
 [ "$(field "$res" walked_total)" = "$(field "$ref" walked_total)" ] &&
     say "equivalence: incremental walked_total $(field "$res" walked_total) == reference full walk $(field "$ref" walked_total)" ||
