@@ -185,3 +185,63 @@ fn a_declined_repository_is_stored_as_not_measured() {
         "{row}"
     );
 }
+
+/// #190 was reported under `~/Library/Caches`, where tool caches are
+/// measured as external units, not by the project walk. A pass parked
+/// inside one (the pip cache here) is stopped and named, and the next pass
+/// skips that path there too, stores it as not measured, and finishes.
+/// Tempting wrong patch: honoring the quarantine only in the project walk,
+/// so the external-unit measurement parks on it again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pass_parked_inside_an_external_unit_is_skipped_next_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+    let (store, home, logs) = (tmp.join("store"), tmp.join("home"), tmp.join("logs"));
+    for d in [&store, &home, &logs] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(
+        store.join("config.toml"),
+        "observe_timeout_sec = 5\n[scan]\ndefaults = false\nenabled_detectors = [\"pip\"]\n",
+    )
+    .unwrap();
+    let pip = home.join("Library/Caches/pip");
+    let stuck = pip.join("http/stuck");
+    std::fs::create_dir_all(&stuck).unwrap();
+    std::fs::write(pip.join("http/f"), vec![1u8; 8192]).unwrap();
+
+    let (out, took) = observe(&store, &home, &logs, &stuck);
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let log = std::fs::read_to_string(logs.join("observe.log")).unwrap();
+    assert!(
+        log.contains(&format!("in walk at {}", stuck.display())),
+        "{log}"
+    );
+
+    let (out2, took2) = observe(&store, &home, &logs, &stuck);
+    let so = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        out2.status.success(),
+        "{so}\n{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert!(took2 < Duration::from_secs(30), "{took2:?}");
+    assert!(
+        so.contains("external_units=1"),
+        "measured as an external unit: {so}"
+    );
+    assert!(so.contains("not measured (stalled on"), "{so}");
+    let (cov, _) = stored(&store, &home, &logs);
+    assert!(
+        cov.iter()
+            .any(|c| c["path"] == stuck.display().to_string() && c["status"] == "not-measured"),
+        "{cov:?}"
+    );
+}

@@ -1356,6 +1356,7 @@ fn process_size(
     let listed = if dataless {
         Err(std::io::Error::other("dataless directory"))
     } else {
+        crate::beacon::test_park(&path);
         crate::fs_gate::read_dir(&path)
     };
     let Ok(entries) = listed else {

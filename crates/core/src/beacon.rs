@@ -114,13 +114,16 @@ pub(crate) fn test_park(path: &Path) {
     }
 }
 
-/// The step running longest right now: phase, path and for how long.
+/// The innermost step still running: of the steps in flight, the one
+/// entered last. At a stall every running step is stuck, and the latest
+/// one is the deepest (an external unit waits on the walk workers inside
+/// it; the walk directory a worker parked in names the path).
 pub fn stuck() -> Option<(&'static str, PathBuf, Duration)> {
     let used = NEXT_SLOT.load(Ordering::Relaxed).min(SLOTS);
     TABLE[..used]
         .iter()
         .filter_map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).clone())
-        .min_by_key(|(_, _, at)| *at)
+        .max_by_key(|(_, _, at)| *at)
         .map(|(ph, p, at)| (ph, p, at.elapsed()))
 }
 

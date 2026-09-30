@@ -161,3 +161,27 @@ fn a_fifo_at_every_loose_git_file_never_parks_the_pass() {
         );
     }
 }
+
+/// #196-style fault: one entry of the git dir cannot be checked (an
+/// unlistable subdirectory). That entry is skipped, never a reason to
+/// decline the whole repository. Tempting wrong patch: treating any
+/// sweep error as "could block".
+#[test]
+fn an_unreadable_git_subdir_does_not_decline_the_repo() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let r = repo(tmp.path());
+    let odd = r.join(".git/odd");
+    std::fs::create_dir_all(odd.join("inner")).unwrap();
+    std::fs::set_permissions(&odd, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r2 = r.clone();
+    let (sigs, _) = within("signals with an unreadable git subdir", move || {
+        swamp_core::signals::compute_signals_raw(&r2, 0)
+    });
+    std::fs::set_permissions(&odd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        sigs.iter()
+            .any(|s| s.name == "last_commit" && !s.value.contains("unknown")),
+        "{sigs:?}"
+    );
+}
