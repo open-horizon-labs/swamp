@@ -92,7 +92,10 @@ fn safe_to_open(dir: &Path) -> bool {
                 return decline(dir, "a file in its git dir could block a read");
             }
             Sweep::TooLarge => {
-                return decline(dir, "its git dir has more entries than the pre-open check reads");
+                return decline(
+                    dir,
+                    "its git dir has more entries than the pre-open check reads",
+                );
             }
         }
     }

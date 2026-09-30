@@ -297,6 +297,33 @@ mod tests {
         read_session_rows(db, &ctx)
     }
 
+    /// #190: SQLite opens `-wal`/`-shm` itself with a blocking open, so a
+    /// FIFO sidecar would park the read. Tempting wrong patch: checking
+    /// only the main database file's header.
+    #[test]
+    fn a_fifo_wal_sidecar_declines_the_database_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state_5.sqlite");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("CREATE TABLE threads (id TEXT);")
+            .unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let side = dir.path().join(format!("state_5.sqlite{suffix}"));
+            let _ = fs::remove_file(&side);
+            let c = std::ffi::CString::new(side.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_rows(&db).is_none());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("parked on a FIFO sidecar")
+        );
+    }
+
     #[test]
     fn worktree_pool_follows_upstream_desktop_setting_rules() {
         let home = Path::new("/codex-home");
