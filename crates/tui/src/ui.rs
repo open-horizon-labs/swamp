@@ -1226,6 +1226,9 @@ fn draw_tool_sheet(frame: &mut Frame, sheet: &crate::tool_sheet::ToolSheet, size
     if popup.width < 4 || popup.height < 3 {
         return;
     }
+    // The sheet swallows every key but its own, so nothing of the screen
+    // beneath (its rail, its footer key hints) may show around it.
+    frame.render_widget(Clear, size);
     frame.render_widget(Clear, popup);
     sheet.note_drawn(size.width, size.height);
     let (width, rows) = crate::tool_sheet::body_size(size.width, size.height);
