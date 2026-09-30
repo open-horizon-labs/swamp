@@ -115,6 +115,7 @@ pub fn reason_label(reason: &UnownedReason) -> &'static str {
         UnownedReason::NoContainingRepo => "no-containing-repo",
         UnownedReason::SharedCache => "shared-cache",
         UnownedReason::PermissionDenied => "permission-denied",
+        UnownedReason::StandaloneCargoTarget => "standalone-cargo-target",
         UnownedReason::DockerNoJoin => "docker-no-join",
     }
 }
@@ -1732,14 +1733,18 @@ pub fn render_view_external_with(
             .growth_bytes
             .map(human_bytes_signed)
             .unwrap_or_else(|| "—".to_string());
-        let consumer_facts = u
-            .evidence
-            .iter()
-            .filter(|e| {
-                e.kind == crate::evidence::FactKind::Consumer
-                    && matches!(e.status, crate::evidence::FactStatus::Known(_))
-            })
-            .count();
+        let known_consumer = |link: bool| {
+            u.evidence
+                .iter()
+                .filter(|e| {
+                    e.kind == crate::evidence::FactKind::Consumer
+                        && matches!(e.status, crate::evidence::FactStatus::Known(_))
+                        && (e.subtype == crate::evidence::FactSubtype::RecordedLink) == link
+                })
+                .count()
+        };
+        let consumer_facts = known_consumer(false);
+        let link_facts = known_consumer(true);
         let consumers = if u.consumers.is_empty() && consumer_facts > 0 {
             // The declarations are attached as evidence rows (rendered
             // just below), not as the unit's own consumer list: say so
@@ -1758,9 +1763,15 @@ pub fn render_view_external_with(
                     .join(", ")
             )
         };
+        let consumers = if link_facts > 0 {
+            // Second tier: what the tool recorded, counted apart from
+            // what a project declared.
+            format!("{consumers}; recorded links: {link_facts} (the tool's own metadata, below)")
+        } else {
+            consumers
+        };
         let note = u
-            .note
-            .as_deref()
+            .display_note()
             .map(|n| format!("  [{n}]"))
             .unwrap_or_default();
         let _ = writeln!(
@@ -1782,12 +1793,23 @@ pub fn render_view_external_with(
                 r.of, r.include_all
             );
         }
+        let _ = writeln!(out, "    {}", u.last_used.describe(observed_at));
         for line in render_evidence_lines(&u.evidence) {
+            let _ = writeln!(out, "    {line}");
+        }
+        for line in render_unit_children(u, observed_at) {
             let _ = writeln!(out, "    {line}");
         }
         let inside: Vec<crate::artifact::NestedArtifact> = interiors
             .iter()
             .filter(|i| i.present && i.path.starts_with(&u.path))
+            // Another unit's interior (go-build under Library/Caches) is
+            // listed once, under that unit.
+            .filter(|i| {
+                !sorted.iter().any(|o| {
+                    o.path != u.path && o.path.starts_with(&u.path) && i.path.starts_with(&o.path)
+                })
+            })
             .cloned()
             .collect();
         if let Some((_, section)) = render_container_section(&inside, observed_at, "    ") {
@@ -1804,6 +1826,148 @@ pub fn render_view_external_with(
         sorted.len()
     );
     out
+}
+
+/// The standalone Cargo target directories the walk found, as their own
+/// kind (#171): rows of the unowned list that carry Cargo's own signature.
+/// Their bytes are counted under `unowned`, never in the external total.
+pub fn standalone_cargo_targets(
+    unowned: &[crate::report::UnownedRow],
+) -> Vec<&crate::report::UnownedRow> {
+    let mut rows: Vec<&crate::report::UnownedRow> = unowned
+        .iter()
+        .filter(|u| u.reason == UnownedReason::StandaloneCargoTarget)
+        .collect();
+    rows.sort_by_key(|u| std::cmp::Reverse(u.bytes));
+    rows
+}
+
+/// `--view external`'s section for [`standalone_cargo_targets`]: empty
+/// when there are none.
+pub fn render_standalone_targets(unowned: &[crate::report::UnownedRow]) -> String {
+    let rows = standalone_cargo_targets(unowned);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nstandalone Cargo targets (their own kind; counted under unowned, not in the external total above):"
+    );
+    for row in &rows {
+        let _ = writeln!(
+            out,
+            "{:<10}  standalone-cargo-target  {}  [{}]",
+            human_bytes(row.bytes),
+            row.path_or_object,
+            row.note.as_deref().unwrap_or("")
+        );
+        for line in render_evidence_lines(&row.evidence) {
+            let _ = writeln!(out, "    {line}");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "standalone Cargo targets: {} in {} director{}",
+        human_bytes(rows.iter().map(|r| r.bytes).sum()),
+        rows.len(),
+        if rows.len() == 1 { "y" } else { "ies" }
+    );
+    out
+}
+
+/// The text of one drilldown row after its byte figure: the folder's
+/// name exactly as on disk with its facts, or what a remainder or
+/// adjustment row stands for. Shared with the TUI so the two say the same
+/// thing.
+pub fn describe_unit_child(child: &crate::drilldown::UnitChild, now: u64) -> String {
+    use crate::drilldown::{ChildKind, ChildMeasure};
+    match child.kind {
+        ChildKind::Remainder => {
+            let mut text = format!(
+                "remainder: {} other entr{} (the other folders, and files directly inside)",
+                child.entries,
+                if child.entries == 1 { "y" } else { "ies" }
+            );
+            if child.not_measured > 0 {
+                text.push_str(&format!(
+                    "; {} folder{} not measured",
+                    child.not_measured,
+                    if child.not_measured == 1 { "" } else { "s" }
+                ));
+            }
+            text
+        }
+        ChildKind::Adjustment => {
+            "adjustment: hardlinked files are counted once in this unit's total".to_string()
+        }
+        ChildKind::NotRemeasured => {
+            "not re-measured this pass: the unit keeps its last complete total".to_string()
+        }
+        ChildKind::Entry => {
+            let mut text = child.name.clone();
+            match child.measure {
+                ChildMeasure::NotMeasured => {
+                    text.push_str("  (not measured: this folder could not be read)");
+                    return text;
+                }
+                ChildMeasure::Partial => {
+                    text.push_str("  (partly measured: a folder below it could not be read)");
+                }
+                ChildMeasure::Complete => {}
+            }
+            text.push_str(&format!(
+                "  modified {}  {}",
+                age_label(child.mtime_max, now),
+                child.last_used.describe(now)
+            ));
+            text
+        }
+    }
+}
+
+/// The byte column of a drilldown row: the size, a signed figure for an
+/// adjustment, and words -- never `0B` -- for a folder that was not
+/// measured.
+pub fn unit_child_size(child: &crate::drilldown::UnitChild) -> String {
+    match (child.bytes, child.kind) {
+        (None, _) => "not measured".to_string(),
+        (
+            Some(b),
+            crate::drilldown::ChildKind::Adjustment | crate::drilldown::ChildKind::NotRemeasured,
+        ) => human_bytes_signed(b),
+        (Some(b), _) if child.measure == crate::drilldown::ChildMeasure::Partial => {
+            format!(">={}", human_bytes(b.max(0) as u64))
+        }
+        (Some(b), _) => human_bytes(b.max(0) as u64),
+    }
+}
+
+/// A unit's depth-2 drilldown as text lines: the top folders largest
+/// first, then a remainder row, so the sizes add up to the total the walk
+/// reported for it. Empty for a unit that is not drilled into.
+fn render_unit_children(u: &crate::external::ExternalUnit, now: u64) -> Vec<String> {
+    if u.children.is_empty() {
+        return Vec::new();
+    }
+    let mut lines =
+        vec!["inside, largest first (rows add up to the total the walk measured):".to_string()];
+    for child in &u.children {
+        lines.push(format!(
+            "  {:>13}  {}",
+            unit_child_size(child),
+            describe_unit_child(child, now)
+        ));
+    }
+    let sum = crate::drilldown::rows_total(&u.children);
+    if sum != u.bytes as i64 {
+        lines.push(format!(
+            "  the rows above sum to {} measured this pass; this unit's total above is {}",
+            human_bytes(sum.max(0) as u64),
+            human_bytes(u.bytes)
+        ));
+    }
+    lines
 }
 
 /// One line's worth of a modification age, correctly labelled: unknown
@@ -1849,6 +2013,7 @@ pub fn evidence_subtype_label(subtype: crate::evidence::FactSubtype) -> &'static
         S::ToolReportedUse => "tool-reported use",
         S::DeclaredConsumer => "declared consumer",
         S::InferredConsumer => "inferred consumer",
+        S::RecordedLink => "recorded link",
         S::Process => "process",
         S::OpenFile => "open file",
         S::Lock => "lock",
@@ -1998,7 +2163,13 @@ pub fn evidence_warnings(evidence: &[crate::evidence::Evidence]) -> Vec<String> 
     for e in evidence {
         match (e.kind, &e.status) {
             (FactKind::Consumer, FactStatus::Known(FactValue::Text(who))) => {
-                out.push(format!("declared consumer: {who}"));
+                if e.subtype == crate::evidence::FactSubtype::RecordedLink {
+                    // A link the tool recorded is not a declaration: it
+                    // says where a build came from, not who depends on it.
+                    out.push(format!("recorded link (the tool's own metadata): {who}"));
+                } else {
+                    out.push(format!("declared consumer: {who}"));
+                }
             }
             (FactKind::Consumer, FactStatus::Known(FactValue::List(who))) => {
                 out.push(format!(

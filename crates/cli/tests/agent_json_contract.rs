@@ -775,3 +775,68 @@ fn json_only_views_refuse_text_mode_explicitly() {
         assert!(stderr.contains("JSON only"), "{stderr}");
     }
 }
+
+/// The volume ledger's JSON rows are bounded by default (50 largest, with
+/// `rows_total` and `rows_truncated` saying so) and `--all` returns every
+/// row; the totals cover every row either way (#169).
+#[test]
+fn disk_json_rows_are_bounded_by_default_and_all_returns_every_row() {
+    use swamp_core::growth::{VolumeLedgerRow, VolumeMetaRow, write_volume_ledger};
+    let store = tempfile::tempdir().unwrap();
+    let now = swamp_core::entities::now();
+    let rows: Vec<VolumeLedgerRow> = (0..60u64)
+        .map(|i| VolumeLedgerRow {
+            path: format!("/x/{i:02}"),
+            category: "other".into(),
+            allocated_bytes: Some((i + 1) * 1_000),
+            overlap_bytes: 0,
+            entry_count: Some(1),
+            unreadable_count: 0,
+            measured_at: now,
+            method: "walk: allocated bytes, lstat only".into(),
+            exactness: "exact".into(),
+            note: None,
+        })
+        .collect();
+    let meta = VolumeMetaRow {
+        measured_at: now,
+        cycle_started_at: 1,
+        cycle_complete_at: now,
+        complete: true,
+        budget_secs: 120,
+        budget_used_ms: 1,
+        statfs_at: now,
+        container_total: Some(1_000_000),
+        container_used: Some(100_000),
+        container_free: Some(900_000),
+        data_volume_used: None,
+    };
+    write_volume_ledger(store.path(), &rows, &meta, None).unwrap();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = run(store.path(), args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let bounded = json(&["report", "--view", "disk", "--json"]);
+    let r = &bounded["result"];
+    assert_eq!(r["rows"].as_array().unwrap().len(), 50);
+    assert_eq!(r["rows_total"], 60);
+    assert_eq!(r["rows_truncated"], true);
+    assert_eq!(r["rows"][0]["path"], "/x/59", "largest first");
+    assert_eq!(
+        r["everything_else"]["folders"], 60,
+        "totals cover every row"
+    );
+    let all = json(&["report", "--view", "disk", "--json", "--all"]);
+    let r = &all["result"];
+    assert_eq!(r["rows"].as_array().unwrap().len(), 60);
+    assert_eq!(r["rows_truncated"], false);
+    for key in ["bookkeeping_balanced", "residual_flag"] {
+        assert!(r["residual"].get(key).is_some(), "{key}");
+    }
+    assert!(r["audit"].get("audit_flag").is_some());
+}

@@ -968,7 +968,10 @@ fn the_docs_say_what_the_code_runs() {
         );
         assert!(usage.contains(&v), "usage.md does not name {v}");
     }
-    for var in swamp_core::fs_gate::spawn::TOOL_ENV_PASSTHROUGH {
+    for var in swamp_core::fs_gate::program_paths::MISE_PASSTHROUGH
+        .iter()
+        .chain(&["DEVELOPER_DIR"])
+    {
         assert!(usage.contains(var), "usage.md does not name {var}");
         assert!(guard.contains(var), "the guardrail does not name {var}");
     }

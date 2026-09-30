@@ -344,7 +344,7 @@ impl XcodeJoinTable {
     pub fn open(swamp_dir: &Path) -> Self {
         Self(KeyedTable {
             path: dir(swamp_dir).join("xcode_derived_data.parquet"),
-            value_columns: &["outcome", "detail"],
+            value_columns: &["outcome", "detail", "last_accessed"],
         })
     }
     pub fn load(&self) -> HashMap<String, CachedRows> {

@@ -85,6 +85,50 @@ pub struct ExternalUnit {
     /// history); never a new per-unit scan on every report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<crate::evidence::Evidence>,
+    /// Bytes of project worktrees that live inside this unit and are
+    /// counted under their projects instead: excluded from `bytes`, and
+    /// kept here as a number so a view can add the parts back up without
+    /// parsing text (#185). Zero when no worktree is inside.
+    #[serde(default)]
+    pub bytes_counted_elsewhere: u64,
+    /// How many worktrees `bytes_counted_elsewhere` stands for.
+    #[serde(default)]
+    pub overlap_count: u32,
+    /// When this unit was last run or opened, and where that fact came
+    /// from (#176). `no record` when nothing reliable says.
+    #[serde(default)]
+    pub last_used: crate::last_used::LastUsed,
+    /// Depth-2 drilldown (#178): the top child folders and a remainder
+    /// row that make the rows sum to the walk's total. Empty when the
+    /// unit is not drilled into.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<crate::drilldown::UnitChild>,
+}
+
+impl ExternalUnit {
+    /// The human sentence for the overlap fields, rendered from them:
+    /// nothing is stored as text.
+    pub fn overlap_note(&self) -> Option<String> {
+        (self.overlap_count > 0).then(|| {
+            format!(
+                "{} inside is counted under projects ({} worktree{}), not in this total",
+                crate::render::human_bytes_pub(self.bytes_counted_elsewhere),
+                self.overlap_count,
+                if self.overlap_count == 1 { "" } else { "s" }
+            )
+        })
+    }
+
+    /// The one bracketed note a row shows: the coverage note (`note`)
+    /// and the overlap sentence, each only when it applies.
+    pub fn display_note(&self) -> Option<String> {
+        match (self.note.as_deref(), self.overlap_note()) {
+            (Some(n), Some(o)) => Some(format!("{n}; {o}")),
+            (Some(n), None) => Some(n.to_string()),
+            (None, Some(o)) => Some(o),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Turns this unit's existing declared-consumer sidecar
@@ -199,6 +243,10 @@ struct MeasuredUnit {
     /// from it: their count and the bytes the project rows report for
     /// them.
     overlap: Option<(usize, u64)>,
+    /// The last-use sources this unit's detector declared for it.
+    last_use_sources: Vec<crate::locations::LastUseSource>,
+    /// The depth-2 drilldown taken (or replayed) this pass.
+    children: Vec<crate::drilldown::UnitChild>,
 }
 
 /// A project worktree the report already measured, handed to the
@@ -548,6 +596,28 @@ pub fn observe_external(
     order.sort_by_key(|i| remainder_roles.contains_key(i));
     let mut unmeasured: Vec<PathBuf> = Vec::new();
 
+    // Where each measured location's last use is recorded, asked of the
+    // detectors that declared it (never a table of tool names here), and
+    // the drilldown rows an earlier pass stored for units whose folded
+    // rows this pass may replay instead of re-walk.
+    let last_use_decls: HashMap<usize, Vec<crate::locations::LastUseSource>> = {
+        let located: Vec<crate::build_stores::Located> = canon_candidates
+            .iter()
+            .map(|(c, canonical)| crate::build_stores::Located {
+                detector_id: &c.detector_id,
+                category: c.category,
+                path: canonical,
+            })
+            .collect();
+        crate::last_used::declared_sources(&detectors, &located)
+    };
+    let previous_children: HashMap<String, Vec<crate::drilldown::UnitChild>> = swamp_dir
+        .map(crate::growth::previous_unit_children)
+        .unwrap_or_default();
+    let mut sources_by_key: HashMap<String, Vec<crate::locations::LastUseSource>> = HashMap::new();
+    // What an incomplete fold's rows would show as children this pass.
+    let mut lower_children: HashMap<String, Vec<crate::drilldown::UnitChild>> = HashMap::new();
+
     for idx in order {
         let (candidate, canonical) = &canon_candidates[idx];
         let role = remainder_roles.get(&idx).copied();
@@ -609,6 +679,26 @@ pub fn observe_external(
         nested_exclusions.dedup();
         let device = device_of(&canonical);
         let key = unit_key(&detector_id, category, device, &canonical);
+        let sources = last_use_decls.get(&idx).cloned().unwrap_or_default();
+        sources_by_key.insert(key.clone(), sources.clone());
+        let unit_id =
+            crate::growth::external_unit_table_id(&detector_id, category_str(category), &canonical);
+        // A unit that declares a last-use source is drilled into at any
+        // size (its children are the depth-2 rows of a reclaim view); an
+        // unclassified root only once it is big enough to be worth
+        // reading as more than one number. A root last seen below the
+        // threshold is not drilled, so a small unclassified root keeps
+        // its replay.
+        let want_children = crate::drilldown::wants_children(
+            category == StorageCategory::Unclassified,
+            !sources.is_empty(),
+            swamp_dir
+                .and_then(|dir| last_known_external(dir, &key).ok().flatten())
+                .map(|(bytes, _)| bytes),
+        );
+        let known_children = previous_children.get(&unit_id).filter(|c| !c.is_empty());
+        // Replay needs the drilldown to replay with it.
+        let reuse_ok = known_children.is_some() || !want_children;
 
         // Access and measurement both go through the one folded
         // measurement seam; nothing in this module lists a directory or
@@ -618,11 +708,17 @@ pub fn observe_external(
         // this pass's event window vouches for costs no listing, no
         // `stat` and not even the readability probe.
         let debug_trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+        if debug_trace {
+            eprintln!(
+                "[xtrace] measuring {} want_children={want_children}",
+                canonical.display()
+            );
+        }
         let before = debug_trace.then(crate::work_counters::snapshot);
         let started = std::time::Instant::now();
-        let observation = match store_containers.get(&idx) {
+        let (observation, child_dirs) = match store_containers.get(&idx) {
             Some(container) => {
-                let reuse = probe.can_reuse(container);
+                let reuse = probe.can_reuse(container) && reuse_ok;
                 let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
                     swamp_dir,
                     &canonical,
@@ -645,10 +741,33 @@ pub fn observe_external(
                 if let crate::folded_measurement::UnitObservation::Unit(_) = &obs {
                     measured_stores.push((idx, dirs.is_none()));
                 }
+                let for_children = if want_children { dirs.clone() } else { None };
                 if let Some(dirs) = dirs {
                     store_dirs.extend(crate::build_stores::folded_dirs(&canonical, dirs));
                 }
-                obs
+                (obs, for_children)
+            }
+            None if want_children => {
+                let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
+                    swamp_dir,
+                    &canonical,
+                    &nested_exclusions,
+                    observed_at,
+                    coverage,
+                    reuse_ok,
+                );
+                if debug_trace {
+                    let after = crate::work_counters::snapshot();
+                    let before = before.unwrap();
+                    eprintln!(
+                        "[xtrace] drill  {} dirs_delta={} files_delta={} elapsed={:?}",
+                        canonical.display(),
+                        after.dirs_listed - before.dirs_listed,
+                        after.files_statted - before.files_statted,
+                        started.elapsed()
+                    );
+                }
+                (obs, dirs)
             }
             None => {
                 let obs = crate::folded_measurement::observe_unit(
@@ -669,8 +788,29 @@ pub fn observe_external(
                         started.elapsed()
                     );
                 }
-                obs
+                (obs, None)
             }
+        };
+        // The drilldown of this pass's own rows, or (for a replayed unit)
+        // the one stored with them. Only for a unit that was measured at
+        // all; an unclassified root under the threshold is one row.
+        let children: Vec<crate::drilldown::UnitChild> = match &observation {
+            crate::folded_measurement::UnitObservation::Unit(folded) if want_children => {
+                let big_enough = crate::drilldown::worth_listing(!sources.is_empty(), folded.bytes);
+                match child_dirs {
+                    Some(dirs) if big_enough => crate::drilldown::children_of(
+                        &canonical,
+                        dirs,
+                        folded.bytes,
+                        crate::drilldown::DRILLDOWN_TOP_N,
+                    ),
+                    None if folded.reused && big_enough => {
+                        known_children.cloned().unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
         };
         let row = match observation {
             // Genuinely absent: no candidate this pass. If it was
@@ -705,6 +845,7 @@ pub fn observe_external(
                 }
                 lower_bounds.insert(key.clone(), row);
                 unmeasured.push(canonical.clone());
+                lower_children.insert(key.clone(), children);
                 protected_keys.insert(key);
                 continue;
             }
@@ -752,6 +893,8 @@ pub fn observe_external(
                 hardlinked: row.hardlinked,
                 mtime_max: row.mtime_max,
                 overlap,
+                last_use_sources: sources,
+                children,
             },
         );
     }
@@ -890,6 +1033,10 @@ pub fn observe_external(
         crate::build_stores::save_units(dir, &this_pass, carried, observed_at);
     }
 
+    let overlap_marks: HashMap<String, (u32, u64)> = swamp_dir
+        .map(crate::growth::read_overlap_marks)
+        .unwrap_or_default();
+    let mut overlap_marks_next: HashMap<String, (u32, u64)> = overlap_marks.clone();
     for (
         key,
         MeasuredUnit {
@@ -902,10 +1049,32 @@ pub fn observe_external(
             hardlinked,
             mtime_max,
             overlap,
+            last_use_sources,
+            children,
         },
     ) in meta_by_key
     {
-        let (growth_bytes, regrowth_count) = annotations.get(&key).copied().unwrap_or((None, 0));
+        let (mut growth_bytes, regrowth_count) =
+            annotations.get(&key).copied().unwrap_or((None, 0));
+        // A worktree registered or unregistered inside this unit moves its
+        // bytes with nothing on disk changing: not growth. Growth is not
+        // shown while the change is still inside the growth window.
+        let overlap_now = overlap.map_or(0u32, |(n, _)| n as u32);
+        let changed_at = match overlap_marks.get(&key) {
+            Some((count, at)) if *count != overlap_now => observed_at,
+            Some((_, at)) => *at,
+            None => 0,
+        };
+        overlap_marks_next.insert(key.clone(), (overlap_now, changed_at));
+        let mut coverage_note = None;
+        if changed_at > 0 && changed_at.saturating_add(since_secs) > observed_at {
+            growth_bytes = None;
+            coverage_note = Some(
+                "worktrees inside this unit changed what it counts: a coverage change, so \
+                 growth is not shown until it is out of the growth window"
+                    .to_string(),
+            );
+        }
         let consumers = consumers_by_key.get(&key).cloned().unwrap_or_default();
         let mut evidence = consumers_evidence(&consumers);
         // Activity (#54): the folded walk's own newest-child mtime for
@@ -917,6 +1086,7 @@ pub fn observe_external(
             observed_at,
             crate::entities::now(),
         ));
+        let found = crate::last_used::probe(&path, &last_use_sources, crate::entities::now());
         units.push(ExternalUnit {
             detector_id,
             detector_name,
@@ -930,15 +1100,25 @@ pub fn observe_external(
             regrowth_count,
             observed_at,
             consumers,
-            note: overlap.map(|(n, b)| {
-                format!(
-                    "{} inside is counted under projects ({n} worktree{}), not in this total",
-                    crate::render::human_bytes_pub(b),
-                    if n == 1 { "" } else { "s" }
-                )
-            }),
+            // The overlap is two numbers now; the sentence is rendered
+            // from them (`ExternalUnit::overlap_note`).
+            note: coverage_note,
             evidence,
+            bytes_counted_elsewhere: overlap.map_or(0, |(_, b)| b),
+            overlap_count: overlap.map_or(0, |(n, _)| n as u32),
+            last_used: found.last_used,
+            children: crate::drilldown::reconciled(
+                crate::last_used::with_child_last_used(children, &found.children),
+                bytes,
+            ),
         });
+    }
+    if let Some(dir) = swamp_dir
+        && observe
+    {
+        // A cache that fails to write means no memory of the change: the
+        // next pass may show growth once, the slow answer, never a crash.
+        let _ = crate::growth::write_overlap_marks(dir, &overlap_marks_next);
     }
     for key in &protected_keys {
         // A protected (inaccessible-this-pass) unit still needs to be
@@ -986,6 +1166,26 @@ pub fn observe_external(
                     "coverage incomplete this pass: could not be read",
                 ),
             };
+            let sources = sources_by_key.get(key).cloned().unwrap_or_default();
+            let found = crate::last_used::probe(&path_buf, &sources, crate::entities::now());
+            let unit_id =
+                crate::growth::external_unit_table_id(&detector_id, &category_s, &path_buf);
+            // Rows must sum to the total the unit shows. The rows of this
+            // pass sum to this pass's lower bound; the stored rows sum to
+            // the last complete measurement. Pair each with its own total,
+            // and let `reconciled` name any remaining gap.
+            let fresh = lower_children.remove(key).filter(|c| !c.is_empty());
+            let stored = previous_children.get(&unit_id).cloned();
+            let children = match (&last, bound) {
+                (Some(last), Some(b)) if b.bytes > last.0 => fresh.or(stored),
+                (Some(last), _) => stored
+                    .clone()
+                    .filter(|c| crate::drilldown::rows_total(c) == last.0 as i64)
+                    .or(fresh)
+                    .or(stored),
+                _ => fresh.or(stored),
+            }
+            .unwrap_or_default();
             units.push(ExternalUnit {
                 detector_id: detector_id.clone(),
                 // The authorized scope already told us this detector's
@@ -1006,6 +1206,13 @@ pub fn observe_external(
                 consumers,
                 note: Some(note.to_string()),
                 evidence,
+                bytes_counted_elsewhere: 0,
+                overlap_count: 0,
+                last_used: found.last_used,
+                children: crate::drilldown::reconciled(
+                    crate::last_used::with_child_last_used(children, &found.children),
+                    bytes,
+                ),
             });
         }
     }

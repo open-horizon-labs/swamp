@@ -12,8 +12,9 @@
 
 use super::{
     ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
-    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
-    RecoveryHint, StorageCategory, ToolManagedLocation, ToolManager,
+    LastUseDecl, LastUseSource, LocationStatus, ManagerConvention, ManagerDecl, ManagerProbe,
+    Platform, ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
+    StoreAnchor, SubjectShape, ToolManagedLocation, ToolManager,
 };
 
 pub const MISE_DETECTOR_ID: &str = "mise";
@@ -72,6 +73,32 @@ impl Detector for MiseDetector {
         &[ToolManagedLocation {
             suffix: "installs",
             manager: ToolManager::Mise,
+        }]
+    }
+
+    /// mise's `installs/<tool>/<version>`: its prune report names
+    /// `<tool>@<version>`, its global configuration names the tool.
+    fn manager(&self) -> Option<ManagerDecl> {
+        Some(ManagerDecl {
+            manager: "mise",
+            display: "mise",
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["installs"],
+            },
+            subject: SubjectShape::NameBeforeAt,
+            catch_all: true,
+            probes: &[ManagerProbe::MisePruneDryRun, ManagerProbe::MiseGlobalTools],
+        })
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["installs"],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 3 },
         }]
     }
 

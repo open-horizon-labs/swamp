@@ -17,8 +17,8 @@
 
 use super::{
     BuildStoreDecl, BuildStoreKind, CommandOutcome, ConventionRole, Detector, Environment,
-    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
-    RecoveryHint, StorageCategory, StoreAnchor,
+    LastUseDecl, LastUseSource, LocationStatus, ManagerConvention, Platform, ProposedLocation,
+    Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
 };
 
 pub const XCODE_DETECTOR_ID: &str = "xcode";
@@ -89,6 +89,16 @@ impl Detector for XcodeDetector {
                 },
             },
         ]
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: StoreAnchor::CategorizedExcept {
+                category: StorageCategory::BuildOutput,
+                except: &[&["Archives"]],
+            },
+            source: LastUseSource::XcodeDerivedDataPlist,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

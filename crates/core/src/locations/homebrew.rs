@@ -26,8 +26,9 @@
 //!   other two, so nothing is counted twice.
 
 use super::{
-    CommandOutcome, Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance,
-    StorageCategory,
+    CommandOutcome, Detector, Environment, LastUseDecl, LastUseSource, LocationStatus, ManagerDecl,
+    ManagerProbe, Platform, ProposedLocation, Provenance, StorageCategory, StoreAnchor,
+    SubjectShape,
 };
 
 pub const HOMEBREW_DETECTOR_ID: &str = "homebrew";
@@ -120,6 +121,24 @@ fn is_homebrew_prefix(prefix: &std::path::Path, provenance: &Provenance) -> bool
     crate::fs_gate::exists(prefix.join("Cellar")) || crate::fs_gate::exists(prefix.join("Homebrew"))
 }
 
+/// Homebrew's own report about what it installed: what its dry-run
+/// autoremove lists, and what it records as installed on request.
+const MANAGER_PROBES: &[ManagerProbe] = &[
+    ManagerProbe::BrewAutoremoveDryRun,
+    ManagerProbe::BrewInstalledOnRequest,
+];
+
+fn manager_decl(anchor: StoreAnchor, catch_all: bool) -> ManagerDecl {
+    ManagerDecl {
+        manager: "brew",
+        display: "Homebrew",
+        anchor,
+        subject: SubjectShape::FolderName,
+        catch_all,
+        probes: MANAGER_PROBES,
+    }
+}
+
 const REINSTALL: super::RecoveryHint = super::RecoveryHint {
     command: "brew reinstall <formula>",
     cost: super::RecoveryCost::NetworkRefetch,
@@ -149,8 +168,28 @@ impl Detector for HomebrewDevToolsDetector {
         Some(REINSTALL)
     }
 
+    /// Each dev formula is its own unit named for the formula, so a
+    /// report about a formula joins to the unit by name; a report about
+    /// one outside the allowlist belongs to `Homebrew (other)`.
+    fn manager(&self) -> Option<ManagerDecl> {
+        Some(manager_decl(StoreAnchor::SoleLocation, false))
+    }
+
     fn group(&self) -> Option<&'static str> {
         Some(HOMEBREW_DETECTOR_ID)
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        // One unit per allowlisted formula (`Cellar/<formula>`): its
+        // `<version>/bin/*` are the key files. The legacy whole-Cellar
+        // detector declares the same layout one level up.
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &[],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 2 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
@@ -230,6 +269,12 @@ impl Detector for HomebrewOtherDetector {
         Some(HOMEBREW_DETECTOR_ID)
     }
 
+    /// The remainder stands for every formula not measured on its own, so
+    /// a report about one of them attaches to it as a whole.
+    fn manager(&self) -> Option<ManagerDecl> {
+        Some(manager_decl(StoreAnchor::SoleLocation, true))
+    }
+
     fn remainder_of(&self) -> Option<super::Remainder> {
         Some(super::Remainder {
             of: HOMEBREW_DEVTOOLS_DETECTOR_ID,
@@ -302,6 +347,28 @@ impl Detector for HomebrewDetector {
     /// enabled_detectors = ["homebrew"]` turns it on.
     fn default_enabled(&self) -> bool {
         false
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["Cellar"],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 3 },
+        }]
+    }
+
+    /// The whole Cellar: a report about a formula joins to its folder,
+    /// and one that matches none belongs to the Cellar as a whole.
+    fn manager(&self) -> Option<ManagerDecl> {
+        Some(manager_decl(
+            StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["Cellar"],
+            },
+            true,
+        ))
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

@@ -191,10 +191,83 @@ pub(crate) fn folded_dirs(store: &Path, mut dirs: Vec<crate::report::DirRollup>)
 // Persisted units, for replay
 // ---------------------------------------------------------------------
 
-/// The fingerprint every stored row carries: units written by another
-/// swamp version are never replayed.
+/// Every build adapter's source, embedded at compile time. A stored
+/// unit's wording (its consequence text, its guidance, the folders it
+/// names) is produced by these files, so a change to any of them is a
+/// change to what a replayed unit would say. `every_adapter_file_is_in_the_revision` fails when a file is added to the directory and not
+/// listed here.
+const ADAPTER_SOURCES: &[(&str, &str)] = &[
+    ("android.rs", include_str!("build_adapters/android.rs")),
+    (
+        "bounded_io.rs",
+        include_str!("build_adapters/bounded_io.rs"),
+    ),
+    ("cargo.rs", include_str!("build_adapters/cargo.rs")),
+    (
+        "docker_buildkit.rs",
+        include_str!("build_adapters/docker_buildkit.rs"),
+    ),
+    ("go.rs", include_str!("build_adapters/go.rs")),
+    ("gradle.rs", include_str!("build_adapters/gradle.rs")),
+    (
+        "jvm_common.rs",
+        include_str!("build_adapters/jvm_common.rs"),
+    ),
+    ("layout.rs", include_str!("build_adapters/layout.rs")),
+    ("matrix.rs", include_str!("build_adapters/matrix.rs")),
+    ("maven.rs", include_str!("build_adapters/maven.rs")),
+    ("mod.rs", include_str!("build_adapters/mod.rs")),
+    ("node.rs", include_str!("build_adapters/node.rs")),
+    ("python.rs", include_str!("build_adapters/python.rs")),
+    ("registry.rs", include_str!("build_adapters/registry.rs")),
+    (
+        "tool_stores.rs",
+        include_str!("build_adapters/tool_stores.rs"),
+    ),
+    (
+        "xcode_swift.rs",
+        include_str!("build_adapters/xcode_swift.rs"),
+    ),
+];
+
+/// A short digest of the adapters' source: what changes when an
+/// adapter's output can.
+pub(crate) fn adapter_revision() -> String {
+    static REVISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REVISION
+        .get_or_init(|| {
+            revision_of(
+                &ADAPTER_SOURCES
+                    .iter()
+                    .map(|(_, src)| *src)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .clone()
+}
+
+fn revision_of(sources: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for source in sources {
+        // Length-prefixed, so moving text between two files changes it.
+        hasher.update(&(source.len() as u64).to_le_bytes());
+        hasher.update(source.as_bytes());
+    }
+    hasher.finalize().to_hex().as_str()[..16].to_string()
+}
+
+/// The fingerprint every stored row carries. A row is replayed only when
+/// the swamp version, the detector catalog and the adapters' own source
+/// all match the ones that wrote it: an adapter changed under the same
+/// catalog version invalidates its stored units instead of replaying
+/// wording the new adapter would not produce (#186).
 fn fingerprint() -> String {
-    format!("swamp-{}", env!("CARGO_PKG_VERSION"))
+    format!(
+        "swamp-{}/catalog-{}/adapters-{}",
+        env!("CARGO_PKG_VERSION"),
+        crate::locations::CATALOG_VERSION,
+        adapter_revision()
+    )
 }
 
 /// Every stored store container's units, with the observation that last
@@ -691,6 +764,103 @@ mod tests {
                 "{kind:?} is a store kind no detector declares: dead vocabulary"
             );
         }
+    }
+
+    fn one_stored_unit() -> NestedArtifact {
+        let c = BuildContainer::shared_store_of(
+            "maven",
+            PathBuf::from("/fixture/repo"),
+            BuildStoreKind::MavenRepository,
+        );
+        crate::build_adapters::NestedUnitBuilder::new(
+            &c,
+            ArtifactRole::SharedStoreEntry,
+            PathBuf::from("/fixture/repo/org/x/1.0"),
+        )
+        .supported_with_reason("fixture")
+        .bytes_on_basis(4096, AccountingBasis::Allocated)
+        .consequence("a consequence")
+        .no_action_because("shared")
+        .build()
+    }
+
+    /// #186. The tempting wrong patch is the fingerprint this replaced:
+    /// the swamp version alone. A developer who changes an adapter's
+    /// wording under the same catalog version and the same crate version
+    /// then replays the old wording until `observe --full`.
+    #[test]
+    fn a_stored_unit_written_under_another_adapter_revision_is_not_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        save_units(
+            dir.path(),
+            &[("scope".to_string(), vec![one_stored_unit()])],
+            HashMap::new(),
+            100,
+        );
+        assert!(
+            load_units(dir.path()).contains_key("scope"),
+            "rows written under the running fingerprint replay"
+        );
+
+        // The same rows, as an earlier adapter revision wrote them.
+        let table = crate::assoc_store::BuildStoreTable::open(dir.path());
+        let mut cache = table.load();
+        for rows in cache.values_mut() {
+            assert!(rows.fingerprint.contains(&adapter_revision()));
+            rows.fingerprint = rows
+                .fingerprint
+                .replace(&adapter_revision(), "0000000000000000");
+        }
+        table.save(&cache, 100).unwrap();
+        assert!(
+            load_units(dir.path()).is_empty(),
+            "an adapter changed under the same catalog version must invalidate the stored row"
+        );
+
+        // And the shape this replaced (the crate version alone) is never
+        // taken for current either.
+        for rows in cache.values_mut() {
+            rows.fingerprint = format!("swamp-{}", env!("CARGO_PKG_VERSION"));
+        }
+        table.save(&cache, 100).unwrap();
+        assert!(load_units(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn the_fingerprint_names_the_catalog_and_moves_with_any_adapter_source() {
+        let fp = fingerprint();
+        assert!(fp.contains(crate::locations::CATALOG_VERSION), "{fp}");
+        assert!(fp.contains(&adapter_revision()), "{fp}");
+        let a = revision_of(&["fn consequence() -> &str { \"a download\" }", "layout"]);
+        // One edited word in one adapter.
+        let b = revision_of(&["fn consequence() -> &str { \"a rebuild\" }", "layout"]);
+        assert_ne!(a, b);
+        // Text moved between two files is a different source.
+        assert_ne!(revision_of(&["ab", "c"]), revision_of(&["a", "bc"]));
+        assert_eq!(
+            a,
+            revision_of(&["fn consequence() -> &str { \"a download\" }", "layout"])
+        );
+    }
+
+    #[test]
+    fn every_adapter_file_is_in_the_revision() {
+        // The tempting wrong patch: a new adapter file nobody added to
+        // ADAPTER_SOURCES, whose edits then never invalidate a stored row.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/build_adapters");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".rs"))
+            .collect();
+        on_disk.sort();
+        let mut listed: Vec<String> = ADAPTER_SOURCES
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        listed.sort();
+        assert_eq!(on_disk, listed);
     }
 
     #[test]

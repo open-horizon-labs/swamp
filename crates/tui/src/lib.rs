@@ -315,6 +315,7 @@ fn stored_multi_root_app(
     app.set_external_units(snapshot.external_units);
     app.set_store_interiors(snapshot.store_interiors);
     app.set_agent_units(snapshot.agent_units);
+    app.set_manager_facts(snapshot.manager_facts);
     app.scope = Some(scope.clone());
     app.observed_label = "from last observation".into();
     app.disk_banner = banner;
@@ -375,6 +376,7 @@ pub fn run(root: &Path) -> Result<()> {
             a.set_external_units(snapshot.external_units);
             a.set_store_interiors(snapshot.store_interiors);
             a.set_agent_units(snapshot.agent_units);
+            a.set_manager_facts(snapshot.manager_facts);
             a.disk_banner = banner.clone();
             a
         }
@@ -392,6 +394,7 @@ pub fn run(root: &Path) -> Result<()> {
                 root.clone(),
             );
             a.observed_label = "no observation yet".into();
+            a.store_rebuild = swamp_core::report::store_is_older_generation(&store);
             a
         }
     };
@@ -475,6 +478,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
             app.scope = Some(scope.clone());
             app.observed_label = "no observation yet".into();
             app.has_index = false;
+            app.store_rebuild = swamp_core::report::store_is_older_generation(&store);
             app.set_declared_roots(&swamp_core::roots::declared_roots(scope, &[]));
             finish_startup(&mut app, &store, None);
             app

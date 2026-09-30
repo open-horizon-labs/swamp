@@ -168,6 +168,10 @@ if [ -f "$S/state/$key.code" ]; then exit "$(cat "$S/state/$key.code")"; fi
             consumers: Vec::new(),
             note: None,
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         }]);
         app.set_view(ViewKind::External);
         app.selected = 0;
@@ -493,6 +497,10 @@ fn simulator_app(f: &Fakes, state: &str) -> App {
         consumers: Vec::new(),
         note: None,
         evidence: Vec::new(),
+        bytes_counted_elsewhere: 0,
+        overlap_count: 0,
+        last_used: Default::default(),
+        children: Vec::new(),
     }]);
     app.set_view(ViewKind::External);
     app.selected = 0;

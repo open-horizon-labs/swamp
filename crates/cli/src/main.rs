@@ -69,6 +69,13 @@ enum View {
     /// history and declared consumers. Read-only: this view never
     /// removes anything, in this command or any other.
     External,
+    /// The Reclaim view (#175): every unit of developer storage, largest
+    /// first, with what getting it back costs, when it was last used and
+    /// from what record, who is known to need it, what a package manager
+    /// itself reports, and which removal path exists. A read of stored
+    /// facts: it starts no process and lists no directory, and it says
+    /// what its consumer evidence was checked against.
+    Reclaim,
     /// Agent-tool storage (#91-#99/#100): sessions, caches, logs,
     /// checkpoints and protected config for every named coding-agent
     /// tool (Claude Code, Codex, Oh My Pi, OpenCode, Gemini CLI, Pi,
@@ -80,6 +87,14 @@ enum View {
     /// is TUI-only (Space/Backspace/Enter) -- see `swamp protect` for
     /// the human-keep-intent surface this view respects.
     Agents,
+    /// Where the whole disk went (#169, #170): the APFS container's
+    /// used bytes split into accounted locations, everything else,
+    /// system volumes, purgeable space, snapshots, what could not be
+    /// read, and a named residual, each row with the time it was
+    /// measured. A pure read of the volume ledger `swamp observe`
+    /// stores: it never lists a directory, stats a file or runs a
+    /// program. With no ledger it says so and exits 0.
+    Disk,
 }
 
 impl View {
@@ -216,7 +231,9 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
         /// Show all text rows: projects, agent units, or Rust units
-        /// (Rust defaults to 30 per container). JSON uses --limit/--offset.
+        /// (Rust defaults to 30 per container). JSON uses --limit/--offset,
+        /// except the volume ledger (`--view disk`, and the `disk` object):
+        /// its JSON `rows` are the 50 largest unless `--all`.
         #[arg(long)]
         all: bool,
         /// List every unjoined Docker object individually instead of the
@@ -304,6 +321,15 @@ enum Command {
         /// re-enriched. Plain `observe` already enriches missing/stale rows.
         #[arg(long, conflicts_with = "no_enrich")]
         enrich: bool,
+        /// Run the volume pass now (the whole-disk ledger behind `report
+        /// --view disk`) whatever the age of the last one. A plain
+        /// `observe` runs it when the last is older than
+        /// `volume_pass_interval_hours` (default 24; 0 turns that off). It
+        /// measures for at most `volume_pass_budget_secs` (default 120) at
+        /// background priority and continues at the next observe. Not
+        /// valid with explicit roots.
+        #[arg(long)]
+        volume: bool,
     },
     /// Linux: watch the scope's roots with inotify until stopped and keep
     /// a bounded change list, so a later `observe` can reuse measurements
@@ -433,6 +459,13 @@ fn resolve_scope(explicit: &[PathBuf]) -> Result<swamp_core::scope::EffectiveSco
 /// history: it is coverage bookkeeping only, per
 /// `.oh/guardrails/coverage-changes-are-not-storage-changes.md`.
 fn note_and_persist_scope(store_dir: &Path, scope: &swamp_core::scope::EffectiveScope) {
+    if swamp_core::fs_gate::StoreDir::at(store_dir)
+        .and_then(|store| store.is_newer_generation())
+        .unwrap_or(false)
+    {
+        eprintln!("store written by a newer swamp; not modifying it");
+        return;
+    }
     let current_store = swamp_core::fs_gate::StoreDir::at(store_dir)
         .and_then(|store| store.has_current_format())
         .unwrap_or(false);
@@ -796,6 +829,7 @@ fn bound_interior_units(value: &mut serde_json::Value, limit: usize, offset: usi
 
 #[allow(clippy::too_many_arguments)]
 fn report_json_envelope(
+    all_rows: bool,
     r: &Report,
     root: &Path,
     view: Option<View>,
@@ -810,6 +844,7 @@ fn report_json_envelope(
     external_units: &[swamp_core::external::ExternalUnit],
     agent_units: &[swamp_core::agents::AgentUnit],
     store_interiors: &[swamp_core::artifact::NestedArtifact],
+    reclaim: Option<&swamp_core::reclaim::ReclaimView>,
 ) -> Result<serde_json::Value> {
     let store_dir = swamp_dir();
     let since_str = swamp_core::agent_json::effective_since(&store_dir, since);
@@ -846,6 +881,10 @@ fn report_json_envelope(
                 serde_json::json!(units)
             }
             View::External => serde_json::json!({
+                // Standalone Cargo targets are their own kind: listed here
+                // beside the units, counted under `unowned` (never in
+                // `total_bytes`, which is the external units alone).
+                "standalone_cargo_targets": swamp_core::render::standalone_cargo_targets(&rr.unowned),
                 "units": external_units,
                 "total_bytes": swamp_core::external::total_bytes(external_units),
                 // Each machine-wide build store's identified interior,
@@ -859,6 +898,10 @@ fn report_json_envelope(
                     })
                     .collect::<serde_json::Map<String, serde_json::Value>>(),
             }),
+            View::Reclaim => match reclaim {
+                Some(view) => serde_json::to_value(view)?,
+                None => serde_json::Value::Null,
+            },
             View::Agents => {
                 let filtered: Vec<&swamp_core::agents::AgentUnit> = agent_units
                     .iter()
@@ -869,6 +912,7 @@ fn report_json_envelope(
                     "total_bytes": filtered.iter().map(|u| u.bytes).sum::<u64>(),
                 })
             }
+            View::Disk => disk_json_now(&store_dir, all_rows),
             _ => swamp_core::agent_json::view_payload(&rr, &name, project),
         };
         let page = swamp_core::agent_json::paginate(&mut result, limit, offset);
@@ -912,6 +956,8 @@ fn report_json_envelope(
     let mut value = serde_json::to_value(&rr)?;
     value["since"] = serde_json::json!(since_str);
     value["index_refreshed"] = serde_json::json!(index_refreshed);
+    // The whole-disk ledger, read from the store (never a walk).
+    value["disk"] = disk_json_now(&store_dir, all_rows);
     if !scope_coverage.is_empty() {
         value["scope_coverage"] = serde_json::json!(scope_coverage);
     }
@@ -940,6 +986,34 @@ fn report_json_envelope(
         }
     }
     Ok(value)
+}
+
+/// The volume ledger as JSON, read now from the store. A store that
+/// cannot be read is `measured: false` with the reason, never an error
+/// for the report around it.
+fn disk_json_now(store_dir: &Path, all: bool) -> serde_json::Value {
+    match swamp_core::volume_ledger::read_account(store_dir) {
+        Ok(account) => swamp_core::volume_ledger::disk_json(
+            account.as_ref(),
+            swamp_core::entities::now(),
+            (!all).then_some(swamp_core::volume_ledger::DEFAULT_JSON_ROWS),
+        ),
+        Err(e) => serde_json::json!({
+            "measured": false,
+            "note": format!("the volume ledger could not be read: {e}"),
+        }),
+    }
+}
+
+/// `report --view disk` text.
+fn disk_text_now(store_dir: &Path) -> String {
+    match swamp_core::volume_ledger::read_account(store_dir) {
+        Ok(account) => swamp_core::volume_ledger::render_disk_view(
+            account.as_ref(),
+            swamp_core::entities::now(),
+        ),
+        Err(e) => format!("Disk ledger: could not be read ({e}); run `swamp observe --volume`\n"),
+    }
 }
 
 const PREVIOUS_SCOPE_NOTE: &str = "the scope's roots changed since this observation; nothing was walked and no growth is computed across the two scopes";
@@ -1115,6 +1189,21 @@ fn main() -> Result<()> {
                 }
             });
             let store_dir = swamp_dir();
+            // `--view disk` reads only the volume ledger: no scope to
+            // resolve, no observation needed, nothing to walk.
+            if view == Some(View::Disk) {
+                if json {
+                    let envelope = serde_json::json!({
+                        "view": "disk",
+                        "project": serde_json::Value::Null,
+                        "result": disk_json_now(&store_dir, all),
+                    });
+                    safe_println!("{}", serde_json::to_string_pretty(&envelope)?);
+                } else {
+                    safe_print!("{}", disk_text_now(&store_dir));
+                }
+                return Ok(());
+            }
             // R12: `report` is a pure read. The scope this invocation
             // names (an explicit root is a scope of one, #42) is
             // resolved only to know *which* stored snapshot to read and
@@ -1183,6 +1272,19 @@ fn main() -> Result<()> {
             let external_units = snapshot.external_units;
             let agent_units = snapshot.agent_units;
             let store_interiors = snapshot.store_interiors;
+            // The Reclaim view is a pure function of these stored facts.
+            let reclaim_view = (view == Some(View::Reclaim)).then(|| {
+                swamp_core::reclaim::build(&swamp_core::reclaim::ReclaimInput {
+                    units: &external_units,
+                    interiors: &store_interiors,
+                    unowned: &r.unowned,
+                    manager_facts: &snapshot.manager_facts,
+                    declared_roots: &declared_json_roots,
+                    explicit_scope: scope.explicit,
+                    projects: r.projects.len(),
+                    observed_at: r.observed_at,
+                })
+            });
             let root = r.root.clone();
             if !coverage.is_empty() {
                 print_scope_coverage_note(&coverage);
@@ -1208,6 +1310,7 @@ fn main() -> Result<()> {
             };
             if json {
                 let mut value = report_json_envelope(
+                    all,
                     &r,
                     &root,
                     view,
@@ -1222,6 +1325,7 @@ fn main() -> Result<()> {
                     &external_units,
                     &agent_units,
                     &store_interiors,
+                    reclaim_view.as_ref(),
                 )?;
                 bound_interior_units(&mut value, unit_limit, unit_offset);
                 if let Some(obj) = value.as_object_mut() {
@@ -1295,13 +1399,19 @@ fn main() -> Result<()> {
                     Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
                         safe_print!(
-                            "{}",
+                            "{}{}",
                             swamp_core::render::render_view_external_with(
                                 &external_units,
                                 &store_interiors,
                                 r.observed_at,
-                            )
+                            ),
+                            swamp_core::render::render_standalone_targets(&r.unowned)
                         )
+                    }
+                    Some(View::Reclaim) => {
+                        if let Some(v) = &reclaim_view {
+                            safe_print!("{}", swamp_core::reclaim::render_text(v));
+                        }
                     }
                     Some(View::Agents) => {
                         safe_print!(
@@ -1314,6 +1424,7 @@ fn main() -> Result<()> {
                             )
                         )
                     }
+                    Some(View::Disk) => safe_print!("{}", disk_text_now(&store_dir)),
                     Some(v @ (View::Projects | View::Grown)) => {
                         eprintln!("--view {} is JSON only; add --json", v.name());
                         std::process::exit(1);
@@ -1344,13 +1455,19 @@ fn main() -> Result<()> {
                     Some(View::Reconciliation) => safe_print!("{}", render_view_reconciliation(&r)),
                     Some(View::External) => {
                         safe_print!(
-                            "{}",
+                            "{}{}",
                             swamp_core::render::render_view_external_with(
                                 &external_units,
                                 &store_interiors,
                                 r.observed_at,
-                            )
+                            ),
+                            swamp_core::render::render_standalone_targets(&r.unowned)
                         )
+                    }
+                    Some(View::Reclaim) => {
+                        if let Some(v) = &reclaim_view {
+                            safe_print!("{}", swamp_core::reclaim::render_text(v));
+                        }
                     }
                     Some(View::Agents) => {
                         safe_print!(
@@ -1363,6 +1480,7 @@ fn main() -> Result<()> {
                             )
                         )
                     }
+                    Some(View::Disk) => safe_print!("{}", disk_text_now(&store_dir)),
                     Some(v @ (View::Projects | View::Grown)) => {
                         eprintln!("--view {} is JSON only; add --json", v.name());
                         std::process::exit(1);
@@ -1480,6 +1598,7 @@ fn main() -> Result<()> {
             since,
             no_enrich,
             enrich,
+            volume,
         } => {
             swamp_core::github::set_force_refresh(enrich);
             let store_dir = swamp_dir();
@@ -1522,6 +1641,7 @@ fn main() -> Result<()> {
                 verify_du,
                 since,
                 !no_enrich,
+                volume,
             );
             progress.stop();
             result?;

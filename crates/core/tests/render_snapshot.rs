@@ -486,6 +486,10 @@ fn external_unit(
         consumers: Vec::new(),
         note: None,
         evidence,
+        bytes_counted_elsewhere: 0,
+        overlap_count: 0,
+        last_used: Default::default(),
+        children: Vec::new(),
     }
 }
 

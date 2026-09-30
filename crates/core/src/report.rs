@@ -101,6 +101,13 @@ pub enum UnownedReason {
     /// recorded as 0; the row exists so the count is visible instead of
     /// silently dropped.
     PermissionDenied,
+    /// A directory outside every checkout that carries Cargo's own
+    /// signature: a `CACHEDIR.TAG` whose first line is the Cache
+    /// Directory Tagging signature, beside `.rustc_info.json` (#171).
+    /// It is what `CARGO_TARGET_DIR` builds into. Nothing in it records
+    /// which project built it (its `.d` files use relative paths), so no
+    /// project is named, and the Trash flow can plan it.
+    StandaloneCargoTarget,
     /// A Docker object (image/build-cache/volume) with no explicit join
     /// evidence: no matching compose-project label, no label whose value
     /// is a path inside a discovered worktree, and no
@@ -2514,6 +2521,15 @@ pub fn observe_scope(
     };
     let mut force_full = force_full;
     if observe
+        && let Some(dir) = store_dir
+        && crate::fs_gate::store::StoreDir::at(dir)?.is_newer_generation()?
+    {
+        // Another swamp (a newer one) owns this store's format. Reading is
+        // fine; writing derived tables under a marker we do not know could
+        // corrupt it, and resetting would throw its work away.
+        anyhow::bail!("store written by a newer swamp; not modifying it");
+    }
+    if observe
         && owns_root_coverage
         && want == ObservationParts::ALL
         && let Some(dir) = store_dir
@@ -3615,6 +3631,23 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
             .push(m);
     }
 
+    let mut children_by_unit: std::collections::HashMap<
+        String,
+        Vec<&crate::growth::columns::StoredUnitChildRow>,
+    > = std::collections::HashMap::new();
+    for c in &tables.children {
+        children_by_unit
+            .entry(c.unit_id.clone())
+            .or_default()
+            .push(c);
+    }
+
+    let meta_by_unit: std::collections::HashMap<&str, &crate::growth::columns::StoredUnitMetaRow> =
+        tables
+            .meta
+            .iter()
+            .map(|m| (m.unit_id.as_str(), m))
+            .collect();
     snapshot.external_units = tables
         .external
         .iter()
@@ -3631,7 +3664,12 @@ fn rebuild_units_from_tables(store_dir: &Path, key: &str, snapshot: &mut ReportS
                     note: c.basis.clone(),
                 })
                 .collect();
-            crate::growth::external_unit_from_stored(stored, consumers)
+            let children = children_by_unit
+                .get(&stored.id)
+                .cloned()
+                .unwrap_or_default();
+            let meta = meta_by_unit.get(stored.id.as_str()).copied();
+            crate::growth::external_unit_from_stored(stored, consumers, &children, meta)
         })
         .collect();
 
@@ -3768,6 +3806,7 @@ fn empty_snapshot(observed_at: u64, store_dir: &Path) -> ReportSnapshot {
         external_units: Vec::new(),
         agent_units: Vec::new(),
         store_interiors: Vec::new(),
+        manager_facts: crate::manager_facts::ManagerFacts::default(),
     }
 }
 
@@ -3820,6 +3859,17 @@ fn stored_choice(scope: &crate::scope::EffectiveScope, store_dir: &Path) -> Opti
             observed_at: c.observed_at,
             roots: c.roots,
         })
+}
+
+/// Whether the store carries an explicit marker from an older swamp: its
+/// derived tables cannot be read, and the observer resets and rebuilds
+/// them (`docs/architecture.md`). A store with no marker at all is simply
+/// new, and an unreadable marker is not called older. What lets the TUI
+/// say "being rebuilt" instead of "nothing has been scanned".
+pub fn store_is_older_generation(store_dir: &Path) -> bool {
+    crate::fs_gate::store::StoreDir::at(store_dir)
+        .and_then(|store| store.has_incompatible_marker())
+        .unwrap_or(false)
 }
 
 /// Whether the store holds any observation at all, of any scope: the
@@ -3903,6 +3953,7 @@ pub fn report_scope_from_store(
     rebuild_units_from_tables(store_dir, &key, &mut snapshot);
     rebuild_nested_artifacts_from_tables(store_dir, &key, &mut snapshot);
     rebuild_evidence_from_tables(store_dir, &key, &mut snapshot);
+    snapshot.manager_facts = crate::growth::read_manager_fact_table(store_dir);
     // R20: last -- every derived field (summary, series, unowned, the
     // drill-down, an artifact's growth/allocation) is computed from the
     // facts rebuilt above and the volumes' history, never read from a

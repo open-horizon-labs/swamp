@@ -102,7 +102,9 @@ observation produced: the project, worktree and artifact rows
 `artifact_shape.parquet` + `artifact_shape_lists.parquet`, and the
 per-volume current-artifact table); external and agent-tool storage
 units (`external_units.parquet`/`agent_units.parquet` +
-`unit_consumers.parquet`/`agent_unit_members.parquet`); a volume's
+`unit_consumers.parquet`/`agent_unit_members.parquet`, and the sibling
+tables `unit_meta.parquet` for an external unit's last-used and overlap and
+`unit_children.parquet` for its depth-2 rows); a volume's
 unowned rows (`unowned.parquet` + lists/evidence, and
 `docker_unowned.parquet` for the Docker objects no project claims);
 nested build-artifact units (`nested_artifacts.parquet` + lists/
@@ -535,6 +537,267 @@ The TUI has a dedicated, read-only External view (`v`/`9`): the same
 one-row-per-unit facts as `--view external`, never markable -- act on
 what it shows with the manager's own tools, not swamp.
 
+### Last run or opened
+
+Every external unit shows one fact about use, with where it came from:
+
+```text
+Last run or opened: Jul 8 (file access time)
+Last run or opened: Sep 6 (Xcode DerivedData record)
+Last run or opened: no record
+```
+
+In JSON it is `last_used`: `at` (epoch seconds, `null` for no record),
+`source` (`tool_native:<name>`, `file_atime` or `none`) and, beside a
+tool-native value, `atime` -- the key files' access time, kept so the two
+can be compared. The label is a fact about one file or one record. It is
+never "unused" and never "since": a unit whose row says Jul 8 was last
+opened that day as far as the record shows, which is not a statement that
+nothing needs it. Dates are UTC.
+
+**Precedence, highest first.**
+
+1. A **tool-native record**: the tool's own database or metadata, written
+   for this purpose. A backup, an antivirus scan or an indexer cannot move
+   it.
+2. The **file access time of the unit's key files** -- the regular files
+   directly inside a `bin` directory of the unit. Never a directory's own
+   access time (a listing moves it), never a symlink's, never a file swamp
+   opened.
+3. **No record.** Never a date derived from a modification time.
+
+When both exist and disagree the tool-native value is shown and the access
+time stays in the JSON. A unit that declares no source shows no record.
+
+| Unit kind | Source | Read from | Checked on a real machine |
+|---|---|---|---|
+| rustup toolchains | file access time | `toolchains/<toolchain>/bin/*` | yes: a toolchain's `rustc` access time moved when it ran, its `bin` directory's did not |
+| mise installs | file access time | `installs/<tool>/<version>/bin/*` | yes |
+| pyenv versions | file access time | `versions/<version>/bin/*` | yes |
+| Homebrew Cellar | file access time | `Cellar/<formula>/<version>/bin/*` | layout yes; the detector is off by default, so the default report does not exercise it |
+| Android SDK packages | file access time | `<package>/<version>/bin/*` (`cmdline-tools`, `cmake`); a package with no `bin` (system images, platforms, emulator, platform-tools, build-tools) shows no record | yes |
+| ESP-IDF tools | file access time | `tools/<tool>/<version>/<tool>/bin/*` | yes |
+| Cargo registry cache and sources, git databases and checkouts | tool-native: `~/.cargo/.global-cache`, shown as "last used by cargo" | the newest `timestamp` in the table for that subtree (`registry_crate`, `registry_src`, `git_db`, `git_checkout`), opened with SQLite's immutable read-only mode: no file created beside cargo's database (no `-shm`/`-wal`), no lock taken; a read torn by a checkpoint is "unavailable", and a change still in a WAL is not seen | yes: the database and its values were read on this machine (SQLite `user_version` 7) |
+| Xcode DerivedData | tool-native: each project folder's `info.plist` `LastAccessedDate` | the existing bounded `plutil` read; a project shows its own, the unit the newest | yes |
+| CoreSimulator devices | not implemented | `device.plist` has no last-booted key on this machine (keys seen: `deviceType`, `isDeleted`, `isEphemeral`, `name`, `runtime`, `runtimePolicy`, `state`, `UDID`; no device was booted) | unverified |
+| Docker and OrbStack | build-cache entries keep the daemon's own `last_used` (an existing fact); images and volumes report none | the daemon | existing |
+| npm `_cacache`, Gradle | not implemented | | unverified |
+| everything else | no record | | |
+
+Access time is a weak signal and the docs say so where it is used:
+
+- **Backup tools, antivirus and indexers touch it.** A unit can show a
+  recent date because something scanned it: a later access date may be an
+  indexer or a backup reading the file, not you. It is therefore an upper
+  bound on how recently the unit was used, never proof of use.
+- **`--version` counts.** So does any read; a shell completion that runs a
+  tool counts as a run.
+- **Mounts.** On a `noatime` mount nothing updates it; on `relatime` (Linux
+  default) it updates when the previous value is older than the file's
+  modification or a day. APFS behaves the same way for this purpose.
+- **Aliases are not double counted.** Symlinks (mise's `latest`, Homebrew's
+  `bin` links) are skipped, so an alias never lends its target's time to
+  another unit.
+- **A date in the future is not shown.** A tool-native record dated after now
+  (a tracker written in milliseconds reads as the year 58,000, a copied plist
+  as 2099) is set aside as `no record (ignored: date in the future)`. A scan
+  that hits its listing limit says `no record (probe limit reached)`, not a
+  bare `no record`.
+- **It is read on every observation, not replayed.** Reading a file raises
+  no filesystem event, so an unchanged unit that is replayed without a walk
+  would report an access time that is only as new as its last walk. Swamp
+  lists the declared `bin` directories and takes one `lstat` per key file
+  each observation instead: bounded (a unit that would need more than 4,096
+  listings shows no record), counted in the observation's work counters,
+  and it opens nothing (justification: `docs/architecture.md`). `swamp report` never does this: it reads the stored
+  value.
+
+### What is inside a big root
+
+A large `unclassified` root (`~/Library/Caches` was one 36.8 GB row) and
+every unit that declares a last-use source list their immediate child
+folders, largest first, with size, modification time and last-used:
+
+```text
+36.9GB  unclassified  /Users/me/Library/Caches
+    inside, largest first (rows add up to the total the walk measured):
+           19.5GB  hiphi-endpoints  modified 1d ago  Last run or opened: no record
+           ...
+          281.7MB  remainder: 145 other entries (the other folders, and files directly inside); 9 folders not measured
+           -3.7MB  adjustment: hardlinked files are counted once in this unit's total
+```
+
+- **Bounded.** The top 15 rows (`DRILLDOWN_TOP_N`) and one remainder row; an
+  unclassified root is listed only at or above 1 GiB
+  (`DRILLDOWN_MIN_BYTES`). Both are constants in `drilldown.rs`.
+- **Exact.** The rows sum to the total the same walk measured, in `--json`
+  too (`children`). The remainder is the walk's total minus the listed
+  rows, so it holds the other folders and the files directly inside. A
+  hardlinked file the walk counted once but two parent folders counted
+  under each appears as the signed `adjustment` row, never as missing bytes.
+- **Not measured is not zero.** A folder the process could not list is
+  shown as `not measured` (`bytes: null`); one with an unreadable folder
+  below it is `partial` and its size is a lower bound. Unlisted unreadable
+  folders are counted in the remainder row.
+- **Names, sizes and dates only.** Folder names are shown as they are on
+  disk; no file content and no `Info.plist` is read for them.
+- **From the one walk.** The rows come from the per-directory rows the
+  folded walk already produces, are stored in `unit_children.parquet`, and
+  are replayed with the unit when it is unchanged. In the TUI the External
+  view's row opens (`Enter`) onto them; the selected row's detail line
+  carries the last-used fact.
+
+### The Reclaim view
+
+```bash
+swamp report --view reclaim
+swamp report --view reclaim --json
+```
+
+One row per unit of developer storage (every external unit, and each
+standalone Cargo target directory), largest allocated size first, ties by
+path. Each row says, as facts with their sources:
+
+- **Size and growth**, and, for a unit that is drilled into, its folders
+  (bounded top rows plus one remainder, adding up to the unit's size; a folder
+  that could not be read is `not measured`, never `0B`).
+- **Regeneration cost.** In order of precedence: the consequence text a build
+  adapter stated for the unit's own interior ("reinstall is a download --
+  iOS_23F77 is downloaded again when a simulator needs it"); the detector's
+  recovery hint with its command (`brew reinstall <formula>`); the category
+  default below. `cannot be regenerated` is said for local state and models.
+- **Last used**, with its source (`Sep 6 (Xcode DerivedData record)`, `Jul 8
+  (file access time)`) or `no record`, exactly as in the section above.
+- **Consumers**, in two tiers: declared (a project's declaration, a lockfile, a
+  manager's global default) and recorded links (what the tool itself recorded,
+  such as Xcode's `WorkspacePath` or a standalone Cargo target's dep-info).
+- **What a package manager reports**, quoted verbatim and attributed:
+  `Homebrew reports unneeded (brew autoremove): "Would autoremove 4 unneeded
+  formulae:"`, `mise reports prunable (mise prune --tools --dry-run): "mise
+  poetry@2.1.3 is prunable: ..."`. Swamp never says a unit is unused, obsolete or
+  safe; these are the manager's sentences.
+- **The removal path that exists.** A standalone Cargo target: Trash after
+  review, marked in the TUI's unowned view. An installation: `tool command, not
+  available yet`. Everything else: `view only`.
+
+| Storage category | Class | Words when nothing more specific exists | Source |
+|---|---|---|---|
+| installation | download | reinstall is a download | each manager documents a reinstall command; the detector's hint has the exact one |
+| downloads, cache | download | downloaded or derived again by the tool on next use | npm, pip, uv, Cargo and Gradle document their caches as refilled on use |
+| build-output | rebuild | rebuilt by the tool's build command | the tool's own build command |
+| environments | not established | recreating restores what the manifest names, not data added later | an emulator's apps and data are not in a manifest |
+| local-state, models | not regenerable | cannot be regenerated | state a tool wrote for the user; a model's source may be gone |
+| unclassified | not established | no detector says what is inside | none |
+| standalone-cargo-target | rebuild | rebuild with `cargo build` | Cargo's own consequence, stated on the row |
+
+When a build adapter's own text is used, it decides the class: text that names a
+download or reinstall is `download`, one that names a rebuild is `rebuild`, one that
+says the bytes are gone or unique is `not-regenerable`, one that says removal breaks
+something, or says nothing about cost, is `not-established` and stays out of the
+regenerable total.
+
+**Scope statement.** Every listing prints `consumer evidence checked against N
+projects in M declared roots`; with no declared root it says `consumer evidence covers
+the built-in default roots only` and marks the evidence incomplete. If a declared root is missing, unreadable, only
+partly read or excluded, it says `incomplete` and names the root; an explicit
+root named on the command line says the declared roots were not used; with no
+declared roots it says only the built-in roots were checked. A row with no
+declared consumer says `none found among N projects in M declared roots`, never
+that nothing needs it: a tool used only by a project outside those roots looks
+exactly the same.
+
+**Defaults and requested installs are held out.** A rustup default toolchain, a
+tool in mise's global configuration and a Homebrew formula installed on request
+are marked `active default` / `installed on request` and excluded from the
+regenerable total. A unit that cannot separate them (Homebrew's remainder unit)
+is held whole. If the manager's own record could not be read, the row says
+`unknown` and is held out too; before the first manager pass every such row is
+`unknown`.
+
+**The manager pass** runs in `swamp observe` (the scheduled run included) after
+the observation, and nowhere else: `report` and the TUI read what it stored and
+start no process. It asks only `brew autoremove --dry-run`, `brew list --formula
+--installed-on-request`, `mise prune --dry-run` and `mise ls --global --json`,
+and reads rustup's `settings.toml`. Each command is an allow-listed shape in the
+spawn layer, counted, killed after 20 seconds (the pass after 45). The program is
+found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, and for mise `~/.local/bin`, `~/.cargo/bin` when `HOME` is absolute), never through `PATH`; a candidate must be an executable regular file (a symlink such as Homebrew's is followed) owned by root or you and not group or world writable, else the next is tried; the child's environment is built from scratch
+(only `HOME`, a fixed `PATH`, colour, pager and Homebrew auto-update/analytics/cleanup
+off, and, for mise only, the directory settings the mise detector honors and mise itself reads: `MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`, `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, so the probe describes the store the unit measures); and it runs from `/`, so a project
+directory cannot change what mise lists. Output over 1 MiB is refused. A hold (a default, a global tool, an install on request) read more than a day before the listing is `unknown` and held out, and one read hours before says so. Every quote shows
+when it was recorded and says `older than this listing` when a later observation did not
+run the pass; a quote naming one version of a tool says so. A missing
+binary, a time-out, a non-zero exit or output that is not the expected shape is
+one `not observed` line in the view's coverage notes, never an error. The answers
+are stored in `manager_facts.parquet`, a table older versions ignore (the store
+marker does not change); a store without it reads as "not observed yet".
+
+**JSON** (`result` of the `--view reclaim` envelope):
+
+```text
+observed_at
+scope        { projects, declared_roots, complete, incomplete_because[], statement }
+totals       { count, bytes, regenerable_bytes, held_bytes,
+               not_regenerable_bytes, not_established_bytes,
+               per_kind[ { kind, count, bytes, regenerable_bytes } ],
+               scope_statement }
+coverage_notes[]
+rows[]       { path, kind, detector, bytes, growth_bytes?,
+               regeneration { class, words, source },
+               last_used { at|null, source, atime? }, last_used_text,
+               consumers { declared[], recorded_links[], unknown[], summary },
+               manager[ { manager, subject, quote, attribution } ],
+               hold? { kind, label, subjects[], whole_unit },
+               removal { kind, text }, regenerable_bytes, held_bytes, note?,
+               children[ { kind, name, bytes|null, measure, last_used,
+                           last_used_text?, text, manager[], hold? } ] }
+```
+
+`bytes == regenerable_bytes + held_bytes + not_regenerable_bytes +
+not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
+is not measured). `totals` is the object the storage headline reuses.
+
+In the TUI, `v` reaches the Reclaim view (after External). It is built from the
+stored facts, scans nothing on open, and keeps the same layout as every view:
+the scope statement sits under the heading, the cost, last-used fact and removal
+path are the signals (and the detail pane's first lines at any width), `→` or
+`Enter` opens a unit onto its folders, and a default is flagged beside its
+name. `R` refreshes exactly as before.
+
+### Standalone Cargo target directories
+
+A directory `CARGO_TARGET_DIR` builds into, inside a root you declared,
+is recognized by Cargo's own signature: a regular `CACHEDIR.TAG` whose
+first line is `Signature: 8a477f597d28d172789f06886806bc55` **and** a
+regular `.rustc_info.json` beside it. It shows in the unowned view as
+`standalone-cargo-target` with its allocated size, its modification time,
+and the consequence "rebuild with `cargo build`".
+
+- A directory with only the tag (pytest, uv and others write the same
+  signature) is not called Cargo's, and neither is a `target/` sitting next
+  to a `Cargo.toml` (a Cargo project that is not a git checkout keeps its
+  build directory there).
+- Swamp does not link it to a project and guesses none. Whether the
+  directory itself records one varies, and was checked here: a target built
+  from a git worktree records absolute workspace source paths in
+  `<profile>/deps/*.d` (`/private/tmp/swamp-cli-brokenpipe-target-145` records
+  `/private/tmp/swamp-fix-cli-defects/crates/...`), while targets built in
+  place record relative ones and `.fingerprint/*` records only hashes. When
+  absolute paths are there the row shows their common directory as a
+  **recorded link** (second tier, labelled "recorded in dep-info, not checked
+  to exist"); it is never used to select, order or authorize anything.
+- It has its own section in `swamp report --view external` (and
+  `standalone_cargo_targets` in `--json`, and rows in the TUI's External view),
+  counted under unowned and not in the external total.
+- A project's own `target/` is a build artifact of that project and is
+  counted once there, never also as a standalone target.
+- It is plannable through the same reviewed Trash flow as any build output:
+  mark it in the TUI's unowned view (the plan is `actions::propose`'s, the
+  same call every other plan unit goes through). The confirm line says what
+  it is, what a rebuild costs, and shows the in-use reading taken when it
+  was planned. Nothing is removed without the human's Enter.
+- Only roots you declare are scanned; `/private/tmp` is not in the default
+  scope.
+
 ## Agent-tool storage
 
 Coding-agent tools (Claude Code, Codex, its desktop app, Oh My Pi,
@@ -626,6 +889,146 @@ status rows. The project tree's own Tree view also shows the collapsed
 "Agent storage (linked)" summary row (informational; marking a specific
 unit still happens in the Agents view).
 
+## Where the whole disk went (the volume ledger)
+
+`swamp report` answers for the roots and locations swamp knows. Everything
+else on the disk (and the parts of the disk no path reaches) is the volume
+ledger's job: one scheduled measurement, read back without touching the disk.
+
+```bash
+swamp observe --volume        # measure now (a plain scheduled observe does it when due)
+swamp report --view disk      # read it: never a walk, never a program run
+swamp report --view disk --json          # totals plus the 50 largest rows
+swamp report --view disk --json --all    # every row
+```
+
+`report --view disk` prints, each with the time it was measured:
+
+- **Disk**: the APFS container's total, used and free (one `statfs`). `df`'s
+  "used" is the whole container, not the Data volume.
+- **Accounted**: the catalog and declared locations, taken from the
+  observation that just ran (not walked again), counted once. Units are
+  disjoint as the observation measures them (`/opt/homebrew` without the
+  formulae under it), so nested units add up. An agent tool's sessions and
+  caches are a finer view of a folder measured whole elsewhere: shown, never
+  added, and their folder is walked like any other.
+- **Everything else**: a coarse measurement of the rest of the data volume,
+  one row per folder at depth 1 of `/` and depth 2 under your home, `/Library`,
+  `/opt`, `/private`, `/Applications`, `/Users` and `/System/Library`, with the
+  five largest shown. Sizes are allocated bytes (`st_blocks`), `lstat` only: no
+  file is opened, no symlink followed, no FIFO or socket touched. A file with
+  several hardlinks is counted once for the whole pass (a bounded set of about 68 MB; past two
+  million linked files a link may be counted twice, and the run says so; a
+  hardlink whose two folders were measured in different runs of a resumed pass
+  is counted in each run).
+- **System volumes**: System, Preboot, Recovery, Update, VM and the like from
+  `diskutil apfs list`, with the sentence that they are separate volumes
+  sharing the container's free space. This machine's Data volume is the one
+  `diskutil info` says is mounted at `/System/Volumes/Data`; any other volume
+  with the Data role in the container is its own row. **Purgeable** space and
+  local **snapshots** (`tmutil listlocalsnapshots /`, names only: `tmutil`
+  reports no sizes) appear when `diskutil` and `tmutil` say so, and are never
+  added to the total (purgeable space is already inside the folders above).
+- **Not measured**: every folder that could not be read (macOS privacy-protected
+  folders such as Photos, Mail, Messages, Safari, Group Containers and
+  Containers), with the exact count and the first 200 names. Never zero, never
+  dropped. swamp does not ask for Full Disk Access; the report only says it
+  would change this. **Not measured yet this pass** lists, by name, the
+  locations the cursor has not reached (an unfinished pass).
+- **Protected folders: not measured (N folders)**, with the sentence "the
+  unexplained part of the Data volume, up to X GB, may be inside them". X is the
+  Data volume's own consumed bytes minus everything measured. It is an
+  ESTIMATE, it exists only while something is unreadable or not yet measured, and
+  it is not part of any check.
+- **Unattributed: allocation not explained by any measured part (bookkeeping)**:
+  the parts, estimate included, minus the container's used bytes, signed
+  (negative when clones or shared extents were counted once per file). That the
+  parts add up (`bookkeeping_balanced`, within 1%) is arithmetic, not evidence:
+  the estimate is a leftover, so it can balance anything, and a `FLAG` prints only
+  when even that arithmetic fails. It says nothing about whether the walk is
+  right. `unexplained_bytes` in the JSON is the container's used bytes minus the
+  measured parts alone (protected folders included); on a Mac with protected
+  folders it is large, and that is not a claim about the walk either.
+- **Walk spot audit** is the check that can fail. Each pass, after the walk and
+  inside the budget, up to five readable folders measured this run (the largest
+  one always, the rest rotating by day number, never a folder with an
+  unreadable part) are measured again by a naive, independent method: a plain
+  recursive sum of `st_blocks * 512`, a hardlink once per audit, sharing only
+  the system calls with the walker. Each is compared with the ledger's row; a
+  difference beyond `max(1%, 4 MiB)` sets `audit_flag` and prints `FLAG: walk spot
+  audit disagrees on <path>: ledger X vs audit Y (Z%)`. Otherwise the report says
+  "walk spot-audited: 5 folders, max difference 0.3%". Audit time is part of the
+  budget; a spent budget skips it with a note. The results are stored as
+  `audit` rows in the ledger (no new columns).
+- **On other volumes**: a declared root on another volume is listed as
+  "not part of this container" and never added to the internal disk's
+  accounted bytes.
+
+Mounted disk images (the simulator runtime volumes under
+`/Library/Developer/CoreSimulator/Volumes`) are a *view* of the image files
+stored under `/System/Library/AssetsV2`: those image files are counted once,
+where they are stored, and the mounted volumes are listed as "not added"
+notes. Another volume of the same container and a network share are listed the
+same way, with no size.
+
+### How it runs
+
+- **Only in `swamp observe`.** Never on `swamp ui` open, never in `report`.
+  A plain `observe` runs it when the last complete pass is older than
+  `volume_pass_interval_hours` (default 24; `0` turns the automatic pass off).
+  `observe --volume` runs it now. It needs the configured scope: with explicit
+  roots the accounted part would be those roots only, so it is refused (and the
+  automatic pass does not run when `$HOME` is not the account's home directory,
+  as in a sandbox or a test fixture).
+- **After the observation, under its own lock.** The observation finishes and
+  releases its lock first; the pass takes `volume-pass.lock` (transient), so a
+  slow or stuck pass can never make a scheduled observe say "another
+  observation is running". The observation writer lock is taken only for the
+  two small ledger writes.
+- **The mount table is read first.** A mount point is never statted, and nothing
+  behind a network, FUSE or automounter filesystem (`smbfs`, `nfs`, `afpfs`,
+  `webdav`, `fuse*`, `sshfs`, `cifs`, `9p`, `autofs`) is touched: a stalled
+  server cannot hang the pass. Every mount is listed and none is entered. (On
+  Linux, a mount that shares the root filesystem, such as a btrfs subvolume at
+  `/home`, is measured as a folder of its own rather than dropped.)
+- **Low priority, bounded, resumable.** Its threads run at background
+  priority, three at a time. One run is bounded by `volume_pass_budget_secs`
+  (default 120; values under 5 are raised to 5): the three system queries
+  (each killed after 20 s) and planning (limited to half a budget; a plan that
+  hits it is incomplete and the cycle is not called complete) come first, the
+  walk stops at the budget minus a slice kept for the spot audit (checked per
+  entry, so mid-folder: a folder that did not finish leaves no row), and when
+  those overheads leave the walk less than half a budget it gets half a budget
+  anyway. Past 2 budgets from the start of the run the pass stops waiting for a
+  worker stuck in a system call. The real bound is therefore 2 budgets plus the
+  system queries. A stuck folder is recorded as not measured, the path is
+  logged, the lock released, and the NEXT run tries it again; after three runs in
+  a row it is skipped until the next cycle (with the date) and that is logged once.
+  The cursor is stored in the ledger: every row keeps its own measured time, and
+  a partial pass shows a partial ledger with honest ages. A folder that fills a
+  whole run by itself is measured as its children from then on. An unfinished
+  pass continues at every observe whatever the interval says. Rows dated in the
+  future are not believed and are measured again. A ledger file that cannot be
+  parsed is moved aside as `*.corrupt-<time>` (removed after seven days) and the
+  pass starts fresh; a file that merely could not be read (an I/O error) is left
+  where it is and the pass is skipped.
+- **Skipped, with one line, when the disk-full guard trips** (`min_free_bytes`)
+  or when the store's format marker is not this build's generation (older, or
+  newer: this build never writes into a newer swamp's store).
+- **New files only.** The ledger is `volume_ledger.parquet` and
+  `volume_ledger_meta.parquet` in the store. No existing table changed, the
+  store-format marker did not move, and an older swamp ignores both files. A
+  format reset leaves them alone: the ledger is a measurement, not derived from
+  another table.
+- **The programs are fixed.** `diskutil` and `tmutil` run from `/usr/sbin/diskutil`
+  and `/usr/bin/tmutil`, never through `PATH`.
+- **A second pass over an unchanged disk gives identical bytes but is not
+  faster.** There is no event replay for the whole disk (yet), so every pass
+  measures every row again; the budget bounds it instead.
+- **On Linux** the container is the filesystem under `/`, the mount table comes
+  from `/proc/self/mounts`, and there are no system-volume, purgeable or
+  snapshot lines (nothing to ask).
+
 ## Cleanup recommendations
 
 Age is a cleanup signal, not a proof requirement. Supported Cargo cleanup groups
@@ -687,6 +1090,7 @@ swamp report ~/src --view docker   # also: BuildKit records per builder, in the 
 swamp report ~/src --view worktrees --filter 'merge-complete idle > 48h'
 swamp report ~/src --view unowned
 swamp report ~/src --view reconciliation --verify-du
+swamp report --view disk         # the whole-disk ledger; needs no root and no observation
 ```
 
 Replace `api` with a project name from your report. Additional views include `kinds`; `--worktree <path>` prints one worktree's signals.
@@ -971,8 +1375,8 @@ What each domain actually establishes:
 
 | Domain | What it can show | What it cannot |
 |---|---|---|
-| Activity | Newest recorded modification among a unit's measured children (never "last used"); a tool's own reported use timestamp (Docker's `last_used`, a Cargo fingerprint), kept distinct from filesystem age | Whether a human intentionally used the content; access time when the mount suppresses `atime` (`noatime`/`relatime`, detected and reported `unavailable`) |
-| Consumer | A declared reference: a version-manager pin, a dependency lockfile entry, an Xcode `WorkspacePath`, a Docker join -- who *asks for* something | Whether that reference was ever actually exercised at runtime |
+| Activity | Newest recorded modification among a unit's measured children (never "last used"); a tool's own reported use timestamp (Docker's `last_used`, a Cargo fingerprint), kept distinct from filesystem age; and, for external units, the separate **last-used** fact above | Whether a human intentionally used the content; access time when the mount suppresses `atime` (`noatime`/`relatime`, detected and reported `unavailable`) |
+| Consumer | A declared reference: a version-manager pin, a dependency lockfile entry, a Docker join -- who *asks for* something; and, one tier down, a **recorded link** a tool wrote about its own output (an Xcode `WorkspacePath`), worded as such | Whether that reference was ever actually exercised at runtime |
 | Current-use | A live, bounded, read-only check: an open file handle (`lsof`), a running Docker container, a simulator's booted state, a manager lock file's holder | Whether something not currently open/running/locked has no consumer at all -- absence here is not proof of no use |
 | Recovery | A sourced restoration path (rebuild from present source, network-fetch from a named lockfile, local reinstall from a known version, or "potentially unique local state" for mutable environments) with named prerequisites and a concrete smallest useful follow-up check | Whether the network/registry/credentials needed at restore time are actually available -- always stated as a material unknown, never assumed |
 | Reclaimability | Allocated bytes (always known), an estimated-reclaimable figure that is bounded rather than exact when hardlinks/APFS clones/snapshots are in play, and an observed post-action free-space change (`statvfs` before/after) | An exact reclaimed-byte guarantee from a scan alone; Trash, snapshots, open files and concurrent writers can all suppress the expected change |
@@ -992,7 +1396,7 @@ the table.
 | Docker images/volumes | unknown: the daemon reports creation time and container references, not a last-used timestamp |
 | Cargo nested build artifacts | fingerprint file mtime (tool-reported build time), where a .fingerprint entry exists |
 | agent-tool session/category units | modification age of the session/category's own recorded mtime_max; no tool reports a distinct use timestamp |
-| external location detectors (version managers, package caches, SDKs) | modification age of the measured directory only; no per-tool invocation history is read |
+| external location detectors (version managers, package caches, SDKs) | modification age of the measured directory; plus a separate last-used fact where a source is declared (tool record, else key-file access time, else none) |
 <!-- END ACTIVITY_EVIDENCE_INVENTORY -->
 
 `swamp protect add/remove` changes the keep-list; `protect list` reads it.
@@ -1069,6 +1473,7 @@ contract: `skills/swamp/references/commands-and-json.md`.
 | `report <root> --view projects --json` | -- | Ranked project summaries |
 | `report <root> --view worktrees --json` | `--filter` | Worktree and GitHub facts |
 | `report <root> --view docker --json` | `--project`, `--unowned-only` | Docker objects and attribution |
+| `report --view disk --json` | -- | The stored volume ledger: container, accounted, everything else, system volumes, not measured, named residual |
 
 `report --json` is a pure read: it never records a new observation, never
 shells out, and never re-derives GitHub/Docker facts -- run `swamp
@@ -1108,6 +1513,8 @@ retention_days = 30
 large_file_min_bytes = 1048576
 observe_timeout_sec = 1800
 # min_free_bytes = 1073741824   # unset: the greater of 1 GiB and 1% of the volume; 0 disables
+volume_pass_interval_hours = 24 # a plain `observe` runs the volume pass when the last is older; 0 = only `observe --volume`
+volume_pass_budget_secs = 120   # one run of the volume pass measures for at most this long
 
 [scan]
 defaults = true

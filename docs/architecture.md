@@ -51,7 +51,9 @@ The observation path has five responsibilities:
 4. **Persist facts and history.** Store current typed rows and prior values needed for growth comparisons.
 5. **Assemble reports.** Apply the requested view, project filter, and pagination to the stored observation.
 
-`swamp observe` performs this work without rendering a report. The TUI uses observation in the background. Before any derived-table reads, an absent or incompatible store-format marker causes the shared observer to reset recognized Swamp-owned derived generations under a serialized writer lock and perform a fresh scan. The marker is committed only after the observation pipeline succeeds; partial or missing roots are recorded normally and do not defer schema reset. Configuration, protection intent, notes, ledger state, user-declared consumer associations, unknown files, and active enrichment remain. Once the marker is current, compatible history survives narrow-root observations. `swamp report` is a pure read and skips incompatible cached generations rather than attempting cleanup.
+`swamp observe` performs this work without rendering a report. The TUI uses observation in the background. Before any derived-table reads, an absent or incompatible store-format marker causes the shared observer to reset recognized Swamp-owned derived generations under a serialized writer lock and perform a fresh scan. The marker is committed only after the observation pipeline succeeds; partial or missing roots are recorded normally and do not defer schema reset. Configuration, protection intent, notes, ledger state, user-declared consumer associations, unknown files, and active enrichment remain. Once the marker is current, compatible history survives narrow-root observations. `swamp report` is a pure read and skips incompatible cached generations rather than attempting cleanup. The marker stays generation 2 through v0.8.0, on purpose: an installed v0.7.x resets the store on any marker it does not know (newer too), and a machine with two installs and a scheduled observe would reset it on every alternation, wiping history each time. v0.8.0's additions are therefore new sibling tables that v0.7.x ignores (`unit_meta.parquet`: last-used and the structured overlap, keyed by unit id; `unit_children.parquet`: the depth-2 rows; `external/overlap_marks.parquet`: when a unit's worktree overlap last changed; `manager_facts.parquet`: what a package manager's own tooling said in the last scheduled `observe`, machine wide, replaced whole by each pass, verbatim in its `text` column, absent until the first pass and then read as "not observed yet"), and `external_units.parquet` keeps exactly the v0.7.5 columns (a test pins them). A sibling row applies only to the `external_units` row with the same `observed_at`, so rows a v0.7.x pass left behind are never shown as current. A missing sibling table means no last-used and no drilldown, never an error. The reset rule is one-directional: only an older (or absent, or unrecognized) marker resets; a newer marker is read where possible and never reset or written (`swamp observe` says "store written by a newer swamp; not modifying it"). Stored build-store units carry a fingerprint of the swamp version, the detector catalog version and a digest of every build adapter's source (`build_stores::adapter_revision`), so an adapter changed under the same catalog version invalidates those rows (and only those: the fingerprint is per row, and a mismatch is a re-identification, never a store reset). It lives in the existing per-row fingerprint rather than a table of its own because v0.7.x treats that field as opaque and a row written by either version is refused by the other, never mixed.
+
+**Why key-file access time is probed on every observation.** `incremental-walk-only-changed-subtrees` and `no-second-traversal-on-report-path` say unchanged units are replayed without listing. Access time is the one fact that breaks that: reading a file raises no FSEvents event, so a replayed unit would keep an access time only as new as its last walk, always older than reality. So each observation lists the declared `bin` directories of a unit (bounded: 4,096 listings, then "probe limit reached") and takes one `lstat` per key file; it opens nothing, counts in the work counters, and `report` never does it. Cost measured on this machine: a cold `find` over the Cellar, mise, rustup, pyenv and espressif `bin` layouts together is under 0.6 s, and an incremental observe is unchanged within noise (12.1 s against 12.0 s).
 
 A scope with no observation returns an explicit error, not a fabricated empty report. Report timestamps refer to the observation, not the moment someone requested JSON.
 
@@ -104,6 +106,64 @@ History starts at the first observation and is limited by retained measurements.
 Multi-root comparisons retain each root's coverage and use the common available interval where required. A short or missing baseline is disclosed rather than described as a full requested window. Growth windows are observation data: request the intended window when observing.
 
 History records sizes and metadata. It cannot restore files, prove which process wrote them, or establish that a file has not been used.
+
+## Volume ledger
+
+The report is about scope. The volume ledger (#169, #170) is about the disk:
+it answers "where did the space go" for the whole APFS container, including
+what no path reaches, and says what it did not measure.
+
+- **A measurement, not a view.** `volume_ledger.parquet` (one row per location:
+  path, category, allocated bytes or null, overlap bytes, entry count,
+  unreadable count, `measured_at`, method, exactness, note) and
+  `volume_ledger_meta.parquet` (one row: when the run finished, the cursor, the
+  budget and what it used, the `statfs` container snapshot and `diskutil`'s Data
+  volume figure) are new files. No existing table changed and the store-format
+  marker did not move, so an older swamp ignores them and a format reset leaves
+  them. Bytes are null exactly when a row is `not_measured`.
+- **One pass, only in `observe`.** `volume_ledger::pass::run` follows a successful
+  observation (`swamp observe`, scheduled or `--volume`), under the single-flight
+  observe lock and without the writer lock, which it takes for the two writes
+  only. It copies the observation's own unit and root totals (nothing measured
+  twice; units are disjoint by construction, except an agent home's view of its
+  own unit and mounted disk images, which are subtracted as overlap), plans a
+  coarse walk of the data volume outside them, and measures at background priority
+  with a bounded pool under a time budget. The cursor is
+  `cycle_started_at`: a location is pending until its row is at least that new.
+- **Walk the data volume from its own mount point.** On macOS `/System/Volumes/Data`
+  holds exactly the data-side of `/System` (`/System/Library/AssetsV2`) and `/usr`
+  (`/usr/local`); the sealed system volume is never listed and is the System line
+  from `diskutil`. `st_dev` cannot tell them apart (every path under `/` reports one
+  device), so a device test would either walk the sealed volume or skip
+  `AssetsV2`. Rows keep logical paths (`/System/Library/AssetsV2`); `Mapped` is the
+  only place the mount point exists.
+- **System volumes and snapshots** come from three read-only spawns
+  (`diskutil apfs list -plist`, `diskutil info -plist /System/Volumes/Data`,
+  `tmutil listlocalsnapshots /`), allow-listed in `fs_gate::spawn` (fixed argv,
+  kill on timeout, counted). A missing program, a timeout, a permission error or an
+  unreadable answer is a note on a not-measured row, never a zero.
+- **The bookkeeping is computed at read time** (`volume_ledger::account`), not
+  stored: accounted + everything else + system volumes + the protected-folder
+  estimate (the Data volume's consumed bytes minus what was measured, only while
+  something is unreadable or pending) + a signed, named residual equals the
+  container's used bytes. That is bookkeeping (`bookkeeping_balanced`), not
+  evidence about the walk: the estimate is a leftover, so it balances anything.
+  The check that can fail is the **spot audit**: up to five folders measured this
+  run are re-measured by an independent naive sum and compared; a difference
+  beyond `max(1%, 4 MiB)` sets `audit_flag`. Audit results are ordinary
+  `audit`-category ledger rows. Purgeable space, mounted images, another
+  volume of the container, locations on other volumes and network shares are
+  listed and never added.
+- **Decoupled and bounded.** The pass runs after the observation and its lock,
+  under `volume-pass.lock`. The mount table is read before any path is touched
+  (network, FUSE and automounter mounts are never statted or entered); workers are
+  detached and the pass stops waiting at twice its budget, records the stuck path
+  as not measured and lets the next run resume from the cursor. A local heartbeat
+  (the last path each worker touched) names the stuck path; unifying it with the
+  shared stall beacon in PR #191 is a follow-up.
+- **Reading never walks.** `report --view disk`, the `disk` object of
+  `report --json` and any other reader call `volume_ledger::read_account`: two
+  Parquet reads, no listing, no stat, no spawn (the work counters assert it).
 
 ## Enrichment and freshness
 

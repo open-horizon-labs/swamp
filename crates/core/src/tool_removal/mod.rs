@@ -291,7 +291,7 @@ impl Host {
     pub fn with_parent_env(mut self, vars: &[(&str, &str)]) -> Self {
         self.resolver = self.resolver.with_parent_env(
             vars.iter()
-                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         );
         self

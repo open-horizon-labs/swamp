@@ -21,6 +21,76 @@ observations, not general performance guarantees. See the README for current use
   runtime are named on the confirm. Each removal is one `tool-remove` ledger row with the
   command, the manager's version and what the re-read showed; there is no CLI for it.
   `brew uninstall` and `rustup toolchain uninstall` have no dry run and stay facts only.
+- **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
+  unit of developer storage, largest first, with what getting it back costs in the
+  tool's own words, when it was last used and from what record, who is known to
+  need it (declared, and recorded by the tool), what Homebrew or mise itself
+  reports (quoted and attributed, never swamp's verdict), and which removal path
+  exists. Every listing says what its consumer evidence was checked against and
+  when that is incomplete; a rustup default toolchain, a mise global tool and a
+  formula installed on request are marked and held out of the regenerable total,
+  and `unknown` when the manager's record could not be read. A scheduled `observe`
+  asks the managers two read-only questions each (dry runs only, from fixed program paths, a scrubbed environment and one fixed directory) into a new
+  `manager_facts.parquet` that older versions ignore; `report` and the TUI start
+  no process.
+- **Each unit says when it was last run or opened, and where that comes from.**
+  `swamp report --view external` (and `--json`, and the TUI's selected-row detail)
+  now shows `Last run or opened: Jul 8 (file access time)`, `... Sep 6 (Xcode
+  DerivedData record)` or `... no record`, never "unused". A tool's own record wins:
+  Xcode DerivedData's `LastAccessedDate` (on this machine, the one project's Sep 6)
+  and Cargo's `~/.cargo/.global-cache` (opened read-only, per subtree). Otherwise the
+  access time of the files directly in a `bin` folder (rustup toolchains, mise
+  installs, pyenv versions, Homebrew Cellar, Android SDK packages, ESP-IDF tools),
+  never a directory's own time and never a symlink's; on this machine rustup showed
+  Sep 25 for 1.90 against Sep 30 for stable. No signal is `no record`, never a date
+  taken from a modification time. The docs list which source each kind uses, which
+  were checked here, and the ways access time misleads (backups, antivirus,
+  indexers, `--version`). It is read fresh on every observation, opens no file, and
+  `swamp report` only reads the stored value.
+- **`~/Library/Caches` and the other big roots are no longer one number.**
+  `~/Library/Caches` (36.9 GB, one row) now lists its top 15 child folders with size,
+  modification time and last-used, plus a remainder row, so the rows add up to the
+  total exactly (it needs one signed adjustment row for hardlinks counted once, -3.7
+  MB here). A folder that cannot be listed says `not measured`, never `0B`. Toolchain
+  roots (rustup, mise, pyenv, Cellar, ESP-IDF, Android packages), DerivedData and the
+  Cargo stores list their children the same way. Names, sizes and dates only.
+- **Standalone Cargo target directories are their own kind.** A directory that
+  `CARGO_TARGET_DIR` built into (Cargo's `CACHEDIR.TAG` signature and
+  `.rustc_info.json`), inside a root you declared, shows as `standalone-cargo-target`
+  with its size, age and "rebuild with `cargo build`" instead of unowned residual, and
+  can be planned for the Trash with the usual in-use reading. They have their own section
+  in `--view external`, `--json` and the TUI's External view. A `target/` beside a
+  `Cargo.toml` is not called standalone, and when a target's dep-info records absolute
+  source paths (one of the four here does) they show as a labelled recorded link, never
+  as a selector. Declared over `/private/tmp`
+  here it found the four from the report (6.65, 1.66, 1.25 and 1.11 GB, matching `du`) and
+  every other worker's `CARGO_TARGET_DIR`, 53 GB in 24 directories. A directory with only the
+  tag (pytest, uv) is not called Cargo's, and a project's own `target/` is still counted
+  once, under the project.
+- **The overlap note is data now.** The bytes a unit holds that are counted under
+  project worktrees are two fields (`bytes_counted_elsewhere`, `overlap_count`) in
+  `--json` and the store; the sentence is rendered from them. This is a store-format
+  change: the first `swamp observe` after upgrading rebuilds the derived tables
+  (configuration, protection, notes and the ledger are kept).
+- **Upgrading does not reset your store, and two installs can share it.** The store
+  format stays as v0.7.5 has it. Everything v0.8.0 adds lives in new tables that v0.7.5
+  ignores, and `external_units` keeps its v0.7.5 columns. Checked with the real v0.7.5
+  binary in both directions on a copy of this machine's store: neither reset it, lost data
+  or printed `no_observation`. A v0.8.0 that meets a store written by a newer swamp reads
+  it and refuses to modify it ("store written by a newer swamp; not modifying it")
+  instead of resetting it.
+- **An adapter change under the same catalog version no longer replays old rows.** The
+  stored identification of build stores now carries a digest of the adapters' source,
+  so developers no longer need `swamp observe --full` after editing an adapter.
+- **Homebrew's dev-tool formulas show last-used too** (llvm, zig, cmake, dotnet and the
+  rest of the default list), read from each formula's `bin/`. A date in the future (a
+  tracker in milliseconds, a 2099 plist) is set aside, not shown. Registering a worktree
+  inside a unit no longer shows as the unit shrinking: growth is not shown across that
+  coverage change.
+- **Xcode's `WorkspacePath` is worded as what it is.** It was listed as a declared
+  consumer; it is a link Xcode recorded about its own output, so it shows as a
+  recorded link.
+
 - **ESP-IDF's tool directory is reported.** `~/.espressif` (or `IDF_TOOLS_PATH`) was
   8.3 GB here and invisible. `swamp report --view external` now shows `tools/`,
   `dist/` (downloaded archives) and `python_env/` as separate rows, each with what
@@ -84,6 +154,63 @@ observations, not general performance guarantees. See the README for current use
   observation that way; `R` or the next scheduled `observe` builds the new one. `swamp ui`
   scans on its own only when the store holds no observation at all.
 - **Declared roots are in the TUI header and help and in `report --json`** (`declared_roots`).
+- **`swamp report --view disk` says where the whole disk went.** Until now `report`
+  headlined 16 GB under `~/src` while `df` said 443 GB used. `swamp observe --volume`
+  (or any scheduled `observe` when the last pass is older than
+  `volume_pass_interval_hours`, default 24) now measures the rest of the data volume
+  once and stores it in a new ledger (`volume_ledger.parquet` and a meta file), and
+  `report --view disk` (and a `disk` object in `report --json`) reads it back with the
+  time each row was measured, never walking, statting or running anything. On this
+  Mac: container 494.4 GB, 427.2 GB used = catalog and declared locations 204.6 GB
+  (counted once) + everything else 132.5 GB (330 folders, top five shown: Library
+  31.7, AssetsV2 27.8, /private/tmp 14.7, /private/var 11.6, ~/.local 7.4) + system
+  volumes 46.6 GB + "not measured (unreadable folders or not yet measured),
+  estimated" 43.3 GB + a residual of +219 MB (0.05% of used).
+  Measured against `du` on the same disk: /Applications 24.27 GB (du 24.27), /opt
+  25.31 (25.31), /Library 14.45 (14.45), /System/Library/AssetsV2 27.81 (27.80),
+  /private 60.22 (60.12), home: the ledger's figure exceeds `du`'s (163.1 GB); the difference is not fully
+  explained here (`du` cannot read some protected containers, so part of it may be the
+  OrbStack data image).
+- **The walk is spot-audited, and the sum is called what it is.** That the parts
+  add up to the container's used bytes is bookkeeping (the estimate for protected
+  folders is a leftover, so it balances anything), and the report says so
+  (`bookkeeping_balanced`). The check that can fail is new: each pass re-measures up
+  to five readable folders (the largest, plus a daily rotation) with an independent
+  naive sum and compares them with the ledger; a difference beyond max(1%, 4 MiB)
+  prints `FLAG: walk spot audit disagrees on <path>` (JSON `audit_flag`). The
+  protected-folder estimate is shown as "not measured (N folders); the unexplained
+  part of the Data volume, up to X GB, may be inside them (estimate)" and is not
+  part of any check.
+- **A folder swamp cannot read is `not measured`, never zero.** 981 folders here
+  (Photos, Mail, Containers, Group Containers, `/private/var/db`, the Spotlight
+  index, ...) are listed by name (the first 200 in `--json`) with the exact count.
+  swamp does not ask for Full Disk Access; the report says what it would change.
+- **`df`'s "used" is explained.** The System line lists System (14.1 GB), Preboot
+  (21.8), Recovery (3.1), Update (1.2), VM (6.4) from `diskutil apfs list`, as
+  separate volumes that share the container's free space; purgeable space and
+  local snapshots (three here: names only, `tmutil` reports no sizes) appear when
+  `diskutil` and `tmutil` say so. A missing or failing `diskutil`/`tmutil` is a note
+  on a "not measured" row, never a 0 B line. The three queries are new allow-listed,
+  read-only, counted spawns.
+- **Nothing is counted twice.** The simulator runtime volumes mounted under
+  `/Library/Developer/CoreSimulator/Volumes` (43.6 GB) are views of the image files
+  in `/System/Library/AssetsV2`: the images are counted once, where they are stored,
+  and the mounts are listed as "not added" notes. `/System` is not skipped as sealed:
+  the pass walks the data volume from its own mount point, where `/System` holds
+  exactly the 27.8 GB of runtime images (every path under `/` reports one device, so
+  a device test cannot tell sealed from data).
+- **The pass respects its budget and resumes.** It runs after the observation, under
+  its own `volume-pass.lock`, and reads the mount table before touching any path (a
+  network mount is never statted). It measures at background priority, three folders
+  at a time, for at most `volume_pass_budget_secs` (default 120, minimum 5; the system queries and planning come first, planning limited
+  to half a budget), then stops even mid-folder and continues at the next `observe`; each
+  row keeps its own time. Past two budgets (plus the system queries) it stops waiting for
+  a stuck path, logs it and tries it again next run (skipped after three). Here a warm pass takes about 30-35
+  s and an 8-second budget stopped at 8.0-8.1 s five runs in a row. A second pass over
+  an unchanged disk gives the same bytes but is not faster (no event replay for the
+  whole disk yet). It is new files only: no existing table changed, the store-format
+  marker did not move, an older swamp ignores them, and the writer lock is held for the
+  two small writes only.
 
 ## v0.7.5
 

@@ -322,7 +322,7 @@ pub fn docker_last_used_evidence(last_used: Option<&str>, observed_at: u64) -> E
 /// Minimal RFC3339 -> unix-seconds parse (`YYYY-MM-DDTHH:MM:SS[.frac]Z`),
 /// good enough for Docker's own timestamp format; returns `None` (never
 /// panics) on anything else, which the caller reports as `Unknown`.
-fn parse_rfc3339_secs(s: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     let bytes = s.as_bytes();
     if bytes.len() < 19 {
@@ -380,7 +380,7 @@ pub const ACTIVITY_EVIDENCE_INVENTORY: &[(&str, &str)] = &[
     ),
     (
         "external location detectors (version managers, package caches, SDKs)",
-        "modification age of the measured directory only; no per-tool invocation history is read",
+        "modification age of the measured directory; plus a separate last-used fact where a source is declared (tool record, else key-file access time, else none)",
     ),
 ];
 

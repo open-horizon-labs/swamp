@@ -95,6 +95,12 @@ const TABLES: &[&str] = &[
     "artifact_shape.parquet",
     "artifact_shape_lists.parquet",
     "external_units.parquet",
+    "unit_children.parquet",
+    "unit_meta.parquet",
+    "manager_facts.parquet",
+    "overlap_marks.parquet",
+    "volume_ledger.parquet",
+    "volume_ledger_meta.parquet",
     "agent_units.parquet",
     "agent_unit_members.parquet",
     "unit_consumers.parquet",
@@ -143,6 +149,17 @@ fn allowed(rel: &Path) -> bool {
         && (name.ends_with(".parquet") || name.ends_with(".sync"))
     {
         return true;
+    }
+    // A ledger the volume pass moved aside because it could not be parsed
+    // (`volume_ledger.parquet.corrupt-<time>`, removed after seven days).
+    for base in ["volume_ledger.parquet", "volume_ledger_meta.parquet"] {
+        if name
+            .strip_prefix(base)
+            .and_then(|r| r.strip_prefix(".corrupt-"))
+            .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return true;
+        }
     }
     // Lock files and the store's own bookkeeping markers.
     if name.ends_with(".lock") || name == "housekeeping.version" {

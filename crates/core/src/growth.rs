@@ -50,6 +50,10 @@ pub const DEFAULT_SINCE: &str = "24h";
 pub const DEFAULT_LARGE_FILE_MIN_BYTES: u64 = 1024 * 1024;
 /// Default watchdog budget for one `observe` invocation.
 pub const DEFAULT_OBSERVE_TIMEOUT_SEC: u64 = crate::schedule::DEFAULT_OBSERVE_TIMEOUT_SECS;
+/// A scheduled `observe` runs the volume pass when the last is older than this.
+pub const DEFAULT_VOLUME_PASS_INTERVAL_HOURS: u64 = 24;
+/// Seconds of measuring one volume-pass run may take.
+pub const DEFAULT_VOLUME_PASS_BUDGET_SECS: u64 = 120;
 /// Delta files beyond this count trigger compaction into a single file.
 const COMPACTION_THRESHOLD: usize = 20;
 
@@ -79,6 +83,13 @@ pub struct GrowthConfig {
     /// (and the TUI's refresh) refuse to run. `None` = the greater of
     /// 1 GiB and 1% of the volume; `Some(0)` disables the check.
     pub min_free_bytes: Option<u64>,
+    /// Hours after which a scheduled `observe` runs the volume pass again
+    /// (`volume_pass_interval_hours`; `swamp observe --volume` forces it
+    /// now). An unfinished pass continues at every observe regardless.
+    pub volume_pass_interval_hours: u64,
+    /// Seconds of measuring one volume-pass run may take
+    /// (`volume_pass_budget_secs`); what is not done resumes next run.
+    pub volume_pass_budget_secs: u64,
     /// The `[scan]` table: built-in defaults, includes, excludes, and
     /// disabled detectors (#41). See `crate::scope`.
     pub scan: crate::scope::ScanConfig,
@@ -92,6 +103,8 @@ impl Default for GrowthConfig {
             large_file_min_bytes: DEFAULT_LARGE_FILE_MIN_BYTES,
             observe_timeout_sec: DEFAULT_OBSERVE_TIMEOUT_SEC,
             min_free_bytes: None,
+            volume_pass_interval_hours: DEFAULT_VOLUME_PASS_INTERVAL_HOURS,
+            volume_pass_budget_secs: DEFAULT_VOLUME_PASS_BUDGET_SECS,
             scan: crate::scope::ScanConfig::default(),
         }
     }
@@ -116,6 +129,11 @@ observe_timeout_sec = {}\n\
 # than this many bytes free. Default (unset): the greater of 1 GiB and 1% of the volume.\n\
 # 0 disables the check.\n\
 {}\
+# Hours between volume passes (the whole-disk ledger behind `report --view disk`); a scheduled\n\
+# `observe` runs one when the last is older. `swamp observe --volume` runs one now.\n\
+volume_pass_interval_hours = {}\n\
+# Seconds one volume-pass run may measure before it stops and resumes at the next observe.\n\
+volume_pass_budget_secs = {}\n\
 {}",
             self.since,
             self.retention_days,
@@ -125,6 +143,8 @@ observe_timeout_sec = {}\n\
                 Some(n) => format!("min_free_bytes = {n}\n"),
                 None => "# min_free_bytes = 1073741824\n".to_string(),
             },
+            self.volume_pass_interval_hours,
+            self.volume_pass_budget_secs,
             self.scan.to_toml_table(),
         )
     }
@@ -144,6 +164,8 @@ struct RawConfig {
     large_file_min_bytes: u64,
     observe_timeout_sec: u64,
     min_free_bytes: Option<u64>,
+    volume_pass_interval_hours: u64,
+    volume_pass_budget_secs: u64,
     scan: crate::scope::ScanConfig,
 }
 
@@ -156,6 +178,8 @@ impl Default for RawConfig {
             large_file_min_bytes: d.large_file_min_bytes,
             observe_timeout_sec: d.observe_timeout_sec,
             min_free_bytes: d.min_free_bytes,
+            volume_pass_interval_hours: d.volume_pass_interval_hours,
+            volume_pass_budget_secs: d.volume_pass_budget_secs,
             scan: d.scan,
         }
     }
@@ -169,6 +193,8 @@ impl From<RawConfig> for GrowthConfig {
             large_file_min_bytes: r.large_file_min_bytes,
             observe_timeout_sec: r.observe_timeout_sec,
             min_free_bytes: r.min_free_bytes,
+            volume_pass_interval_hours: r.volume_pass_interval_hours,
+            volume_pass_budget_secs: r.volume_pass_budget_secs,
             scan: r.scan,
         }
     }
@@ -1566,6 +1592,7 @@ fn unowned_reason_to_str(reason: &UnownedReason) -> &'static str {
         UnownedReason::NoContainingRepo => "NoContainingRepo",
         UnownedReason::SharedCache => "SharedCache",
         UnownedReason::PermissionDenied => "PermissionDenied",
+        UnownedReason::StandaloneCargoTarget => "StandaloneCargoTarget",
         UnownedReason::DockerNoJoin => "DockerNoJoin",
     }
 }
@@ -1577,6 +1604,7 @@ fn unowned_reason_from_str(s: &str) -> UnownedReason {
         "InconclusiveEvidence" => UnownedReason::InconclusiveEvidence,
         "SharedCache" => UnownedReason::SharedCache,
         "PermissionDenied" => UnownedReason::PermissionDenied,
+        "StandaloneCargoTarget" => UnownedReason::StandaloneCargoTarget,
         "DockerNoJoin" => UnownedReason::DockerNoJoin,
         _ => UnownedReason::NoContainingRepo,
     }
@@ -1792,6 +1820,9 @@ pub struct ReportSnapshot {
     pub external_units: Vec<crate::external::ExternalUnit>,
     pub agent_units: Vec<crate::agents::AgentUnit>,
     pub store_interiors: Vec<crate::artifact::NestedArtifact>,
+    /// What package managers' own tooling said in the last scheduled
+    /// `observe` (`manager_facts`): stored, never asked at read time.
+    pub manager_facts: crate::manager_facts::ManagerFacts,
 }
 
 // ---------------------------------------------------------------------
@@ -3217,6 +3248,235 @@ fn unit_consumers_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("unit_consumers.parquet")
 }
 
+fn unit_meta_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("unit_meta.parquet")
+}
+
+/// The stored volume-ledger rows and their meta row, as the volume pass
+/// wrote them (#169). Never walks, never spawns: two small Parquet reads.
+pub use columns::{StoredVolumeLedgerRow as VolumeLedgerRow, StoredVolumeMetaRow as VolumeMetaRow};
+
+fn volume_ledger_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("volume_ledger.parquet")
+}
+
+fn volume_meta_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("volume_ledger_meta.parquet")
+}
+
+/// Whether the store carries a format marker that is not this build's
+/// generation: a NEWER swamp wrote it (this build never modifies such a
+/// store), or an older one that has not been reset yet. The volume pass
+/// writes nothing then: its files are new and independent of the marker,
+/// but a store this build does not understand is not one to add to.
+pub fn store_marker_is_foreign(swamp_dir: &Path) -> Result<bool> {
+    let dir = store::StoreDir::at(swamp_dir)?;
+    Ok(dir.has_incompatible_marker()? || dir.is_newer_generation()?)
+}
+
+/// The volume pass's own lock (`volume-pass.lock`): `Ok(None)` when
+/// another pass holds it.
+pub fn try_lock_volume_pass(
+    swamp_dir: &Path,
+) -> Result<Option<crate::fs_gate::continuity::FileLock>> {
+    Ok(store::StoreDir::at(swamp_dir)?.try_lock_volume_pass()?)
+}
+
+/// Deletes quarantined ledger files older than seven days.
+pub fn remove_stale_quarantined_ledgers(swamp_dir: &Path, now: u64) -> Result<usize> {
+    Ok(store::StoreDir::at(swamp_dir)?.remove_stale_quarantine(now, 7 * 86_400)?)
+}
+
+/// Moves an unreadable ledger (and its meta) aside so the next pass can
+/// start fresh.
+pub fn quarantine_volume_ledger(swamp_dir: &Path, stamp: u64) -> Result<()> {
+    let dir = store::StoreDir::at(swamp_dir)?;
+    dir.quarantine_file("volume_ledger.parquet", stamp)?;
+    dir.quarantine_file("volume_ledger_meta.parquet", stamp)?;
+    Ok(())
+}
+
+/// `(rows, meta)`; an absent ledger is `(empty, None)`, not an error.
+pub fn read_volume_ledger(
+    swamp_dir: &Path,
+) -> Result<(Vec<VolumeLedgerRow>, Option<VolumeMetaRow>)> {
+    let rows = columns::read_volume_ledger_rows(&volume_ledger_path(swamp_dir))?;
+    let meta = columns::read_volume_meta_rows(&volume_meta_path(swamp_dir))?
+        .into_iter()
+        .next();
+    Ok((rows, meta))
+}
+
+/// Replaces the ledger. Takes the observation writer lock for the two
+/// small writes only (never while the pass walks), rows first and the
+/// meta row last: the meta row is what says a run finished. The write is
+/// refused when another writer changed the meta row since the caller
+/// read it (`read_measured_at` is that read's `measured_at`, `None` for
+/// no meta row).
+pub fn write_volume_ledger(
+    swamp_dir: &Path,
+    rows: &[VolumeLedgerRow],
+    meta: &VolumeMetaRow,
+    read_measured_at: Option<u64>,
+) -> Result<()> {
+    let dir = store::StoreDir::at(swamp_dir)?;
+    dir.create()?;
+    let _lock = dir.lock_observation_writes()?;
+    let now = columns::read_volume_meta_rows(&volume_meta_path(swamp_dir))?
+        .into_iter()
+        .next()
+        .map(|m| m.measured_at);
+    if now != read_measured_at {
+        anyhow::bail!("the volume ledger was written by another process during this pass");
+    }
+    columns::write_volume_ledger_rows(&volume_ledger_path(swamp_dir), rows)?;
+    columns::write_volume_meta_rows(&volume_meta_path(swamp_dir), std::slice::from_ref(meta))
+}
+
+fn unit_children_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("unit_children.parquet")
+}
+
+fn manager_facts_path(swamp_dir: &Path) -> PathBuf {
+    swamp_dir.join("manager_facts.parquet")
+}
+
+/// Replaces `manager_facts.parquet` with the rows of one scheduled pass
+/// (`manager_facts::collect`), under the same writer lock every
+/// observation write takes. The table is machine wide, so the whole file
+/// is the last pass.
+pub fn write_manager_fact_table(
+    swamp_dir: &Path,
+    facts: &[crate::manager_facts::ManagerFact],
+) -> Result<()> {
+    let store = store::StoreDir::at(swamp_dir)?;
+    if store.is_newer_generation()? {
+        anyhow::bail!("store written by a newer swamp; not modifying it");
+    }
+    let _writer_lock = store.lock_observation_writes()?;
+    let rows: Vec<columns::StoredManagerFactRow> = facts
+        .iter()
+        .map(|f| columns::StoredManagerFactRow {
+            manager: f.manager.clone(),
+            probe: f.probe.clone(),
+            kind: f.kind.label().to_string(),
+            subject: f.subject.clone(),
+            text: f.text.clone(),
+            observed_at: f.observed_at,
+        })
+        .collect();
+    let file = manager_facts_path(swamp_dir);
+    columns::write_manager_fact_rows(&file, &rows)
+        .with_context(|| format!("write {}", file.display()))
+}
+
+/// The stored manager facts. A store with no such table (never observed
+/// by a swamp that records them, or a table that cannot be read) is
+/// `observed: false`: the view says "not observed yet", never an error
+/// and never "nothing reported". A row of a kind this build does not
+/// know is skipped, so a newer swamp's table reads as far as it can.
+pub(crate) fn read_manager_fact_table(swamp_dir: &Path) -> crate::manager_facts::ManagerFacts {
+    let rows = columns::read_manager_fact_rows(&manager_facts_path(swamp_dir)).unwrap_or_default();
+    let observed = rows
+        .iter()
+        .any(|r| r.kind == crate::manager_facts::FactKind::Pass.label());
+    let facts = rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(crate::manager_facts::ManagerFact {
+                kind: crate::manager_facts::FactKind::from_label(&r.kind)?,
+                manager: r.manager,
+                probe: r.probe,
+                subject: r.subject,
+                text: r.text,
+                observed_at: r.observed_at,
+            })
+        })
+        .collect();
+    crate::manager_facts::ManagerFacts { observed, facts }
+}
+
+/// One `unit_children.parquet` row per drilldown line, in display order.
+fn stored_child_rows(
+    scope_key: &str,
+    unit_id: &str,
+    observed_at: u64,
+    children: &[crate::drilldown::UnitChild],
+) -> Vec<columns::StoredUnitChildRow> {
+    children
+        .iter()
+        .enumerate()
+        .map(|(seq, c)| columns::StoredUnitChildRow {
+            scope_key: scope_key.to_string(),
+            unit_id: unit_id.to_string(),
+            observed_at,
+            seq: seq as u32,
+            kind: c.kind.label().to_string(),
+            name: c.name.clone(),
+            bytes: c.bytes,
+            measure: c.measure.label().to_string(),
+            mtime_max: c.mtime_max,
+            entries: c.entries,
+            not_measured: c.not_measured,
+            last_used: c.last_used.at,
+            last_used_source: Some(c.last_used.source_column()),
+            last_used_atime: c.last_used.atime,
+        })
+        .collect()
+}
+
+fn children_from_stored(rows: &[&columns::StoredUnitChildRow]) -> Vec<crate::drilldown::UnitChild> {
+    use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
+    let mut sorted: Vec<&&columns::StoredUnitChildRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.seq);
+    sorted
+        .into_iter()
+        .filter_map(|r| {
+            Some(UnitChild {
+                kind: ChildKind::from_label(&r.kind)?,
+                name: r.name.clone(),
+                bytes: r.bytes,
+                measure: ChildMeasure::from_label(&r.measure)?,
+                mtime_max: r.mtime_max,
+                entries: r.entries,
+                not_measured: r.not_measured,
+                last_used: crate::last_used::LastUsed::from_columns(
+                    r.last_used,
+                    r.last_used_source.as_deref(),
+                    r.last_used_atime,
+                ),
+            })
+        })
+        .collect()
+}
+
+/// The drilldown rows an earlier pass stored for each unit id, across
+/// every scope. Lets an unchanged unit -- whose folded rows are replayed
+/// instead of re-walked -- keep its drilldown without a listing.
+pub(crate) fn previous_unit_children(
+    swamp_dir: &Path,
+) -> std::collections::HashMap<String, Vec<crate::drilldown::UnitChild>> {
+    let rows = columns::read_unit_child_rows(&unit_children_path(swamp_dir)).unwrap_or_default();
+    let mut by_unit: std::collections::HashMap<String, Vec<&columns::StoredUnitChildRow>> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        by_unit.entry(r.unit_id.clone()).or_default().push(r);
+    }
+    by_unit
+        .into_iter()
+        .map(|(id, rows)| {
+            // Two scopes can store the same unit; the first scope's rows
+            // are used whole, never interleaved with another's.
+            let first_scope = rows[0].scope_key.clone();
+            let same: Vec<&columns::StoredUnitChildRow> = rows
+                .into_iter()
+                .filter(|r| r.scope_key == first_scope)
+                .collect();
+            (id, children_from_stored(&same))
+        })
+        .collect()
+}
+
 fn agent_unit_members_path(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("agent_unit_members.parquet")
 }
@@ -3526,6 +3786,54 @@ pub fn write_unit_tables(
     columns::write_unit_rows(&agent_file, &agent_rows)
         .with_context(|| format!("write {}", agent_file.display()))?;
 
+    let children_file = unit_children_path(swamp_dir);
+    let mut child_rows: Vec<columns::StoredUnitChildRow> =
+        columns::read_unit_child_rows(&children_file)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key != scope_key)
+            .collect();
+    for u in external_units {
+        let unit_id = external_unit_table_id(
+            &u.detector_id,
+            crate::external::category_str(u.category),
+            &u.path,
+        );
+        child_rows.extend(stored_child_rows(
+            scope_key,
+            &unit_id,
+            u.observed_at,
+            &u.children,
+        ));
+    }
+    columns::write_unit_child_rows(&children_file, &child_rows)
+        .with_context(|| format!("write {}", children_file.display()))?;
+
+    let meta_file = unit_meta_path(swamp_dir);
+    let mut meta_rows: Vec<columns::StoredUnitMetaRow> = columns::read_unit_meta_rows(&meta_file)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.scope_key != scope_key)
+        .collect();
+    for u in external_units {
+        meta_rows.push(columns::StoredUnitMetaRow {
+            scope_key: scope_key.to_string(),
+            unit_id: external_unit_table_id(
+                &u.detector_id,
+                crate::external::category_str(u.category),
+                &u.path,
+            ),
+            observed_at: u.observed_at,
+            last_used: u.last_used.at,
+            last_used_source: Some(u.last_used.source_column()),
+            last_used_atime: u.last_used.atime,
+            bytes_counted_elsewhere: u.bytes_counted_elsewhere,
+            overlap_count: u.overlap_count,
+        });
+    }
+    columns::write_unit_meta_rows(&meta_file, &meta_rows)
+        .with_context(|| format!("write {}", meta_file.display()))?;
+
     let consumers_file = unit_consumers_path(swamp_dir);
     let mut consumer_rows: Vec<columns::StoredUnitConsumerRow> =
         columns::read_unit_consumer_rows(&consumers_file)
@@ -3579,6 +3887,8 @@ pub(crate) struct StoredUnitTables {
     pub(crate) agent: Vec<columns::StoredUnitRow>,
     pub(crate) consumers: Vec<columns::StoredUnitConsumerRow>,
     pub(crate) agent_members: Vec<columns::StoredAgentMemberRow>,
+    pub(crate) children: Vec<columns::StoredUnitChildRow>,
+    pub(crate) meta: Vec<columns::StoredUnitMetaRow>,
 }
 
 pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<StoredUnitTables> {
@@ -3608,11 +3918,27 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
             .into_iter()
             .filter(|r| r.scope_key == scope_key)
             .collect();
+    let children: Vec<columns::StoredUnitChildRow> =
+        columns::read_unit_child_rows(&unit_children_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
+    // Sibling tables a swamp that predates them never wrote: absent or
+    // unreadable is "no last-used, no drilldown", never an error.
+    let meta: Vec<columns::StoredUnitMetaRow> =
+        columns::read_unit_meta_rows(&unit_meta_path(swamp_dir))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key)
+            .collect();
     Some(StoredUnitTables {
+        meta,
         external,
         agent,
         consumers,
         agent_members,
+        children,
     })
 }
 
@@ -3626,7 +3952,16 @@ pub(crate) fn read_unit_tables(swamp_dir: &Path, scope_key: &str) -> Option<Stor
 pub(crate) fn external_unit_from_stored(
     stored: &columns::StoredUnitRow,
     consumers: Vec<crate::external::ExternalConsumer>,
+    children: &[&columns::StoredUnitChildRow],
+    meta: Option<&columns::StoredUnitMetaRow>,
 ) -> crate::external::ExternalUnit {
+    // Sibling rows describe this unit only when written by the same pass.
+    let meta = meta.filter(|m| m.observed_at == stored.observed_at);
+    let children: Vec<&columns::StoredUnitChildRow> = children
+        .iter()
+        .copied()
+        .filter(|c| c.observed_at == stored.observed_at)
+        .collect();
     let category = crate::external::category_from_str(&stored.category)
         .unwrap_or(crate::locations::StorageCategory::Unclassified);
     let provenance = match &stored.provenance_kind {
@@ -3648,6 +3983,18 @@ pub(crate) fn external_unit_from_stored(
         consumers,
         note: stored.consequence.clone(),
         evidence: Vec::new(),
+        bytes_counted_elsewhere: meta.map_or(0, |m| m.bytes_counted_elsewhere),
+        overlap_count: meta.map_or(0, |m| m.overlap_count),
+        last_used: meta
+            .map(|m| {
+                crate::last_used::LastUsed::from_columns(
+                    m.last_used,
+                    m.last_used_source.as_deref(),
+                    m.last_used_atime,
+                )
+            })
+            .unwrap_or_default(),
+        children: children_from_stored(&children),
     }
 }
 
@@ -4519,6 +4866,7 @@ fn fact_subtype_label(s: crate::evidence::FactSubtype) -> &'static str {
         ToolReportedUse => "tool-reported-use",
         DeclaredConsumer => "declared-consumer",
         InferredConsumer => "inferred-consumer",
+        RecordedLink => "recorded-link",
         Process => "process",
         OpenFile => "open-file",
         Lock => "lock",
@@ -4546,6 +4894,7 @@ fn fact_subtype_from_label(s: &str) -> crate::evidence::FactSubtype {
         "tool-reported-use" => ToolReportedUse,
         "declared-consumer" => DeclaredConsumer,
         "inferred-consumer" => InferredConsumer,
+        "recorded-link" => RecordedLink,
         "process" => Process,
         "open-file" => OpenFile,
         "lock" => Lock,
@@ -6971,6 +7320,36 @@ pub(crate) fn external_row_key(
     format!("{detector_id}\u{1}{category}\u{1}{device}\u{1}{path}")
 }
 
+fn overlap_marks_path(swamp_dir: &Path) -> PathBuf {
+    external_dir(swamp_dir).join("overlap_marks.parquet")
+}
+
+/// `key -> (worktrees subtracted last pass, when that count last changed)`.
+pub(crate) fn read_overlap_marks(swamp_dir: &Path) -> HashMap<String, (u32, u64)> {
+    columns::read_overlap_mark_rows(&overlap_marks_path(swamp_dir))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.key, (r.count, r.changed_at)))
+        .collect()
+}
+
+pub(crate) fn write_overlap_marks(
+    swamp_dir: &Path,
+    marks: &HashMap<String, (u32, u64)>,
+) -> Result<()> {
+    store::StoreDir::at(&external_dir(swamp_dir))?.create()?;
+    let mut rows: Vec<columns::StoredOverlapMarkRow> = marks
+        .iter()
+        .map(|(k, (count, changed_at))| columns::StoredOverlapMarkRow {
+            key: k.clone(),
+            count: *count,
+            changed_at: *changed_at,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+    columns::write_overlap_mark_rows(&overlap_marks_path(swamp_dir), &rows)
+}
+
 fn external_dir(swamp_dir: &Path) -> PathBuf {
     swamp_dir.join("external")
 }
@@ -7362,6 +7741,39 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     #[allow(unused_imports)]
     use std::fs::{self, File};
+
+    /// The tempting wrong patch: a manager-fact row whose kind this build
+    /// does not know (written by a newer swamp) fails the whole read. It is
+    /// skipped and the rest reads; a table that is absent is "not
+    /// observed", not an empty pass.
+    #[test]
+    fn a_manager_fact_row_of_an_unknown_kind_is_skipped_and_an_absent_table_is_not_observed() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(!read_manager_fact_table(dir).observed);
+        let row = |kind: &str, subject: Option<&str>| columns::StoredManagerFactRow {
+            manager: "brew".into(),
+            probe: "autoremove-dry-run".into(),
+            kind: kind.into(),
+            subject: subject.map(str::to_string),
+            text: "t".into(),
+            observed_at: 1,
+        };
+        columns::write_manager_fact_rows(
+            &manager_facts_path(dir),
+            &[
+                row("pass", None),
+                row("from-the-future", Some("x")),
+                row("reports-unneeded", Some("libevent")),
+            ],
+        )
+        .unwrap();
+        let got = read_manager_fact_table(dir);
+        assert!(got.observed);
+        assert_eq!(got.facts.len(), 2, "{:?}", got.facts);
+        assert!(got.facts.iter().all(|f| f.subject.as_deref() != Some("x")));
+    }
     #[test]
     fn artifact_and_file_compaction_preserve_sources_on_publish_failure() -> anyhow::Result<()> {
         use super::*;
@@ -8946,6 +9358,10 @@ mod tests {
             ],
             note: Some("coverage incomplete this pass: could not be read".into()),
             evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: Default::default(),
+            children: Vec::new(),
         };
 
         let link_states = [
@@ -9054,7 +9470,8 @@ mod tests {
                 note: c.basis.clone(),
             })
             .collect();
-        let rebuilt_external = external_unit_from_stored(&tables.external[0], rebuilt_consumers);
+        let rebuilt_external =
+            external_unit_from_stored(&tables.external[0], rebuilt_consumers, &[], None);
         assert_eq!(
             serde_json::to_value(&rebuilt_external).unwrap(),
             serde_json::to_value(&external).unwrap(),

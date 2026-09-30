@@ -150,6 +150,18 @@ pub struct Row {
     /// (mise installs, simulator runtimes; #177): Backspace opens that
     /// manager's sheet instead of a Trash confirm.
     pub tool: Option<swamp_core::tool_removal::Manager>,
+    /// Already-worded last-used fact with its source
+    /// (`Last run or opened: Jul 8 (file access time)`), for a row whose
+    /// unit has one. Shown in the detail pane, never as a table column.
+    pub last_used: Option<String>,
+    /// Replaces the number in the Size column with words when a number
+    /// would be a lie: `unmeasured` for a folder that could not be read
+    /// (never `0B`), a signed figure for an adjustment. At most ten cells.
+    pub size_text: Option<String>,
+    /// Extra lines for the detail pane, already worded (the Reclaim view's
+    /// consumer sentence, a manager's quoted statement). Shown after the
+    /// last-used line; empty for every other view.
+    pub detail_lines: Vec<String>,
 }
 
 impl Row {
@@ -177,6 +189,9 @@ impl Row {
             project: None,
             evidence: Vec::new(),
             tool: None,
+            last_used: None,
+            size_text: None,
+            detail_lines: Vec::new(),
         }
     }
 }
@@ -552,6 +567,9 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             // rows for evidence, same as every other per-project fact.
             evidence: Vec::new(),
             tool: None,
+            last_used: None,
+            size_text: None,
+            detail_lines: Vec::new(),
         });
     }
     out
@@ -682,6 +700,9 @@ pub fn tree_rows_with_agents(
                 .map(|a| a.evidence.clone())
                 .unwrap_or_default(),
             tool: None,
+            last_used: None,
+            size_text: None,
+            detail_lines: Vec::new(),
         });
         if is_collapsed {
             continue;
@@ -1658,6 +1679,9 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
             project: None,
             evidence: Vec::new(),
             tool: None,
+            last_used: None,
+            size_text: None,
+            detail_lines: Vec::new(),
         })
         .collect()
 }
@@ -2101,26 +2125,53 @@ pub fn unowned_rows(report: &Report) -> Vec<Row> {
         .unowned
         .iter()
         .filter(|u| u.reason != UnownedReason::DockerNoJoin)
-        .map(|u| {
-            let mut row = Row::leaf(
-                0,
-                format!("{:?} · {}", u.reason, u.path_or_object),
-                u.bytes,
-                None,
-            );
-            // Bytes nothing claims are still bytes, and the path is real:
-            // it can be marked like any other unit and goes to Trash.
-            // Except one the walk could not even read — there is nothing
-            // to stand behind.
-            if u.reason != UnownedReason::PermissionDenied {
-                row.kind = Some(ArtifactKind::Loose);
-                row.unit = Some(UnitId::for_artifact(std::path::Path::new(
-                    &u.path_or_object,
-                )));
-            }
-            row
-        })
+        .map(unowned_row)
         .collect()
+}
+
+/// The External view's rows for standalone Cargo targets: their own kind,
+/// markable through the reviewed Trash flow like the same rows in the
+/// unowned view (they are the same rows).
+pub fn standalone_target_rows(report: &Report) -> Vec<Row> {
+    swamp_core::render::standalone_cargo_targets(&report.unowned)
+        .into_iter()
+        .map(unowned_row)
+        .collect()
+}
+
+fn unowned_row(u: &swamp_core::report::UnownedRow) -> Row {
+    let standalone = u.reason == UnownedReason::StandaloneCargoTarget;
+    let mut row = Row::leaf(
+        0,
+        if standalone {
+            // What it is and what losing it costs, in the row itself: a
+            // Cargo target directory swamp does not link to a project,
+            // rebuilt by `cargo build`.
+            format!(
+                "standalone Cargo target · {} · rebuild with `cargo build`",
+                u.path_or_object
+            )
+        } else {
+            format!("{:?} · {}", u.reason, u.path_or_object)
+        },
+        u.bytes,
+        None,
+    );
+    // Bytes nothing claims are still bytes, and the path is real: it can be
+    // marked like any other unit and goes to Trash. Except one the walk
+    // could not even read: there is nothing to stand behind.
+    if u.reason != UnownedReason::PermissionDenied {
+        row.kind = Some(if standalone {
+            ArtifactKind::BuildOutput
+        } else {
+            ArtifactKind::Loose
+        });
+        row.unit = Some(UnitId::for_artifact(std::path::Path::new(
+            &u.path_or_object,
+        )));
+    }
+    row.evidence = u.evidence.clone();
+    row
 }
 
 /// External/shared storage view (#43/#51/#60): the same flat shape
@@ -2168,20 +2219,70 @@ pub fn external_rows_with(
             row.signals
                 .push(format!("removed by {} itself · Backspace", m.name()));
         }
-        let has_interior = interiors
+        row.last_used = Some(u.last_used.describe(observed_at));
+        // The interior this unit itself owns: not the interior of another
+        // unit that happens to sit under its path (`go-build` under
+        // `~/Library/Caches` is its own unit, listed once, there).
+        let own_interiors: Vec<swamp_core::artifact::NestedArtifact> = interiors
             .iter()
-            .any(|i| i.path != u.path && i.path.starts_with(&u.path));
-        if has_interior {
+            .filter(|i| i.path != u.path && i.path.starts_with(&u.path))
+            .filter(|i| {
+                !units.iter().any(|o| {
+                    o.path != u.path && o.path.starts_with(&u.path) && i.path.starts_with(&o.path)
+                })
+            })
+            .cloned()
+            .collect();
+        let has_interior = !own_interiors.is_empty();
+        if has_interior || !u.children.is_empty() {
             let key = format!("store-open:{}", u.path.display());
             let open = collapsed.contains(&key);
-            let children =
-                family_tree_children_of(interiors, observed_at, &u.path, 1, "", collapsed);
+            let mut children = unit_child_rows(u, observed_at);
+            if has_interior && children.is_empty() {
+                children =
+                    family_tree_children_of(&own_interiors, observed_at, &u.path, 1, "", collapsed);
+            } else if has_interior {
+                // Both describe the same bytes. The folders are the rows
+                // that add up; the identified families sit under one
+                // closed header, so no byte is listed twice unless asked.
+                let ikey = format!("interior-open:{}", u.path.display());
+                let iopen = collapsed.contains(&ikey);
+                let fams = family_tree_children_of(
+                    &own_interiors,
+                    observed_at,
+                    &u.path,
+                    2,
+                    "   ",
+                    collapsed,
+                );
+                let mut header = Row::leaf(
+                    1,
+                    "identified interior, by family (the same bytes as the folders above)".into(),
+                    0,
+                    None,
+                );
+                header.size_text = Some("same bytes".into());
+                header.expandable = !fams.is_empty();
+                header.expansion_key = Some(ikey);
+                header.rail = if iopen { "▾ ".into() } else { "▸ ".into() };
+                header.collapsed_children = (!iopen).then_some(fams.len());
+                header.signals = vec!["inspection only".into(), "blocked".into()];
+                children.push(header);
+                if iopen {
+                    children.extend(fams);
+                }
+            }
             row.expandable = !children.is_empty();
             row.expansion_key = Some(key);
             row.rail = if open { "▾ ".into() } else { "▸ ".into() };
             row.collapsed_children = (!open).then_some(children.len());
             row.signals
                 .insert(0, "store interior below · inspection only".into());
+            row.signals = vec![if has_interior {
+                "store interior below · inspection only".into()
+            } else {
+                "folders below · inspection only".into()
+            }];
             rows.push(row);
             if open {
                 rows.extend(children);
@@ -2191,6 +2292,192 @@ pub fn external_rows_with(
         }
     }
     rows
+}
+
+/// `-50MB adj` (or just `-921.1MB` when the tag would not fit the ten-cell
+/// Size column): a signed correction, never drawn as a size.
+fn compact_signed(bytes: i64) -> String {
+    let signed = swamp_core::render::human_bytes_signed(bytes).replace(".0", "");
+    let tagged = format!("{signed} adj");
+    if tagged.chars().count() <= 10 {
+        tagged
+    } else {
+        signed
+    }
+}
+
+/// One unit's depth-2 drilldown as inspection-only rows (#178). A folder
+/// that could not be read says so instead of showing `0B`, and the last
+/// row is the remainder that makes the rows add up to the unit's total.
+fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row> {
+    use swamp_core::drilldown::{ChildKind, ChildMeasure};
+    let count = u.children.len();
+    u.children
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let last = i + 1 == count;
+            let label = match (c.kind, c.measure) {
+                (ChildKind::Entry, ChildMeasure::NotMeasured) => {
+                    format!("{} · not measured (unreadable, not zero)", c.name)
+                }
+                (ChildKind::Entry, ChildMeasure::Partial) => {
+                    format!("{} · partly measured, size is a lower bound", c.name)
+                }
+                (ChildKind::Entry, ChildMeasure::Complete) => c.name.clone(),
+                (ChildKind::Adjustment | ChildKind::NotRemeasured, _) => format!(
+                    "{} ({})",
+                    swamp_core::render::describe_unit_child(c, now),
+                    swamp_core::render::unit_child_size(c)
+                ),
+                (ChildKind::Remainder, _) => swamp_core::render::describe_unit_child(c, now),
+            };
+            let mut row = Row::leaf(1, label, c.bytes.unwrap_or(0).max(0) as u64, None);
+            // A number would be a lie for these: unreadable is not zero,
+            // and a negative correction is not 0B.
+            row.size_text = match (c.kind, c.bytes) {
+                (_, None) => Some("unmeasured".to_string()),
+                (ChildKind::Adjustment | ChildKind::NotRemeasured, Some(b)) => {
+                    Some(compact_signed(b))
+                }
+                _ => None,
+            };
+            row.rail = if last {
+                "└─ ".into()
+            } else {
+                "├─ ".into()
+            };
+            row.allocated = row.size_text.is_none();
+            row.mtime_max = c.mtime_max;
+            row.signals = vec![
+                swamp_core::render::describe_unit_child(c, now),
+                "blocked".into(),
+            ];
+            if c.kind == ChildKind::Entry {
+                row.last_used = Some(c.last_used.describe(now));
+            }
+            row
+        })
+        .collect()
+}
+
+/// The Reclaim view (#175): one row per unit of developer storage,
+/// largest first, from the stored facts `swamp_core::reclaim::build` joins.
+/// Never markable (`unit: None`): removal is the reviewed Trash flow in the
+/// unowned view for a standalone Cargo target, the manager's own command
+/// (not built yet) for an installation, and nothing for the rest. A row
+/// opens (`Enter`) onto the unit's folders, whose rows add up to its size.
+///
+/// The layout is fixed like every other view: the name column leads with
+/// the unit and its kind, and the cost, last-used fact and removal path
+/// are the signals (and the detail pane's first lines at any width), so
+/// no width rule moves.
+pub fn reclaim_rows(
+    view: &swamp_core::reclaim::ReclaimView,
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for r in &view.rows {
+        // A held unit says so beside its name: at 80 columns the signals
+        // are not on screen, and a default must not look like any row.
+        let flag = r
+            .hold
+            .as_ref()
+            .map(|h| format!("  [{}]", h.short()))
+            .unwrap_or_default();
+        let mut row = Row::leaf(
+            0,
+            format!("{} · {}{flag}", r.kind, r.path),
+            r.bytes,
+            r.growth_bytes,
+        );
+        row.signals = vec![
+            r.regeneration.words.clone(),
+            format!("last used {}", r.last_used_text),
+            r.removal.text.clone(),
+        ];
+        row.last_used = Some(format!("Last used: {}", r.last_used_text));
+        row.mtime_max = r
+            .children
+            .iter()
+            .map(|c| c.last_used.at.unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        let mut standing: Vec<String> = Vec::new();
+        if let Some(h) = &r.hold {
+            standing.push(swamp_core::reclaim::hold_line(h));
+        }
+        standing.extend(r.manager.iter().take(2).map(|q| q.line()));
+        if standing.is_empty() {
+            standing.push(format!("cost from: {}", r.regeneration.source));
+        }
+        row.detail_lines = vec![r.consumers.summary.clone(), standing.join(" · ")];
+        let key = format!("reclaim-open:{}", r.path);
+        if r.children.is_empty() {
+            rows.push(row);
+            continue;
+        }
+        let open = collapsed.contains(&key);
+        let count = r.children.len();
+        let children: Vec<Row> = r
+            .children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| reclaim_child_row(c, i + 1 == count))
+            .collect();
+        row.expandable = true;
+        row.expansion_key = Some(key);
+        row.rail = if open { "▾ ".into() } else { "▸ ".into() };
+        row.collapsed_children = (!open).then_some(children.len());
+        rows.push(row);
+        if open {
+            rows.extend(children);
+        }
+    }
+    rows
+}
+
+fn reclaim_child_row(c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
+    use swamp_core::drilldown::ChildKind;
+    let flag = c
+        .hold
+        .as_ref()
+        .map(|h| format!("  [{}]", h.short()))
+        .unwrap_or_default();
+    let mut row = Row::leaf(
+        1,
+        format!("{}{flag}", c.text),
+        c.bytes.unwrap_or(0).max(0) as u64,
+        None,
+    );
+    // A number would be a lie for these: unreadable is not zero, and a
+    // negative correction is not 0B.
+    row.size_text = match (c.kind, c.bytes) {
+        (_, None) => Some("unmeasured".to_string()),
+        (ChildKind::Adjustment | ChildKind::NotRemeasured, Some(b)) => Some(compact_signed(b)),
+        _ => None,
+    };
+    row.allocated = row.size_text.is_none();
+    row.rail = if last {
+        "└─ ".into()
+    } else {
+        "├─ ".into()
+    };
+    row.signals = c
+        .last_used_text
+        .iter()
+        .map(|t| format!("last used {t}"))
+        .chain(c.hold.iter().map(swamp_core::reclaim::hold_line))
+        .chain(c.manager.iter().map(|q| q.line()))
+        .collect();
+    row.last_used = c.last_used_text.as_ref().map(|t| format!("Last used: {t}"));
+    row.detail_lines = c
+        .hold
+        .iter()
+        .map(swamp_core::reclaim::hold_line)
+        .chain(c.manager.iter().map(|q| q.line()))
+        .collect();
+    row
 }
 
 /// Agent-tool storage view (#91/#100): one row per `AgentUnit`, grouped

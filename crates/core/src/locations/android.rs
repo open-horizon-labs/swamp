@@ -12,8 +12,8 @@
 //! `crate::locations::gradle`'s job, not this detector's.
 
 use super::{
-    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
-    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LastUseDecl, LastUseSource,
+    LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 use std::path::PathBuf;
 
@@ -108,6 +108,18 @@ impl Detector for AndroidDetector {
                 },
             },
         ]
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        // `cmdline-tools/<version>/bin`, `cmake/<version>/bin`; a package
+        // folder with no `bin` (system images, platforms) has no record.
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &[],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 2 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

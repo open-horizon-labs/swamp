@@ -257,3 +257,146 @@ pub fn is_enospc(e: &io::Error) -> bool {
 pub fn is_enospc(_e: &io::Error) -> bool {
     false
 }
+
+/// Lowers the calling thread to background scheduling: on macOS the
+/// Darwin background band (`PRIO_DARWIN_BG` on this thread: CPU and disk
+/// I/O yield to foreground work), on Linux nice 10. The volume pass's
+/// workers call it first so a whole-disk measurement never competes with
+/// what the person is doing. Best effort: a refusal changes nothing else.
+#[cfg(target_os = "macos")]
+pub fn lower_current_thread_priority() {
+    // SAFETY: setpriority on this thread takes no pointers; failure is
+    // reported through errno and deliberately ignored.
+    unsafe {
+        libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, libc::PRIO_DARWIN_BG);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn lower_current_thread_priority() {
+    // SAFETY: gettid and setpriority take no pointers; failure is ignored.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        libc::setpriority(libc::PRIO_PROCESS, tid, 10);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn lower_current_thread_priority() {}
+
+/// Test fixture: a named pipe at `path` (nothing ever opens it). The
+/// walker must measure a tree holding one without blocking on it.
+#[cfg(all(unix, any(test, feature = "testing")))]
+pub fn make_fifo_for_test(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    // SAFETY: `c` is a valid NUL-terminated pathname for the call.
+    if unsafe { libc::mkfifo(c.as_ptr(), 0o600) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The home directory the account database names for this process's uid
+/// (`getpwuid_r`), which is not `$HOME`: a sandbox or a test points
+/// `$HOME` somewhere else. `None` when the database has no entry.
+#[cfg(unix)]
+pub fn account_home() -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut buf = vec![0 as libc::c_char; 8192];
+    // SAFETY: an all-zero `passwd` is a valid out-parameter for getpwuid_r.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for the call and `buf.len()` is its size.
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_dir` is a NUL-terminated string inside `buf`.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        dir.to_bytes(),
+    )))
+}
+
+#[cfg(not(unix))]
+pub fn account_home() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// One mounted filesystem, from the OS's own mount table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountPoint {
+    pub path: std::path::PathBuf,
+    pub fs_type: String,
+    /// On this machine's own storage (not a network share).
+    pub local: bool,
+}
+
+/// The mount table: `getmntinfo` on macOS (a snapshot, no I/O to the
+/// mounted volumes), `/proc/self/mounts` on Linux. Empty when the table
+/// cannot be read: the caller then knows of no mounts, and says so.
+#[cfg(target_os = "macos")]
+pub fn mount_points() -> Vec<MountPoint> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf: *mut libc::statfs = std::ptr::null_mut();
+    // SAFETY: `buf` receives a pointer to libc-owned memory that stays
+    // valid until the next `getmntinfo` call on this thread; entries are
+    // copied out before returning and never freed here.
+    let n = unsafe { libc::getmntinfo(&mut buf, libc::MNT_NOWAIT) };
+    if n <= 0 || buf.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `getmntinfo` returned `n` initialized entries at `buf`.
+    let entries = unsafe { std::slice::from_raw_parts(buf, n as usize) };
+    entries
+        .iter()
+        .map(|e| {
+            // SAFETY: the name fields are NUL-terminated C strings.
+            let on = unsafe { std::ffi::CStr::from_ptr(e.f_mntonname.as_ptr()) };
+            let ty = unsafe { std::ffi::CStr::from_ptr(e.f_fstypename.as_ptr()) };
+            MountPoint {
+                path: std::path::PathBuf::from(std::ffi::OsStr::from_bytes(on.to_bytes())),
+                fs_type: ty.to_string_lossy().into_owned(),
+                local: e.f_flags & libc::MNT_LOCAL as u32 != 0,
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub fn mount_points() -> Vec<MountPoint> {
+    let Ok(table) =
+        super::read::bounded_read("/proc/self/mounts", super::read::BoundedCap::SYSTEM_TABLE)
+    else {
+        return Vec::new();
+    };
+    table
+        .lossy()
+        .lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let _dev = f.next()?;
+            let path = f.next()?.replace("\\040", " ");
+            let ty = f.next()?.to_string();
+            let network = matches!(
+                ty.as_str(),
+                "nfs" | "nfs4" | "cifs" | "smbfs" | "fuse.sshfs"
+            );
+            Some(MountPoint {
+                path: std::path::PathBuf::from(path),
+                fs_type: ty,
+                local: !network,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn mount_points() -> Vec<MountPoint> {
+    Vec::new()
+}

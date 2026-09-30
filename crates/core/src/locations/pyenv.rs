@@ -4,8 +4,8 @@
 
 use super::{
     ConventionRole, Detector, Environment, InstalledVersionLayout, InstalledVersionNaming,
-    LocationStatus, ManagerConvention, Platform, ProposedLocation, Provenance, RecoveryCost,
-    RecoveryHint, StorageCategory,
+    LastUseDecl, LastUseSource, LocationStatus, ManagerConvention, Platform, ProposedLocation,
+    Provenance, RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor,
 };
 
 pub const PYENV_DETECTOR_ID: &str = "pyenv";
@@ -46,6 +46,16 @@ impl Detector for PyenvDetector {
             command: "pyenv install <version>",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["versions"],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 2 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {

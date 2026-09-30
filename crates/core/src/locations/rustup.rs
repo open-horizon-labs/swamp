@@ -9,8 +9,9 @@
 
 use super::{
     ConventionRole, Detector, Environment, GlobalDefaultFile, GlobalDefaultFormat,
-    InstalledVersionLayout, InstalledVersionNaming, LocationStatus, ManagerConvention, Platform,
-    ProposedLocation, Provenance, RecoveryCost, RecoveryHint, StorageCategory,
+    InstalledVersionLayout, InstalledVersionNaming, LastUseDecl, LastUseSource, LocationStatus,
+    ManagerConvention, ManagerDecl, ManagerProbe, Platform, ProposedLocation, Provenance,
+    RecoveryCost, RecoveryHint, StorageCategory, StoreAnchor, SubjectShape,
 };
 
 pub const RUSTUP_DETECTOR_ID: &str = "rustup";
@@ -57,6 +58,33 @@ impl Detector for RustupDetector {
             command: "rustup toolchain install <toolchain>",
             cost: RecoveryCost::NetworkRefetch,
         })
+    }
+
+    /// `toolchains/<channel>-<host triple>`; the default is the one
+    /// `settings.toml` names.
+    fn manager(&self) -> Option<ManagerDecl> {
+        Some(ManagerDecl {
+            manager: "rustup",
+            display: "rustup",
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["toolchains"],
+            },
+            subject: SubjectShape::ChannelWithHostTriple,
+            catch_all: true,
+            probes: &[ManagerProbe::SettingsDefault],
+        })
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        // `toolchains/<toolchain>/bin/{rustc,cargo,...}`.
+        &[LastUseDecl {
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Installation,
+                suffix: &["toolchains"],
+            },
+            source: LastUseSource::KeyFileAtime { max_depth: 2 },
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
