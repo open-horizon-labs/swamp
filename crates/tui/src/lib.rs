@@ -100,6 +100,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
             KeyCode::Up => app.tool_move(-1),
             KeyCode::Down => app.tool_move(1),
             KeyCode::Enter => app.tool_enter(),
+            KeyCode::Char('Y') => app.tool_remove_key(),
             KeyCode::Char('R') if !app.tool_sheet.as_ref().is_some_and(|s| s.waiting()) => {
                 app.tool_sheet = None;
                 app.refresh_now();
@@ -693,8 +694,17 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         if app.quit {
             return Ok(());
         }
+        // A confirm just appeared: whatever was already queued (key
+        // repeat, typeahead, a paste) was typed before it was seen.
+        if app.take_confirm_drain() {
+            while event::poll(Duration::ZERO)? {
+                let _ = event::read()?;
+            }
+        }
         if event::poll(RedrawGate::wait(app))? {
             match event::read()? {
+                // A paste is never keys: nothing on screen acts on it.
+                Event::Paste(_) => {}
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     gate.touch();
                     handle_terminal_key(app, key);

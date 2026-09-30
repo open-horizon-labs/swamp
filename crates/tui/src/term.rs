@@ -26,7 +26,12 @@ static UI_THREAD: AtomicU64 = AtomicU64::new(0);
 /// gone (a closed ssh session).
 pub fn restore_to(out: &mut impl Write) {
     let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(out, LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = crossterm::execute!(
+        out,
+        crossterm::event::DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
     let _ = out.flush();
 }
 
@@ -68,7 +73,13 @@ impl TerminalGuard {
         let built = (|| -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
             crossterm::terminal::enable_raw_mode()?;
             let mut stdout = std::io::stdout();
-            crossterm::execute!(stdout, EnterAlternateScreen)?;
+            // Bracketed paste: a paste arrives as one `Event::Paste`, never
+            // as keys, so pasted text cannot press `Y` on a confirm.
+            crossterm::execute!(
+                stdout,
+                EnterAlternateScreen,
+                crossterm::event::EnableBracketedPaste
+            )?;
             Ok(Terminal::new(CrosstermBackend::new(stdout))?)
         })();
         match built {

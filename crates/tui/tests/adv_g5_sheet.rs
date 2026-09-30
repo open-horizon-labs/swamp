@@ -361,7 +361,9 @@ fn adv_keys_during_a_running_removal_neither_kill_nor_hide_it() {
     handle_key(&mut app, KeyCode::Enter);
     wait(&mut app);
     rows(&mut app, 120, 30);
-    handle_key(&mut app, KeyCode::Enter);
+    // Owner decision C1: the removal runs on `Y`, after the hold-off.
+    std::thread::sleep(swamp_tui::tool_sheet::HOLD_OFF + std::time::Duration::from_millis(50));
+    handle_key(&mut app, KeyCode::Char('Y'));
     for code in [
         KeyCode::Esc,
         KeyCode::Char('q'),

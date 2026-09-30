@@ -38,7 +38,13 @@ pub struct ToolSheet {
     pub stage: Stage,
     pub listing: Option<Listing>,
     pub cursor: usize,
+    /// When the confirm was first drawn (set by the drawing code, which
+    /// only has `&self`): `Y` counts from there.
+    first_drawn: std::cell::Cell<Option<std::time::Instant>>,
 }
+
+/// How long a confirm must have been on screen before `Y` runs it.
+pub const HOLD_OFF: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// What a tool worker reports.
 #[derive(Debug)]
@@ -55,7 +61,29 @@ impl ToolSheet {
             stage: Stage::Listing,
             listing: None,
             cursor: 0,
+            first_drawn: std::cell::Cell::new(None),
         }
+    }
+
+    /// The drawing code calls this each time it paints the sheet.
+    pub fn note_drawn(&self) {
+        if matches!(self.stage, Stage::Confirm(_)) && self.first_drawn.get().is_none() {
+            self.first_drawn.set(Some(std::time::Instant::now()));
+        }
+    }
+
+    /// Forgets when a confirm was drawn (a new confirm starts over).
+    pub fn disarm(&mut self) {
+        self.first_drawn.set(None);
+    }
+
+    /// Whether the confirm has been drawn at least once, [`HOLD_OFF`] ago.
+    pub fn armed(&self) -> bool {
+        matches!(self.stage, Stage::Confirm(_))
+            && self
+                .first_drawn
+                .get()
+                .is_some_and(|t| t.elapsed() >= HOLD_OFF)
     }
 
     /// Whether a worker is running for this sheet.
@@ -76,7 +104,7 @@ impl ToolSheet {
         match self.stage {
             Stage::Listing | Stage::Reviewing(_) => "Esc cancel (nothing is removed)",
             Stage::Choose => "↑↓ choose · Enter review · Esc close",
-            Stage::Confirm(_) => "Enter run the command above · Esc back, nothing runs",
+            Stage::Confirm(_) => "Y remove (cannot be undone) · Esc cancel",
             Stage::Refused { .. } => "Esc back",
             Stage::Running(_) => "Running: keys wait until the manager finishes",
             Stage::Done(_) => "Esc close · R refresh swamp's measurements",

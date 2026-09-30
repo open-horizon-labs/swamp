@@ -260,6 +260,8 @@ pub struct App {
     /// The one tool worker in flight (listing, review or removal): one at
     /// a time, never on this thread.
     tool_rx: Option<std::sync::mpsc::Receiver<crate::tool_sheet::ToolEvent>>,
+    /// A confirm just appeared: queued input is dropped before any key.
+    confirm_drain: bool,
     /// How tool removal reaches the machine: the real managers, or a
     /// test's sandbox of fakes.
     pub tool_host: swamp_core::tool_removal::Host,
@@ -640,6 +642,7 @@ impl App {
             cargo_inspection_scroll: 0,
             tool_sheet: None,
             tool_rx: None,
+            confirm_drain: false,
             tool_host: swamp_core::tool_removal::Host::system(),
             operation: None,
             operation_rx: None,
@@ -3135,11 +3138,9 @@ impl App {
     /// exactly its command (after the re-review `execute` does).
     pub fn tool_enter(&mut self) {
         use crate::tool_sheet::{Stage, ToolEvent};
-        let store = swamp_core::fs_gate::StoreDir::resolved();
         if self.tool_rx.is_some() {
             return;
         }
-        let (w, h) = (self.width, self.height);
         let sizes = self.tool_sizes();
         let host = self.tool_host.clone();
         let Some(sheet) = self.tool_sheet.as_mut() else {
@@ -3164,22 +3165,48 @@ impl App {
                     let _ = tx.send(ToolEvent::Reviewed(r));
                 });
             }
-            Stage::Confirm(preview) => {
-                // Enter runs only what the human can see in full.
-                if h != 0 && !crate::tool_sheet::confirm_fits(preview, w, h) {
-                    return;
-                }
-                let preview = preview.clone();
-                sheet.stage = Stage::Running(preview.title().to_string());
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.tool_rx = Some(rx);
-                crate::worker::spawn(move || {
-                    let out = crate::actions::run_tool_removal(&host, &preview, &sizes, &store);
-                    let _ = tx.send(ToolEvent::Ran(Box::new(out)));
-                });
-            }
+            // Enter never runs a removal: a held, queued or pasted Enter
+            // that opened the review must not also confirm it. Only `Y`
+            // on the confirm does ([`App::tool_remove_key`]).
             _ => {}
         }
+    }
+
+    /// `Y` on the confirm: runs exactly the drawn preview's command, and
+    /// only when the confirm has been drawn, in full, at a known size, at
+    /// least [`crate::tool_sheet::HOLD_OFF`] ago.
+    pub fn tool_remove_key(&mut self) {
+        use crate::tool_sheet::{Stage, ToolEvent};
+        if self.tool_rx.is_some() {
+            return;
+        }
+        let store = swamp_core::fs_gate::StoreDir::resolved();
+        let (w, h) = (self.width, self.height);
+        let sizes = self.tool_sizes();
+        let host = self.tool_host.clone();
+        let Some(sheet) = self.tool_sheet.as_mut() else {
+            return;
+        };
+        let Stage::Confirm(preview) = &sheet.stage else {
+            return;
+        };
+        if w == 0 || h == 0 || !crate::tool_sheet::confirm_fits(preview, w, h) || !sheet.armed() {
+            return;
+        }
+        let preview = preview.clone();
+        sheet.stage = Stage::Running(preview.title().to_string());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tool_rx = Some(rx);
+        crate::worker::spawn(move || {
+            let out = crate::actions::run_tool_removal(&host, &preview, &sizes, &store);
+            let _ = tx.send(ToolEvent::Ran(Box::new(out)));
+        });
+    }
+
+    /// True once after a confirm appears: the event loop then drops every
+    /// input event already queued (typeahead, key repeat, a paste).
+    pub fn take_confirm_drain(&mut self) -> bool {
+        std::mem::replace(&mut self.confirm_drain, false)
     }
 
     /// Esc in the sheet: back one step, or close. A running removal is
@@ -3253,7 +3280,11 @@ impl App {
                     refusal,
                 };
             }
-            ToolEvent::Reviewed(Ok(preview)) => sheet.stage = Stage::Confirm(preview),
+            ToolEvent::Reviewed(Ok(preview)) => {
+                sheet.stage = Stage::Confirm(preview);
+                sheet.disarm();
+                self.confirm_drain = true;
+            }
             ToolEvent::Reviewed(Err(refusal)) => {
                 let what = sheet
                     .listing

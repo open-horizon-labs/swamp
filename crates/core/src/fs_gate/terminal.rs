@@ -14,7 +14,7 @@
 #![allow(unsafe_code)]
 
 /// Leave the alternate screen, show the cursor, reset attributes.
-const RESTORE: &[u8] = b"\x1b[?1049l\x1b[?25h\x1b[0m";
+const RESTORE: &[u8] = b"\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m";
 
 struct Saved(std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>);
 // SAFETY: written once, while `ARMED` is false, before it is set with

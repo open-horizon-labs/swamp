@@ -290,7 +290,7 @@ fn the_mise_row_opens_the_managers_list_and_never_marks_for_trash() {
     assert!(app.marked.is_empty());
     for (w, h) in [(80u16, 24u16), (120, 30)] {
         let r = rows(&mut app, w, h);
-        row_of(&r, "every version mise reports prunable (1)");
+        row_of(&r, "go@1.23.5  mise reports prunable");
         row_of(&r, "node@24.14.1");
         assert!(
             r[h as usize - 3].contains("Enter review"),
@@ -333,7 +333,7 @@ fn the_confirm_rows_never_move_and_the_keys_stay_visible() {
             row_of(&r, "mise says:");
             row_of(&r, "mise's dry run (verbatim):");
             assert!(
-                r[h as usize - 3].contains("Enter run the command above"),
+                r[h as usize - 3].contains("Y remove (cannot be undone) · Esc cancel"),
                 "keys row:\n{}",
                 r.join("\n")
             );
@@ -402,8 +402,10 @@ fn enter_runs_the_drawn_command_and_the_result_is_plain() {
         .trim_matches(|c: char| c == '│' || c.is_whitespace())
         .to_string();
     let words = swamp_core::tool_removal::parse_command_line(&drawn);
-    // Enter, the key itself (the sandbox host records in its own store).
-    handle_key(&mut app, KeyCode::Enter);
+    // `Y`, after the confirm has been on screen for the hold-off (the
+    // sandbox host records in its own store).
+    std::thread::sleep(swamp_tui::tool_sheet::HOLD_OFF + Duration::from_millis(50));
+    handle_key(&mut app, KeyCode::Char('Y'));
     wait(&mut app);
     let ran: Vec<Vec<String>> = f
         .calls()
@@ -444,7 +446,8 @@ fn enter_on_a_confirm_that_does_not_fit_runs_nothing() {
     handle_key(&mut app, KeyCode::Enter);
     wait(&mut app);
     rows(&mut app, 60, 10);
-    handle_key(&mut app, KeyCode::Enter);
+    std::thread::sleep(swamp_tui::tool_sheet::HOLD_OFF + Duration::from_millis(50));
+    handle_key(&mut app, KeyCode::Char('Y'));
     assert!(matches!(
         app.tool_sheet.as_ref().unwrap().stage,
         Stage::Confirm(_)
@@ -522,7 +525,7 @@ fn simulator_runtime_confirm_names_devices_and_a_booted_one_refuses() {
         row_of(&r, "Warning: 2 simulator devices on this runtime");
         row_of(&r, "(simctl's sizeBytes)");
         row_of(&r, "Reinstall is a download of");
-        assert!(r[h as usize - 3].contains("Enter run the command above"));
+        assert!(r[h as usize - 3].contains("Y remove (cannot be undone)"));
         assert_plain(&r);
     }
     let f = Fakes::new();
@@ -532,7 +535,7 @@ fn simulator_runtime_confirm_names_devices_and_a_booted_one_refuses() {
     wait(&mut app);
     for (w, h) in [(80u16, 24u16), (120, 30)] {
         let r = rows(&mut app, w, h);
-        row_of(&r, "iPhone 17 Pro is booted on this runtime");
+        row_of(&r, "iPhone 17 Pro (Booted) is not shut down");
         row_of(&r, "Next: Shut it down in Simulator");
         assert_plain(&r);
     }
@@ -541,4 +544,85 @@ fn simulator_runtime_confirm_names_devices_and_a_booted_one_refuses() {
         "{:?}",
         f.calls()
     );
+}
+
+fn uninstalls(f: &Fakes) -> usize {
+    f.calls()
+        .iter()
+        .filter(|c| c[1..] == ["-C", "/", "uninstall", "go@1.23.5"])
+        .count()
+}
+
+/// Owner decision C1. Tempting wrong patch: "Enter on the confirm runs
+/// it". Typeahead, a double or held Enter, and a pasted newline (it
+/// arrives as Enter without bracketed paste) never run a removal: Enter
+/// only opens the review; running takes `Y`.
+#[test]
+fn no_enter_ever_runs_a_removal() {
+    let f = Fakes::new();
+    f.mise(0);
+    let mut app = f.app();
+    rows(&mut app, 120, 30);
+    choose(&mut app, "go@1.23.5");
+    for _ in 0..3 {
+        handle_key(&mut app, KeyCode::Enter); // held Enter
+    }
+    wait(&mut app);
+    rows(&mut app, 120, 30);
+    std::thread::sleep(swamp_tui::tool_sheet::HOLD_OFF + Duration::from_millis(50));
+    for _ in 0..5 {
+        handle_key(&mut app, KeyCode::Enter); // typeahead, paste, repeat
+        rows(&mut app, 120, 30);
+    }
+    wait(&mut app);
+    assert_eq!(uninstalls(&f), 0, "{:?}", f.calls());
+    assert!(matches!(
+        app.tool_sheet.as_ref().unwrap().stage,
+        Stage::Confirm(_)
+    ));
+}
+
+/// Tempting wrong patch: "Y is enough". `Y` before the confirm has been
+/// drawn, and `Y` within the hold-off after its first draw, run nothing;
+/// `Y` after it runs exactly once.
+#[test]
+fn y_runs_only_after_the_confirm_has_been_seen_for_the_hold_off() {
+    let f = Fakes::new();
+    f.mise(0);
+    let mut app = f.app();
+    rows(&mut app, 120, 30);
+    choose(&mut app, "go@1.23.5");
+    handle_key(&mut app, KeyCode::Enter);
+    handle_key(&mut app, KeyCode::Char('Y')); // typed ahead, during review
+    wait(&mut app);
+    handle_key(&mut app, KeyCode::Char('Y')); // never drawn yet
+    rows(&mut app, 120, 30);
+    handle_key(&mut app, KeyCode::Char('Y')); // drawn, inside the hold-off
+    wait(&mut app);
+    assert_eq!(uninstalls(&f), 0, "{:?}", f.calls());
+    std::thread::sleep(swamp_tui::tool_sheet::HOLD_OFF + Duration::from_millis(50));
+    rows(&mut app, 120, 30);
+    handle_key(&mut app, KeyCode::Char('Y'));
+    handle_key(&mut app, KeyCode::Char('Y'));
+    wait(&mut app);
+    assert_eq!(uninstalls(&f), 1, "{:?}", f.calls());
+}
+
+/// The keys row names the remove key and says it cannot be undone.
+#[test]
+fn the_confirm_keys_row_names_the_remove_key() {
+    let f = Fakes::new();
+    f.mise(0);
+    let mut app = f.app();
+    choose(&mut app, "go@1.23.5");
+    handle_key(&mut app, KeyCode::Enter);
+    wait(&mut app);
+    for (w, h) in [(80u16, 24u16), (120, 30)] {
+        let r = rows(&mut app, w, h);
+        assert!(
+            r[h as usize - 3].contains("Y remove (cannot be undone) · Esc cancel"),
+            "{}",
+            r.join("\n")
+        );
+    }
 }
