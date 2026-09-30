@@ -362,12 +362,21 @@ fn adv2_old_ui_state_with_removed_view_keys_loads() {
 fn adv2_every_view_every_size_keeps_the_legend() {
     let mut bad = Vec::new();
     let mut sizes = Vec::new();
-    for w in 1..=200u16 {
-        for h in [1u16, 2, 3, 4, 5, 8, 24, 60] {
+    // Every width to 24, then every 10th to 200 (and the edges); heights
+    // likewise: enough to catch width and height math at small sizes and
+    // at the thresholds (12, 16, 22) without a minute of debug rendering.
+    let sampled = |max: u16| -> Vec<u16> {
+        (1..=24u16)
+            .chain((30..=max).step_by(10))
+            .chain([max])
+            .collect()
+    };
+    for w in sampled(200) {
+        for h in [1u16, 2, 3, 4, 5, 8, 11, 12, 15, 16, 21, 22, 24, 60] {
             sizes.push((w, h));
         }
     }
-    for h in 1..=60u16 {
+    for h in sampled(60) {
         for w in [1u16, 10, 20, 40, 80, 200] {
             sizes.push((w, h));
         }

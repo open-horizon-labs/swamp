@@ -731,8 +731,8 @@ pub struct UiState {
     pub reverse: bool,
     #[serde(default)]
     pub keep_executables: bool,
-    /// The person has opened Reclaim or Disk once: the "New: press c for
-    /// Reclaim" line is not shown again. Additive: an older swamp ignores
+    /// The person has opened Tools or Disk once: the "New: Tab opens Tools
+    /// and Disk" line is not shown again. Additive: an older swamp ignores
     /// the key and keeps its own.
     #[serde(default)]
     pub views_seen: bool,

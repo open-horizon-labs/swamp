@@ -861,3 +861,136 @@ fn the_reclaim_pointer_names_the_jump_key_not_tab() {
         "{last}"
     );
 }
+
+/// Tempting wrong patch: an open confirm lets the cursor, the views or the
+/// marks move under it, so Enter confirms a plan the person no longer sees.
+/// Every such key is swallowed; the keys the confirm uses still work.
+#[test]
+fn an_open_confirm_swallows_every_key_that_would_change_what_is_under_it() {
+    let keys = [
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Home,
+        KeyCode::End,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Char('v'),
+        KeyCode::Char('1'),
+        KeyCode::Char('2'),
+        KeyCode::Char('3'),
+        KeyCode::Char('/'),
+        KeyCode::Char(':'),
+        KeyCode::Char('0'),
+        KeyCode::Char(' '),
+        KeyCode::Char('A'),
+    ];
+    for k in keys {
+        let mut a = app();
+        a.selected = 1.min(a.rows().len().saturating_sub(1));
+        a.confirm_open = true;
+        let (view, sel, filter) = (a.view, a.selected, a.filter_text.clone());
+        swamp_tui::handle_key(&mut a, k);
+        assert!(a.confirm_open, "{k:?} closed the confirm");
+        assert_eq!(a.view, view, "{k:?} changed the view under the confirm");
+        assert_eq!(a.selected, sel, "{k:?} moved the cursor under the confirm");
+        assert_eq!(a.filter_text, filter, "{k:?}");
+        assert!(!a.editing_filter && a.picker.is_none(), "{k:?}");
+    }
+    // Esc still takes it back.
+    let mut a = app();
+    a.confirm_open = true;
+    swamp_tui::handle_key(&mut a, KeyCode::Esc);
+    assert!(!a.confirm_open);
+}
+
+/// Every key the legend or help names is bound in that mode: the legend's
+/// keys are read from the drawn footer and pressed.
+#[test]
+fn every_key_the_legend_names_does_something() {
+    let a = app();
+    let legend = frame(&a, 200, 24).pop().unwrap();
+    // "Tab section  v view  / filter  R refresh  ..." -> the key of each item.
+    let mut bound = 0;
+    for item in legend.split("  ") {
+        let key = item.split(' ').next().unwrap_or("");
+        let code = match key {
+            "Tab" => KeyCode::Tab,
+            "v" => KeyCode::Char('v'),
+            "/" => KeyCode::Char('/'),
+            // R needs a store and a scope to start a scan; its own tests
+            // (refresh_now, r_while_another_observation_runs) press it.
+            "R" => continue,
+            // Marking and removal start background work that needs a store;
+            // their tests press them. Here: the main keymap binds each.
+            "⌫" | "Space" | "A" | "↑↓" | "→/←" => {
+                let src = include_str!("../src/lib.rs");
+                let pat = match key {
+                    "⌫" => "KeyCode::Backspace =>",
+                    "Space" => "KeyCode::Char(' ') =>",
+                    "↑↓" => "KeyCode::Down =>",
+                    "→/←" => "KeyCode::Right =>",
+                    _ => "KeyCode::Char('A') =>",
+                };
+                assert!(
+                    src.contains(pat),
+                    "the legend names {key:?} but the keymap lacks {pat}"
+                );
+                bound += 1;
+                continue;
+            }
+            "g/s/n/t/a" => KeyCode::Char('g'),
+            "r" => KeyCode::Char('r'),
+            "?" => KeyCode::Char('?'),
+            "q" => KeyCode::Char('q'),
+            "" => continue,
+            other => {
+                panic!("the legend names {other:?}, which this test does not know how to press")
+            }
+        };
+        let mut b = app();
+        // Something to act on, in a mode that can be seen to change.
+        let before = (
+            b.view,
+            b.selected,
+            b.sort,
+            b.reverse,
+            b.help_open,
+            b.picker.is_some(),
+            b.quit,
+            b.operation.is_some()
+                || b.pending.is_some()
+                || b.refusal_active().is_some()
+                || b.status.is_some()
+                || b.last_result.is_some()
+                || !b.marked.is_empty()
+                || b.confirm_open,
+        );
+        swamp_tui::handle_key(&mut b, code);
+        let after = (
+            b.view,
+            b.selected,
+            b.sort,
+            b.reverse,
+            b.help_open,
+            b.picker.is_some(),
+            b.quit,
+            b.operation.is_some()
+                || b.pending.is_some()
+                || b.refusal_active().is_some()
+                || b.status.is_some()
+                || b.last_result.is_some()
+                || !b.marked.is_empty()
+                || b.confirm_open,
+        );
+        assert_ne!(
+            before, after,
+            "the legend names {key:?} but pressing it does nothing"
+        );
+        bound += 1;
+    }
+    assert!(bound >= 10, "{legend}");
+}

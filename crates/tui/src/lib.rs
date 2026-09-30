@@ -161,6 +161,30 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         return;
     }
+    // An open confirm is its own small mode: the plan on screen is what
+    // Enter would run, so nothing may change what is under it. Keys that
+    // move the cursor, switch views or sections, open the filter, or mark
+    // and unmark are swallowed; the ones it uses (Enter, Esc, d, b, k, ?,
+    // R, q) fall through to the arms below.
+    if app.confirm_open
+        && matches!(
+            code,
+            KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Backspace
+                | KeyCode::Char('v' | '0'..='3' | '/' | ':' | ' ' | 'A')
+        )
+    {
+        return;
+    }
     match code {
         KeyCode::Char('q') => app.quit = true,
         KeyCode::Char('b') => app.open_blocked(),
