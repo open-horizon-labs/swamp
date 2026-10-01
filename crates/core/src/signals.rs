@@ -352,15 +352,73 @@ pub fn tip_sha(dir: &Path) -> Option<String> {
 /// locally from the repository's own refs (no network, no `gh`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TipReach {
-    /// HEAD is an ancestor of (or equal to) this branch's tip: a short
-    /// remote-tracking name (`origin/feat`) or a local default branch.
-    Reachable(String),
+    /// HEAD is an ancestor of (or equal to) this branch's tip.
+    Reachable(TipBranch),
     /// HEAD is in no remote-tracking branch and not in the default
     /// branch, every one of which was checked.
     NotReachable,
     /// Not established: unborn HEAD, a lookup failed, or the time/ref
     /// budget ran out before every branch was checked.
     Unknown,
+}
+
+/// The branch a worktree's HEAD was found in, and how old that evidence
+/// is. Equality is the branch's identity (name and kind); the fetch date
+/// is evidence about it, not part of it.
+#[derive(Debug, Clone, Eq)]
+pub struct TipBranch {
+    /// `origin/feat`, or `main` for a local branch.
+    pub name: String,
+    /// A local branch (in the common `.git`, not pushed by this fact).
+    pub local: bool,
+    /// Unix seconds of the last fetch that could have updated a remote
+    /// tracking ref; `None` when it cannot be told.
+    pub fetched_at: Option<u64>,
+}
+
+impl PartialEq for TipBranch {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.local == other.local
+    }
+}
+
+impl From<&str> for TipBranch {
+    fn from(name: &str) -> Self {
+        TipBranch::remote(name.to_string(), None)
+    }
+}
+
+impl TipBranch {
+    pub fn remote(name: String, fetched_at: Option<u64>) -> Self {
+        TipBranch {
+            name,
+            local: false,
+            fetched_at,
+        }
+    }
+
+    pub fn local(name: String) -> Self {
+        TipBranch {
+            name,
+            local: true,
+            fetched_at: None,
+        }
+    }
+
+    /// The words inside the parentheses of `tip_reachable=yes (...)`.
+    pub fn describe(&self, now: u64) -> String {
+        if self.local {
+            return format!("local {}, not pushed", self.name);
+        }
+        match self.fetched_at {
+            Some(t) => format!(
+                "{}, as of last fetch {}",
+                self.name,
+                crate::last_used::format_day(t, now)
+            ),
+            None => format!("{}, fetch time unknown", self.name),
+        }
+    }
 }
 
 /// Time one worktree's local ancestry check may take before it reports

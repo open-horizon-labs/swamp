@@ -179,7 +179,9 @@ impl Consumer for AssemblyGate {
                     worktree.signals.push(Signal {
                         name: "tip_reachable".to_string(),
                         value: match &tip {
-                            crate::signals::TipReach::Reachable(b) => format!("yes ({b})"),
+                            crate::signals::TipReach::Reachable(b) => {
+                                format!("yes ({})", b.describe(crate::entities::now()))
+                            }
                             crate::signals::TipReach::NotReachable => "no".to_string(),
                             crate::signals::TipReach::Unknown => "unknown".to_string(),
                         },

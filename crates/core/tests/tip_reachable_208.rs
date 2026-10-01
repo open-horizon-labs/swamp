@@ -108,11 +108,13 @@ fn detached_head_is_judged_by_its_commit() {
     assert_eq!(reach(&w), TipReach::NotReachable);
 }
 
-/// Tempting wrong patch: no remote means reachable-or-unknown. With no
-/// remote-tracking branch and the commit only on a feature branch the
-/// answer is a plain no; the commit on the local default branch is yes.
+/// Tempting wrong patch: no remote means reachable-or-unknown, or a local
+/// default branch counts anywhere. With no remote-tracking branch the answer
+/// is a plain no in a primary checkout (the local branch lives in the same
+/// `.git`), and a linked worktree may count the local default branch, named
+/// as local and not pushed.
 #[test]
-fn no_remote_is_no_unless_the_local_default_branch_has_it() {
+fn no_remote_is_no_and_a_local_branch_counts_only_from_a_linked_worktree() {
     let tmp = tempfile::tempdir().unwrap();
     let w = tmp.path().join("solo");
     std::fs::create_dir_all(&w).unwrap();
@@ -123,8 +125,26 @@ fn no_remote_is_no_unless_the_local_default_branch_has_it() {
     assert_eq!(reach(&w), TipReach::NotReachable);
     git(&w, &["checkout", "-q", "main"]);
     git(&w, &["merge", "-q", "--ff-only", "feat"]);
-    git(&w, &["checkout", "-q", "feat"]);
-    assert_eq!(reach(&w), TipReach::Reachable("main".into()));
+    assert_eq!(reach(&w), TipReach::NotReachable, "primary checkout");
+    let linked = tmp.path().join("linked");
+    git(
+        &w,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            linked.to_str().unwrap(),
+        ],
+    );
+    match reach(&linked) {
+        TipReach::Reachable(b) => {
+            assert!(b.local);
+            assert_eq!(b.describe(0), "local main, not pushed");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Tempting wrong patch: the worktree's own branch counts, so the main
@@ -163,7 +183,7 @@ fn merge_complete_keeps_merged_as_the_pr_fact_and_names_the_branch() {
     assert!(mc.terms.contains(&"merged=unknown".to_string()), "{mc:?}");
     assert!(
         mc.terms
-            .contains(&"tip_reachable=yes (origin/audit/x)".to_string()),
+            .contains(&"tip_reachable=yes (origin/audit/x, fetch time unknown)".to_string()),
         "{mc:?}"
     );
     assert_eq!(mc.verdict, TriState::Unknown);

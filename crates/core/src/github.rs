@@ -1739,7 +1739,10 @@ pub fn merge_complete(
         term_str("clean", clean_term),
         unpushed_str,
         match tip {
-            TipReach::Reachable(branch) => format!("tip_reachable=yes ({branch})"),
+            TipReach::Reachable(branch) => format!(
+                "tip_reachable=yes ({})",
+                branch.describe(crate::entities::now())
+            ),
             _ => term_str("tip_reachable", tip_reachable_term),
         },
     ];
