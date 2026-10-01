@@ -68,6 +68,11 @@ pub fn current_uid() -> u32 {
     sys::current_uid()
 }
 
+/// Whether a process with this pid exists (`kill(pid, 0)`; no spawn).
+pub fn pid_alive(pid: u32) -> bool {
+    sys::pid_alive(pid)
+}
+
 /// A swamp state directory (see [`store::StoreDir`]). Named here so any
 /// module can hold or pass one; building one from a caller's path
 /// (`StoreDir::at`) is the store modules' capability.

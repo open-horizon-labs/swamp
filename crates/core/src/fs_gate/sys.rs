@@ -492,3 +492,46 @@ pub(crate) fn group_name(gid: u32) -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+/// Whether a process with this pid exists: `kill(pid, 0)`. `EPERM` (it
+/// exists but belongs to someone else) is alive; `ESRCH` is gone. A pid
+/// that does not fit a `pid_t`, or 0 (this process group), is not alive.
+pub fn pid_alive(pid: u32) -> bool {
+    let Ok(p) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if p <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks; nothing is delivered.
+    if unsafe { libc::kill(p, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(test)]
+mod pid_alive_tests {
+    /// A live child, the same child after it is reaped, and pid 1 (alive,
+    /// not ours: `EPERM`). Tempting wrong patch: `kill(pid, 0) == 0` only,
+    /// which reads another user's live lock holder as dead and reclaims it.
+    #[test]
+    fn live_dead_and_eperm() {
+        assert!(super::pid_alive(std::process::id()));
+        assert!(super::pid_alive(1), "pid 1 exists (EPERM for a user)");
+        assert!(!super::pid_alive(0));
+        assert!(!super::pid_alive(u32::MAX));
+        // A pid that existed and is gone: a short-lived thread is not a
+        // process, so use a forked child via libc, reaped before the check.
+        // SAFETY: the child calls only _exit.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        assert!(child > 0);
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(!super::pid_alive(child as u32), "a reaped child is gone");
+    }
+}

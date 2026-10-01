@@ -54,8 +54,6 @@ pub enum Program {
     Id,
     /// The scheduled refresh's LaunchAgent (`launchctl bootstrap|bootout|…`).
     Launchctl,
-    /// Liveness of the observation lock holder (`kill -0 <pid>`).
-    Kill,
     /// `brew --prefix` (detector query) and, in a scheduled `observe`
     /// only, the two read-only manager reports (`autoremove --dry-run`,
     /// `list --formula --installed-on-request`).
@@ -99,7 +97,6 @@ impl Program {
         Program::Df,
         Program::Id,
         Program::Launchctl,
-        Program::Kill,
         Program::Brew,
         Program::Mise,
         Program::Defaults,
@@ -109,7 +106,8 @@ impl Program {
         Program::Tmutil,
     ];
 
-    /// The executable name looked up on `PATH`.
+    /// The program's file name (its fixed locations are
+    /// `fs_gate::program_paths::candidates`; `PATH` is never searched).
     pub fn binary(self) -> &'static str {
         match self {
             Program::Lsof => "lsof",
@@ -122,7 +120,6 @@ impl Program {
             Program::Df => "df",
             Program::Id => "id",
             Program::Launchctl => "launchctl",
-            Program::Kill => "kill",
             Program::Brew => "brew",
             Program::Mise => "mise",
             Program::Defaults => "defaults",
@@ -130,18 +127,6 @@ impl Program {
             Program::Loginctl => "loginctl",
             Program::Diskutil => "diskutil",
             Program::Tmutil => "tmutil",
-        }
-    }
-
-    /// What is executed. `diskutil` and `tmutil` are fixed absolute paths:
-    /// an earlier directory on `PATH` (a shim, a hostile directory) is
-    /// never the program a volume pass runs. Everything else resolves
-    /// through `PATH` as before.
-    pub fn executable(self) -> &'static str {
-        match self {
-            Program::Diskutil => "/usr/sbin/diskutil",
-            Program::Tmutil => "/usr/bin/tmutil",
-            other => other.binary(),
         }
     }
 
@@ -190,8 +175,6 @@ enum Slot {
     DockerRef,
     /// One or more [`Slot::DockerRef`]s (a batched `inspect`).
     DockerRefs,
-    /// A decimal number (a pid).
-    Number,
     /// `gui/<uid>` (a launchd domain).
     LaunchdDomain,
     /// `gui/<uid>/<label>` for swamp's own label.
@@ -287,7 +270,6 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("bootout"), LaunchdService],
             &[Lit("unload"), Lit("-w"), SwampPlist],
         ],
-        Program::Kill => &[&[Lit("-0"), Number]],
         // `brew --prefix` is the detector's query. The manager reports are
         // not shapes at all: they run only as a `ManagerCommand`, which
         // builds its own argv, so no other caller can run `brew
@@ -459,7 +441,6 @@ fn matches_shape(shape: &[Slot], args: &[String]) -> bool {
             Slot::Lit(w) => a == w,
             Slot::AbsPath => a.starts_with('/'),
             Slot::DockerRef => docker_ref(a),
-            Slot::Number => digits(a),
             Slot::LaunchdDomain => a.strip_prefix("gui/").is_some_and(digits),
             Slot::LaunchdService => a
                 .strip_prefix("gui/")
@@ -652,10 +633,29 @@ impl Running {
     ) -> io::Result<Self> {
         use std::os::unix::process::CommandExt;
         install_cleanup_once();
-        crate::work_counters::record_spawn();
+        // Counted once per start, in each arm right above its
+        // `Command::new` (the guard test pairs the two).
         let mut command = match plan {
-            super::program_paths::Plan::Inherit(exe) => Command::new(exe),
+            #[cfg(test)]
+            super::program_paths::Plan::Inherit(exe) => {
+                crate::work_counters::record_spawn();
+                Command::new(exe)
+            }
+            super::program_paths::Plan::Fixed { exe, arg0, path } => {
+                crate::work_counters::record_spawn();
+                let mut c = Command::new(exe);
+                c.arg0(arg0).env("PATH", path);
+                for (k, _) in std::env::vars_os() {
+                    if k.to_str()
+                        .is_some_and(super::program_paths::removed_for_fixed)
+                    {
+                        c.env_remove(k);
+                    }
+                }
+                c
+            }
             super::program_paths::Plan::Scrubbed(s) => {
+                crate::work_counters::record_spawn();
                 let mut c = Command::new(&s.exe);
                 c.env_clear()
                     .envs(s.env.iter().cloned())
@@ -1322,10 +1322,19 @@ mod tests {
         assert!(grand > 0, "grandchild never started");
         // SAFETY: getpgid only reads.
         let pgid = unsafe { libc::getpgid(grand) };
-        assert!(
+        // The parent registers the group right after `spawn` returns, but
+        // the child can fork and write its pid file before that (#203: the
+        // scan raced the registration on a loaded runner). Wait for the
+        // registration itself, bounded; never for a fixed time.
+        let registered = |p: i32| {
             LIVE.iter()
-                .any(|s| s.load(std::sync::atomic::Ordering::SeqCst) == pgid)
-        );
+                .any(|s| s.load(std::sync::atomic::Ordering::SeqCst) == p)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !registered(pgid) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(registered(pgid), "the child's group was never registered");
         // What the TUI cancel, the exit hook and the signal handler run.
         kill_registered(|p| p == pgid);
         let out = rx
@@ -1366,8 +1375,6 @@ mod tests {
                 vec!["-c", "core.pager=sh", "worktree", "list"],
             ),
             // Programs the old deny-list never looked at.
-            (Program::Kill, vec!["-9", "1"]),
-            (Program::Kill, vec!["1"]),
             (Program::Launchctl, vec!["remove", "com.apple.something"]),
             (Program::Brew, vec!["uninstall", "x"]),
             // The manager reports are the dry runs only. The tempting wrong
@@ -1513,7 +1520,6 @@ mod tests {
                     "ref0=refs/heads/main",
                 ],
             ),
-            (Program::Kill, vec!["-0", "123"]),
             (Program::Brew, vec!["--prefix"]),
             (Program::Id, vec!["-u"]),
             (Program::Df, vec!["-k", "/"]),

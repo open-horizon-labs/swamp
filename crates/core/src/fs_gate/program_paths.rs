@@ -1,32 +1,39 @@
-//! Where an allow-listed program is found, and what environment its
-//! child gets. One facility for every spawn that has been migrated to it
-//! (the package managers today; the rest under #199, and the tool-managed
-//! removal of #177 reuses it as is).
+//! Where every allow-listed program is found, and what environment its
+//! child gets (#199). The one facility for every spawn: the package
+//! managers, git, gh, docker, the system tools, and tool-managed removal
+//! (#177).
 //!
-//! The rules, for a program with a candidate list:
+//! The rules:
 //!
-//! * **Absolute path from a fixed list.** The executable is the first
-//!   candidate that is a regular file. The inherited `PATH` is never
-//!   consulted, so a `brew` or `mise` placed earlier on it (a shim, a
-//!   wrapper, a hostile checkout's `bin`) is never what swamp runs. None
-//!   present is `NotFound`, the same "not installed" a missing binary was.
-//! * **Environment from scratch.** The child starts with an empty
-//!   environment and gets only: a `PATH` of the program's own directory
-//!   plus `/usr/bin:/bin`, `HOME`, `NO_COLOR=1`, `LC_ALL=C`, pagers off and
-//!   Homebrew's auto-update, analytics, cleanup and hints off. The one
-//!   variables passed through are mise's own directory settings
-//!   (`MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`,
-//!   `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
-//!   `XDG_CACHE_HOME`): the same ones the mise detector honors, so the
-//!   probe describes the store the unit measures. Nothing else of
-//!   `HOMEBREW_*`, `MISE_*` or `RUSTUP_*` in swamp's own environment
-//!   reaches the child.
-//! * **A fixed working directory** (`/`): a manager that resolves local
-//!   configuration up the tree (mise) answers the same wherever swamp was
-//!   started.
-//!
-//! A program with no candidate list keeps its old behavior (its
-//! `Program::executable`, the inherited environment) until it is migrated.
+//! * **Absolute path from a fixed list** ([`candidates`], per program and
+//!   platform). The first candidate that exists is used or refused, never
+//!   skipped for a later one. The inherited `PATH` is never consulted, so
+//!   a program placed earlier on it (a shim, a wrapper, a hostile
+//!   checkout's `bin`) is never what swamp runs. None present is
+//!   `NotFound`: "not available", the same as not installed.
+//! * **Checked file and directories.** The real file is an executable
+//!   owned by the user or root, not group- or world-writable; the
+//!   candidate's directory, every directory a symlink chain passes
+//!   through, and the real file's directory are owned by the user or root,
+//!   not world-writable, and group-writable only for the macOS `admin`
+//!   group.
+//! * **Home-relative candidates** (`~/.local/bin`, `~/.cargo/bin`,
+//!   `~/.docker/bin`, `~/.orbstack/bin`) come after every system location:
+//!   any process the user runs can plant a file there, so they are used
+//!   only when no system location has the program, which is about the
+//!   trust the user's own `PATH` gives them.
+//! * **Environment.** `brew` and `mise` start from an empty environment
+//!   and get only: a `PATH` of the program's own directory plus
+//!   `/usr/bin:/bin`, `HOME`, `NO_COLOR=1`, `LC_ALL=C`, pagers off and
+//!   Homebrew's auto-update, analytics, cleanup and hints off, plus mise's
+//!   own directory settings (the ones the mise detector honors). Every
+//!   other program ([`Plan::Fixed`]) keeps the inherited environment for
+//!   its credentials and contexts, minus loader injection and exec hooks
+//!   ([`removed_for_fixed`]: `DYLD_*`, `LD_*`, `GIT_CONFIG*`, `GIT_SSH*`,
+//!   `GIT_EXEC_PATH`, ...) and with a fixed `PATH` ([`fixed_path`]).
+//! * **A fixed working directory** (`/`) for the managers: a manager that
+//!   resolves local configuration up the tree (mise) answers the same
+//!   wherever swamp was started.
 //!
 //! **Tests.** With swamp-core's `testing` feature (never in a shipped
 //! build graph) `SWAMP_TEST_PROGRAM_DIR` names a directory holding fakes:
@@ -40,10 +47,26 @@ use std::path::{Path, PathBuf};
 /// How a program is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// The program is not migrated to the scrubbed environment: it runs
-    /// as `Program::executable` says (an absolute path where one is
-    /// fixed, else a `PATH` lookup) with the inherited environment.
+    /// Unit tests of the spawn layer only: a bare name (`sh`) looked up
+    /// on `PATH`. No production spawn is planned this way (#199).
+    #[cfg(test)]
     Inherit(&'static str),
+    /// A program found at one of its fixed locations and checked like any
+    /// other (owner, mode, directory), run with the inherited environment:
+    /// `git`, `gh` and `docker` need the user's own credentials and
+    /// contexts, which a from-scratch environment would drop. Never a
+    /// `PATH` lookup (#199). `exe` is the checked, symlink-resolved file;
+    /// `arg0` is the program's own name, so a multi-call binary reached
+    /// through a link (OrbStack's `docker` -> `docker-tools`) still sees
+    /// the name it dispatches on.
+    Fixed {
+        exe: PathBuf,
+        arg0: &'static str,
+        /// The child's `PATH`: the program's own directory, then the
+        /// system directories, then Homebrew's and `/usr/local/bin` only
+        /// when they pass the directory check.
+        path: String,
+    },
     /// Absolute executable, a from-scratch environment and a fixed
     /// working directory.
     Scrubbed(Scrubbed),
@@ -56,32 +79,82 @@ pub struct Scrubbed {
     pub cwd: PathBuf,
 }
 
-/// The fixed locations of `program`, in order. Empty for a program that
-/// has no fixed list.
+/// The fixed locations of `program`, in order: the first that exists is
+/// the one used (and checked); none present is "not available". Never the
+/// inherited `PATH` (#199): a shim earlier on it is never what swamp runs.
+/// macOS and Linux lists differ where the programs live in different
+/// places; a location that does not exist on a platform simply never
+/// matches.
 pub(super) fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
+    let name = program.binary();
+    let at =
+        |dirs: &[&str]| -> Vec<PathBuf> { dirs.iter().map(|d| Path::new(d).join(name)).collect() };
+    // Linux: the system directories in search order, then Linuxbrew.
+    const LINUX_SYSTEM: &[&str] = &["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"];
+    const LINUXBREW: &str = "/home/linuxbrew/.linuxbrew/bin";
+    let linux_with_brew = || {
+        let mut c = at(LINUX_SYSTEM);
+        c.push(Path::new(LINUXBREW).join(name));
+        c
+    };
+    let mac = cfg!(target_os = "macos");
+    // A relative HOME would name these against the working directory,
+    // which is whatever checkout swamp was started in.
+    let in_home = |c: &mut Vec<PathBuf>, rels: &[&str]| {
+        if home.is_absolute() {
+            c.extend(rels.iter().map(|r| home.join(r)));
+        }
+    };
     match program {
-        Program::Brew => vec![
-            PathBuf::from("/opt/homebrew/bin/brew"),
-            PathBuf::from("/usr/local/bin/brew"),
-            PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"),
-        ],
-        Program::Mise => {
-            let mut c = vec![
-                PathBuf::from("/opt/homebrew/bin/mise"),
-                PathBuf::from("/usr/local/bin/mise"),
-            ];
-            // A relative HOME would name these against the working
-            // directory, which is whatever checkout swamp was started in.
-            if home.is_absolute() {
-                c.push(home.join(".local/bin/mise"));
-                c.push(home.join(".cargo/bin/mise"));
-            }
+        Program::Brew if mac => at(&["/opt/homebrew/bin", "/usr/local/bin"]),
+        Program::Brew => {
+            let mut c = vec![Path::new(LINUXBREW).join(name)];
+            c.extend(at(&["/usr/local/bin", "/usr/bin"]));
             c
         }
-        // Tool-managed removal's simulator runtimes (#177). Not migrated for
-        // the detector's own `simctl list devices -j` yet (#199).
-        Program::Xcrun => vec![PathBuf::from("/usr/bin/xcrun")],
-        _ => Vec::new(),
+        Program::Mise => {
+            let mut c = if mac {
+                at(&["/opt/homebrew/bin", "/usr/local/bin"])
+            } else {
+                let mut c = at(&["/usr/local/bin", "/usr/bin"]);
+                c.push(Path::new(LINUXBREW).join(name));
+                c
+            };
+            in_home(&mut c, &[".local/bin/mise", ".cargo/bin/mise"]);
+            c
+        }
+        // macOS-only programs: Apple's own locations.
+        Program::Xcrun | Program::Plutil | Program::Defaults | Program::Tmutil => at(&["/usr/bin"]),
+        Program::Diskutil => at(&["/usr/sbin"]),
+        Program::Launchctl => at(&["/bin"]),
+        Program::Lsof if mac => at(&["/usr/sbin"]),
+        Program::Du | Program::Id if mac => at(&["/usr/bin"]),
+        Program::Df if mac => at(&["/bin"]),
+        // Linux-only programs, and the system tools on Linux.
+        Program::Systemctl
+        | Program::Loginctl
+        | Program::Lsof
+        | Program::Du
+        | Program::Df
+        | Program::Id => at(LINUX_SYSTEM),
+        // Homebrew's first on macOS: it is the git/gh the user installed
+        // and runs; `/usr/bin/git` is Apple's.
+        Program::Git | Program::Gh if mac => {
+            at(&["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"])
+        }
+        Program::Git | Program::Gh => linux_with_brew(),
+        // Docker Desktop and OrbStack both link `/usr/local/bin/docker`;
+        // OrbStack also installs `~/.orbstack/bin`, Docker Desktop
+        // `~/.docker/bin`. Linux packages install `/usr/bin/docker`.
+        Program::Docker => {
+            let mut c = if mac {
+                at(&["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin"])
+            } else {
+                linux_with_brew()
+            };
+            in_home(&mut c, &[".docker/bin/docker", ".orbstack/bin/docker"]);
+            c
+        }
     }
 }
 
@@ -241,12 +314,28 @@ pub(super) fn resolve_strict(candidates: &[PathBuf]) -> Result<Resolved, String>
     let exe = std::fs::canonicalize(found)
         .map_err(|e| format!("{} could not be resolved: {e}", found.display()))?;
     trusted_file(&exe)?;
+    // Every directory the path passes through on its way to the file is
+    // checked: the candidate's own, each link's in a chain, the real
+    // file's. A link planted in a writable directory, pointing at a
+    // perfectly trusted binary, is still a link anyone could repoint.
+    let mut cur = found.clone();
+    for _ in 0..40 {
+        let dir = cur.parent().map(Path::to_path_buf).unwrap_or_default();
+        trusted_dir(&dir)?;
+        match std::fs::read_link(&cur) {
+            Ok(next) => {
+                cur = if next.is_absolute() {
+                    next
+                } else {
+                    dir.join(next)
+                }
+            }
+            Err(_) => break,
+        }
+    }
     let real_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     trusted_dir(&real_dir)?;
-    let path_head = match found.parent() {
-        Some(d) if trusted_dir(d).is_ok() => d.to_path_buf(),
-        _ => real_dir,
-    };
+    let path_head = found.parent().map(Path::to_path_buf).unwrap_or(real_dir);
     Ok(Resolved { exe, path_head })
 }
 
@@ -377,12 +466,75 @@ fn developer_dir_ok(d: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// How to start `program`. `NotFound` when it is migrated and no
-/// candidate exists.
-pub fn plan(program: Program) -> io::Result<Plan> {
-    if !migrated(program) {
-        return Ok(Plan::Inherit(program.executable()));
+/// Inherited variables a `Plan::Fixed` child never sees (#199): loader
+/// injection, and every variable through which git, gh, ssh or a shell
+/// runs a program or reads configuration the user did not write to their
+/// own config files (a checkout's direnv or mise `[env]` can set any of
+/// them). Exact names and prefixes; everything else (credentials and
+/// contexts: `HOME`, `DOCKER_*`, `GH_TOKEN`, `XDG_*`, `SSH_AUTH_SOCK`,
+/// `TMPDIR`, `LANG`/`LC_*`) passes.
+const FIXED_REMOVED_PREFIXES: &[&str] = &["DYLD_", "LD_", "GIT_CONFIG", "GIT_SSH"];
+const FIXED_REMOVED: &[&str] = &[
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_PROXY_COMMAND",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_TEMPLATE_DIR",
+    "EDITOR",
+    "VISUAL",
+    "GH_EDITOR",
+    "BROWSER",
+    "GH_BROWSER",
+    "BASH_ENV",
+    "ENV",
+    "PERL5LIB",
+    "PERL5OPT",
+];
+
+/// Whether an inherited variable is removed for a `Plan::Fixed` child.
+pub(super) fn removed_for_fixed(key: &str) -> bool {
+    FIXED_REMOVED.contains(&key) || FIXED_REMOVED_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// A `Plan::Fixed` child's `PATH`: `head` (the program's own, checked
+/// directory), the system directories, and Homebrew's and
+/// `/usr/local/bin` only when they pass [`trusted_dir`] (gh finds git
+/// there, docker its credential helpers). Never the inherited `PATH`.
+fn fixed_path(head: &Path) -> String {
+    let mut dirs: Vec<String> = vec![head.display().to_string()];
+    for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        dirs.push(d.to_string());
     }
+    for d in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        if std::fs::metadata(d).is_ok() && trusted_dir(Path::new(d)).is_ok() {
+            dirs.push(d.to_string());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    dirs.join(":")
+}
+
+/// Whether `program` is present at one of its fixed locations (or, in a
+/// test build with `SWAMP_TEST_PROGRAM_DIR`, as a fake): present, not
+/// necessarily trusted or runnable.
+pub fn present(program: Program) -> bool {
+    if let Some(found) = test_override(program) {
+        return found.is_some();
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    candidates(program, Path::new(&home))
+        .iter()
+        .any(|c| std::fs::symlink_metadata(c).is_ok())
+}
+
+/// How to start `program`: its first fixed location, checked. `NotFound`
+/// ("not available") when none exists; `PermissionDenied`, naming what
+/// failed, when the first that exists is not trusted.
+pub fn plan(program: Program) -> io::Result<Plan> {
     let home = std::env::var("HOME").unwrap_or_default();
     let exe = match test_override(program) {
         Some(found) => found,
@@ -395,9 +547,20 @@ pub fn plan(program: Program) -> io::Result<Plan> {
     let Some(exe) = exe else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("{} was not found in its known locations", program.binary()),
+            format!(
+                "{} is not available: not found in its known locations (swamp does not search PATH)",
+                program.binary()
+            ),
         ));
     };
+    if !migrated(program) {
+        let head = exe.parent().unwrap_or(Path::new("/usr/bin")).to_path_buf();
+        return Ok(Plan::Fixed {
+            path: fixed_path(&head),
+            exe,
+            arg0: program.binary(),
+        });
+    }
     Ok(Plan::Scrubbed(Scrubbed {
         env: scrubbed_env(program, &exe, &home),
         exe,
@@ -513,14 +676,29 @@ mod tests {
         assert!(trusted_file(&exe).is_ok());
     }
 
+    /// The tools that are not package managers run from a fixed location
+    /// with the inherited environment (their credentials and contexts),
+    /// named by their own arg0, or are not available; never scrubbed, never
+    /// a bare name.
     #[test]
-    fn a_program_that_is_not_migrated_keeps_its_old_behavior() {
-        assert_eq!(plan(Program::Git).unwrap(), Plan::Inherit("git"));
-        assert_eq!(plan(Program::Lsof).unwrap(), Plan::Inherit("lsof"));
-        assert_eq!(
-            plan(Program::Tmutil).unwrap(),
-            Plan::Inherit("/usr/bin/tmutil")
-        );
+    fn other_programs_run_from_a_fixed_location_with_their_own_name() {
+        for p in Program::ALL
+            .iter()
+            .filter(|p| !matches!(p, Program::Brew | Program::Mise))
+        {
+            match plan(*p) {
+                Ok(Plan::Fixed { exe, arg0, .. }) => {
+                    assert!(exe.is_absolute(), "{p:?}");
+                    assert_eq!(arg0, p.binary());
+                }
+                Ok(other) => panic!("{p:?} planned as {other:?}"),
+                Err(e) => assert!(
+                    e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::PermissionDenied,
+                    "{p:?}: {e}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -577,6 +755,209 @@ mod tests {
             r.exe,
             std::fs::canonicalize(&good).unwrap(),
             "a symlink is followed"
+        );
+    }
+
+    /// #199: every program has a fixed, absolute candidate list, so no
+    /// program is ever looked up by bare name. Tempting wrong patch:
+    /// migrating the programs the auditor named and leaving the rest on
+    /// `PATH` (an empty list fell back to the bare name before).
+    #[test]
+    fn every_program_has_absolute_candidates() {
+        for p in Program::ALL {
+            let c = candidates(*p, Path::new("/Users/x"));
+            assert!(!c.is_empty(), "{p:?} has no fixed location");
+            assert!(c.iter().all(|c| c.is_absolute()), "{p:?}: {c:?}");
+        }
+    }
+
+    /// Linux: the system tools are looked for in every system directory,
+    /// and git, gh and docker in Linuxbrew too, so a fleet runner's
+    /// `/usr/bin/gh` or `/home/linuxbrew/.linuxbrew/bin/git` is found.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_lists_cover_the_system_dirs_and_linuxbrew() {
+        let home = Path::new("/home/x");
+        for p in [
+            Program::Lsof,
+            Program::Du,
+            Program::Df,
+            Program::Id,
+            Program::Systemctl,
+            Program::Loginctl,
+            Program::Git,
+            Program::Gh,
+            Program::Docker,
+        ] {
+            let c = candidates(p, home);
+            for d in ["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"] {
+                assert!(
+                    c.contains(&Path::new(d).join(p.binary())),
+                    "{p:?} misses {d}"
+                );
+            }
+        }
+        for p in [
+            Program::Git,
+            Program::Gh,
+            Program::Docker,
+            Program::Brew,
+            Program::Mise,
+        ] {
+            let c = candidates(p, home);
+            assert!(
+                c.contains(&Path::new("/home/linuxbrew/.linuxbrew/bin").join(p.binary())),
+                "{p:?} misses Linuxbrew"
+            );
+        }
+    }
+
+    /// docs/usage.md's table names every candidate directory of this
+    /// platform's lists, in the program's row. Tempting wrong patch:
+    /// adding a location to the code and not to the table users read.
+    #[test]
+    fn the_usage_table_matches_the_candidate_lists() {
+        let doc =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/usage.md"))
+                .unwrap();
+        let col = if cfg!(target_os = "macos") { 1 } else { 2 };
+        let home = Path::new("/home/x");
+        for p in Program::ALL {
+            let row = doc
+                .lines()
+                .find(|l| {
+                    l.starts_with("| `")
+                        && l.split('|')
+                            .nth(1)
+                            .is_some_and(|c| c.contains(&format!("`{}`", p.binary())))
+                })
+                .unwrap_or_else(|| panic!("no usage row for {}", p.binary()));
+            let cell = row.split('|').nth(col + 1).unwrap();
+            // A program this platform never runs (systemctl on macOS,
+            // diskutil on Linux) is "(not used)" there.
+            if cell.contains("(not used)") {
+                continue;
+            }
+            for c in candidates(*p, home) {
+                let dir = c.parent().unwrap();
+                let shown = match dir.strip_prefix(home) {
+                    Ok(rel) => format!("`~/{}`", rel.display()),
+                    Err(_) => format!("`{}`", dir.display()),
+                };
+                assert!(
+                    cell.contains(&shown),
+                    "{}: {shown} missing from {cell}",
+                    p.binary()
+                );
+            }
+        }
+    }
+
+    /// The variables git, gh and docker need still reach a `Plan::Fixed`
+    /// child; only the loader and exec-hook ones are removed. Tempting
+    /// wrong patch: `env_clear`, which drops `GH_TOKEN`, `DOCKER_HOST`,
+    /// `SSH_AUTH_SOCK` and makes the tools answer for nobody.
+    #[test]
+    fn fixed_children_keep_credentials_and_contexts() {
+        for k in [
+            "HOME",
+            "DOCKER_CONFIG",
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "GH_TOKEN",
+            "GH_HOST",
+            "GH_CONFIG_DIR",
+            "GITHUB_TOKEN",
+            "XDG_CONFIG_HOME",
+            "SSH_AUTH_SOCK",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "USER",
+        ] {
+            assert!(!removed_for_fixed(k), "{k} must pass");
+        }
+        for k in [
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_EXEC_PATH",
+            "GIT_SSH_COMMAND",
+            "GIT_SSH",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "BASH_ENV",
+        ] {
+            assert!(removed_for_fixed(k), "{k} must be removed");
+        }
+        let p = fixed_path(Path::new("/opt/x/bin"));
+        assert!(
+            p.starts_with("/opt/x/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            "{p}"
+        );
+    }
+
+    /// A world-writable directory holding the program, or a directory
+    /// owned by another user, refuses; a symlinked binary is followed to
+    /// the real file, which is checked too. Tempting wrong patch:
+    /// checking only the file, so a writable directory lets anyone swap
+    /// it.
+    #[test]
+    fn a_world_writable_dir_refuses_and_a_link_is_checked_at_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        let exe = open.join("git");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = resolve_strict(std::slice::from_ref(&exe)).unwrap_err();
+        assert!(err.contains("writable by every user"), "{err}");
+        // A trusted link to a binary inside the world-writable directory
+        // is refused too: the target's directory is what is checked.
+        let trusted = tmp.path().join("trusted");
+        std::fs::create_dir(&trusted).unwrap();
+        std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = trusted.join("git");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        assert!(resolve_strict(&[link]).is_err());
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Auditor: the directory the candidate lives in must be trusted too,
+    /// not only the link target's. A world-writable `/usr/local/bin` lets
+    /// another user point `docker` at any trusted binary (an interpreter
+    /// that then reads a file named by the first argument from the
+    /// inherited working directory). Tempting wrong patch (the head):
+    /// checking the candidate directory only to pick the PATH head.
+    #[test]
+    fn audit_a_link_in_a_world_writable_candidate_dir_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = real.join("sh");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = open.join("docker");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let got = resolve_strict(&[link]);
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            got.is_err(),
+            "accepted a link planted in a world-writable dir: {got:?}"
         );
     }
 
