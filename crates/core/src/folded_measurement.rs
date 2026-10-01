@@ -460,16 +460,23 @@ fn record_folded_measurement(
 /// never mistakes a plain stamp row for a total.
 const CHILD_TOTAL_MARK: &str = "\u{2}child-total";
 
+/// The name, under a subfolder's rel_dir, of the row holding that
+/// subfolder's bytes with every hard link counted (what its directory
+/// rollups sum to, which the drilldown shows beside an adjustment row).
+/// A NUL cannot be in a file name, so this never names a real directory.
+const RAW_BYTES_ROW: &str = "\0raw";
+
 /// The rows one folded measurement stores: one stamp row per directory it
 /// listed (plus `carried`, the stored rows of subfolders this pass
 /// replayed), the folded total on the root row and, when they provably
 /// add up to it, each immediate subfolder's own total on its row.
 ///
-/// Per-child totals are recorded only when nothing in the unit has a
-/// second hard link (a link between two subfolders would be counted
-/// twice when one is replayed and the other re-walked) and when root
-/// files plus subfolder totals equal the folded total and newest mtime
-/// exactly. Anything else stores the plain rows, and the next changed
+/// Per-child totals (each hard-linked inode counted once within its
+/// subfolder) are recorded only when no inode is linked from two
+/// subfolders or from the root's own files (it would be counted twice
+/// when one side is replayed and the other re-walked), which holds
+/// exactly when root files plus subfolder totals equal the folded total;
+/// the newest mtime must match too. Anything else stores the plain rows, and the next changed
 /// pass walks the whole unit, which is always the correct answer.
 fn folded_rows(
     path: &Path,
@@ -485,24 +492,36 @@ fn folded_rows(
     let mut rows: Vec<crate::growth::FoldedRow> = Vec::with_capacity(stamps.len() + carried.len());
     let mut saw_root = false;
     let mut root_own: u64 = 0;
-    let mut shared = false;
+    let mut root_linked = false;
     let mut files_max: u64 = 0;
-    let mut children: std::collections::HashMap<String, (u64, u64)> =
+    // Per immediate subfolder: bytes (each hard-linked inode once within
+    // the subfolder), newest file mtime, whether it holds a linked file.
+    let mut children: std::collections::HashMap<String, (u64, u64, bool)> =
         std::collections::HashMap::new();
+    let mut raw: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<(String, u64, u64)> = std::collections::HashSet::new();
     for stamp in stamps {
         // A stamp from outside the unit cannot be validated against the
         // unit root later, so the whole measurement is not stored.
         let rel = stamp.path.strip_prefix(path).ok()?.display().to_string();
         saw_root |= rel.is_empty();
-        shared |= stamp.shared_inode;
         files_max = files_max.max(stamp.files_mtime_max);
+        let bucket = rel.split('/').next().unwrap_or("").to_string();
+        let mut bytes = stamp.own_bytes;
+        for (dev, ino, b) in &stamp.linked {
+            if !seen.insert((bucket.clone(), *dev, *ino)) {
+                bytes = bytes.saturating_sub(*b);
+            }
+        }
         if rel.is_empty() {
-            root_own += stamp.own_bytes;
+            root_own += bytes;
+            root_linked |= stamp.shared_inode;
         } else {
-            let first = rel.split('/').next().unwrap_or(&rel).to_string();
-            let entry = children.entry(first).or_insert((0, 0));
-            entry.0 += stamp.own_bytes;
+            *raw.entry(bucket.clone()).or_insert(0) += stamp.own_bytes;
+            let entry = children.entry(bucket).or_insert((0, 0, false));
+            entry.0 += bytes;
             entry.1 = entry.1.max(stamp.files_mtime_max);
+            entry.2 |= stamp.shared_inode;
         }
         rows.push(crate::growth::FoldedRow {
             unit_path: unit_path.clone(),
@@ -532,8 +551,10 @@ fn folded_rows(
         }
         rows.push(row);
     }
-    let consistent = !folded.hardlinked
-        && !shared
+    // The buckets add up to the deduplicated total exactly only when no
+    // inode is linked from two of them: then a subfolder can be replayed
+    // on its own without counting a shared file twice.
+    let consistent = !root_linked
         && root_own + children.values().map(|c| c.0).sum::<u64>() + carried_total == folded.bytes
         && files_max == folded.mtime_max;
     for (i, row) in rows.iter_mut().enumerate() {
@@ -551,11 +572,29 @@ fn folded_rows(
             row.mtime_max = 0;
             row.exclusions = digest.clone();
         } else if i < first_carried
-            && let Some((bytes, mtime_max)) = children.get(&row.rel_dir)
+            && let Some((bytes, mtime_max, linked)) = children.get(&row.rel_dir)
         {
             row.bytes = *bytes;
             row.mtime_max = *mtime_max;
+            row.hardlinked = *linked;
             row.exclusions = marked.clone();
+        }
+    }
+    if consistent {
+        for (name, (_, _, linked)) in &children {
+            if *linked {
+                rows.push(crate::growth::FoldedRow {
+                    unit_path: unit_path.clone(),
+                    rel_dir: format!("{name}/{RAW_BYTES_ROW}"),
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    bytes: raw.get(name).copied().unwrap_or(0),
+                    hardlinked: true,
+                    mtime_max: 0,
+                    observed_at,
+                    exclusions: marked.clone(),
+                });
+            }
         }
     }
     Some(rows)
@@ -572,8 +611,9 @@ fn folded_rows(
 /// replaced by a rename -- is replayed, and one walk measures the root's
 /// own files plus every other subfolder (changed, new, or not vouched
 /// for). The sum is what a full walk would have found, because nothing
-/// in the unit has a second hard link (checked again on this walk; a
-/// link found now falls back to the full walk).
+/// is linked across subfolders (the stored totals prove it for the
+/// replayed ones; a linked file in the walked part falls back to the
+/// full walk).
 ///
 /// `None` whenever that cannot be shown: no trusted window, no stored
 /// per-child totals, a changed exclusion set, nothing to replay. The
@@ -591,7 +631,7 @@ fn partial_measure(
     let rows = crate::growth::folded_rows_for(dir, &unit_path);
     let root = rows.iter().find(|r| r.rel_dir.is_empty())?;
     let digest = exclusions_digest(exclusions);
-    if root.exclusions != digest || root.hardlinked {
+    if root.exclusions != digest {
         return None;
     }
     let marked = format!("{digest}{CHILD_TOTAL_MARK}");
@@ -617,6 +657,8 @@ fn partial_measure(
         true,
     );
     crate::work_counters::record_cache_miss();
+    // A linked file in the walked part may share its inode with a
+    // replayed subfolder: walk the whole unit instead.
     if row.hardlinked {
         return None;
     }
@@ -626,7 +668,7 @@ fn partial_measure(
     let folded = FoldedUnit {
         reused: false,
         bytes: row.bytes + reused.iter().map(|r| r.bytes).sum::<u64>(),
-        hardlinked: false,
+        hardlinked: reused.iter().any(|r| r.hardlinked),
         mtime_max: reused
             .iter()
             .map(|r| r.mtime_max)
@@ -673,13 +715,18 @@ fn partial_measure(
                 .max()
                 .unwrap_or(0);
             let newest = dirs_newest.max(child.mtime_max as i64);
+            let raw_name = format!("{}/{RAW_BYTES_ROW}", child.rel_dir);
+            let own = carried
+                .iter()
+                .find(|r| r.rel_dir == raw_name)
+                .map_or(child.bytes, |r| r.bytes);
             dirs.push(crate::report::DirRollup {
                 worktree_id: worktree_id.to_string(),
                 track: None,
                 rel_path: child.rel_dir.clone(),
                 parent_rel_path: Some(String::new()),
-                allocated_total: child.bytes,
-                own_allocated: child.bytes,
+                allocated_total: own,
+                own_allocated: own,
                 file_count: 0,
                 entry_count: 0,
                 symlink_count: 0,
@@ -956,6 +1003,7 @@ pub fn folded_bytes_bounded_stamped(
             own_bytes: 0,
             files_mtime_max: 0,
             shared_inode: false,
+            linked: Vec::new(),
         });
         let mut here = 0u64;
         for entry in rd.flatten() {
@@ -1361,10 +1409,38 @@ mod tests {
             "a renamed-in folder was replayed"
         );
 
+        // A hardlink inside one replayed subfolder: replayed, counted once.
+        std::fs::write(
+            unit.join("a/sub/linked"),
+            crate::fs_gate::settle::noise(16384),
+        )
+        .unwrap();
+        std::fs::hard_link(unit.join("a/sub/linked"), unit.join("a/sub/linked2")).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("a")], 4_000);
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 5_500, &window, true, true);
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 5_000);
+        let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 5_800, &window, true, true)
+        });
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(
+            cost.subtrees_reused, 2,
+            "a (with its link) and c are replayed"
+        );
+        assert!(f.hardlinked);
+        assert_eq!(
+            shape(&f, &unit, dirs),
+            golden(&unit),
+            "an inner link was counted twice"
+        );
+
         // A hardlink across two subfolders: never summed twice.
         std::fs::hard_link(unit.join("a/x"), unit.join("b/link")).unwrap();
         crate::fs_gate::settle::settle();
-        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 4_500);
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 5_700);
         let (obs, dirs) =
             observe_unit_with_dirs(Some(store.path()), &unit, &[], 6_000, &window, true, true);
         let UnitObservation::Unit(f) = obs else {

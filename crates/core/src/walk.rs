@@ -946,6 +946,9 @@ pub struct DirStamp {
     pub own_bytes: u64,
     pub files_mtime_max: u64,
     pub shared_inode: bool,
+    /// `(device, inode, allocated bytes)` of each file here with another
+    /// hard link, so per-child totals can count each inode once.
+    pub linked: Vec<(u64, u64, u64)>,
 }
 
 /// `attribute_parallel` that takes `carry`ed artifact rows as read (see
@@ -1598,6 +1601,7 @@ fn process_size(
     let mut symlink_count: u32 = 0;
     let mut files_mtime_max: u64 = 0;
     let mut shared_inode = false;
+    let mut linked: Vec<(u64, u64, u64)> = Vec::new();
     let mut dir_mtime_max: i64 = own_meta.as_ref().map(|m| m.mtime()).unwrap_or(0);
     for (i, entry) in entries.enumerate() {
         if i % 1024 == 1023 {
@@ -1654,7 +1658,12 @@ fn process_size(
                 .mtime_max
                 .fetch_max(meta.mtime().max(0) as u64, Ordering::Relaxed);
             files_mtime_max = files_mtime_max.max(meta.mtime().max(0) as u64);
-            shared_inode |= meta.nlink() > 1;
+            if meta.nlink() > 1 {
+                shared_inode = true;
+                if shared.stamp_dirs {
+                    linked.push((meta.dev(), meta.ino(), allocated_bytes(&meta)));
+                }
+            }
             if meta.nlink() <= 1 || group.local_seen.lock().unwrap().insert(key) {
                 group
                     .local_total
@@ -1684,6 +1693,7 @@ fn process_size(
             own_bytes: own_allocated,
             files_mtime_max,
             shared_inode,
+            linked,
         });
     }
     if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {

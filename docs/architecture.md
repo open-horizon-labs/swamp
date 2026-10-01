@@ -75,6 +75,8 @@ Platform events say where measurements may have changed. They are not themselves
 
 Deeper Cargo inspection is a separate, bounded read through `inspect-cargo`. It does not run Cargo or persist a second artifact database. This keeps diagnostic detail out of the normal refresh cost.
 
+An external unit is reused at two grains. When the event window shows nothing under the unit, its stored total is replayed with no listing at all. When it shows changes, only the changed part is walked: a full measurement records each immediate subfolder's folded total (only when nothing in the unit has a second hard link and root files plus subfolders add up to the total exactly), and a later pass replays every subfolder the window vouches for and whose own directory stamp is unchanged (a folder renamed into place under the same name is walked), then walks the root's files and the remaining subfolders. The result, including the depth-2 drilldown, equals a full walk; build stores whose adapter identifies from every directory row are still walked whole. A directory FSEvents cannot itemize (`MustScanSubDirs`) refuses only the unit roots that contain it or sit inside it; dropped events and wrapped ids refuse every root in the stream.
+
 Implementation: [folded_measurement.rs](../crates/core/src/folded_measurement.rs).
 
 ### Platform contracts
@@ -174,6 +176,23 @@ what no path reaches, and says what it did not measure.
 ## Enrichment and freshness
 
 Git facts add dirty state, unpushed commits, branch information, and activity context. GitHub enrichment adds cached PR and merge information when available. Docker supplies its own object identities and accounting. These facts have different sources and refresh costs from filesystem measurements.
+
+### Enrichment caches
+
+Enrichment is pass-through: `report` and the TUI read stored rows and start no process; `observe` asks a producer only when its stored answer cannot be shown to still hold. Warm costs below are one unchanged scheduled pass on the maintainer's store copy (#181).
+
+| Enrichment | Key | Expiry | Negative answers | Warm pass, before | Warm pass, after |
+|---|---|---|---|---|---|
+| GitHub PR / merge facts | worktree, branch, tip commit | merged: never; otherwise 24 h; `--enrich` forces | no PR, `gh` unavailable and failed lookups are stored, 24 h | 1 `gh auth status` spawn; tip commits read one worktree at a time | no spawn; tip commits read on a pool of 4 |
+| Homebrew reports (`brew autoremove --dry-run`, installed on request) | bytes and newest mtime of `Cellar` and `Caskroom` plus every brew unit | 24 h | a `not observed` answer is never reused | 2 brew spawns, about 1.3 s | none |
+| mise reports (prune dry run, global list) | none: they read configuration outside mise's units | asked every pass | recomputed | 2 spawns, about 0.1 s | unchanged |
+| rustup default toolchain | none (one settings-file read) | every pass | recomputed | one file read | unchanged |
+| Agent identification | per file: adapter version, length, mtime, ctime, inode; per container: shape key and the event window | none | stored as a fingerprint-only row | replayed | unchanged |
+| Git facts per worktree | worktree id under the event window | a full walk recomputes them | carried forward | replayed | unchanged |
+| Docker objects | daemon answer, `cached_at` | 300 s (60 s unavailable); a default `observe` asks live | stored, 60 s | 7 spawns, 1.3 s (3 s at background priority) | unchanged: daemon state has no content key swamp can read |
+| Last used | none (key-file access times change on read) | every pass | recomputed | bounded scan per unit (4096 listings) | unchanged |
+| Volume ledger system facts | the ledger's own cycle (24 h, 120 s budget) | not run until due | not stored | none when not due; 3 spawns per resume while a cycle is open | unchanged |
+| External unit sizes | event window, per unit and per immediate subfolder | none | an incomplete fold is never stored | busy units walked whole (`~/Library/Caches` 163k files) | only changed subfolders walked |
 
 Project linkage uses evidence such as recorded working directories, known checkout/worktree paths, and supported tool metadata. A path that moved, collides with another project name, or lacks reliable context must not silently become a confident assignment.
 
