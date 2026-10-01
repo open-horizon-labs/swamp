@@ -649,6 +649,12 @@ folders, largest first, with size, modification time and last-used:
   rows, so it holds the other folders and the files directly inside. A
   hardlinked file the walk counted once but two parent folders counted
   under each appears as the signed `adjustment` row, never as missing bytes.
+- **The hard-link flag can lag.** A unit's `hardlinked` (in `--json`) is
+  what its last walk of each subfolder saw. A subfolder an observe replays
+  (no change under it) keeps that answer: a hard link made from outside the
+  unit to a file inside it fires no change there, so it is seen only when
+  that subfolder next changes. The bytes are exact either way; whether
+  another link shares them is checked when the folder changes.
 - **Not measured is not zero.** A folder the process could not list is
   shown as `not measured` (`bytes: null`); one with an unreadable folder
   below it is `partial` and its size is a lower bound. Unlisted unreadable

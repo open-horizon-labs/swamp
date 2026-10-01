@@ -1641,3 +1641,20 @@ fn with_walked_note(note: Option<String>, walked_at: Option<u64>) -> Option<Stri
         None => walked,
     })
 }
+
+#[cfg(test)]
+mod walked_note_tests {
+    /// #181 review round 2. Tempting wrong patch: replay sealed volumes
+    /// and say nothing, so the unit reads as measured by this pass. The
+    /// note names when the volumes were walked, after any coverage note.
+    #[test]
+    fn a_replayed_volume_says_when_it_was_walked() {
+        let at = crate::entities::now() - 3 * 86_400;
+        let note = super::with_walked_note(Some("partial".into()), Some(at)).unwrap();
+        assert!(
+            note.starts_with("partial; read-only volumes inside walked "),
+            "{note}"
+        );
+        assert_eq!(super::with_walked_note(None, None), None);
+    }
+}

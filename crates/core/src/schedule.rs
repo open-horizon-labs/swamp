@@ -1346,7 +1346,10 @@ mod tests {
     fn a_rotation_that_cannot_happen_does_not_fail_the_append() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("observe.log");
-        fs::write(&log, vec![b'x'; store::LOG_CAP_BYTES as usize]).unwrap();
+        // A full log of whole lines (the append starts a line of its own).
+        let mut full = vec![b'x'; store::LOG_CAP_BYTES as usize];
+        full.push(b'\n');
+        fs::write(&log, full).unwrap();
         // With three rotated files the shift `.2 -> .3` is the step that
         // fails: `.3` is a non-empty directory, which no rename replaces.
         fs::write(tmp.path().join("observe.log.1"), b"one\n").unwrap();

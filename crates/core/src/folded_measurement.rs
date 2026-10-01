@@ -1869,6 +1869,36 @@ mod tests {
         assert_eq!(again.bytes, first.bytes);
     }
 
+    /// #181 review round 2 (f). Tempting wrong patch: drop the "every
+    /// entry is a sealed mount" check because the folder's own stamp
+    /// already moves when an entry is added. A plain folder that was there
+    /// at the first walk can change inside without moving the parent's
+    /// stamp: the unit is then not vouched for.
+    #[test]
+    fn a_plain_folder_beside_the_volumes_stops_the_vouching() {
+        use crate::fs_events::EventCoverage;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, _sealed, _) = rev2_sealed_unit(tmp.path());
+        std::fs::create_dir_all(unit.join("plain")).unwrap();
+        std::fs::write(unit.join("plain/f"), b"x").unwrap();
+        crate::fs_gate::settle::settle();
+        let none = EventCoverage::untrusted();
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let before = std::fs::symlink_metadata(&unit).unwrap();
+        std::fs::write(unit.join("plain/g"), crate::fs_gate::settle::noise(65_536)).unwrap();
+        let after = std::fs::symlink_metadata(&unit).unwrap();
+        assert_eq!(
+            stamp_ns(&before),
+            stamp_ns(&after),
+            "precondition: the parent's stamp did not move"
+        );
+        let vouched = sealed_only_unchanged(Some(store.path()), &unit);
+        crate::fs_gate::fs_space::testing::clear();
+        assert!(!vouched, "a changed plain folder was vouched for");
+    }
+
     /// A different exclusion set describes different bytes, so it must
     /// not be answered from a measurement taken under the old one.
     #[test]
