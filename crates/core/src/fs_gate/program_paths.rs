@@ -730,6 +730,47 @@ mod tests {
         }
     }
 
+    /// docs/usage.md's table names every candidate directory of this
+    /// platform's lists, in the program's row. Tempting wrong patch:
+    /// adding a location to the code and not to the table users read.
+    #[test]
+    fn the_usage_table_matches_the_candidate_lists() {
+        let doc =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/usage.md"))
+                .unwrap();
+        let col = if cfg!(target_os = "macos") { 1 } else { 2 };
+        let home = Path::new("/home/x");
+        for p in Program::ALL {
+            let row = doc
+                .lines()
+                .find(|l| {
+                    l.starts_with("| `")
+                        && l.split('|')
+                            .nth(1)
+                            .is_some_and(|c| c.contains(&format!("`{}`", p.binary())))
+                })
+                .unwrap_or_else(|| panic!("no usage row for {}", p.binary()));
+            let cell = row.split('|').nth(col + 1).unwrap();
+            // A program this platform never runs (systemctl on macOS,
+            // diskutil on Linux) is "(not used)" there.
+            if cell.contains("(not used)") {
+                continue;
+            }
+            for c in candidates(*p, home) {
+                let dir = c.parent().unwrap();
+                let shown = match dir.strip_prefix(home) {
+                    Ok(rel) => format!("`~/{}`", rel.display()),
+                    Err(_) => format!("`{}`", dir.display()),
+                };
+                assert!(
+                    cell.contains(&shown),
+                    "{}: {shown} missing from {cell}",
+                    p.binary()
+                );
+            }
+        }
+    }
+
     /// A world-writable directory holding the program, or a directory
     /// owned by another user, refuses; a symlinked binary is followed to
     /// the real file, which is checked too. Tempting wrong patch:
