@@ -129,15 +129,14 @@ pub(super) fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
         Program::Launchctl => at(&["/bin"]),
         Program::Lsof if mac => at(&["/usr/sbin"]),
         Program::Du | Program::Id if mac => at(&["/usr/bin"]),
-        Program::Df | Program::Kill if mac => at(&["/bin"]),
+        Program::Df if mac => at(&["/bin"]),
         // Linux-only programs, and the system tools on Linux.
         Program::Systemctl
         | Program::Loginctl
         | Program::Lsof
         | Program::Du
         | Program::Df
-        | Program::Id
-        | Program::Kill => at(LINUX_SYSTEM),
+        | Program::Id => at(LINUX_SYSTEM),
         // Homebrew's first on macOS: it is the git/gh the user installed
         // and runs; `/usr/bin/git` is Apple's.
         Program::Git | Program::Gh if mac => {
@@ -784,7 +783,6 @@ mod tests {
             Program::Du,
             Program::Df,
             Program::Id,
-            Program::Kill,
             Program::Systemctl,
             Program::Loginctl,
             Program::Git,

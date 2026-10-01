@@ -1735,7 +1735,7 @@ swamp runs a fixed set of programs, each from a fixed list of locations, **never
 | `mise` | `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin` | `/usr/local/bin`, `/usr/bin`, `/home/linuxbrew/.linuxbrew/bin`, `~/.local/bin`, `~/.cargo/bin` |
 | `lsof` | `/usr/sbin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
 | `du`, `id` | `/usr/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
-| `df`, `kill` | `/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `df` | `/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
 | `systemctl`, `loginctl` | (not used) | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
 | `xcrun`, `plutil`, `defaults`, `tmutil` | `/usr/bin` | (not used) |
 | `diskutil` | `/usr/sbin` | (not used) |

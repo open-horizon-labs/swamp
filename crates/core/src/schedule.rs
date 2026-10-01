@@ -714,14 +714,12 @@ fn lock_path(store_dir: &Path) -> PathBuf {
     store_dir.join("observe.lock")
 }
 
+/// Whether the lock holder is still running: `kill(pid, 0)`, no
+/// process started. It used to run the `kill` program, which a minimal
+/// Linux image (the CI fleet's) does not have, so a live holder read as
+/// dead and its lock was reclaimed under it.
 fn pid_alive(pid: u32) -> bool {
-    fs_gate::spawn::run(
-        fs_gate::spawn::Program::Kill,
-        ["-0", &pid.to_string()],
-        std::time::Duration::from_secs(5),
-    )
-    .map(|o| o.success())
-    .unwrap_or(false)
+    fs_gate::sys::pid_alive(pid)
 }
 
 /// Result of trying to take the single-flight observation lock.

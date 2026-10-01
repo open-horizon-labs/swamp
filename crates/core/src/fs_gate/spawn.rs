@@ -54,8 +54,6 @@ pub enum Program {
     Id,
     /// The scheduled refresh's LaunchAgent (`launchctl bootstrap|bootout|…`).
     Launchctl,
-    /// Liveness of the observation lock holder (`kill -0 <pid>`).
-    Kill,
     /// `brew --prefix` (detector query) and, in a scheduled `observe`
     /// only, the two read-only manager reports (`autoremove --dry-run`,
     /// `list --formula --installed-on-request`).
@@ -99,7 +97,6 @@ impl Program {
         Program::Df,
         Program::Id,
         Program::Launchctl,
-        Program::Kill,
         Program::Brew,
         Program::Mise,
         Program::Defaults,
@@ -123,7 +120,6 @@ impl Program {
             Program::Df => "df",
             Program::Id => "id",
             Program::Launchctl => "launchctl",
-            Program::Kill => "kill",
             Program::Brew => "brew",
             Program::Mise => "mise",
             Program::Defaults => "defaults",
@@ -276,7 +272,6 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("bootout"), LaunchdService],
             &[Lit("unload"), Lit("-w"), SwampPlist],
         ],
-        Program::Kill => &[&[Lit("-0"), Number]],
         // `brew --prefix` is the detector's query. The manager reports are
         // not shapes at all: they run only as a `ManagerCommand`, which
         // builds its own argv, so no other caller can run `brew
@@ -1383,8 +1378,6 @@ mod tests {
                 vec!["-c", "core.pager=sh", "worktree", "list"],
             ),
             // Programs the old deny-list never looked at.
-            (Program::Kill, vec!["-9", "1"]),
-            (Program::Kill, vec!["1"]),
             (Program::Launchctl, vec!["remove", "com.apple.something"]),
             (Program::Brew, vec!["uninstall", "x"]),
             // The manager reports are the dry runs only. The tempting wrong
@@ -1530,7 +1523,6 @@ mod tests {
                     "ref0=refs/heads/main",
                 ],
             ),
-            (Program::Kill, vec!["-0", "123"]),
             (Program::Brew, vec!["--prefix"]),
             (Program::Id, vec!["-u"]),
             (Program::Df, vec!["-k", "/"]),
