@@ -691,8 +691,9 @@ path. Each row says, as facts with their sources:
 - **The removal path that exists.** Every unit and every listed folder: Trash
   after review (Space, then Backspace in the TUI; see "Cleanup and recovery").
   A unit whose manager swamp runs removal for (mise installs, simulator
-  runtimes) also names that manager's own command (Backspace on an unmarked
-  row). JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
+  runtimes, including `/Library/Developer/CoreSimulator/Volumes`) also names
+  that manager's own command, which is permanent with no Trash (Backspace with
+  nothing marked); the text never says the command is "not available yet". JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
 
 | Storage category | Class | Words when nothing more specific exists | Source |
 |---|---|---|---|

@@ -307,9 +307,9 @@ fn removal(kind: RemovalKind, manager: Option<&str>) -> Removal {
         kind,
         text: match (kind, manager) {
             (RemovalKind::TrashOrToolCommand, Some(m)) => format!(
-                "Trash after review (Space, then Backspace), or {m}'s own command (Backspace on an unmarked row)"
+                "Trash (Space, then Backspace); {m}'s own command, permanent (Backspace, nothing marked)"
             ),
-            _ => "Trash after review (Space, then Backspace)".to_string(),
+            _ => "Trash (Space, then Backspace)".to_string(),
         },
     }
 }
