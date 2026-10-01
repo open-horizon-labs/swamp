@@ -949,6 +949,9 @@ pub struct DirStamp {
     /// `(device, inode, allocated bytes)` of each file here with another
     /// hard link, so per-child totals can count each inode once.
     pub linked: Vec<(u64, u64, u64)>,
+    /// This directory, or an entry directly in it, could not be read: the
+    /// fold under it is a lower bound.
+    pub incomplete: bool,
 }
 
 /// `attribute_parallel` that takes `carry`ed artifact rows as read (see
@@ -1569,6 +1572,18 @@ fn process_size(
         // (#65: partial/unreadable containers are incomplete coverage,
         // never a disappearance or a quiet shrink).
         shared.incomplete.store(true, Ordering::Relaxed);
+        if shared.stamp_dirs {
+            shared.dir_stamps.lock().unwrap().push(DirStamp {
+                path: path.clone(),
+                mtime_ns: 0,
+                ctime_ns: 0,
+                own_bytes: 0,
+                files_mtime_max: 0,
+                shared_inode: false,
+                linked: Vec::new(),
+                incomplete: true,
+            });
+        }
         if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
             let rel_path = rel_path_string(root, &path);
             let parent_rel_path = parent_rel_path_of(&rel_path);
@@ -1601,6 +1616,7 @@ fn process_size(
     let mut symlink_count: u32 = 0;
     let mut files_mtime_max: u64 = 0;
     let mut shared_inode = false;
+    let mut dir_incomplete = false;
     let mut linked: Vec<(u64, u64, u64)> = Vec::new();
     let mut dir_mtime_max: i64 = own_meta.as_ref().map(|m| m.mtime()).unwrap_or(0);
     for (i, entry) in entries.enumerate() {
@@ -1609,6 +1625,7 @@ fn process_size(
         }
         let Ok(entry) = entry else {
             shared.incomplete.store(true, Ordering::Relaxed);
+            dir_incomplete = true;
             continue;
         };
         if shared.excluded.iter().any(|e| entry.path().starts_with(e)) {
@@ -1616,6 +1633,7 @@ fn process_size(
         }
         let Ok(ft) = entry.file_type() else {
             shared.incomplete.store(true, Ordering::Relaxed);
+            dir_incomplete = true;
             continue;
         };
         if ft.is_symlink() {
@@ -1639,6 +1657,7 @@ fn process_size(
                 Err(e) if crate::fs_gate::is_vanished_entry(&e) => continue,
                 Err(_) => {
                     shared.incomplete.store(true, Ordering::Relaxed);
+                    dir_incomplete = true;
                     continue;
                 }
             };
@@ -1694,6 +1713,7 @@ fn process_size(
             files_mtime_max,
             shared_inode,
             linked,
+            incomplete: dir_incomplete,
         });
     }
     if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {

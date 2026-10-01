@@ -342,15 +342,14 @@ pub fn measure(
         mtime_max: row.mtime_max,
         complete,
     };
-    // An incomplete measurement is never stored: writing it would either
-    // overwrite a good prior measurement with a smaller partial one (a
-    // fabricated shrink) or anchor a future reuse on rows that undercount
-    // the tree. The key keeps whatever it last had; the caller decides
-    // how to report this pass (`.oh/guardrails/coverage-changes-are-not-
-    // storage-changes.md`).
-    if let Some(dir) = store
-        && complete
-    {
+    // An incomplete measurement is stored only with its root row marked
+    // as a lower bound (`INCOMPLETE_MARK`), so it can never be replayed
+    // whole; its readable subfolders' totals let the next changed pass
+    // re-walk only the rest (#181: `~/Library/Caches` holds folders this
+    // process may not list, so it was walked whole every pass). The
+    // caller decides how to report this pass
+    // (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    if let Some(dir) = store {
         record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
     }
     let mut folded = folded;
@@ -460,6 +459,10 @@ fn record_folded_measurement(
 /// never mistakes a plain stamp row for a total.
 const CHILD_TOTAL_MARK: &str = "\u{2}child-total";
 
+/// Appended to the root row's digest of a measurement that was a lower
+/// bound: stored only so its complete subfolders can be replayed.
+const INCOMPLETE_MARK: &str = "\u{2}incomplete";
+
 /// The name, under a subfolder's rel_dir, of the row holding that
 /// subfolder's bytes with every hard link counted (what its directory
 /// rollups sum to, which the drilldown shows beside an adjustment row).
@@ -500,10 +503,23 @@ fn folded_rows(
         std::collections::HashMap::new();
     let mut raw: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut seen: std::collections::HashSet<(String, u64, u64)> = std::collections::HashSet::new();
+    let mut incomplete_buckets: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for stamp in stamps {
         // A stamp from outside the unit cannot be validated against the
         // unit root later, so the whole measurement is not stored.
         let rel = stamp.path.strip_prefix(path).ok()?.display().to_string();
+        if stamp.incomplete {
+            // An unreadable directory: its subfolder is never replayed,
+            // and an unreadable root stores nothing.
+            if rel.is_empty() {
+                return None;
+            }
+            incomplete_buckets.insert(rel.split('/').next().unwrap_or("").to_string());
+            if stamp.mtime_ns == 0 && stamp.ctime_ns == 0 && stamp.own_bytes == 0 {
+                continue;
+            }
+        }
         saw_root |= rel.is_empty();
         files_max = files_max.max(stamp.files_mtime_max);
         let bucket = rel.split('/').next().unwrap_or("").to_string();
@@ -545,7 +561,8 @@ fn folded_rows(
     for row in carried {
         let mut row = row.clone();
         row.observed_at = observed_at;
-        if row.exclusions == marked {
+        // A subfolder's total row, not its all-links byte row below it.
+        if row.exclusions == marked && !row.rel_dir.contains('/') {
             carried_total += row.bytes;
             files_max = files_max.max(row.mtime_max);
         }
@@ -554,7 +571,11 @@ fn folded_rows(
     // The buckets add up to the deduplicated total exactly only when no
     // inode is linked from two of them: then a subfolder can be replayed
     // on its own without counting a shared file twice.
-    let consistent = !root_linked
+    // Every lower bound is accounted for by a subfolder that will be
+    // walked again; otherwise nothing is marked.
+    let attributed = folded.complete || !incomplete_buckets.is_empty();
+    let consistent = attributed
+        && !root_linked
         && root_own + children.values().map(|c| c.0).sum::<u64>() + carried_total == folded.bytes
         && files_max == folded.mtime_max;
     for (i, row) in rows.iter_mut().enumerate() {
@@ -562,6 +583,11 @@ fn folded_rows(
             row.bytes = folded.bytes;
             row.hardlinked = folded.hardlinked;
             row.mtime_max = folded.mtime_max;
+            // A lower bound is never replayed whole: its root row carries
+            // a digest the whole-unit reuse cannot match.
+            if !folded.complete {
+                row.exclusions = format!("{digest}{INCOMPLETE_MARK}");
+            }
             continue;
         }
         if row.rel_dir.contains('/') {
@@ -572,6 +598,7 @@ fn folded_rows(
             row.mtime_max = 0;
             row.exclusions = digest.clone();
         } else if i < first_carried
+            && !incomplete_buckets.contains(&row.rel_dir)
             && let Some((bytes, mtime_max, linked)) = children.get(&row.rel_dir)
         {
             row.bytes = *bytes;
@@ -582,7 +609,7 @@ fn folded_rows(
     }
     if consistent {
         for (name, (_, _, linked)) in &children {
-            if *linked {
+            if *linked && !incomplete_buckets.contains(name) {
                 rows.push(crate::growth::FoldedRow {
                     unit_path: unit_path.clone(),
                     rel_dir: format!("{name}/{RAW_BYTES_ROW}"),
@@ -631,7 +658,7 @@ fn partial_measure(
     let rows = crate::growth::folded_rows_for(dir, &unit_path);
     let root = rows.iter().find(|r| r.rel_dir.is_empty())?;
     let digest = exclusions_digest(exclusions);
-    if root.exclusions != digest {
+    if root.exclusions != digest && root.exclusions != format!("{digest}{INCOMPLETE_MARK}") {
         return None;
     }
     let marked = format!("{digest}{CHILD_TOTAL_MARK}");
@@ -688,10 +715,7 @@ fn partial_measure(
         .filter(|r| in_reused(&r.rel_dir))
         .cloned()
         .collect();
-    if complete
-        && let Some(new_rows) =
-            folded_rows(path, exclusions, observed_at, &folded, &stamps, &carried)
-    {
+    if let Some(new_rows) = folded_rows(path, exclusions, observed_at, &folded, &stamps, &carried) {
         let _ = crate::growth::store_folded_rows(dir, &unit_path, &new_rows);
     }
     if let Some((worktree_id, _)) = worktree {
@@ -749,7 +773,11 @@ pub(crate) fn child_totals(
 ) -> Option<std::collections::HashMap<String, (u64, u64)>> {
     let rows = crate::growth::folded_rows_for(store, &unit.display().to_string());
     let root = rows.iter().find(|r| r.rel_dir.is_empty())?;
-    let marked = format!("{}{CHILD_TOTAL_MARK}", root.exclusions);
+    let digest = root
+        .exclusions
+        .strip_suffix(INCOMPLETE_MARK)
+        .unwrap_or(&root.exclusions);
+    let marked = format!("{digest}{CHILD_TOTAL_MARK}");
     let totals: std::collections::HashMap<String, (u64, u64)> = rows
         .iter()
         .filter(|r| r.exclusions == marked && !r.rel_dir.contains('/'))
@@ -895,14 +923,14 @@ pub fn observe_unit_with_dirs(
                 mtime_max: row.mtime_max,
                 complete,
             };
-            // Same rule as `measure`: an incomplete fold is never stored
-            // (it would overwrite a good prior measurement with a
-            // partial one), but the store's own directory rows are
-            // still handed back so the adapter can identify whatever
-            // *was* read -- best-effort, same as any other unreadable
-            // subdirectory.
+            // A build store's incomplete fold is never stored (its
+            // adapter replays the store whole); a drilled unit's is, as in
+            // `measure`, marked as a lower bound. The store's own
+            // directory rows are still handed back so the adapter can
+            // identify whatever *was* read -- best-effort, same as any
+            // other unreadable subdirectory.
             if let Some(dir) = store
-                && complete
+                && (complete || allow_partial)
             {
                 record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
             }
@@ -1004,6 +1032,7 @@ pub fn folded_bytes_bounded_stamped(
             files_mtime_max: 0,
             shared_inode: false,
             linked: Vec::new(),
+            incomplete: false,
         });
         let mut here = 0u64;
         for entry in rd.flatten() {
@@ -1451,6 +1480,51 @@ mod tests {
             golden(&unit),
             "a hardlink was counted twice"
         );
+    }
+
+    /// Tempting wrong patches: (1) store nothing for a unit with an
+    /// unreadable folder, so it is walked whole every pass (the
+    /// maintainer's `~/Library/Caches`); (2) store it as a complete
+    /// measurement, so it is replayed whole as if it were exact. The
+    /// readable subfolders are replayed, the unreadable one is tried again,
+    /// the answer stays a lower bound equal to a fresh walk's, and the
+    /// stored rows are never replayed whole.
+    #[test]
+    fn a_unit_with_an_unreadable_folder_replays_its_readable_ones() {
+        use crate::fs_events::EventCoverage;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("cache");
+        fixture(&unit);
+        std::fs::create_dir_all(unit.join("locked/inner")).unwrap();
+        std::fs::set_permissions(unit.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let none = EventCoverage::untrusted();
+        let first = measure(Some(store.path()), &unit, &[], 1_000, &none);
+        assert!(!first.complete);
+        let quiet = EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 500);
+        assert!(
+            reuse_folded_measurement(Some(store.path()), &unit, &[], &quiet).is_none(),
+            "a lower bound was replayed whole"
+        );
+        std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(8192)).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 500);
+        let (second, cost) = crate::work_counters::measured(|| {
+            measure(Some(store.path()), &unit, &[], 2_000, &window)
+        });
+        assert_eq!(cost.subtrees_reused, 2, "a and c are replayed: {cost:?}");
+        let fresh = tempfile::tempdir().unwrap();
+        let golden = measure(Some(fresh.path()), &unit, &[], 9_000, &none);
+        std::fs::set_permissions(unit.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            (second.bytes, second.mtime_max, second.complete),
+            (golden.bytes, golden.mtime_max, golden.complete)
+        );
+        assert!(!second.complete);
     }
 
     /// A different exclusion set describes different bytes, so it must

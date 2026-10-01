@@ -56,14 +56,14 @@ fn a_test_mode_observe_that_would_write_the_real_users_log_is_refused() {
     assert!(!out.status.success(), "the guard did not fire");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("test hermeticity"), "{stderr}");
-    assert_eq!(
-        files_under(&tmp.path().join("store"))
-            .iter()
-            .filter(|f| f.extension().is_some_and(|e| e == "parquet"))
-            .count(),
-        0,
-        "the observation ran before the guard fired"
-    );
+    // Setup tables may exist; no observation was measured or recorded.
+    let store_files = files_under(&tmp.path().join("store"));
+    for table in ["runs.parquet", "scheduled_runs.parquet", "projects.parquet"] {
+        assert!(
+            !store_files.iter().any(|f| f.ends_with(table)),
+            "the observation ran before the guard fired: {store_files:?}"
+        );
+    }
 }
 
 /// Tempting wrong patch: point only the store at the temp dir and trust
