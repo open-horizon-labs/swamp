@@ -918,7 +918,7 @@ fn adv_bidi_in_a_repo_folder_name_is_stripped() {
     );
     let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
     let rows = model_rows(&root, &units, 2_000_000_000);
-    let json = serde_json::to_string(&rows).unwrap();
+    let json = serde_json::to_value(&rows).unwrap().to_string();
     assert!(!json.contains('\u{202E}'), "{json}");
 }
 

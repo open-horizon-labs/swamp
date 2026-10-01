@@ -229,7 +229,7 @@ pub(crate) fn enrich_with(
             // No fetch this pass: an older answer is kept (and stays in the
             // cache), labelled as older; never dropped.
             None => cards.lookup(&key, API_FORMAT).map(|mut e| {
-                e.fields.insert("stale".into(), "1".into());
+                e.fields.insert("past_ttl".into(), "1".into());
                 e
             }),
         };
@@ -283,7 +283,7 @@ pub(crate) fn enrich_with(
             // Keep the revision-pinned entry wanted whether or not it is used.
             let _ = cards.lookup(&rev_key(&store, &kind, &id, sha), API_FORMAT);
         }
-        let older = if entry.fields.contains_key("stale") {
+        let older = if entry.fields.contains_key("past_ttl") {
             "; older than the refresh interval, a scheduled observe asks again"
         } else {
             ""
