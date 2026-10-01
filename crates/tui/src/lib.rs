@@ -1152,6 +1152,48 @@ mod tests {
         }
     }
 
+    /// Adversarial (#210): the "never cut mid-hint" rule must hold for the
+    /// keys row in every mode, not only the main legend. Tempting wrong
+    /// patch: fit only `footer_legend` and leave the fixed mode strings
+    /// (filter editor, blocked list) to be clipped by the terminal.
+    #[test]
+    fn adv_mode_key_rows_never_cut_a_hint_at_narrow_widths() {
+        type Setup = fn(&mut App);
+        let modes: [(&str, Setup, &[&str]); 2] = [
+            (
+                "filter editor",
+                |a| a.editing_filter = true,
+                &["Tab complete", "Enter apply", "Esc cancel"],
+            ),
+            (
+                "blocked list",
+                |a| a.blocked_open = true,
+                &["↑↓ scroll", "r check again", "Esc close"],
+            ),
+        ];
+        for (name, setup, hints) in modes {
+            for w in 12u16..=80 {
+                let mut app = App::new(empty_report(), "/root".into());
+                setup(&mut app);
+                let mut t = Terminal::new(TestBackend::new(w, 24)).unwrap();
+                t.draw(|f| ui::draw(f, &app)).unwrap();
+                let buf = t.backend().buffer().clone();
+                let line: String = (0..w).map(|x| buf[(x, 23)].symbol().to_string()).collect();
+                let line = line.trim_end();
+                for part in line.split(" · ").map(str::trim).filter(|p| !p.is_empty()) {
+                    assert!(
+                        hints.contains(&part),
+                        "{name} width {w}: cut hint {part:?} in {line:?}"
+                    );
+                }
+                assert!(
+                    line.contains("Esc"),
+                    "{name} width {w}: no way out shown: {line:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn footer_legend_names_the_refresh_key() {
         let app = App::new(empty_report(), "/root".into());
