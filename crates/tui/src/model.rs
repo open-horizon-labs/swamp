@@ -2455,7 +2455,7 @@ pub fn reclaim_rows(
             standing.push(format!("cost from: {}", r.regeneration.source));
         }
         row.detail_lines = vec![
-            format!("removal: {}", r.removal.text),
+            format!("removal: {}", r.removal.tui_text),
             r.consumers.summary.clone(),
             standing.join(" · "),
         ];

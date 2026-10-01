@@ -1194,6 +1194,81 @@ mod tests {
         }
     }
 
+    /// Tempting wrong patch: only the main legend and two modes are fitted;
+    /// help's title, the plan confirm and the tool sheet are cut by the
+    /// terminal. In each mode, at every width, the last row/title shows only
+    /// whole hints and the way out (Esc) while any hint fits.
+    #[test]
+    fn every_mode_keeps_the_way_out_and_cuts_no_hint() {
+        use crate::tool_sheet::{Stage, ToolSheet};
+        let manager = swamp_core::tool_removal::Manager::Mise;
+        type Setup = fn(&mut App);
+        let modes: [(&str, Setup, usize, &[&str]); 5] = [
+            (
+                "help",
+                |a| a.help_open = true,
+                0,
+                &["help", "↑↓ PgUp PgDn Home End scroll", "Esc closes"],
+            ),
+            (
+                "confirm",
+                |a| a.confirm_open = true,
+                23,
+                &[
+                    "Enter confirm",
+                    "Esc back",
+                    "The whole plan does not fit: enlarge the terminal or mark fewer rows",
+                    "Plan does not fit",
+                ],
+            ),
+            (
+                "tool sheet listing",
+                |a| a.tool_sheet = Some(ToolSheet::new(swamp_core::tool_removal::Manager::Mise)),
+                22,
+                &["Esc cancel (nothing is removed)", "Esc cancel"],
+            ),
+            (
+                "tool sheet choose",
+                |a| {
+                    let mut t = ToolSheet::new(swamp_core::tool_removal::Manager::Mise);
+                    t.stage = Stage::Choose;
+                    a.tool_sheet = Some(t);
+                },
+                22,
+                &["↑↓ choose", "Enter review", "Esc close"],
+            ),
+            (
+                "filter",
+                |a| a.editing_filter = true,
+                23,
+                &["Tab complete", "Enter apply", "Esc cancel"],
+            ),
+        ];
+        let _ = manager;
+        for (name, setup, row, hints) in modes {
+            for w in 14u16..=100 {
+                let mut app = App::new(empty_report(), "/root".into());
+                setup(&mut app);
+                let mut t = Terminal::new(TestBackend::new(w, 24)).unwrap();
+                t.draw(|f| ui::draw(f, &app)).unwrap();
+                let buf = t.backend().buffer().clone();
+                let line: String = (0..w)
+                    .map(|x| buf[(x, row as u16)].symbol().to_string())
+                    .collect();
+                let line = line.rsplit('┌').next().unwrap_or(&line);
+                let line = line.trim_matches(|c: char| " │─┐└┘".contains(c));
+                for part in line.split(" · ").map(str::trim).filter(|p| !p.is_empty()) {
+                    // help's title also carries a "N-M of T" range.
+                    let range = part.contains(" of ") && part.contains('-');
+                    assert!(
+                        hints.contains(&part) || range,
+                        "{name} width {w}: cut hint {part:?} in {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn footer_legend_names_the_refresh_key() {
         let app = App::new(empty_report(), "/root".into());

@@ -115,15 +115,16 @@ impl ToolSheet {
         format!(" Remove with {}, no Trash ", self.manager.name())
     }
 
-    /// The keys for this stage: always the sheet's last row.
-    pub fn keys(&self) -> &'static str {
+    /// The keys for this stage as whole hints: always the sheet's last
+    /// row. The way out comes first so it is the last to be dropped.
+    pub fn key_hints(&self) -> Vec<&'static str> {
         match self.stage {
-            Stage::Listing | Stage::Reviewing(_) => "Esc cancel (nothing is removed)",
-            Stage::Choose => "↑↓ choose · Enter review · Esc close",
-            Stage::Confirm(_) => "Y remove (cannot be undone) · Esc cancel",
-            Stage::Refused { .. } => "Esc back",
-            Stage::Running(_) => "Running: keys wait until the manager finishes",
-            Stage::Done(_) => "Esc close · R refresh swamp's measurements",
+            Stage::Listing | Stage::Reviewing(_) => vec!["Esc cancel (nothing is removed)"],
+            Stage::Choose => vec!["↑↓ choose", "Enter review", "Esc close"],
+            Stage::Confirm(_) => vec!["Y remove (cannot be undone)", "Esc cancel"],
+            Stage::Refused { .. } => vec!["Esc back"],
+            Stage::Running(_) => vec!["Running: keys wait until the manager finishes"],
+            Stage::Done(_) => vec!["Esc close", "R refresh swamp's measurements"],
         }
     }
 

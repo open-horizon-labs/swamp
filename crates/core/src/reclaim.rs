@@ -299,18 +299,32 @@ pub enum RemovalKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Removal {
     pub kind: RemovalKind,
+    /// For the CLI report and JSON: keys are named as the TUI's.
     pub text: String,
+    /// The TUI's own wording, for its detail pane (not in the JSON).
+    #[serde(skip)]
+    pub tui_text: String,
 }
 
 fn removal(kind: RemovalKind, manager: Option<&str>) -> Removal {
-    Removal {
-        kind,
-        text: match (kind, manager) {
-            (RemovalKind::TrashOrToolCommand, Some(m)) => format!(
+    let (text, tui_text) = match (kind, manager) {
+        (RemovalKind::TrashOrToolCommand, Some(m)) => (
+            format!(
+                "in the TUI: Space then Backspace moves to Trash; Backspace with nothing marked runs {m}'s own command (permanent)"
+            ),
+            format!(
                 "Trash (Space, then Backspace); {m}'s own command, permanent (Backspace, nothing marked)"
             ),
-            _ => "Trash (Space, then Backspace)".to_string(),
-        },
+        ),
+        _ => (
+            "in the TUI: Space then Backspace moves to Trash".to_string(),
+            "Trash (Space, then Backspace)".to_string(),
+        ),
+    };
+    Removal {
+        kind,
+        text,
+        tui_text,
     }
 }
 

@@ -1168,13 +1168,13 @@ fn removal_paths_are_only_the_ones_that_exist() {
     let r = row(&sim, "/Library/Developer/CoreSimulator/Volumes");
     assert_eq!(r.removal.kind, RemovalKind::TrashOrToolCommand);
     assert!(
-        r.removal.text.contains("simctl's own command"),
+        r.removal.text.contains("in the TUI") && r.removal.text.contains("simctl's own command"),
         "{}",
         r.removal.text
     );
     assert!(r.removal.text.contains("permanent"), "{}", r.removal.text);
     assert!(
-        r.removal.text.contains("Trash (Space"),
+        r.removal.tui_text.contains("Trash (Space"),
         "{}",
         r.removal.text
     );
