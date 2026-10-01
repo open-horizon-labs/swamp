@@ -54,26 +54,38 @@ impl Consumer for GithubConsumer {
                     .map(|m| crate::fs_gate::MetadataExt::dev(&m))
                     .unwrap_or(0);
                 // Only worktrees whose remote resolves to a github.com owner/repo.
-                let mut owned: Vec<(String, String, String, Option<String>, String)> = Vec::new();
                 let mut ids: Vec<&String> = by_worktree.keys().collect();
                 ids.sort();
-                for worktree_id in ids {
-                    let Some(remote) = remotes.get(worktree_id) else {
-                        continue;
-                    };
-                    let Some((owner, repo)) = crate::github::github_owner_repo(remote) else {
-                        continue;
-                    };
-                    let sig = &by_worktree[worktree_id];
-                    let tip_sha = crate::signals::tip_sha(&sig.path).unwrap_or_default();
-                    owned.push((
-                        worktree_id.clone(),
-                        owner,
-                        repo,
-                        sig.branch.clone(),
-                        tip_sha,
-                    ));
-                }
+                let candidates: Vec<(&String, String, String)> = ids
+                    .into_iter()
+                    .filter_map(|worktree_id| {
+                        let remote = remotes.get(worktree_id)?;
+                        let (owner, repo) = crate::github::github_owner_repo(remote)?;
+                        Some((worktree_id, owner, repo))
+                    })
+                    .collect();
+                // Each tip is one repository open (#181: 83 worktrees opened
+                // one after another were ~1 s of a warm pass, ~2 s at
+                // background priority); the opens are independent, so they
+                // run on a small pool and keep their order.
+                let paths: Vec<&std::path::Path> = candidates
+                    .iter()
+                    .map(|(id, _, _)| by_worktree[*id].path.as_path())
+                    .collect();
+                let tips = tip_shas_parallel(&paths);
+                let owned: Vec<(String, String, String, Option<String>, String)> = candidates
+                    .into_iter()
+                    .zip(tips)
+                    .map(|((worktree_id, owner, repo), tip_sha)| {
+                        (
+                            worktree_id.clone(),
+                            owner,
+                            repo,
+                            by_worktree[worktree_id].branch.clone(),
+                            tip_sha,
+                        )
+                    })
+                    .collect();
                 let inputs: Vec<crate::github::EnrichInput> = owned
                     .iter()
                     .map(
@@ -138,5 +150,83 @@ impl Consumer for GithubConsumer {
             }
             _ => Ok(vec![]),
         }
+    }
+}
+
+/// `signals::tip_sha` for every path, in input order, on up to four
+/// threads (a scheduled observe runs at low priority; four keeps the opens
+/// from crowding the rest of the pass).
+fn tip_shas_parallel(paths: &[&std::path::Path]) -> Vec<String> {
+    let workers = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(4)
+        .min(4)
+        .min(paths.len())
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<std::sync::Mutex<String>> = paths
+        .iter()
+        .map(|_| std::sync::Mutex::new(String::new()))
+        .collect();
+    let scope = crate::work_counters::current();
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            let scope = scope.clone();
+            let (next, out) = (&next, &out);
+            s.spawn(move || {
+                crate::work_counters::install(scope);
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(path) = paths.get(i) else { break };
+                    *out[i].lock().unwrap() = crate::signals::tip_sha(path).unwrap_or_default();
+                }
+            });
+        }
+    });
+    out.into_iter().map(|m| m.into_inner().unwrap()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    /// Tempting wrong patch: collect the tips as the threads finish, so a
+    /// tip lands on another worktree's row. Order and values equal the
+    /// serial opens.
+    #[test]
+    fn parallel_tips_keep_input_order_and_equal_the_serial_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let repo = tmp.path().join(format!("r{i}"));
+            std::fs::create_dir_all(&repo).unwrap();
+            if i % 3 != 2 {
+                let git = |args: &[&str]| {
+                    crate::work_counters::record_spawn();
+                    let ok = std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(&repo)
+                        .env("GIT_AUTHOR_NAME", "t")
+                        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                        .env("GIT_COMMITTER_NAME", "t")
+                        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .status()
+                        .unwrap()
+                        .success();
+                    assert!(ok, "{args:?}");
+                };
+                git(&["init", "-q"]);
+                std::fs::write(repo.join("f"), format!("{i}")).unwrap();
+                git(&["add", "f"]);
+                git(&["commit", "-q", "-m", "c", "--no-gpg-sign"]);
+            }
+            paths.push(repo);
+        }
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        let serial: Vec<String> = refs
+            .iter()
+            .map(|p| crate::signals::tip_sha(p).unwrap_or_default())
+            .collect();
+        assert_eq!(serial.iter().filter(|s| !s.is_empty()).count(), 4);
+        assert_eq!(super::tip_shas_parallel(&refs), serial);
     }
 }
