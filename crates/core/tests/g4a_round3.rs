@@ -401,6 +401,14 @@ const TABLE: &[(&str, RegenClass)] = &[
         "the download cache is shared by every Go build on this machine",
         Download,
     ),
+    (
+        "each repo is downloaded again from huggingface.co when a program asks for it",
+        Download,
+    ),
+    (
+        "each model is downloaded again with `ollama pull` when the registry has it",
+        Download,
+    ),
 ];
 
 /// The tempting wrong patch: a cue list tuned on a few texts. Every text
