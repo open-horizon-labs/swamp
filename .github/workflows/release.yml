@@ -211,7 +211,9 @@ jobs:
   # job in every active run has failed. With no run it dispatches one.
   gates:
     name: CI and the full tier passed for this commit
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
+    # Always hosted: this job only polls the Actions API with `gh` for a few
+    # minutes, and the fleet's Linux image does not ship `gh`.
+    runs-on: ubuntu-24.04
     timeout-minutes: 100
     permissions:
       actions: write
