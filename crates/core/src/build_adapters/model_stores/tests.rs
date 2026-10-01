@@ -41,11 +41,11 @@ fn used(p: &Path) {
         .unwrap();
 }
 
-/// Allocated bytes as the filesystem reports them once every earlier
-/// write is reflected (ZFS assigns `st_blocks` at commit; #197).
+/// Allocated bytes as reported now. Fixtures whose sizes a test asserts
+/// call `settle()` once after writing (ZFS assigns `st_blocks` at
+/// commit, 1-5 s per settle there; #197), never per measurement.
 fn allocated(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    crate::fs_gate::settle::settle();
     crate::fs_gate::symlink_metadata(p).map_or(0, |m| m.blocks() * 512)
 }
 
@@ -129,6 +129,7 @@ fn hub_fixture(readme: &str) -> Hub {
     fs::create_dir_all(t.join("snapshots/my-run")).unwrap();
     fs::write(t.join("blobs/w"), vec![2u8; 3000]).unwrap();
     symlink("../../blobs/w", t.join("snapshots/my-run/model.bin")).unwrap();
+    crate::fs_gate::settle::settle();
     Hub { _tmp: tmp, root }
 }
 
@@ -136,7 +137,6 @@ fn hub_fixture(readme: &str) -> Hub {
 /// allocated bytes (symlinks counted as the walk counts them: not at
 /// all), summed upward.
 fn folded(root: &Path) -> FoldedIndex {
-    crate::fs_gate::settle::settle();
     fn total(p: &Path, out: &mut Vec<FoldedDir>) -> u64 {
         let mut sum = 0;
         let (entries, _) = crate::locations::shallow_list_links(p);
@@ -169,8 +169,6 @@ fn identify(
     root: &Path,
     cards: &CardCache,
 ) -> (Vec<NestedArtifact>, crate::work_counters::WorkCounters) {
-    // The adapter stats blobs; on ZFS their blocks appear at commit.
-    crate::fs_gate::settle::settle();
     let idx = folded(root);
     let none = EventCoverage::untrusted();
     let cache = ContainerCache::disabled();
@@ -710,6 +708,22 @@ fn usage_doc_states_the_bounds_the_code_uses() {
 // demonstrates; a FAILING test here is a must-fix finding.
 // ---------------------------------------------------------------------
 
+/// Runs `f` on its own thread and fails the test after `secs` instead of
+/// hanging: a FIFO opened by mistake blocks until a writer appears, which
+/// in a test is never. Tempting wrong patch: timing the call afterwards,
+/// which only reports once the hang ends (26 minutes on the Linux fleet
+/// when a test helper waited on ZFS commits).
+fn within<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .unwrap_or_else(|_| {
+            panic!("{what} did not return within {secs} s: something blocked (a FIFO opened?)")
+        })
+}
+
 fn one_repo(root: &Path, folder: &str, files: &[(&str, Vec<u8>)]) -> PathBuf {
     let r = root.join(folder);
     fs::create_dir_all(r.join("blobs")).unwrap();
@@ -848,6 +862,7 @@ fn adv_a_symlinked_shared_blob_subdir_is_not_counted() {
     let r = root.join("models--org--x");
     fs::create_dir_all(r.join("blobs")).unwrap();
     symlink("../../blobs/ab/big", r.join("blobs/hb")).unwrap();
+    crate::fs_gate::settle::settle();
     let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
     let store_total = folded(&root).get(&root).unwrap().allocated_total;
     let sum: u64 = units
@@ -873,6 +888,7 @@ fn adv_a_link_between_a_repos_own_blobs_is_counted_once() {
         &[("model.safetensors", st_header(&[("w", "F32", &[4])]))],
     );
     symlink("b0", r.join("blobs/alias")).unwrap();
+    crate::fs_gate::settle::settle();
     let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
     let store_total = folded(&root).get(&root).unwrap().allocated_total;
     let sum: u64 = units
@@ -909,6 +925,7 @@ fn adv_a_symlinked_ollama_blobs_dir_is_not_counted() {
         ),
     )
     .unwrap();
+    crate::fs_gate::settle::settle();
     let (units, _) = identify(BuildStoreKind::OllamaModels, &root, &CardCache::default());
     let m = unit(&units, "latest");
     assert_eq!(
@@ -1009,9 +1026,14 @@ fn adv_fifo_blob_and_symlinked_snapshot_are_not_opened() {
     )
     .unwrap();
     symlink("/etc", r.join("snapshots").join(REV2)).unwrap();
-    let t0 = std::time::Instant::now();
-    let (units, w) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
-    assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    let root2 = root.clone();
+    let (units, w) = within(5, "identifying a hub with a FIFO blob", move || {
+        identify(
+            BuildStoreKind::HuggingFaceHub,
+            &root2,
+            &CardCache::default(),
+        )
+    });
     // The 40-byte ref only; the FIFO is never opened.
     assert_eq!(w.header_bytes_read, 40);
     assert!(!text_of(unit(&units, "models--org--f")).contains("22222222"));
@@ -1465,4 +1487,38 @@ fn where_a_read_moves_the_access_time_the_users_time_survives_a_reparse() {
     );
     let lr = ev(unit(&units, "models--org--nfs"), LAST_READ_EVIDENCE)[0];
     assert!(lr.starts_with(&format!("{user}|")), "{lr}");
+}
+
+/// Every file the adapter may open, made a FIFO: a ref, an Ollama
+/// manifest and an Ollama config blob. None is opened (an open of a FIFO
+/// blocks until a writer comes). Tempting wrong patch: a type check after
+/// the open (`fstat`), or a fallback open that drops `O_NONBLOCK`.
+#[test]
+fn no_fifo_anywhere_in_a_model_store_is_opened() {
+    let mkfifo = |p: &Path| {
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "{p:?}");
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let r = one_repo(&root, "models--org--p", &[]);
+    fs::remove_file(r.join("refs/main")).unwrap();
+    mkfifo(&r.join("refs/main"));
+    let hub = root.clone();
+    let (_, w) = within(5, "a hub with a FIFO ref", move || {
+        identify(BuildStoreKind::HuggingFaceHub, &hub, &CardCache::default())
+    });
+    assert_eq!(w.header_bytes_read, 0);
+    let o = ollama_fixture();
+    let lib = o.root.join("manifests/registry.ollama.ai/library");
+    fs::create_dir_all(lib.join("pipe")).unwrap();
+    mkfifo(&lib.join("pipe/latest"));
+    let cfg = o.root.join("blobs").join(digest('c').replacen(':', "-", 1));
+    fs::remove_file(&cfg).unwrap();
+    mkfifo(&cfg);
+    let store = o.root.clone();
+    let (units, _) = within(5, "an Ollama store with FIFO files", move || {
+        identify(BuildStoreKind::OllamaModels, &store, &CardCache::default())
+    });
+    assert!(text_of(unit(&units, "latest")).contains("manifest"));
 }
