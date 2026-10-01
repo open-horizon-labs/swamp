@@ -1590,4 +1590,251 @@ mod tests {
             all.bytes
         );
     }
+
+    /// Adversarial audit of #181 subfolder replay (audit/v080-perf). Each
+    /// case: pass 1 is a full walk that stores per-subfolder totals; the
+    /// disk is mutated; pass 2 gets the event window FSEvents would hand
+    /// it (directory-level events: the changed directory and its parent);
+    /// its answer must equal a fresh full walk's.
+    mod adversarial_181 {
+        use super::*;
+        use crate::fs_events::EventCoverage;
+
+        fn incremental_after(
+            tmp: &Path,
+            unit: &Path,
+            mutate: impl FnOnce(),
+            events: &[PathBuf],
+        ) -> (
+            (u64, u64, bool, bool, String),
+            (u64, u64, bool, bool, String),
+            u64,
+        ) {
+            let store = tempfile::tempdir().unwrap();
+            let none = EventCoverage::untrusted();
+            let _ = observe_unit_with_dirs(Some(store.path()), unit, &[], 1_000, &none, true, true);
+            mutate();
+            crate::fs_gate::settle::settle();
+            let window = EventCoverage::trusted(tmp.to_path_buf(), events.to_vec(), 500);
+            let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+                observe_unit_with_dirs(Some(store.path()), unit, &[], 2_000, &window, true, true)
+            });
+            let UnitObservation::Unit(f) = obs else {
+                panic!("not measured")
+            };
+            (shape(&f, unit, dirs), golden(unit), cost.subtrees_reused)
+        }
+
+        /// Tempting wrong patch: treat "no event at or under the
+        /// subfolder and its own directory stamp unchanged" as proof that
+        /// nothing it holds changed. A hard link made from OUTSIDE the
+        /// unit to a file in a replayed subfolder fires an event only
+        /// where the link was made; the file's link count changed, so a
+        /// full walk now says the unit holds hard-linked files (the
+        /// report then labels its bytes as possibly shared) while the
+        /// replay keeps the stored `hardlinked = false`.
+        #[test]
+        fn a_hard_link_made_from_outside_into_a_replayed_subfolder() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = tmp_path.join("cache");
+            fixture(&unit);
+            std::fs::create_dir_all(tmp_path.join("outside")).unwrap();
+            let (got, want, reused) = incremental_after(
+                &tmp_path,
+                &unit,
+                || {
+                    std::fs::hard_link(unit.join("a/x"), tmp_path.join("outside/link")).unwrap();
+                    // Something else in the unit changed, so the unit is
+                    // re-measured (partially) this pass.
+                    std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(4096))
+                        .unwrap();
+                },
+                &[tmp_path.join("outside"), unit.join("b"), unit.clone()],
+            );
+            assert!(reused > 0, "nothing was replayed");
+            assert_eq!(got, want, "replay kept the old hard-link flag");
+        }
+
+        /// The reverse: the outside link is removed; the stored flag says
+        /// hard-linked, the disk no longer does.
+        #[test]
+        fn a_hard_link_from_outside_removed_while_its_subfolder_is_replayed() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = tmp_path.join("cache");
+            fixture(&unit);
+            std::fs::create_dir_all(tmp_path.join("outside")).unwrap();
+            std::fs::hard_link(unit.join("a/x"), tmp_path.join("outside/link")).unwrap();
+            crate::fs_gate::settle::settle();
+            let (got, want, _) = incremental_after(
+                &tmp_path,
+                &unit,
+                || {
+                    std::fs::remove_file(tmp_path.join("outside/link")).unwrap();
+                    std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(4096))
+                        .unwrap();
+                },
+                &[tmp_path.join("outside"), unit.join("b"), unit.clone()],
+            );
+            assert_eq!(got, want);
+        }
+
+        /// Case-only rename on APFS (case-insensitive): the event is on
+        /// the unit root; the stored row is named `a`, the disk says `A`.
+        #[test]
+        fn a_case_only_rename_of_a_subfolder() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = tmp_path.join("cache");
+            fixture(&unit);
+            let (got, want, _) = incremental_after(
+                &tmp_path,
+                &unit,
+                || {
+                    std::fs::rename(unit.join("a"), unit.join("A")).unwrap();
+                },
+                &[unit.clone(), tmp_path.clone()],
+            );
+            assert_eq!(got, want, "a case-only rename replayed the old name");
+        }
+
+        /// Directory replaced by a file, file replaced by a directory, a
+        /// directory deleted and recreated with the same content, a
+        /// symlink to a directory put in a subfolder's place, a change 40
+        /// levels down: each must equal a full walk.
+        #[test]
+        fn replacements_and_deep_changes_equal_a_full_walk() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let noise = crate::fs_gate::settle::noise;
+            type Case = (&'static str, fn(&Path, &Path), fn(&Path) -> Vec<PathBuf>);
+            let cases: Vec<Case> = vec![
+                (
+                    "dir to file",
+                    |u, _| {
+                        std::fs::remove_dir_all(u.join("c")).unwrap();
+                        std::fs::write(u.join("c"), crate::fs_gate::settle::noise(4096)).unwrap();
+                    },
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "file to dir",
+                    |u, _| {
+                        std::fs::remove_file(u.join("root-file")).unwrap();
+                        std::fs::create_dir_all(u.join("root-file")).unwrap();
+                        std::fs::write(u.join("root-file/q"), crate::fs_gate::settle::noise(4096))
+                            .unwrap();
+                    },
+                    |u| vec![u.to_path_buf(), u.join("root-file")],
+                ),
+                (
+                    "deleted and recreated",
+                    |u, _| {
+                        std::fs::remove_dir_all(u.join("c")).unwrap();
+                        std::fs::create_dir_all(u.join("c")).unwrap();
+                        std::fs::write(u.join("c/w"), crate::fs_gate::settle::noise(12288))
+                            .unwrap();
+                    },
+                    // Coalesced: only the parent named.
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "symlink in place",
+                    |u, t| {
+                        std::fs::rename(u.join("c"), t.join("moved-c")).unwrap();
+                        std::os::unix::fs::symlink(t.join("moved-c"), u.join("c")).unwrap();
+                    },
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "moved out",
+                    |u, t| {
+                        std::fs::rename(u.join("c"), t.join("gone-c")).unwrap();
+                    },
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "deep change",
+                    |u, _| {
+                        let mut d = u.join("b");
+                        for i in 0..40 {
+                            d = d.join(format!("d{i}"));
+                        }
+                        std::fs::write(d.join("deep"), crate::fs_gate::settle::noise(8192))
+                            .unwrap();
+                    },
+                    |u| {
+                        let mut d = u.join("b");
+                        for i in 0..40 {
+                            d = d.join(format!("d{i}"));
+                        }
+                        vec![d.clone(), d.parent().unwrap().to_path_buf()]
+                    },
+                ),
+            ];
+            for (name, mutate, events) in cases {
+                let tmp = tempfile::tempdir().unwrap();
+                let t = std::fs::canonicalize(tmp.path()).unwrap();
+                let unit = t.join("cache");
+                fixture(&unit);
+                let mut d = unit.join("b");
+                for i in 0..40 {
+                    d = d.join(format!("d{i}"));
+                }
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("seed"), noise(4096)).unwrap();
+                crate::fs_gate::settle::settle();
+                let ev = events(&unit);
+                let (got, want, _) = incremental_after(&t, &unit, || mutate(&unit, &t), &ev);
+                assert_eq!(got, want, "{name}");
+            }
+        }
+
+        /// Stored rows from a format that predates per-subfolder totals
+        /// (no marked rows), or a missing root row, must never be
+        /// replayed partially.
+        #[test]
+        fn rows_without_marks_or_without_a_root_are_never_replayed() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let t = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = t.join("cache");
+            fixture(&unit);
+            let store = tempfile::tempdir().unwrap();
+            let none = EventCoverage::untrusted();
+            let _ = measure(Some(store.path()), &unit, &[], 1_000, &none);
+            let key = unit.display().to_string();
+            let rows = crate::growth::folded_rows_for(store.path(), &key);
+            let digest = exclusions_digest(&[]);
+            let old: Vec<_> = rows
+                .iter()
+                .cloned()
+                .map(|mut r| {
+                    if !r.rel_dir.is_empty() {
+                        r.exclusions = digest.clone();
+                        r.bytes = 0;
+                    }
+                    r
+                })
+                .filter(|r| !r.rel_dir.contains('\0'))
+                .collect();
+            crate::growth::store_folded_rows(store.path(), &key, &old).unwrap();
+            let window = EventCoverage::trusted(t.clone(), vec![unit.join("b")], 500);
+            assert!(
+                partial_measure(Some(store.path()), &unit, &[], 2_000, &window, None).is_none()
+            );
+            let rootless: Vec<_> = rows
+                .iter()
+                .filter(|r| !r.rel_dir.is_empty())
+                .cloned()
+                .collect();
+            crate::growth::store_folded_rows(store.path(), &key, &rootless).unwrap();
+            assert!(
+                partial_measure(Some(store.path()), &unit, &[], 2_000, &window, None).is_none()
+            );
+        }
+    }
 }
