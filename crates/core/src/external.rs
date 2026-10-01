@@ -545,6 +545,19 @@ pub fn observe_external(
     let stored_cache = crate::build_adapters::ContainerCache::from_containers(
         previous_units.values().cloned().collect(),
     );
+    // A store holding only sealed read-only volumes whose stamps hold is
+    // vouched for without a window (`sealed_only_unchanged`).
+    let mut vouched = coverage.clone();
+    for container in store_containers.values() {
+        if crate::folded_measurement::sealed_only_unchanged(swamp_dir, &container.path) {
+            vouched.merge(crate::fs_events::EventCoverage::trusted(
+                container.path.clone(),
+                Vec::new(),
+                0,
+            ));
+        }
+    }
+    let coverage = &vouched;
     let no_rows = crate::build_adapters::FoldedIndex::default();
     let probe =
         crate::build_adapters::BuildCtx::new(observed_at, &no_rows, coverage, &stored_cache);

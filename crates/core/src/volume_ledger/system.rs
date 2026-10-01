@@ -388,8 +388,7 @@ pub(crate) fn reuse_within_cycle(
         .iter()
         .all(|m| rows.iter().any(|r| r.method == *m));
     let fresh = rows.iter().all(|r| {
-        r.measured_at >= cycle_started_at
-            && now.saturating_sub(r.measured_at) < FACTS_REUSE_SECS
+        r.measured_at >= cycle_started_at && now.saturating_sub(r.measured_at) < FACTS_REUSE_SECS
     });
     (all_answered && fresh).then_some(SystemFacts {
         rows,

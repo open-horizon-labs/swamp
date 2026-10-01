@@ -2672,6 +2672,10 @@ pub fn observe_scope(
     let _ = &mut external_units;
     if trace {
         eprintln!("[trace] observe: external units: {:?}", phase.elapsed());
+        eprintln!(
+            "[trace] observe: last-used probes: {} ms",
+            crate::last_used::PROBE_MICROS.load(std::sync::atomic::Ordering::Relaxed) / 1000
+        );
     }
     let phase = std::time::Instant::now();
     // Aider's per-repository units need every known worktree root; the

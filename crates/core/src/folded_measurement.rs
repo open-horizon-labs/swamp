@@ -134,6 +134,45 @@ fn sealed_mounts_under(path: &Path) -> Vec<SealedMount> {
     out
 }
 
+/// Whether `path` holds nothing but sealed read-only mounts whose stored
+/// stamps still hold, and is itself the directory its stored root row
+/// describes (#181). Such a location cannot have changed without a new
+/// stamp: its only entries are mount points of read-only filesystems
+/// (nothing can be written inside them), and an entry added, removed or
+/// renamed moves the directory's own mtime/ctime. It is then vouched for
+/// without an event window, so a pass whose window was lost, or a store
+/// last written by another swamp, does not re-walk 1.77 million files of
+/// simulator runtimes. Any other entry, a missing stamp or a changed
+/// one: not vouched, and the usual rules apply.
+pub(crate) fn sealed_only_unchanged(store: Option<&Path>, path: &Path) -> bool {
+    let Some(dir) = store else { return false };
+    let mounts = sealed_mounts_under(path);
+    if mounts.is_empty() {
+        return false;
+    }
+    let unit_path = path.display().to_string();
+    let stored = crate::growth::volume_stamps_for(dir, &unit_path);
+    if !mounts.iter().all(|m| reuse_sealed(&stored, m).is_some()) {
+        return false;
+    }
+    let rows = crate::growth::folded_rows_for(dir, &unit_path);
+    let Some(root) = rows.iter().find(|r| r.rel_dir.is_empty()) else {
+        return false;
+    };
+    let Ok(meta) = crate::fs_gate::symlink_metadata(path) else {
+        return false;
+    };
+    if stamp_ns(&meta) != (root.mtime_ns, root.ctime_ns) {
+        return false;
+    }
+    let Ok(entries) = crate::fs_gate::read_dir(path) else {
+        return false;
+    };
+    entries
+        .map(|e| e.map(|e| e.path()))
+        .all(|p| p.is_ok_and(|p| mounts.iter().any(|m| m.path == p)))
+}
+
 /// One sealed mount's contribution, replayed from its stored stamp or
 /// walked.
 struct SealedPart {
@@ -1577,6 +1616,83 @@ mod tests {
             (golden.bytes, golden.mtime_max, golden.complete)
         );
         assert!(!second.complete);
+    }
+
+    /// #181. Tempting wrong patches: (1) require an event window before
+    /// replaying a store of sealed volumes, so a lost window or another
+    /// swamp's write re-walks 1.77M simulator files; (2) vouch for any
+    /// unit whose sealed mounts hold, missing a file written beside them.
+    /// Only a directory of nothing but unchanged sealed mounts, itself
+    /// unchanged, is vouched for, and its replay equals the first walk.
+    #[test]
+    fn a_store_of_only_sealed_volumes_is_vouched_for_by_its_stamps() {
+        use crate::fs_events::EventCoverage;
+        use crate::fs_gate::fs_space::{VolumeStamp, testing};
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = crate::fs_gate::canonicalize(tmp.path())
+            .unwrap()
+            .join("Volumes");
+        let sealed = unit.join("iOS_1");
+        std::fs::create_dir_all(sealed.join("a")).unwrap();
+        std::fs::write(sealed.join("a/big"), crate::fs_gate::settle::noise(65_536)).unwrap();
+        testing::set(
+            &unit,
+            VolumeStamp {
+                device: 1,
+                read_only: false,
+                total_blocks: 1000,
+                root_ino: 2,
+                root_mtime: 1,
+            },
+        );
+        let stamp = VolumeStamp {
+            device: 2,
+            read_only: true,
+            total_blocks: 4_000,
+            root_ino: 2,
+            root_mtime: 1_000,
+        };
+        testing::set(&sealed, stamp);
+        crate::fs_gate::settle::settle();
+        let none = EventCoverage::untrusted();
+        let (first, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let UnitObservation::Unit(first) = first else {
+            panic!("not measured")
+        };
+        assert!(sealed_only_unchanged(Some(store.path()), &unit));
+
+        let vouched = EventCoverage::trusted(unit.clone(), Vec::new(), 0);
+        let ((again, _), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &vouched, true, false)
+        });
+        let UnitObservation::Unit(again) = again else {
+            panic!("not measured")
+        };
+        assert!(again.reused);
+        assert_eq!(cost.files_statted, 0, "{cost:?}");
+        assert_eq!(
+            (again.bytes, again.mtime_max, again.complete),
+            (first.bytes, first.mtime_max, first.complete)
+        );
+
+        // A volume replaced (new stamp): not vouched for.
+        testing::set(
+            &sealed,
+            VolumeStamp {
+                root_mtime: 2_000,
+                ..stamp
+            },
+        );
+        assert!(!sealed_only_unchanged(Some(store.path()), &unit));
+        testing::set(&sealed, stamp);
+        assert!(sealed_only_unchanged(Some(store.path()), &unit));
+        // A file beside the volumes: not vouched for.
+        std::fs::write(unit.join("loose"), b"x").unwrap();
+        assert!(!sealed_only_unchanged(Some(store.path()), &unit));
+        testing::clear();
     }
 
     /// A different exclusion set describes different bytes, so it must
