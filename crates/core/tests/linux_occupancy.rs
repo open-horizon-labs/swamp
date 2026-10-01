@@ -131,17 +131,13 @@ fn processes_exiting_during_the_scan_do_not_make_the_answer_unknown() {
 fn the_linux_probe_needs_no_lsof() {
     let _serial = serial();
     let (_tmp, target) = fixture();
-    let saved = std::env::var_os("PATH");
-    // SAFETY: this test binary's other tests spawn with absolute paths
-    // or before this point; PATH is restored below.
-    unsafe { std::env::set_var("PATH", "") };
+    let empty = tempfile::tempdir().unwrap();
+    // SAFETY: serialized with this binary's other tests; restored below.
+    // No `lsof` anywhere swamp looks (#199: never PATH), via the test
+    // build's program directory.
+    unsafe { std::env::set_var("SWAMP_TEST_PROGRAM_DIR", empty.path()) };
     let got = probe_path(&target);
-    unsafe {
-        match saved {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-    }
+    unsafe { std::env::remove_var("SWAMP_TEST_PROGRAM_DIR") };
     assert_eq!(got, OccupancyState::Free);
 }
 

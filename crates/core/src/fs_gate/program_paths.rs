@@ -587,14 +587,29 @@ mod tests {
         assert!(trusted_file(&exe).is_ok());
     }
 
+    /// The tools that are not package managers run from a fixed location
+    /// with the inherited environment (their credentials and contexts),
+    /// named by their own arg0, or are not available; never scrubbed, never
+    /// a bare name.
     #[test]
-    fn a_program_that_is_not_migrated_keeps_its_old_behavior() {
-        assert_eq!(plan(Program::Git).unwrap(), Plan::Inherit("git"));
-        assert_eq!(plan(Program::Lsof).unwrap(), Plan::Inherit("lsof"));
-        assert_eq!(
-            plan(Program::Tmutil).unwrap(),
-            Plan::Inherit("/usr/bin/tmutil")
-        );
+    fn other_programs_run_from_a_fixed_location_with_their_own_name() {
+        for p in Program::ALL
+            .iter()
+            .filter(|p| !matches!(p, Program::Brew | Program::Mise))
+        {
+            match plan(*p) {
+                Ok(Plan::Fixed { exe, arg0 }) => {
+                    assert!(exe.is_absolute(), "{p:?}");
+                    assert_eq!(arg0, p.binary());
+                }
+                Ok(other) => panic!("{p:?} planned as {other:?}"),
+                Err(e) => assert!(
+                    e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::PermissionDenied,
+                    "{p:?}: {e}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -652,6 +667,47 @@ mod tests {
             std::fs::canonicalize(&good).unwrap(),
             "a symlink is followed"
         );
+    }
+
+    /// #199: every program has a fixed, absolute candidate list, so no
+    /// program is ever looked up by bare name. Tempting wrong patch:
+    /// migrating the programs the auditor named and leaving the rest on
+    /// `PATH` (an empty list fell back to the bare name before).
+    #[test]
+    fn every_program_has_absolute_candidates() {
+        for p in Program::ALL {
+            let c = candidates(*p, Path::new("/Users/x"));
+            assert!(!c.is_empty(), "{p:?} has no fixed location");
+            assert!(c.iter().all(|c| c.is_absolute()), "{p:?}: {c:?}");
+        }
+    }
+
+    /// A world-writable directory holding the program, or a directory
+    /// owned by another user, refuses; a symlinked binary is followed to
+    /// the real file, which is checked too. Tempting wrong patch:
+    /// checking only the file, so a writable directory lets anyone swap
+    /// it.
+    #[test]
+    fn a_world_writable_dir_refuses_and_a_link_is_checked_at_its_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        let exe = open.join("git");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err = resolve_strict(std::slice::from_ref(&exe)).unwrap_err();
+        assert!(err.contains("writable by every user"), "{err}");
+        // A trusted link to a binary inside the world-writable directory
+        // is refused too: the target's directory is what is checked.
+        let safe = tmp.path().join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = safe.join("git");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        assert!(resolve_strict(&[link]).is_err());
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
