@@ -1400,6 +1400,8 @@ swamp observe ~/src
 swamp report ~/src --view worktrees
 ```
 
+Each worktree also carries `tip_reachable`, a fact `observe` computes from the repository's own refs, offline and without `gh`: whether the worktree's HEAD commit is contained in a remote-tracking branch (`refs/remotes/*`, `*/HEAD` excluded) or in the local default branch. When it is, the branch is named (`tip_reachable=yes (origin/audit/x)`). It is separate from `merged`, which stays the pull-request fact: a branch with no PR reads `merged=unknown` and can still read `tip_reachable=yes`. The worktree's own checked-out branch is never its own proof; a detached HEAD is judged by its commit; a repository that cannot be opened, or more than 400 remote branches, or a 2-second budget, read `tip_reachable=unknown`, never `no`. A squash-merged branch reads `tip_reachable=no` because its commits are in no branch; the `merge-complete` verdict still counts a merged PR as landed.
+
 Reports use the GitHub facts the last `observe` cached. `observe` queries GitHub unless given `--no-enrich`, and reuses a cache entry that is still valid. GitHub cache validity uses the tip SHA: a worktree whose branch is already merged is terminal and is never re-enriched automatically, and every other row is refreshed after a 24-hour TTL. `observe --enrich` is the on-demand override: it refetches everything, ignoring the TTL and the merged rule.
 
 Docker facts are cached for five minutes, with fresh reads during enrichment. Docker must be installed and its daemon reachable. Unavailable Docker data is reported in notes.

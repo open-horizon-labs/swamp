@@ -186,7 +186,120 @@ pub enum Unpushed {
     Unknown,
 }
 
+/// Whether a worktree's HEAD commit is contained in another branch, found
+/// locally from the repository's own refs (no network, no `gh`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TipReach {
+    /// HEAD is an ancestor of (or equal to) this branch's tip: a short
+    /// remote-tracking name (`origin/feat`) or a local default branch.
+    Reachable(String),
+    /// HEAD is in no remote-tracking branch and not in the default
+    /// branch, every one of which was checked.
+    NotReachable,
+    /// Not established: unborn HEAD, a lookup failed, or the time/ref
+    /// budget ran out before every branch was checked.
+    Unknown,
+}
+
+/// Remote-tracking branches checked per worktree before the answer is
+/// "not established" instead of "no".
+const TIP_REF_CAP: usize = 400;
+
 impl Repo {
+    /// Is HEAD contained in a remote-tracking branch (`refs/remotes/*`,
+    /// `*/HEAD` excluded) or in the local default branch? The default
+    /// branch (`origin/HEAD`'s target) is checked first, then the other
+    /// remote branches, then local `main`/`master`. The worktree's own current local branch is never a
+    /// candidate: HEAD is trivially in it. Detached HEAD is fine.
+    pub fn tip_reachable(&self, budget: Duration) -> TipReach {
+        let repo = &self.0;
+        let start = Instant::now();
+        let Ok(head_id) = repo.head_id() else {
+            return TipReach::Unknown;
+        };
+        let head = head_id.detach();
+        let own = repo
+            .head()
+            .ok()
+            .and_then(|h| h.referent_name().map(|n| n.as_bstr().to_string()));
+        let mut candidates: Vec<(String, gix::ObjectId)> = Vec::new();
+        let mut first: Vec<String> = Vec::new();
+        if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD")
+            && let gix::refs::TargetRef::Symbolic(t) = r.target()
+        {
+            first.push(t.as_bstr().to_string());
+        }
+        let mut locals: Vec<(String, gix::ObjectId)> = Vec::new();
+        for local in ["refs/heads/main", "refs/heads/master"] {
+            if own.as_deref() != Some(local)
+                && let Ok(mut r) = repo.find_reference(local)
+                && let Ok(id) = r.peel_to_id()
+            {
+                locals.push((short_ref(local), id.detach()));
+            }
+        }
+        for full in &first {
+            if let Ok(mut r) = repo.find_reference(full.as_str())
+                && let Ok(id) = r.peel_to_id()
+            {
+                candidates.push((short_ref(full), id.detach()));
+            }
+        }
+        let Ok(platform) = repo.references() else {
+            return TipReach::Unknown;
+        };
+        let Ok(iter) = platform.prefixed("refs/remotes/") else {
+            return TipReach::Unknown;
+        };
+        let mut complete = true;
+        let mut seen = 0usize;
+        let mut rest: Vec<(String, gix::ObjectId)> = Vec::new();
+        for r in iter {
+            let Ok(mut r) = r else {
+                complete = false;
+                continue;
+            };
+            let full = r.name().as_bstr().to_string();
+            if full.ends_with("/HEAD") || first.contains(&full) {
+                continue;
+            }
+            seen += 1;
+            if seen > TIP_REF_CAP {
+                complete = false;
+                break;
+            }
+            match r.peel_to_id() {
+                Ok(id) => rest.push((short_ref(&full), id.detach())),
+                Err(_) => complete = false,
+            }
+        }
+        rest.sort();
+        candidates.extend(rest);
+        // The local default branch last: a remote branch that has the
+        // commit is the better name for it.
+        candidates.extend(locals);
+        for (name, tip) in candidates {
+            if start.elapsed() >= budget {
+                return TipReach::Unknown;
+            }
+            if tip == head {
+                return TipReach::Reachable(name);
+            }
+            match repo.merge_base(head, tip) {
+                Ok(base) if base.detach() == head => return TipReach::Reachable(name),
+                Ok(_) => {}
+                // No common history: not an ancestor.
+                Err(gix::repository::merge_base::Error::NotFound { .. }) => {}
+                Err(_) => complete = false,
+            }
+        }
+        if complete {
+            TipReach::NotReachable
+        } else {
+            TipReach::Unknown
+        }
+    }
+
     /// Opens the repository at (or containing) `dir`.
     pub fn open(dir: &Path) -> Option<Repo> {
         if !safe_to_open(dir) {
@@ -279,6 +392,14 @@ impl Repo {
     pub fn worktree_locked(&self) -> bool {
         self.0.worktree().is_some_and(|wt| wt.is_locked())
     }
+}
+
+/// `refs/remotes/origin/x` as `origin/x`, `refs/heads/main` as `main`.
+fn short_ref(full: &str) -> String {
+    full.strip_prefix("refs/remotes/")
+        .or_else(|| full.strip_prefix("refs/heads/"))
+        .unwrap_or(full)
+        .to_string()
 }
 
 /// An exclude stack plus index for one checkout, reused across many

@@ -129,11 +129,21 @@ impl Consumer for AssemblyGate {
         let (docker_rows, docker_unowned, docker_attributed, docker_unowned_bytes, docker_notes) =
             p.docker.clone().unwrap();
 
+        // Local ancestry of every worktree's HEAD, once, in parallel.
+        let tip_paths: Vec<std::path::PathBuf> = projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter().map(|w| w.path.clone()))
+            .collect();
+        let mut tips = crate::signals::tip_reach_parallel(&tip_paths).into_iter();
+
         for project in &mut projects {
             if let Some(tags) = ecosystems.get(&project.project_id) {
                 project.ecosystems = tags.clone();
             }
             for worktree in &mut project.worktrees {
+                let tip = tips
+                    .next()
+                    .unwrap_or(crate::fs_gate::git::TipReach::Unknown);
                 let raw = signals.get(&worktree.worktree_id);
                 if let Some(sig) = raw {
                     worktree.signals = sig.rows.clone();
@@ -145,6 +155,7 @@ impl Consumer for AssemblyGate {
                         raw.and_then(|r| r.raw.dirty),
                         raw.and_then(|r| r.raw.unpushed),
                         &facts.merged,
+                        &tip,
                     );
                     worktree.signals.push(Signal {
                         name: "merge_complete".to_string(),
@@ -164,6 +175,17 @@ impl Consumer for AssemblyGate {
                     });
                     worktree.merge_complete = Some(mc);
                     worktree.github = Some(facts.clone());
+                } else {
+                    // No GitHub facts at all (detached HEAD, no remote,
+                    // no `gh`): the local ancestry fact is still known.
+                    worktree.signals.push(Signal {
+                        name: "tip_reachable".to_string(),
+                        value: match &tip {
+                            crate::fs_gate::git::TipReach::Reachable(b) => format!("yes ({b})"),
+                            crate::fs_gate::git::TipReach::NotReachable => "no".to_string(),
+                            crate::fs_gate::git::TipReach::Unknown => "unknown".to_string(),
+                        },
+                    });
                 }
                 if let Some(rows) = docker_rows.get(&worktree.worktree_id) {
                     worktree.artifacts.extend(rows.iter().cloned());

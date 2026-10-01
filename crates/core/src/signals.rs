@@ -348,6 +348,37 @@ pub fn tip_sha(dir: &Path) -> Option<String> {
     Repo::open(dir)?.head_id_hex()
 }
 
+/// Time one worktree's local ancestry check may take before it reports
+/// "not established".
+const TIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// For each worktree path, whether its HEAD is contained in a
+/// remote-tracking branch or the default branch (local, offline; see
+/// [`crate::fs_gate::git::Repo::tip_reachable`]). Order is preserved; a
+/// repository that cannot be opened is `Unknown`, not `NotReachable`.
+pub fn tip_reach_parallel(paths: &[std::path::PathBuf]) -> Vec<crate::fs_gate::git::TipReach> {
+    use crate::fs_gate::git::TipReach;
+    let one = |p: &std::path::PathBuf| match Repo::open(p) {
+        Some(r) => r.tip_reachable(TIP_BUDGET),
+        None => TipReach::Unknown,
+    };
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(8));
+    if paths.len() < 2 || workers < 2 {
+        return paths.iter().map(one).collect();
+    }
+    let chunk = paths.len().div_ceil(workers);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|c| s.spawn(move || c.iter().map(one).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
+}
+
 /// Parallel equivalent of [`compute_signals_raw`], preserving input
 /// order. Used by `report.rs` so the merge_complete composite and
 /// `idle_secs` field get the raw values without a second per-worktree

@@ -1663,15 +1663,20 @@ pub struct MergeComplete {
 /// Unknown; No otherwise. This is a composite *fact*, not a
 /// recommendation: it is always reported alongside its terms.
 ///
-/// "Tip reachable from default" is established by the same GitHub
-/// evidence that produces `merged` (a merged PR means the tip is an
-/// ancestor of default), so this composite reuses `merged` for that term
-/// rather than re-deriving it from a second call.
+/// `tip_reachable` is its own, local and offline fact (#208): whether the
+/// worktree's HEAD is contained in a remote-tracking branch or the default
+/// branch, named in the term (`tip_reachable=yes (origin/feat)`). It does
+/// not stand in for `merged`, which stays the PR fact. For the verdict a
+/// merged PR still counts as the tip having landed (a squash merge leaves
+/// the tip in no branch, and that must not turn a merged PR into `No`);
+/// otherwise the local fact decides.
 pub fn merge_complete(
     dirty: Option<bool>,
     unpushed: Option<u32>,
     merged: &MergedStatus,
+    tip: &crate::fs_gate::git::TipReach,
 ) -> MergeComplete {
+    use crate::fs_gate::git::TipReach;
     let merged_term = match merged {
         MergedStatus::Yes { .. } => TriState::Yes,
         MergedStatus::No => TriState::No,
@@ -1687,22 +1692,29 @@ pub fn merge_complete(
         Some(_) => TriState::No,
         None => TriState::Unknown,
     };
-    // Reuses `merged_term` as established above (see doc comment).
-    let tip_reachable_term = merged_term;
-
-    let verdict = if [merged_term, clean_term, unpushed_term, tip_reachable_term]
-        .contains(&TriState::Unknown)
-    {
-        TriState::Unknown
-    } else if merged_term == TriState::Yes
-        && clean_term == TriState::Yes
-        && unpushed_term == TriState::Yes
-        && tip_reachable_term == TriState::Yes
-    {
+    let tip_reachable_term = match tip {
+        TipReach::Reachable(_) => TriState::Yes,
+        TipReach::NotReachable => TriState::No,
+        TipReach::Unknown => TriState::Unknown,
+    };
+    let tip_for_verdict = if merged_term == TriState::Yes {
         TriState::Yes
     } else {
-        TriState::No
+        tip_reachable_term
     };
+
+    let verdict =
+        if [merged_term, clean_term, unpushed_term, tip_for_verdict].contains(&TriState::Unknown) {
+            TriState::Unknown
+        } else if merged_term == TriState::Yes
+            && clean_term == TriState::Yes
+            && unpushed_term == TriState::Yes
+            && tip_for_verdict == TriState::Yes
+        {
+            TriState::Yes
+        } else {
+            TriState::No
+        };
 
     let term_str = |label: &str, t: TriState| {
         format!(
@@ -1726,7 +1738,10 @@ pub fn merge_complete(
         term_str("merged", merged_term),
         term_str("clean", clean_term),
         unpushed_str,
-        term_str("tip_reachable", tip_reachable_term),
+        match tip {
+            TipReach::Reachable(branch) => format!("tip_reachable=yes ({branch})"),
+            _ => term_str("tip_reachable", tip_reachable_term),
+        },
     ];
     if let MergedStatus::Yes {
         pr_number: Some(n), ..
@@ -1751,7 +1766,12 @@ mod merge_complete_tests {
             merged_at: None,
             pr_number: Some(7),
         };
-        let mc = merge_complete(Some(false), Some(0), &merged);
+        let mc = merge_complete(
+            Some(false),
+            Some(0),
+            &merged,
+            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+        );
         assert_eq!(mc.verdict, TriState::Yes);
         assert!(mc.terms.iter().any(|t| t == "pr=#7"));
     }
@@ -1762,7 +1782,12 @@ mod merge_complete_tests {
             merged_at: None,
             pr_number: None,
         };
-        let mc = merge_complete(Some(true), Some(0), &merged);
+        let mc = merge_complete(
+            Some(true),
+            Some(0),
+            &merged,
+            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+        );
         assert_eq!(mc.verdict, TriState::No);
         assert!(mc.terms.iter().any(|t| t == "dirty"));
     }
@@ -1770,14 +1795,24 @@ mod merge_complete_tests {
     #[test]
     fn any_unknown_term_makes_the_whole_thing_unknown() {
         let merged = MergedStatus::Unknown;
-        let mc = merge_complete(Some(false), Some(0), &merged);
+        let mc = merge_complete(
+            Some(false),
+            Some(0),
+            &merged,
+            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+        );
         assert_eq!(mc.verdict, TriState::Unknown);
 
         let merged_yes = MergedStatus::Yes {
             merged_at: None,
             pr_number: None,
         };
-        let mc2 = merge_complete(None, Some(0), &merged_yes);
+        let mc2 = merge_complete(
+            None,
+            Some(0),
+            &merged_yes,
+            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+        );
         assert_eq!(mc2.verdict, TriState::Unknown);
     }
 
@@ -1790,15 +1825,30 @@ mod merge_complete_tests {
             merged_at: None,
             pr_number: None,
         };
-        let zero = merge_complete(Some(false), Some(0), &merged);
+        let zero = merge_complete(
+            Some(false),
+            Some(0),
+            &merged,
+            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+        );
         assert!(zero.terms.iter().any(|t| t == "unpushed=0"));
         assert!(!zero.terms.iter().any(|t| t == "unpushed=yes"));
 
-        let three = merge_complete(Some(false), Some(3), &merged);
+        let three = merge_complete(
+            Some(false),
+            Some(3),
+            &merged,
+            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+        );
         assert!(three.terms.iter().any(|t| t == "unpushed=3"));
         assert!(!three.terms.iter().any(|t| t == "unpushed=no"));
 
-        let unknown = merge_complete(Some(false), None, &merged);
+        let unknown = merge_complete(
+            Some(false),
+            None,
+            &merged,
+            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+        );
         assert!(unknown.terms.iter().any(|t| t == "unpushed=unknown"));
     }
 }
