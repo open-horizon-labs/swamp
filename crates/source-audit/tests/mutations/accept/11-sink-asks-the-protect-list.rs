@@ -5,5 +5,5 @@
 /// Accept: protection asked, not re-implemented.
 fn sweep_accept_protected(store: &std::path::Path, p: &std::path::Path) -> anyhow::Result<Option<String>> {
     let list = crate::protection::load_protect(store)?;
-    Ok(list.conflict(p))
+    Ok(list.conflict(p).map(|c| c.entry.display().to_string()))
 }
