@@ -641,16 +641,22 @@ impl Running {
     ) -> io::Result<Self> {
         use std::os::unix::process::CommandExt;
         install_cleanup_once();
-        crate::work_counters::record_spawn();
+        // Counted once per start, in each arm right above its
+        // `Command::new` (the guard test pairs the two).
         let mut command = match plan {
             #[cfg(test)]
-            super::program_paths::Plan::Inherit(exe) => Command::new(exe),
+            super::program_paths::Plan::Inherit(exe) => {
+                crate::work_counters::record_spawn();
+                Command::new(exe)
+            }
             super::program_paths::Plan::Fixed { exe, arg0 } => {
+                crate::work_counters::record_spawn();
                 let mut c = Command::new(exe);
                 c.arg0(arg0);
                 c
             }
             super::program_paths::Plan::Scrubbed(s) => {
+                crate::work_counters::record_spawn();
                 let mut c = Command::new(&s.exe);
                 c.env_clear()
                     .envs(s.env.iter().cloned())
