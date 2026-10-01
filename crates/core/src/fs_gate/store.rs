@@ -1141,12 +1141,33 @@ pub fn append_line(file: LogFile<'_>, line: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    rotate_if_full(&path, LOG_CAP_BYTES)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
     writeln!(f, "{line}")?;
     f.sync_data()
+}
+
+/// The observation log's size cap. A scheduled observe every 15 minutes
+/// writes about 2 MB in two weeks (the per-root lines launchd redirects
+/// into the same file), so without a cap the log grows without bound.
+/// At the cap the log becomes `observe.log.1` (replacing an older one)
+/// and a new `observe.log` starts: at most twice the cap on disk.
+pub const LOG_CAP_BYTES: u64 = 1024 * 1024;
+
+/// Renames `path` to `<path>.1` when it has reached `cap` bytes. A log
+/// that cannot be measured is left alone (the append reports the error).
+fn rotate_if_full(path: &Path, cap: u64) -> io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() >= cap => {
+            let mut rotated = path.as_os_str().to_owned();
+            rotated.push(".1");
+            std::fs::rename(path, PathBuf::from(rotated))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The single-flight observation lock, `<store>/observe.lock`.

@@ -56,8 +56,12 @@ fn a_test_mode_observe_that_would_write_the_real_users_log_is_refused() {
     assert!(!out.status.success(), "the guard did not fire");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("test hermeticity"), "{stderr}");
-    assert!(
-        !tmp.path().join("store").join("last-run.json").exists(),
+    assert_eq!(
+        files_under(&tmp.path().join("store"))
+            .iter()
+            .filter(|f| f.extension().is_some_and(|e| e == "parquet"))
+            .count(),
+        0,
         "the observation ran before the guard fired"
     );
 }

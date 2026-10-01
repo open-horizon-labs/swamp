@@ -1297,6 +1297,44 @@ mod tests {
         );
     }
 
+    /// Tempting wrong patch: truncate the log at the cap (losing the
+    /// recent history `schedule status` falls back to) or rotate into
+    /// numbered files without a limit. The log rotates into exactly one
+    /// `observe.log.1`, the newest line is always in `observe.log`, and
+    /// the two together never exceed twice the cap.
+    #[test]
+    fn the_observe_log_rotates_into_one_file_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("observe.log");
+        // Long lines so three caps' worth of history takes a few hundred
+        // appends (each one syncs).
+        let filler = "x".repeat(8 * 1024);
+        let cap = store::LOG_CAP_BYTES;
+        let appends = 3 * cap / (8 * 1024) + 10;
+        for i in 0..appends {
+            let outcome = RunOutcome {
+                observed_at: 1_000 + i,
+                wall_ms: 1,
+                walked_total: 1,
+                projects: 1,
+                mode: format!("full{filler}"),
+                outcome: "ok".to_string(),
+            };
+            append_log(&log, &outcome).unwrap();
+        }
+        let size = |p: &std::path::Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let rotated = tmp.path().join("observe.log.1");
+        assert!(rotated.exists(), "the log never rotated");
+        assert!(size(&log) <= cap + 9 * 1024, "{}", size(&log));
+        assert!(size(&rotated) <= cap + 9 * 1024, "{}", size(&rotated));
+        let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 2, "more than one rotated file");
+        assert_eq!(
+            last_log_outcome(&log).unwrap().observed_at,
+            1_000 + appends - 1
+        );
+    }
+
     #[test]
     fn timeout_outcome_writes_a_log_line() {
         let tmp = tempfile::tempdir().unwrap();
