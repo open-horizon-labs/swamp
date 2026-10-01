@@ -790,10 +790,10 @@ mod tests {
         assert!(err.contains("writable by every user"), "{err}");
         // A trusted link to a binary inside the world-writable directory
         // is refused too: the target's directory is what is checked.
-        let safe = tmp.path().join("safe");
-        std::fs::create_dir(&safe).unwrap();
-        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let link = safe.join("git");
+        let trusted = tmp.path().join("trusted");
+        std::fs::create_dir(&trusted).unwrap();
+        std::fs::set_permissions(&trusted, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = trusted.join("git");
         std::os::unix::fs::symlink(&exe, &link).unwrap();
         assert!(resolve_strict(&[link]).is_err());
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
