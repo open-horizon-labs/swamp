@@ -33,7 +33,7 @@ pub const NEGATIVE_TTL_SECS: u64 = 86_400;
 /// Fetches one pass may make; the rest wait for the next pass.
 pub const MAX_FETCHES_PER_PASS: usize = 16;
 /// The one line a report shows when enrichment is off.
-pub const OFF_LINE: &str = "Hugging Face Hub facts are not fetched (off by default); `hf_enrich = true` in swamp's config.toml turns on one read-only request per repo during scheduled observes";
+pub const OFF_LINE: &str = "Hugging Face Hub facts are not fetched (off by default); `swamp config set hf-enrich on` (`hf_enrich = true` in config.toml) turns on one read-only request per repo during scheduled observes";
 
 const API_FORMAT: &str = "api-1";
 const TIMEOUT: Duration = Duration::from_secs(12);

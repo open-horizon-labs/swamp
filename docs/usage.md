@@ -674,22 +674,37 @@ row; the Ollama tags under "identified interior"). Each says:
       last read: Sep 29 (file access time of model.safetensors)
       regeneration: downloaded again from huggingface.co (mkrausio/EmoWhisper-AnS-Small-v0.1@e613edc6) when needed; size 968.9MB
       main -> e613edc6; 1 revision(s): e613edc6; 10 file(s) in the shown revision; 10 blob(s)
-      967.0MB of this repo's size is in the hub's shared blobs/ folder: moving this repo folder leaves those bytes there
+      moving this folder frees about 1.9MB; 967.0MB stays in the hub's shared blobs/
    522.7MB  qwen3:0.6b  (ollama model)  qwen3 · 751.63M params · Q4_K_M
       regeneration: downloaded again with `ollama pull qwen3:0.6b` when needed, if the registry has it (a model made with `ollama create` exists only here); size 522.7MB
-      moving this manifest frees none of its 522.7MB of layers in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses
+      moving this manifest frees none of its layers: the layers (522.7MB) stay in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses
 ```
 
 - **What it is** comes only from files already on disk: the model card's YAML
   front matter (`pipeline_tag`, `library_name`, `license`, `base_model`, `tags`,
   `language`), `config.json` (`model_type`, `architectures`, `torch_dtype`), the
   `*.safetensors` header (an 8-byte length and a JSON table of dtypes and shapes:
-  the parameter count is exact, and no tensor is read), a `.gguf` header
+  the parameter count is exact, and no tensor is read; it counts one copy of the
+  weights: the set `model.safetensors.index.json` names, else one shard set
+  `<name>-0000i-of-0000N`, else one file, with a note when the snapshot holds
+  other copies such as Mistral's `consolidated.safetensors` or diffusers' fp16
+  files; a set with shards missing or more than 16 files gives no count, with the
+  reason), a `.gguf` header
   (`general.architecture`, `general.name`, quantization; the count when every
   tensor entry fits in the read), and Ollama's config blob (family, Ollama's own
   parameter-size label, quantization). A field none of them states is absent. The
   card's first paragraph is in the detail pane, with control, bidirectional and
   zero-width characters removed and at most 400 characters.
+- **Never read through a link.** Every folder of the layout (`blobs/`, `refs/`,
+  `snapshots/`, the hub's `blobs/<xx>/`, Ollama's `blobs/` and `manifests/`) is
+  `lstat`ed first; one that is a symlink is a fact on the row ("is a link, not
+  followed") and nothing in it is listed, read or counted. Files are opened with
+  `O_NOFOLLOW` (and `O_NOATIME` on Linux).
+- **Swamp's own read is not a use.** On macOS a read sets a file's access time
+  when it is not newer than the file's last change. Swamp does not read a weight
+  file in that state: the row says the count is "not read yet" and why, and the
+  next observe after a program has opened the file reads it. So the last-read
+  date shown is never one swamp's own read wrote.
 - **Size.** Snapshots are links into `blobs/`; each blob is counted once, and a
   blob two revisions share once. A blob two repos (or two Ollama tags) share is
   counted under the first by path, and the other says so. The models plus the
@@ -701,9 +716,12 @@ row; the Ollama tags under "identified interior"). Each says:
   again from huggingface.co at that revision; one with neither (made locally)
   keeps "cannot be regenerated (no source recorded)". An Ollama tag names its
   `ollama pull`.
-- **Trash.** A repo folder or a manifest can be marked like any row. The confirm
-  says what stays: a repo's bytes in the hub's shared `blobs/`, and every layer of
-  an Ollama manifest (`ollama rm` is the tool's own removal).
+- **Trash.** A repo folder or a manifest can be marked like any row (in the TUI,
+  an Ollama tag is its own row under its store in Reclaim and External). The
+  confirm and the detail pane say what stays: "moving this folder frees about X;
+  Y stays in the hub's shared blobs/", and for a manifest that its layers stay in
+  `blobs/` (`ollama rm` is the tool's own removal). A row belongs to its own
+  store only: `~/.cache/huggingface` above the hub cache lists no models.
 - **Cost.** Every content read goes through a cache in the store
   (`associations/model_cards.parquet`), keyed by what cannot change under the key:
   a revision's files (name, blob and size), a manifest's size and modification
@@ -714,11 +732,14 @@ row; the Ollama tags under "identified interior"). Each says:
   On this machine the cold pass read 67,043 bytes and took 4.6 ms for the hub
   cache and 1,348 bytes in 0.7 ms for Ollama; the warm pass read 0 bytes (0.9 ms
   and 0.3 ms, debug build). The TUI reads only what observe stored.
-- **Hub facts (off by default).** With `hf_enrich = true` in `config.toml`
-  (`swamp config path`), a scheduled or CLI `swamp observe` asks
+- **Hub facts (off by default).** With `swamp config set hf-enrich on`
+  (`hf_enrich = true` in `config.toml`), a scheduled or CLI `swamp observe` asks
   `https://huggingface.co/api/models/<id>` (or `datasets/`, `spaces/`) once per
   repo with `/usr/bin/curl` (allow-listed, 10 s timeout, 1 MiB at most, no header
-  and no token sent), and the row says `from huggingface.co, fetched <date>`:
+  and no token sent: `HF_TOKEN` is never passed, because a token on curl's
+  command line is visible to every process; a gated or private repo shows as
+  "did not answer"; behind a proxy, curl gets `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY` (either case) and `SSL_CERT_FILE`/`CURL_CA_BUNDLE`, nothing else), and the row says `from huggingface.co, fetched <date>`:
   downloads, likes, last modified, whether the revision here is the Hub's current
   one, and, for that revision only, the pipeline tag, library, license and base
   model where the local files did not say. Facts tied to a revision are never
@@ -1751,7 +1772,19 @@ TUI's own Trash move, or a human's own shell command).
 swamp config show
 swamp config path
 swamp config init
+swamp config list                 # every key `set` writes, its effective value and meaning
+swamp config get hf-enrich
+swamp config set hf-enrich on     # one key; other keys, tables and comments are kept
 ```
+
+`config set` writes one top-level key (`since`, `retention_days`,
+`large_file_min_bytes`, `observe_timeout_sec`, `observe_stall_secs`,
+`min_free_bytes` (or `unset`), `volume_pass_interval_hours`,
+`volume_pass_budget_secs`, `hf_enrich`), with `-` and `_` spelled either
+way. An unknown key is refused with the list of valid ones; a value of the
+wrong kind is refused; nothing is written then. The file is edited in place
+(comments, other keys and `[scan]` stay as written) and replaced atomically.
+`[scan]` roots are `add-root` / `remove-root`.
 
 `config init` writes a file only if none exists. Defaults:
 

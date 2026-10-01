@@ -127,6 +127,26 @@ impl Default for GrowthConfig {
 }
 
 impl GrowthConfig {
+    /// The effective value of one top-level key as `swamp config get`
+    /// prints it (`crate::roots::SETTABLE` names the keys).
+    pub fn value_of(&self, key: &str) -> Option<String> {
+        Some(match key {
+            "since" => self.since.clone(),
+            "retention_days" => self.retention_days.to_string(),
+            "large_file_min_bytes" => self.large_file_min_bytes.to_string(),
+            "observe_timeout_sec" => self.observe_timeout_sec.to_string(),
+            "observe_stall_secs" => self.observe_stall_secs.to_string(),
+            "min_free_bytes" => match self.min_free_bytes {
+                Some(n) => n.to_string(),
+                None => "unset (the greater of 1 GiB and 1% of the volume)".to_string(),
+            },
+            "volume_pass_interval_hours" => self.volume_pass_interval_hours.to_string(),
+            "volume_pass_budget_secs" => self.volume_pass_budget_secs.to_string(),
+            "hf_enrich" => if self.hf_enrich { "on" } else { "off" }.to_string(),
+            _ => return None,
+        })
+    }
+
     /// The file contents that reproduce this configuration, every key
     /// written out with its meaning, so `config init` leaves something a
     /// human can edit.

@@ -157,6 +157,19 @@ enum ConfigAction {
     RemoveRoot {
         path: String,
     },
+    /// Set one top-level key (`swamp config set hf-enrich on`). Unknown
+    /// keys and bad values are refused before anything is written; other
+    /// keys, tables and comments are kept; the write is atomic.
+    Set {
+        key: String,
+        value: String,
+    },
+    /// Print one key's effective value.
+    Get {
+        key: String,
+    },
+    /// Every key `config set` writes, its effective value and meaning.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1610,6 +1623,33 @@ fn main() -> Result<()> {
                             eprintln!("{e}");
                             std::process::exit(1);
                         }
+                    }
+                }
+                ConfigAction::Set { key, value } => {
+                    let store = swamp_core::fs_gate::store::StoreDir::resolved();
+                    match swamp_core::roots::set_key(&store, &key, &value) {
+                        Ok(line) => safe_println!("{line} (in {})", path.display()),
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                ConfigAction::Get { key } => {
+                    let k = match swamp_core::roots::settable_key(&key) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let cfg = swamp_core::growth::load_config_checked(&dir)?;
+                    safe_println!("{}", cfg.value_of(k).unwrap_or_default());
+                }
+                ConfigAction::List => {
+                    let cfg = swamp_core::growth::load_config_checked(&dir)?;
+                    for (k, _, what) in swamp_core::roots::SETTABLE {
+                        safe_println!("{k} = {}  # {what}", cfg.value_of(k).unwrap_or_default());
                     }
                 }
                 ConfigAction::RemoveRoot { path: typed } => {
