@@ -1168,6 +1168,21 @@ fn family_member_row(
         ),
     ];
     row.signals.extend(u.coverage.limits.iter().cloned());
+    // A model's own facts: what it is leads the label and the detail pane.
+    if u.adapter.as_deref() == Some("model-stores")
+        && let Some(m) = swamp_core::build_adapters::model_stores::model_rows(
+            u.path.parent().unwrap_or(&u.path),
+            std::slice::from_ref(u),
+            observed_at,
+        )
+        .into_iter()
+        .next()
+    {
+        if let Some(a) = &m.about {
+            row.label = format!("{} · {a}", row.label);
+        }
+        row.detail_lines.extend(model_detail_lines(&m));
+    }
     // Every present path is one the person may move to Trash. A path no
     // cleanup rule covers is marked one at a time, and its confirm lists
     // what swamp did not establish about it.
@@ -2268,7 +2283,12 @@ pub fn external_rows_with(
         if has_interior || !u.children.is_empty() {
             let key = format!("store-open:{}", u.path.display());
             let open = collapsed.contains(&key);
-            let mut children = unit_child_rows(u, observed_at);
+            let models = swamp_core::build_adapters::model_stores::model_rows(
+                &u.path,
+                &own_interiors,
+                observed_at,
+            );
+            let mut children = unit_child_rows(u, observed_at, &models);
             if has_interior && children.is_empty() {
                 children =
                     family_tree_children_of(&own_interiors, observed_at, &u.path, 1, "", collapsed);
@@ -2341,7 +2361,46 @@ fn compact_signed(bytes: i64) -> String {
 /// One unit's depth-2 drilldown as inspection-only rows (#178). A folder
 /// that could not be read says so instead of showing `0B`, and the last
 /// row is the remainder that makes the rows add up to the unit's total.
-fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row> {
+/// A model's lines for the detail pane: what it is, its card, revision,
+/// size, last read, how it comes back, the Hub's answer, and the facts
+/// about its bytes. Stored facts only; nothing is read here.
+fn model_detail_lines(m: &swamp_core::build_adapters::model_stores::ModelRow) -> Vec<String> {
+    let mut out = vec![format!(
+        "what it is: {}",
+        m.about.as_deref().unwrap_or("no field stated in its files")
+    )];
+    if let Some(c) = &m.card {
+        out.push(format!("card: {c}"));
+    }
+    out.push(format!(
+        "{} {}{}",
+        m.kind,
+        m.name,
+        m.revision
+            .as_deref()
+            .map(|r| format!("@{r}"))
+            .unwrap_or_default()
+    ));
+    if let Some(r) = &m.revisions {
+        out.push(r.clone());
+    }
+    out.push(format!("last read: {}", m.last_read));
+    out.push(format!("regeneration: {}", m.regeneration));
+    match m.hub.as_deref() {
+        Some("off") => out.push(swamp_core::hub_api::OFF_LINE.to_string()),
+        Some(h) => out.push(h.to_string()),
+        None => {}
+    }
+    out.extend(m.fields.iter().map(|f| format!("field {f}")));
+    out.extend(m.facts.iter().cloned());
+    out
+}
+
+fn unit_child_rows(
+    u: &swamp_core::external::ExternalUnit,
+    now: u64,
+    models: &[swamp_core::build_adapters::model_stores::ModelRow],
+) -> Vec<Row> {
     use swamp_core::drilldown::{ChildKind, ChildMeasure};
     use swamp_core::reclaim_trash::{child_not_markable, row_path};
     let count = u.children.len();
@@ -2385,6 +2444,18 @@ fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row>
             row.signals = vec![swamp_core::render::describe_unit_child(c, now)];
             if c.kind == ChildKind::Entry {
                 row.last_used = Some(c.last_used.describe(now));
+                let path = u.path.join(&c.name).display().to_string();
+                if let Some(m) = models.iter().find(|m| m.path == path) {
+                    // The repo id reads better than `models--org--name`;
+                    // the folder's own name stays in the detail pane.
+                    row.label = match &m.about {
+                        Some(a) => format!("{} · {a}", m.name),
+                        None => m.name.clone(),
+                    };
+                    row.cleanup_summary = Some(m.regeneration.clone());
+                    row.detail_lines.extend(model_detail_lines(m));
+                    row.detail_lines.push(format!("folder: {}", c.name));
+                }
             }
             match row_path(&u.path.display().to_string(), Some((c.kind, &c.name))) {
                 Some(path) => row.unit = Some(UnitId::for_artifact(&path)),
