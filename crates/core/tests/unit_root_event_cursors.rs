@@ -84,6 +84,7 @@ impl FsEventsSource for ScriptedSource {
                 changed_dirs: Vec::new(),
                 current_event_id: self.current_event_id,
                 device: Some(self.device),
+                device_uuid: None,
                 live: false,
                 consume: None,
             };
@@ -99,6 +100,7 @@ impl FsEventsSource for ScriptedSource {
                 .collect(),
             current_event_id: self.current_event_id,
             device: Some(self.device),
+            device_uuid: None,
             live: false,
             consume: None,
         }

@@ -23,6 +23,19 @@ use std::time::Duration;
 
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
 
+static FORCE_REFRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Explicit `observe --enrich` bypasses Docker's observation cache.
+/// Routine observations retain the recorded daemon capture time.
+pub fn set_force_refresh(on: bool) {
+    FORCE_REFRESH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this invocation explicitly requested fresh daemon facts.
+pub fn force_refresh() -> bool {
+    FORCE_REFRESH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One container's reference to an image or volume, as shown on that
 /// object's row. Never a verdict: "state" and "finished_at" are facts
 /// ("exited"/"running"/... and a timestamp or `None`), not a judgment
@@ -859,57 +872,100 @@ const MAX_BUILDX_BUILDERS: usize = 4;
 /// stated limit, and must not hold the whole observation.
 const BUILDX_TIMEOUT: Duration = Duration::from_secs(3);
 
+fn docker_trace_label(args: &[&str]) -> (&'static str, &'static str) {
+    match args {
+        ["system", "df", ..] => ("system", "df"),
+        ["buildx", "ls", ..] => ("buildx", "ls"),
+        ["buildx", "du", ..] => ("buildx", "du"),
+        ["image", "inspect", ..] => ("image", "inspect"),
+        ["volume", "inspect", ..] => ("volume", "inspect"),
+        ["ps", ..] => ("ps", "containers"),
+        ["inspect", ..] => ("inspect", "containers"),
+        ["version", ..] => ("version", "daemon"),
+        ["builder", "prune", ..] => ("builder", "prune"),
+        _ => ("other", "other"),
+    }
+}
+
 fn run_docker_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value, String> {
-    let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Docker, args, timeout)
-        .map_err(|e| format!("docker: unavailable ({e})"))?;
-    if out.timed_out {
-        return Err("docker: unavailable (timed out)".to_string());
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Docker, args, timeout)
+            .map_err(|e| format!("docker: unavailable ({e})"))?;
+        if out.timed_out {
+            return Err("docker: unavailable (timed out)".to_string());
+        }
+        if !out.success() {
+            return Err("docker: unavailable (daemon not responding)".to_string());
+        }
+        let stdout = out.stdout_lossy();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            return Ok(v);
+        }
+        let lines: Vec<serde_json::Value> = stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        if !lines.is_empty() {
+            return Ok(serde_json::Value::Array(lines));
+        }
+        Err("docker: unavailable (bad output)".to_string())
+    })();
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        let (family, action) = docker_trace_label(args);
+        eprintln!(
+            "[xtrace] docker command: {family} {action} json ok={} elapsed={:?}",
+            result.is_ok(),
+            started.elapsed()
+        );
     }
-    if !out.success() {
-        return Err("docker: unavailable (daemon not responding)".to_string());
-    }
-    let stdout = out.stdout_lossy();
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdout) {
-        return Ok(v);
-    }
-    let lines: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    if !lines.is_empty() {
-        return Ok(serde_json::Value::Array(lines));
-    }
-    Err("docker: unavailable (bad output)".to_string())
+    result
 }
 
 /// [`run_docker_json`], for a query whose output is `buildx du
 /// --verbose`'s documented text shape rather than JSON.
 fn run_docker_text(args: &[&str], timeout: Duration) -> Result<String, String> {
-    let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Docker, args, timeout)
-        .map_err(|e| format!("docker: unavailable ({e})"))?;
-    if out.timed_out {
-        return Err("docker: unavailable (timed out)".to_string());
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let out = crate::fs_gate::spawn::run(crate::fs_gate::spawn::Program::Docker, args, timeout)
+            .map_err(|e| format!("docker: unavailable ({e})"))?;
+        if out.timed_out {
+            return Err("docker: unavailable (timed out)".to_string());
+        }
+        if !out.success() {
+            return Err("docker: unavailable (daemon not responding)".to_string());
+        }
+        Ok(out.stdout_lossy())
+    })();
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        let (family, action) = docker_trace_label(args);
+        eprintln!(
+            "[xtrace] docker command: {family} {action} text ok={} elapsed={:?}",
+            result.is_ok(),
+            started.elapsed()
+        );
     }
-    if !out.success() {
-        return Err("docker: unavailable (daemon not responding)".to_string());
-    }
-    Ok(out.stdout_lossy())
+    result
 }
 
 /// The daemon's API version and the buildx builders' records, after
 /// `docker system df` answered. Each failure is a stated capability
 /// limit on the facts, never an error: an old daemon, a missing buildx,
 /// or one builder that does not answer leaves everything else intact.
-fn load_buildkit_detail(facts: &mut DockerFacts) {
-    match run_docker_json(&["version", "--format", "json"], DOCKER_TIMEOUT) {
+fn load_buildkit_detail(
+    facts: &mut DockerFacts,
+    version: Result<serde_json::Value, String>,
+    builder_listing: Result<serde_json::Value, String>,
+) {
+    match version {
         Ok(v) => facts.capabilities.api_version = api_version_of(&v),
         Err(e) => facts
             .capabilities
             .buildx_limits
             .push(format!("the daemon's API version is unknown ({e})")),
     }
-    let builders = match run_docker_json(&["buildx", "ls", "--format", "json"], BUILDX_TIMEOUT) {
+    let builders = match builder_listing {
         Ok(serde_json::Value::Array(rows)) => rows.iter().filter_map(parse_builder).collect(),
         Ok(row) => parse_builder(&row).into_iter().collect(),
         Err(e) => {
@@ -977,9 +1033,18 @@ pub const DOCKER_CACHE_TTL_SECS: u64 = 300;
 /// started should be noticed soon (the 2026-09-22 re-review's CE6).
 pub const DOCKER_UNAVAILABLE_TTL_SECS: u64 = 60;
 
+fn cached_facts_are_current(facts: &DockerFacts, cached_at: u64, now: u64) -> bool {
+    let ttl = if facts.unavailable.is_none() {
+        DOCKER_CACHE_TTL_SECS
+    } else {
+        DOCKER_UNAVAILABLE_TTL_SECS
+    };
+    cached_at <= now && facts.captured_at.is_none_or(|at| at <= now) && now - cached_at < ttl
+}
+
 /// `load`, with the live answer cached under the store
 /// (`docker_facts.json`) for [`DOCKER_CACHE_TTL_SECS`]. `fresh` forces the
-/// daemon (the scheduled `observe`, `--enrich`).
+/// daemon (explicit `observe --enrich`). Routine observations use the TTL.
 pub fn load_cached(
     facts_path: Option<&Path>,
     store_dir: Option<&Path>,
@@ -992,15 +1057,11 @@ pub fn load_cached(
         return load_live();
     };
     let now = crate::entities::now();
-    if !fresh && let Some((facts, cached_at)) = read_cached_facts(dir) {
-        let ttl = if facts.unavailable.is_none() {
-            DOCKER_CACHE_TTL_SECS
-        } else {
-            DOCKER_UNAVAILABLE_TTL_SECS
-        };
-        if now.saturating_sub(cached_at) < ttl {
-            return facts;
-        }
+    if !fresh
+        && let Some((facts, cached_at)) = read_cached_facts(dir)
+        && cached_facts_are_current(&facts, cached_at, now)
+    {
+        return facts;
     }
     let facts = load_live();
     // The unavailable answer is cached too. Caching only success meant
@@ -1320,6 +1381,90 @@ fn load_from_file(path: &Path) -> DockerFacts {
 /// piece of detail unset rather than failing the whole report -- df's
 /// object identity/sizes already succeeded, so the report still
 /// reconciles.
+type DockerProbe = Result<serde_json::Value, String>;
+type LiveProbeResults = (
+    DockerProbe,
+    DockerProbe,
+    Option<DockerProbe>,
+    Option<DockerProbe>,
+    DockerProbe,
+);
+
+fn run_live_probes(ids: &[String], volume_names: &[String]) -> LiveProbeResults {
+    run_live_probes_with(ids, volume_names, &run_docker_json)
+}
+
+fn run_live_probes_with(
+    ids: &[String],
+    volume_names: &[String],
+    run: &(impl Fn(&[&str], Duration) -> DockerProbe + Sync),
+) -> LiveProbeResults {
+    let image_args: Vec<&str> = std::iter::once("image")
+        .chain(std::iter::once("inspect"))
+        .chain(ids.iter().map(String::as_str))
+        .chain(["--format", "json"])
+        .collect();
+    let volume_args: Vec<&str> = std::iter::once("volume")
+        .chain(std::iter::once("inspect"))
+        .chain(volume_names.iter().map(String::as_str))
+        .chain(["--format", "json"])
+        .collect();
+    // These concurrent probes are part of the caller's observation. Carry
+    // its scoped work sink into every worker so measured() includes their
+    // subprocesses rather than reporting only work on the joining thread.
+    let counters = crate::work_counters::current();
+    std::thread::scope(|scope| {
+        let counters_for = || counters.clone();
+        let version = scope.spawn({
+            let counters = counters_for();
+            move || {
+                crate::work_counters::install(counters);
+                run(&["version", "--format", "json"], DOCKER_TIMEOUT)
+            }
+        });
+        let builders = scope.spawn({
+            let counters = counters_for();
+            move || {
+                crate::work_counters::install(counters);
+                run(&["buildx", "ls", "--format", "json"], BUILDX_TIMEOUT)
+            }
+        });
+        let image_inspect = (!ids.is_empty()).then(|| {
+            let counters = counters_for();
+            scope.spawn(move || {
+                crate::work_counters::install(counters);
+                run(&image_args, DOCKER_TIMEOUT)
+            })
+        });
+        let volume_inspect = (!volume_names.is_empty()).then(|| {
+            let counters = counters_for();
+            scope.spawn(move || {
+                crate::work_counters::install(counters);
+                run(&volume_args, DOCKER_TIMEOUT)
+            })
+        });
+        let ps = scope.spawn({
+            let counters = counters_for();
+            move || {
+                crate::work_counters::install(counters);
+                run(&["ps", "-a", "--format", "json"], DOCKER_TIMEOUT)
+            }
+        });
+        let join = |handle: std::thread::ScopedJoinHandle<'_, DockerProbe>| {
+            handle
+                .join()
+                .unwrap_or_else(|_| Err("docker: unavailable (probe worker failed)".to_string()))
+        };
+        (
+            join(version),
+            join(builders),
+            image_inspect.map(join),
+            volume_inspect.map(join),
+            join(ps),
+        )
+    })
+}
+
 fn load_live() -> DockerFacts {
     let df_value =
         match run_docker_json(&["system", "df", "-v", "--format", "json"], DOCKER_TIMEOUT) {
@@ -1333,67 +1478,101 @@ fn load_live() -> DockerFacts {
         };
     let mut facts = parse_value(&df_value);
     facts.captured_at = Some(crate::entities::now());
-    load_buildkit_detail(&mut facts);
 
-    let ids: Vec<&str> = facts
+    let ids: Vec<String> = facts
         .images
         .iter()
-        .map(|i| i.id.as_str())
+        .map(|i| i.id.clone())
         .filter(|id| !id.is_empty())
         .collect();
-    if !ids.is_empty() {
-        let mut args: Vec<&str> = vec!["image", "inspect"];
-        args.extend(ids);
-        args.extend(["--format", "json"]);
-        if let Ok(inspect_value) = run_docker_json(&args, DOCKER_TIMEOUT)
-            && let Some(entries) = inspect_value.as_array()
-        {
-            merge_image_inspect(&mut facts.images, entries);
-        }
+    let volume_names: Vec<String> = facts.volumes.iter().map(|v| v.name.clone()).collect();
+    // These observations are independent once `system df` has supplied the
+    // authoritative object IDs. Run at most five bounded CLI calls at once;
+    // builder-specific `du` and container inspect remain dependent on their
+    // respective listing calls below.
+    let (version, builders, image_inspect, volume_inspect, ps) =
+        run_live_probes(&ids, &volume_names);
+    load_buildkit_detail(&mut facts, version, builders);
+
+    merge_live_inspects(
+        &mut facts,
+        image_inspect,
+        volume_inspect,
+        ps,
+        |container_ids| {
+            let id_refs: Vec<&str> = container_ids.iter().map(String::as_str).collect();
+            let mut args: Vec<&str> = vec!["inspect"];
+            args.extend(id_refs);
+            args.extend(["--format", "json"]);
+            run_docker_json(&args, DOCKER_TIMEOUT)
+        },
+    );
+
+    facts
+}
+
+/// Merge each optional daemon enrichment independently. The df result is
+/// authoritative for identity and size; a failed detail query must leave that
+/// useful row intact. Container inspect remains dependent on `ps` IDs.
+fn merge_live_inspects(
+    facts: &mut DockerFacts,
+    image_inspect: Option<Result<serde_json::Value, String>>,
+    volume_inspect: Option<Result<serde_json::Value, String>>,
+    ps: Result<serde_json::Value, String>,
+    inspect_containers: impl FnOnce(&[String]) -> Result<serde_json::Value, String>,
+) {
+    if let Some(Ok(inspect_value)) = image_inspect
+        && let Some(entries) = inspect_value.as_array()
+    {
+        merge_image_inspect(&mut facts.images, entries);
+    }
+    if let Some(Ok(inspect_value)) = volume_inspect
+        && let Some(entries) = inspect_value.as_array()
+    {
+        merge_volume_inspect(&mut facts.volumes, entries);
     }
 
-    let volume_names: Vec<&str> = facts.volumes.iter().map(|v| v.name.as_str()).collect();
-    if !volume_names.is_empty() {
-        let mut args: Vec<&str> = vec!["volume", "inspect"];
-        args.extend(volume_names);
-        args.extend(["--format", "json"]);
-        if let Ok(inspect_value) = run_docker_json(&args, DOCKER_TIMEOUT)
-            && let Some(entries) = inspect_value.as_array()
-        {
-            merge_volume_inspect(&mut facts.volumes, entries);
-        }
-    }
-
-    if let Ok(ps_value) = run_docker_json(&["ps", "-a", "--format", "json"], DOCKER_TIMEOUT)
+    if let Ok(ps_value) = ps
         && let Some(rows) = ps_value.as_array()
     {
         let container_ids: Vec<String> = rows
             .iter()
             .filter_map(|r| r.get("ID").and_then(|v| v.as_str()).map(String::from))
             .collect();
-        if !container_ids.is_empty() {
-            let id_refs: Vec<&str> = container_ids.iter().map(String::as_str).collect();
-            let mut args: Vec<&str> = vec!["inspect"];
-            args.extend(id_refs);
-            args.extend(["--format", "json"]);
-            if let Ok(inspect_value) = run_docker_json(&args, DOCKER_TIMEOUT)
-                && let Some(entries) = inspect_value.as_array()
-            {
-                let containers: Vec<ContainerFact> =
-                    entries.iter().map(parse_container_inspect).collect();
-                join_containers(&mut facts, &containers);
-            }
+        if !container_ids.is_empty()
+            && let Ok(inspect_value) = inspect_containers(&container_ids)
+            && let Some(entries) = inspect_value.as_array()
+        {
+            let containers: Vec<ContainerFact> =
+                entries.iter().map(parse_container_inspect).collect();
+            join_containers(facts, &containers);
         }
     }
 
     compute_shared_with(&mut facts.images);
-
-    facts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_daemon_facts_expire_at_the_deadline_and_reject_future_times() {
+        let mut facts = DockerFacts {
+            captured_at: Some(1_000),
+            ..Default::default()
+        };
+        assert!(cached_facts_are_current(&facts, 1_000, 1_299));
+        assert!(!cached_facts_are_current(&facts, 1_000, 1_300));
+        assert!(!cached_facts_are_current(&facts, 1_001, 1_000));
+        assert!(!cached_facts_are_current(&facts, 1_000, 999));
+        facts.captured_at = Some(1_301);
+        assert!(!cached_facts_are_current(&facts, 1_000, 1_299));
+        facts.captured_at = Some(1_000);
+        facts.unavailable = Some("daemon not reachable".into());
+        assert!(cached_facts_are_current(&facts, 1_000, 1_059));
+        assert!(!cached_facts_are_current(&facts, 1_000, 1_060));
+    }
 
     #[test]
     fn parses_human_and_raw_sizes() {
@@ -1487,6 +1666,171 @@ mod tests {
         });
         let facts = parse_value(&value);
         assert_eq!(facts.images[0].containers[0].finished_at, None);
+    }
+
+    #[test]
+    fn live_optional_enrichments_merge_independently_and_inspect_containers_after_ps() {
+        let mut facts = DockerFacts {
+            images: vec![DockerImageFact {
+                id: "sha256:image-a".into(),
+                repo_tags: vec!["app:latest".into()],
+                unique_bytes: 512,
+                ..Default::default()
+            }],
+            volumes: vec![DockerVolumeFact {
+                name: "data".into(),
+                bytes: 1024,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ps = serde_json::json!([{"ID": "container-a"}]);
+        let mut inspected = false;
+        merge_live_inspects(
+            &mut facts,
+            Some(Ok(serde_json::json!([{
+                "Id": "sha256:image-a",
+                "Config": {"Labels": {"com.docker.compose.project": "app"}},
+                "RootFS": {"Layers": ["layer-a"]}
+            }]))),
+            Some(Ok(serde_json::json!([{
+                "Name": "data",
+                "CreatedAt": "2026-09-01T12:00:00Z",
+                "Driver": "local"
+            }]))),
+            Ok(ps),
+            |ids| {
+                inspected = true;
+                assert_eq!(ids, ["container-a"]);
+                Ok(serde_json::json!([{
+                    "Name": "/app-1",
+                    "Config": {"Image": "app:latest"},
+                    "State": {"Status": "running", "FinishedAt": "0001-01-01T00:00:00Z"},
+                    "Mounts": [{"Type": "volume", "Name": "data"}]
+                }]))
+            },
+        );
+
+        assert!(inspected);
+        assert_eq!(facts.images[0].unique_bytes, 512);
+        assert_eq!(facts.images[0].layers, ["layer-a"]);
+        assert_eq!(
+            facts.images[0]
+                .labels
+                .get("com.docker.compose.project")
+                .map(String::as_str),
+            Some("app")
+        );
+        assert_eq!(facts.volumes[0].bytes, 1024);
+        assert_eq!(facts.volumes[0].driver.as_deref(), Some("local"));
+        assert_eq!(facts.images[0].containers[0].name, "app-1");
+        assert_eq!(facts.images[0].containers[0].finished_at, None);
+        assert_eq!(facts.volumes[0].containers[0].state, "running");
+    }
+
+    #[test]
+    fn failed_live_detail_queries_keep_df_rows_and_do_not_inspect_without_ps() {
+        let mut facts = DockerFacts {
+            images: vec![DockerImageFact {
+                id: "sha256:image-a".into(),
+                unique_bytes: 512,
+                ..Default::default()
+            }],
+            volumes: vec![DockerVolumeFact {
+                name: "data".into(),
+                bytes: 1024,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        merge_live_inspects(
+            &mut facts,
+            Some(Err("image inspect timed out".into())),
+            Some(Err("volume inspect failed".into())),
+            Err("ps unavailable".into()),
+            |_| panic!("container inspect depends on a successful ps result"),
+        );
+
+        assert_eq!(facts.images.len(), 1);
+        assert_eq!(facts.images[0].id, "sha256:image-a");
+        assert_eq!(facts.images[0].unique_bytes, 512);
+        assert!(facts.images[0].layers.is_empty());
+        assert_eq!(facts.volumes.len(), 1);
+        assert_eq!(facts.volumes[0].name, "data");
+        assert_eq!(facts.volumes[0].bytes, 1024);
+        assert!(facts.volumes[0].containers.is_empty());
+    }
+
+    #[test]
+    fn live_probes_start_independently_and_container_inspect_waits_for_ps() {
+        use std::sync::{
+            Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let observed =
+            std::sync::Arc::new((Mutex::new(std::collections::HashSet::new()), Condvar::new()));
+        let completed = std::sync::Arc::new(AtomicUsize::new(0));
+        let run = {
+            let observed = observed.clone();
+            let completed = completed.clone();
+            move |args: &[&str], _timeout: Duration| {
+                crate::work_counters::record_spawn();
+                let label = match args.first().copied() {
+                    Some("version") => "version",
+                    Some("buildx") => "buildx-ls",
+                    Some("image") => "image-inspect",
+                    Some("volume") => "volume-inspect",
+                    Some("ps") => "ps",
+                    _ => panic!("unexpected independent Docker probe shape"),
+                };
+                let (lock, wake) = &*observed;
+                let mut started = lock.lock().unwrap();
+                started.insert(label);
+                wake.notify_all();
+                if label == "version" {
+                    let (started, timeout) = wake
+                        .wait_timeout_while(started, Duration::from_secs(2), |seen| seen.len() < 5)
+                        .unwrap();
+                    assert!(
+                        !timeout.timed_out(),
+                        "all independent probes must start before one blocks"
+                    );
+                    assert_eq!(started.len(), 5);
+                    drop(started);
+                } else {
+                    drop(started);
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(match label {
+                    "version" => serde_json::json!({"Server": {"ApiVersion": "1.44"}}),
+                    "ps" => serde_json::json!([{"ID": "container-a"}]),
+                    _ => serde_json::json!([]),
+                })
+            }
+        };
+
+        let ((version, builders, image_inspect, volume_inspect, ps), counted) =
+            crate::work_counters::measured(|| {
+                run_live_probes_with(&["image-a".into()], &["volume-a".into()], &run)
+            });
+        assert_eq!(
+            counted.subprocess_spawns, 5,
+            "the scoped counter must include every Docker fanout worker"
+        );
+        let started = observed.0.lock().unwrap();
+        assert_eq!(started.len(), 5);
+        assert_eq!(completed.load(Ordering::SeqCst), 5);
+        drop(started);
+
+        let mut facts = DockerFacts::default();
+        load_buildkit_detail(&mut facts, version, builders);
+        assert_eq!(facts.capabilities.api_version.as_deref(), Some("1.44"));
+        merge_live_inspects(&mut facts, image_inspect, volume_inspect, ps, |ids| {
+            assert_eq!(ids, ["container-a"]);
+            assert_eq!(completed.load(Ordering::SeqCst), 5);
+            Ok(serde_json::json!([]))
+        });
     }
 
     /// A facts file in the documented shapes: `docker system df -v

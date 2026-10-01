@@ -12,12 +12,52 @@ use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::TCFType;
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
 use core_foundation::string::CFString;
+use core_foundation::uuid::{CFUUID, CFUUIDGetUUIDBytes, CFUUIDRef};
 use fsevent_sys as fs;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
+
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn FSEventsCopyUUIDForDevice(dev: std::os::unix::raw::dev_t) -> CFUUIDRef;
+}
+
+/// Returns the identity of the device's persisted FSEvents stream. Apple
+/// documents this UUID as changing when history is purged, the device is
+/// erased, or the event counter wraps; NULL means no historical stream.
+fn device_uuid(dev: u64) -> Option<String> {
+    // SAFETY: `dev` came from stat and the API returns a retained CFUUID or NULL.
+    let raw = unsafe { FSEventsCopyUUIDForDevice(dev as std::os::unix::raw::dev_t) };
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: FSEventsCopyUUIDForDevice follows the Copy ownership rule.
+    let uuid = unsafe { CFUUID::wrap_under_create_rule(raw) };
+    // SAFETY: `uuid` owns a live CFUUID reference.
+    let b = unsafe { CFUUIDGetUUIDBytes(uuid.as_concrete_TypeRef()) };
+    Some(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b.byte0,
+        b.byte1,
+        b.byte2,
+        b.byte3,
+        b.byte4,
+        b.byte5,
+        b.byte6,
+        b.byte7,
+        b.byte8,
+        b.byte9,
+        b.byte10,
+        b.byte11,
+        b.byte12,
+        b.byte13,
+        b.byte14,
+        b.byte15,
+    ))
+}
 
 /// Bounds one replay's run loop. FSEvents replays retained history
 /// from local, in-kernel state, so a replay that has not reached
@@ -276,12 +316,14 @@ pub fn watch_pending(
 pub struct MacOsFsEventsSource;
 
 impl FsEventsSource for MacOsFsEventsSource {
-    fn anchor_before_full(&self, root: &Path) -> Option<(u64, u64)> {
+    fn anchor_before_full(&self, root: &Path) -> Option<(u64, u64, Option<String>)> {
         // Capture before walking, never after: later events must remain replayable.
+        let device = std::fs::metadata(root).ok()?.dev();
+        let uuid_before = device_uuid(device)?;
         // SAFETY: a read-only query with no arguments.
         let event_id = unsafe { fs::FSEventsGetCurrentEventId() };
-        let device = std::fs::metadata(root).ok()?.dev();
-        (event_id != 0).then_some((event_id, device))
+        let uuid_after = device_uuid(device);
+        full_anchor(event_id, device, Some(uuid_before), uuid_after)
     }
 
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan {
@@ -295,10 +337,25 @@ impl FsEventsSource for MacOsFsEventsSource {
     }
 }
 
+fn full_anchor(
+    event_id: u64,
+    device: u64,
+    uuid_before: Option<String>,
+    uuid_after: Option<String>,
+) -> Option<(u64, u64, Option<String>)> {
+    match (event_id, uuid_before, uuid_after) {
+        (id, Some(before), Some(after)) if id != 0 && before == after => {
+            Some((id, device, Some(after)))
+        }
+        _ => None,
+    }
+}
+
 /// Every root whose pre-checks passed, grouped by the device its
 /// FSEvents history lives on.
 struct Group {
     dev: u64,
+    device_uuid: String,
     /// Index into the caller's request slice, so each plan goes back
     /// to the root that asked for it.
     members: Vec<usize>,
@@ -309,7 +366,47 @@ struct Group {
     since_id: u64,
 }
 
+fn replay_cursor(
+    since: &FsEventsState,
+    dev: u64,
+    current: u64,
+    current_uuid: Option<&str>,
+) -> Result<(u64, String), Box<FsEventsPlan>> {
+    if let Some(stored_device) = since.device
+        && stored_device != dev
+    {
+        let mut plan = FsEventsPlan::refuse(RefreshRefusal::RootMismatch, current, Some(dev));
+        plan.device_uuid = current_uuid.map(str::to_owned);
+        return Err(Box::new(plan));
+    }
+    let Some(device_uuid) = current_uuid else {
+        return Err(Box::new(FsEventsPlan::refuse(
+            RefreshRefusal::FseventsdUnavailable,
+            current,
+            Some(dev),
+        )));
+    };
+    let Some(since_id) = since.event_id else {
+        let mut plan = FsEventsPlan::refuse(RefreshRefusal::NoStoredEventId, current, Some(dev));
+        plan.device_uuid = Some(device_uuid.to_owned());
+        return Err(Box::new(plan));
+    };
+    if since.device_uuid.as_deref() != Some(device_uuid) {
+        let mut plan = FsEventsPlan::refuse(RefreshRefusal::HelperInconclusive, current, Some(dev));
+        plan.device_uuid = Some(device_uuid.to_owned());
+        return Err(Box::new(plan));
+    }
+    if since_id > current {
+        let mut plan = FsEventsPlan::refuse(RefreshRefusal::EventIdFromFuture, current, Some(dev));
+        plan.device_uuid = Some(device_uuid.to_owned());
+        return Err(Box::new(plan));
+    }
+    Ok((since_id, device_uuid.to_owned()))
+}
+
 fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let prechecks = Instant::now();
     // SAFETY: no arguments; a pure query of the FSEvents subsystem.
     let current = unsafe { fs::FSEventsGetCurrentEventId() };
     if current == 0 {
@@ -321,11 +418,10 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
 
     let mut plans: Vec<Option<FsEventsPlan>> = vec![None; requests.len()];
     let mut groups: Vec<Group> = Vec::new();
-    // `FSEventsGetLastEventIdForDeviceBeforeTime` asks fseventsd about
-    // the device, not the root, and costs ~30 ms a call: once per
-    // device, not once per root (R19: 56 unit roots on one device were
-    // 1.7 s of an unchanged pass).
-    let mut last_known_by_dev: std::collections::HashMap<u64, u64> =
+    // Ask once per device for the stream identity, not once per root.
+    // The BeforeTime API returns the newest event before a timestamp,
+    // not the oldest retained event, so it cannot establish a history floor.
+    let mut uuid_by_dev: std::collections::HashMap<u64, Option<String>> =
         std::collections::HashMap::new();
 
     for (i, request) in requests.iter().enumerate() {
@@ -343,63 +439,15 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
             }
         };
 
-        // Sanity check named in the issue: ask FSEvents for the last
-        // event id it can vouch for on this device as of "now". This
-        // is read-only and its only use here is to catch a device
-        // whose FSEvents history log cannot possibly reach back to
-        // `since` (the id looks plausible but predates everything
-        // retained).
-        // SAFETY: `dev` came from a real `stat`;
-        // `CFAbsoluteTimeGetCurrent` takes no arguments.
-        let last_known = *last_known_by_dev.entry(dev).or_insert_with(|| unsafe {
-            fs::FSEventsGetLastEventIdForDeviceBeforeTime(
-                dev,
-                core_foundation_sys::date::CFAbsoluteTimeGetCurrent(),
-            )
-        });
-
-        if let Some(stored_device) = since.device
-            && stored_device != dev
-        {
-            plans[i] = Some(FsEventsPlan::refuse(
-                RefreshRefusal::RootMismatch,
-                current,
-                Some(dev),
-            ));
-            continue;
-        }
-        let Some(since_id) = since.event_id else {
-            plans[i] = Some(FsEventsPlan::refuse(
-                RefreshRefusal::NoStoredEventId,
-                current,
-                Some(dev),
-            ));
-            continue;
-        };
-        if since_id > current {
-            plans[i] = Some(FsEventsPlan::refuse(
-                RefreshRefusal::EventIdFromFuture,
-                current,
-                Some(dev),
-            ));
-            continue;
-        }
-        // `last_known` being 0 means FSEvents could not answer at all
-        // for this device (no history yet observed); that is not by
-        // itself a reason to refuse a replay FSEvents is about to
-        // attempt, so it only gates the case where FSEvents can
-        // positively vouch for a *later* floor than our stored id,
-        // meaning `since_id` is stale history that has already
-        // rotated out.
-        if last_known != 0 && since_id != 0 && since_id < last_known {
-            plans[i] = Some(FsEventsPlan::refuse(
-                RefreshRefusal::HelperInconclusive,
-                current,
-                Some(dev),
-            ));
-            continue;
-        }
-
+        let current_uuid = uuid_by_dev.entry(dev).or_insert_with(|| device_uuid(dev));
+        let (since_id, device_uuid) =
+            match replay_cursor(since, dev, current, current_uuid.as_deref()) {
+                Ok(cursor) => cursor,
+                Err(plan) => {
+                    plans[i] = Some(*plan);
+                    continue;
+                }
+            };
         match groups.iter_mut().find(|g| g.dev == dev) {
             Some(g) => {
                 g.members.push(i);
@@ -407,10 +455,21 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
             }
             None => groups.push(Group {
                 dev,
+                device_uuid,
                 members: vec![i],
                 since_id,
             }),
         }
+    }
+
+    if trace {
+        eprintln!(
+            "[trace] fsevents prechecks: roots={} devices={} groups={} elapsed={:?}",
+            requests.len(),
+            uuid_by_dev.len(),
+            groups.len(),
+            prechecks.elapsed()
+        );
     }
 
     // One stream per device, all at once: each waits on fseventsd for
@@ -429,16 +488,21 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
         })
         .collect();
     type Replayed = Result<(Vec<PathBuf>, Vec<PathBuf>), RefreshRefusal>;
-    let results: Vec<Replayed> = std::thread::scope(|scope| {
+    let results: Vec<(Replayed, bool)> = std::thread::scope(|scope| {
         let handles: Vec<_> = groups
             .iter()
             .zip(group_roots.iter())
             .map(|(group, roots)| {
                 let since_id = group.since_id;
                 let dev = group.dev;
+                let expected_uuid = group.device_uuid.clone();
                 scope.spawn(move || {
                     let started = Instant::now();
-                    let result = run_stream(roots, since_id);
+                    let mut result = run_stream(roots, since_id);
+                    let stream_changed = device_uuid(dev).as_deref() != Some(&expected_uuid);
+                    if stream_changed {
+                        result = Err(RefreshRefusal::HelperInconclusive);
+                    }
                     if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
                         eprintln!(
                             "[xtrace] fsevents group dev={dev} roots={} since={since_id} current={current} ok={} rescans={:?} elapsed={:?}",
@@ -448,7 +512,7 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
                             started.elapsed()
                         );
                     }
-                    result
+                    (result, stream_changed)
                 })
             })
             .collect();
@@ -456,15 +520,32 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
             .into_iter()
             .map(|h| {
                 h.join()
-                    .unwrap_or(Err(RefreshRefusal::FseventsdUnavailable))
+                    .unwrap_or((Err(RefreshRefusal::FseventsdUnavailable), false))
             })
             .collect()
     });
-    for ((group, roots), result) in groups.iter().zip(group_roots.iter()).zip(results) {
+    for ((group, roots), (result, stream_changed)) in
+        groups.iter().zip(group_roots.iter()).zip(results)
+    {
+        if stream_changed {
+            for &i in &group.members {
+                // The pre-replay ID and UUID no longer name the same stream.
+                // Publish neither; the full walk must obtain a fresh,
+                // UUID-bracketed anchor before traversing the filesystem.
+                plans[i] = Some(FsEventsPlan::refuse(
+                    RefreshRefusal::HelperInconclusive,
+                    0,
+                    Some(group.dev),
+                ));
+            }
+            continue;
+        }
         match result {
             Err(reason) => {
                 for &i in &group.members {
-                    plans[i] = Some(FsEventsPlan::refuse(reason, current, Some(group.dev)));
+                    let mut plan = FsEventsPlan::refuse(reason, current, Some(group.dev));
+                    plan.device_uuid = Some(group.device_uuid.clone());
+                    plans[i] = Some(plan);
                 }
             }
             Ok((changes, rescans)) => {
@@ -474,6 +555,9 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
                         Ok(changed) => FsEventsPlan::ok(changed, current, Some(group.dev)),
                         Err(reason) => FsEventsPlan::refuse(reason, current, Some(group.dev)),
                     });
+                    if let Some(plan) = plans[i].as_mut() {
+                        plan.device_uuid = Some(group.device_uuid.clone());
+                    }
                 }
             }
         }
@@ -592,4 +676,202 @@ fn run_stream(
 
     let rescans = std::mem::take(&mut collector.rescans);
     Ok((collector.changes.drain().collect(), rescans))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor(event_id: Option<u64>, device: Option<u64>, uuid: Option<&str>) -> FsEventsState {
+        FsEventsState {
+            event_id,
+            device,
+            device_uuid: uuid.map(str::to_owned),
+            ..FsEventsState::default()
+        }
+    }
+
+    #[test]
+    fn stream_uuid_allows_matching_cursor_and_rejects_missing_or_changed_identity() {
+        let stored = cursor(Some(41), Some(7), Some("stream-a"));
+        // The current event ID is later than the stored one; a matching
+        // stream UUID is the evidence that makes this replay valid.
+        assert_eq!(
+            replay_cursor(&stored, 7, 99, Some("stream-a")).unwrap(),
+            (41, "stream-a".into())
+        );
+
+        for stale in [
+            cursor(Some(41), Some(7), None),
+            cursor(Some(41), Some(7), Some("stream-old")),
+        ] {
+            let refused = replay_cursor(&stale, 7, 99, Some("stream-new")).unwrap_err();
+            assert_eq!(refused.refusal, Some(RefreshRefusal::HelperInconclusive));
+            assert_eq!(refused.device_uuid.as_deref(), Some("stream-new"));
+            assert!(refused.changed_dirs.is_empty());
+        }
+
+        let unavailable = replay_cursor(&stored, 7, 99, None).unwrap_err();
+        assert_eq!(
+            unavailable.refusal,
+            Some(RefreshRefusal::FseventsdUnavailable)
+        );
+    }
+
+    #[test]
+    fn cursor_planner_keeps_device_and_future_id_refusals() {
+        let stored = cursor(Some(41), Some(7), Some("stream-a"));
+        assert_eq!(
+            replay_cursor(&stored, 8, 99, Some("stream-b"))
+                .unwrap_err()
+                .refusal,
+            Some(RefreshRefusal::RootMismatch)
+        );
+        assert_eq!(
+            replay_cursor(&stored, 7, 40, Some("stream-a"))
+                .unwrap_err()
+                .refusal,
+            Some(RefreshRefusal::EventIdFromFuture)
+        );
+        assert_eq!(
+            replay_cursor(
+                &cursor(None, Some(7), Some("stream-a")),
+                7,
+                99,
+                Some("stream-a")
+            )
+            .unwrap_err()
+            .refusal,
+            Some(RefreshRefusal::NoStoredEventId)
+        );
+    }
+
+    #[test]
+    fn full_anchor_requires_one_stream_identity_on_both_sides_of_event_id() {
+        assert_eq!(
+            full_anchor(88, 7, Some("stream-a".into()), Some("stream-a".into())),
+            Some((88, 7, Some("stream-a".into())))
+        );
+        assert_eq!(
+            full_anchor(
+                88,
+                7,
+                Some("before-reset".into()),
+                Some("after-reset".into())
+            ),
+            None
+        );
+        assert_eq!(full_anchor(88, 7, Some("stream-a".into()), None), None);
+        assert_eq!(
+            full_anchor(0, 7, Some("stream-a".into()), Some("stream-a".into())),
+            None
+        );
+    }
+
+    fn callback_collector() -> Collector {
+        Collector {
+            roots: vec![PathBuf::from("/tmp/swamp-root")],
+            changes: Default::default(),
+            rescans: Vec::new(),
+            history_done: false,
+            hard_fail: None,
+        }
+    }
+
+    #[test]
+    fn stream_callback_refuses_every_dropped_or_wrapped_history_flag() {
+        let loss_flags = [
+            fs::kFSEventStreamEventFlagEventIdsWrapped,
+            fs::kFSEventStreamEventFlagUserDropped,
+            fs::kFSEventStreamEventFlagKernelDropped,
+        ];
+        for loss in loss_flags {
+            let mut collector = callback_collector();
+            let path = std::ffi::CString::new("/tmp/swamp-root/changed").unwrap();
+            let path_ptr = path.as_ptr();
+            let paths = &path_ptr as *const *const std::os::raw::c_char;
+            let flags = [loss];
+            stream_callback(
+                std::ptr::null_mut(),
+                &mut collector as *mut Collector as *mut c_void,
+                1,
+                paths as *mut c_void,
+                flags.as_ptr(),
+                std::ptr::null(),
+            );
+            assert_eq!(
+                collector.hard_fail,
+                Some(RefreshRefusal::HelperInconclusive)
+            );
+            assert!(collector.changes.is_empty());
+            assert!(collector.rescans.is_empty());
+        }
+    }
+
+    #[test]
+    fn matching_stream_cursor_still_collects_ordinary_changes() {
+        let (since_id, _) = replay_cursor(
+            &cursor(Some(41), Some(7), Some("stream-a")),
+            7,
+            99,
+            Some("stream-a"),
+        )
+        .unwrap();
+        assert_eq!(since_id, 41);
+
+        let path = std::ffi::CString::new("/tmp/swamp-root/changed").unwrap();
+        let path_ptr = path.as_ptr();
+        let paths = &path_ptr as *const *const std::os::raw::c_char;
+        let flags = [fs::kFSEventStreamEventFlagNone];
+        let mut collector = callback_collector();
+        stream_callback(
+            std::ptr::null_mut(),
+            &mut collector as *mut Collector as *mut c_void,
+            1,
+            paths as *mut c_void,
+            flags.as_ptr(),
+            std::ptr::null(),
+        );
+        assert!(
+            collector
+                .changes
+                .contains(&PathBuf::from("/tmp/swamp-root/changed"))
+        );
+        assert!(collector.hard_fail.is_none());
+    }
+
+    #[test]
+    fn stream_callback_keeps_scan_subdirs_and_root_change_refusals() {
+        let path = std::ffi::CString::new("/tmp/swamp-root/changed").unwrap();
+        let path_ptr = path.as_ptr();
+        let paths = &path_ptr as *const *const std::os::raw::c_char;
+
+        let mut collector = callback_collector();
+        let flags = [fs::kFSEventStreamEventFlagMustScanSubDirs];
+        stream_callback(
+            std::ptr::null_mut(),
+            &mut collector as *mut Collector as *mut c_void,
+            1,
+            paths as *mut c_void,
+            flags.as_ptr(),
+            std::ptr::null(),
+        );
+        assert_eq!(
+            collector.rescans,
+            vec![PathBuf::from("/tmp/swamp-root/changed")]
+        );
+
+        collector = callback_collector();
+        let flags = [fs::kFSEventStreamEventFlagRootChanged];
+        stream_callback(
+            std::ptr::null_mut(),
+            &mut collector as *mut Collector as *mut c_void,
+            1,
+            paths as *mut c_void,
+            flags.as_ptr(),
+            std::ptr::null(),
+        );
+        assert_eq!(collector.hard_fail, Some(RefreshRefusal::RootMismatch));
+        assert!(collector.changes.is_empty());
+    }
 }

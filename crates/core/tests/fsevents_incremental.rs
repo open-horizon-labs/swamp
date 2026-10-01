@@ -60,6 +60,7 @@ impl FsEventsSource for RefusingSource {
             changed_dirs: Vec::new(),
             current_event_id: 999,
             device: Some(1),
+            device_uuid: None,
             live: false,
             consume: None,
         }
@@ -80,6 +81,7 @@ fn incremental_plan(changed: Vec<PathBuf>, event_id: u64) -> FsEventsPlan {
         changed_dirs: changed,
         current_event_id: event_id,
         device: Some(1),
+        device_uuid: None,
         live: false,
         consume: None,
     }
@@ -247,6 +249,8 @@ fn deep_change_inside_a_folded_artifact_resizes_from_interior_rows_and_matches_a
         swamp_core::fs_gate::settle::noise(16384),
     )
     .unwrap();
+    let root_file = fx.node_modules.join("root-level.bin");
+    fixture::write_settled(&root_file, swamp_core::fs_gate::settle::noise(4096)).unwrap();
 
     let first = report_full_mode_with_source(
         &fx.root,
@@ -311,11 +315,13 @@ fn deep_change_inside_a_folded_artifact_resizes_from_interior_rows_and_matches_a
     )
     .unwrap();
     fs::remove_dir_all(&doomed).unwrap();
+    fixture::write_settled(&root_file, swamp_core::fs_gate::settle::noise(32768)).unwrap();
 
     // FSEvents names the directories whose listings changed (and, by our
     // rule, their parents).
     let source = CannedSource(incremental_plan(
         vec![
+            fx.node_modules.clone(),
             deep.clone(),
             fx.node_modules.join("pkg/lib"),
             fx.node_modules.join("pkg/lib/fresh"),

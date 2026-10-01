@@ -2265,6 +2265,8 @@ pub fn resize_artifact_stamped(
     excluded: &[PathBuf],
     stamp_dirs: bool,
 ) -> (ArtifactRow, Vec<DirRollup>, Vec<DirStamp>, bool) {
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let total_started = std::time::Instant::now();
     let _step = crate::beacon::enter("external unit", root_path);
     // Same machinery as the full walk's folded units: the root is one
     // Size job, subdirectories fan out across the pool. A 16 GB `target/`
@@ -2313,6 +2315,7 @@ pub fn resize_artifact_stamped(
         group,
         classified: Classified::stored(kind.clone()),
     });
+    let pool_started = std::time::Instant::now();
     pool.drain(worker_count(), |job| match job {
         AttrJob::Walk(path) => process_walk(path, &[], &shared, &pool),
         AttrJob::Size {
@@ -2321,6 +2324,8 @@ pub fn resize_artifact_stamped(
             classified,
         } => process_size(path, &group, &classified, &shared, &pool),
     });
+    let pool_elapsed = pool_started.elapsed();
+    let output_started = std::time::Instant::now();
     let shared = Arc::try_unwrap(shared).unwrap_or_else(|_| unreachable!("workers joined"));
     let complete = !shared.incomplete.load(Ordering::Relaxed);
     let dirs: Vec<DirRollup> = shared.dirs.into_inner().unwrap().into_values().collect();
@@ -2361,6 +2366,18 @@ pub fn resize_artifact_stamped(
     // `local_bytes` (the full walk charges shared inodes to whichever row
     // saw them first; the incremental merge applies the local delta).
     row.local_bytes = row.bytes.max(row.local_bytes);
+    if trace {
+        eprintln!(
+            "[xtrace] resize_artifact {} pool={pool_elapsed:?} output={:?} total={:?} dirs={} stamps={} complete={} bytes={}",
+            root_path.display(),
+            output_started.elapsed(),
+            total_started.elapsed(),
+            dirs.len(),
+            stamps.len(),
+            complete,
+            row.bytes
+        );
+    }
     (row, dirs, stamps, complete)
 }
 

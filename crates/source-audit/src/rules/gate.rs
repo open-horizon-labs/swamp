@@ -1013,7 +1013,7 @@ pub fn json_writes_allowlisted(ws: &Workspace) -> Vec<String> {
 }
 
 /// One function per Parquet table the store holds, and nothing else may
-/// reach `fs_gate::columns::write_parquet_atomic`
+/// reach either atomic writer in `fs_gate::columns`
 /// (`.oh/guardrails/store-is-facts-report-is-views.md`, R20). Every name
 /// here is a *fact* table: rows that come from an observation (a walk, a
 /// detector, a daemon answer, a `git` query) or the reverse-delta history
@@ -1070,7 +1070,11 @@ pub fn parquet_writers_are_the_named_fact_tables(ws: &Workspace) -> Vec<String> 
                 continue;
             }
             let abs = ws.resolve(mi, &r.segments).join("::");
-            if abs != "@core::fs_gate::columns::write_parquet_atomic" {
+            if !matches!(
+                abs.as_str(),
+                "@core::fs_gate::columns::write_parquet_atomic"
+                    | "@core::fs_gate::columns::write_parquet_atomic_with_dictionary_disabled"
+            ) {
                 continue;
             }
             let (module, f) = match r.in_fn {
@@ -1080,10 +1084,18 @@ pub fn parquet_writers_are_the_named_fact_tables(ws: &Workspace) -> Vec<String> 
                 ),
                 None => (m.path.join("::"), ""),
             };
-            let named = m.krate == Krate::Core
-                && TABLE_WRITERS
-                    .iter()
-                    .any(|(mod_path, name)| *mod_path == module && *name == f);
+            // The default writer delegates to the same atomic implementation.
+            // This precise edge is allowed; generic helpers elsewhere still
+            // cannot mint a table through the encoding-aware entry point.
+            let default_wrapper = m.krate == Krate::Core
+                && module == "fs_gate::columns"
+                && f == "write_parquet_atomic"
+                && abs.ends_with("::write_parquet_atomic_with_dictionary_disabled");
+            let named = default_wrapper
+                || m.krate == Krate::Core
+                    && TABLE_WRITERS
+                        .iter()
+                        .any(|(mod_path, name)| *mod_path == module && *name == f);
             if !named {
                 problems.push(format!(
                     "{}: `write_parquet_atomic` reached from `{}`, which is not one of the named \

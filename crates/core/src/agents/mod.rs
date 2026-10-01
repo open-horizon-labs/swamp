@@ -1074,6 +1074,21 @@ impl<'a> IdentifyCtx<'a> {
         self.observed_at
     }
 
+    /// Whether adapter-level diagnostics were requested by this process.
+    /// Environment access and output stay at the context boundary so
+    /// adapters remain testable and never inspect or emit user data directly.
+    pub fn trace_enabled(&self) -> bool {
+        std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty())
+    }
+
+    /// Emits a caller-formatted diagnostic only when tracing is enabled.
+    /// Adapters provide bounded counters and timings, never file contents.
+    pub fn trace(&self, args: std::fmt::Arguments<'_>) {
+        if self.trace_enabled() {
+            eprintln!("{args}");
+        }
+    }
+
     /// One `lstat(2)` of `path` (never follows a symlink). Adapters stat
     /// through their context, never through `fs_gate` directly
     /// (`adapters_do_not_reach_gates`).
@@ -1956,6 +1971,9 @@ pub fn discover_and_measure_in(
     since_secs: u64,
     coverage: &crate::fs_events::EventCoverage,
 ) -> Result<Vec<AgentUnit>> {
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let trace_started = std::time::Instant::now();
+    let mut trace_mark = trace_started;
     // Protection state is consulted here and again, freshly, at every
     // sink. Corrupt/unreadable state is *unknown*, not empty: rather
     // than fail the whole report, every unit is marked protected with
@@ -2006,6 +2024,13 @@ pub fn discover_and_measure_in(
     }
     .with_known_worktrees(project_worktrees);
     let ctx = IdentifyCtx::with_containers(observed_at, &cache, &containers);
+    if trace {
+        eprintln!(
+            "[atrace] setup protection+registries+caches: {:?}",
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
+    }
 
     // Authorized scope only: a tool home the user excluded, or whose
     // detector is disabled, or that lies outside an explicit command
@@ -2016,7 +2041,9 @@ pub fn discover_and_measure_in(
         let Some(adapter) = adapters.get(&tool_id) else {
             continue;
         };
+        let identify_started = std::time::Instant::now();
         let mut units = adapter.identify(&home, &ctx);
+        let identified_count = units.len();
         // One resolution path for identified and replayed units alike:
         // the declared path live, then folder-name inference against
         // this pass's known worktrees (`ContainerCache::finish_link`).
@@ -2042,6 +2069,16 @@ pub fn discover_and_measure_in(
             }
             candidates_by_key.insert(key, (tool_name.clone(), home.clone(), cand, device));
         }
+        if trace {
+            eprintln!(
+                "[atrace] home adapter {tool_id} candidates={identified_count} elapsed={:?}",
+                identify_started.elapsed()
+            );
+        }
+    }
+    if trace {
+        eprintln!("[atrace] home adapters total: {:?}", trace_mark.elapsed());
+        trace_mark = std::time::Instant::now();
     }
 
     // Project-local units (#96, Aider): materially different shape from
@@ -2069,7 +2106,10 @@ pub fn discover_and_measure_in(
         for wt_path in project_worktrees {
             covered_roots.push(wt_path.clone());
             let device = device_of(wt_path);
+            let identify_started = std::time::Instant::now();
+            let mut identified_count = 0usize;
             for cand in adapter.project_local_units(wt_path, &ctx) {
+                identified_count += 1;
                 let key = unit_key(tool_id, cand.category(), device, cand.path());
                 if cand.complete() {
                     observed.push(ObservedExternal {
@@ -2086,7 +2126,21 @@ pub fn discover_and_measure_in(
                 }
                 candidates_by_key.insert(key, (tool_name.clone(), wt_path.clone(), cand, device));
             }
+            if trace {
+                eprintln!(
+                    "[atrace] project-local adapter {tool_id} root={} candidates={identified_count} elapsed={:?}",
+                    wt_path.display(),
+                    identify_started.elapsed()
+                );
+            }
         }
+    }
+    if trace {
+        eprintln!(
+            "[atrace] project-local adapters total: {:?}",
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
     }
 
     // The cache is persisted on the same terms as the growth history:
@@ -2097,6 +2151,13 @@ pub fn discover_and_measure_in(
     {
         cache.save(dir, observed_at)?;
         containers.save(dir, observed_at)?;
+    }
+    if trace {
+        eprintln!(
+            "[atrace] persist identification/container caches: {:?}",
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
     }
 
     // This observation owns only agent-family rows, and only under the
@@ -2122,6 +2183,14 @@ pub fn discover_and_measure_in(
         }
         None => HashMap::new(),
     };
+    if trace {
+        eprintln!(
+            "[atrace] growth annotation candidates={} elapsed={:?}",
+            observed.len(),
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
+    }
 
     let mut units = Vec::with_capacity(candidates_by_key.len());
     for (key, (tool_name, tool_home, mut cand, _device)) in candidates_by_key {
@@ -2226,6 +2295,14 @@ pub fn discover_and_measure_in(
         });
     }
     units.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.id.cmp(&b.id)));
+    if trace {
+        eprintln!(
+            "[atrace] protection/postprocess candidates={} elapsed={:?} total={:?}",
+            units.len(),
+            trace_mark.elapsed(),
+            trace_started.elapsed()
+        );
+    }
     Ok(units)
 }
 

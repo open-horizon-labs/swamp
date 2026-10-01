@@ -329,9 +329,9 @@ enum Command {
         /// left as-is.
         #[arg(long)]
         no_enrich: bool,
-        /// Force a GitHub refresh now: refetch every worktree, ignoring the
-        /// 24h cache window and the rule that a merged branch is never
-        /// re-enriched. Plain `observe` already enriches missing/stale rows.
+        /// Force a GitHub and Docker refresh now: bypass their cache
+        /// windows. GitHub also refetches merged worktrees. Plain
+        /// `observe` refreshes missing/stale facts.
         #[arg(long, conflicts_with = "no_enrich")]
         enrich: bool,
         /// Run the volume pass now (the whole-disk ledger behind `report
@@ -1713,6 +1713,7 @@ fn main() -> Result<()> {
             volume,
         } => {
             swamp_core::github::set_force_refresh(enrich);
+            swamp_core::docker::set_force_refresh(enrich);
             let store_dir = swamp_dir();
             // One statfs, before the scope is resolved, persisted, or the
             // writer lock taken: an abort leaves the store (coverage

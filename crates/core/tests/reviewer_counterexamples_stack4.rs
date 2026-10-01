@@ -125,6 +125,7 @@ impl FsEventsSource for Refusing {
             changed_dirs: Vec::new(),
             current_event_id: 999,
             device: Some(1),
+            device_uuid: None,
             live: false,
             consume: None,
         }
@@ -191,6 +192,7 @@ fn a_stored_rules_version_without_an_anchor_still_forces_the_rules_walk() {
         &swamp_core::fs_events::FsEventsState {
             event_id: None,
             device: None,
+            device_uuid: None,
             last_observed_at: None,
             rules_version: older,
             unit_root: None,

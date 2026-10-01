@@ -67,6 +67,12 @@ use std::path::{Path, PathBuf};
 
 pub const CODEX_TOOL_ID: &str = "codex";
 
+macro_rules! codex_trace {
+    ($ctx:expr, $($args:tt)*) => {
+        $ctx.trace(format_args!($($args)*))
+    };
+}
+
 const MAX_FOLD_ENTRIES: usize = 200_000;
 /// Rollout files one session-tree **container** will identify. Per
 /// container, never shared: a bound a day directory shares with its
@@ -126,7 +132,18 @@ impl AgentAdapter for Adapter {
 }
 
 pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
+    let trace = ctx.trace_enabled();
+    let trace_total = std::time::Instant::now();
+    let before = trace.then(crate::work_counters::snapshot);
+    let phase = std::time::Instant::now();
     let session_index = SessionIndex::read_from_home(home, ctx);
+    if trace {
+        codex_trace!(
+            ctx,
+            "[codex-trace] session index read: {:?}",
+            phase.elapsed()
+        );
+    }
     let mut walk = SessionWalk {
         home,
         archived: false,
@@ -135,23 +152,97 @@ pub fn identify(home: &Path, ctx: &IdentifyCtx) -> Vec<CandidateAgentUnit> {
         units: Vec::new(),
         containers_used: 0,
     };
+    let phase = std::time::Instant::now();
+    let live_before = trace.then(crate::work_counters::snapshot);
     walk.walk(&home.join("sessions"), 0);
+    if trace {
+        let after = crate::work_counters::snapshot();
+        let before = live_before.unwrap_or_default();
+        codex_trace!(
+            ctx,
+            "[codex-trace] live session walk units={} containers={} elapsed={:?} dirs_delta={} files_delta={} reused={} identified={}",
+            walk.units.len(),
+            walk.containers_used,
+            phase.elapsed(),
+            after.dirs_listed - before.dirs_listed,
+            after.files_statted - before.files_statted,
+            after.containers_reused - before.containers_reused,
+            after.containers_identified - before.containers_identified,
+        );
+    }
     walk.archived = true;
+    let phase = std::time::Instant::now();
+    let archived_before = trace.then(crate::work_counters::snapshot);
     walk.walk(&home.join("archived_sessions"), 0);
+    if trace {
+        let after = crate::work_counters::snapshot();
+        let before = archived_before.unwrap_or_default();
+        codex_trace!(
+            ctx,
+            "[codex-trace] archived session walk units={} containers={} elapsed={:?} dirs_delta={} files_delta={} reused={} identified={}",
+            walk.units.len(),
+            walk.containers_used,
+            phase.elapsed(),
+            after.dirs_listed - before.dirs_listed,
+            after.files_statted - before.files_statted,
+            after.containers_reused - before.containers_reused,
+            after.containers_identified - before.containers_identified,
+        );
+    }
     let mut units = walk.units;
+    let phase = std::time::Instant::now();
     identify_sqlite_stores(home, ctx, &mut units);
+    if trace {
+        codex_trace!(
+            ctx,
+            "[codex-trace] sqlite stores total_units={} elapsed={:?}",
+            units.len(),
+            phase.elapsed()
+        );
+    }
     // Only a pool that is a direct child of the home is identified here:
     // anywhere else it is outside this adapter's authorized root (the
     // project walk still reaches its worktrees through their checkouts'
     // registries), and a deeper one would split a top-level entry the
     // residual accounts for whole.
+    let phase = std::time::Instant::now();
     let pool_entry = codex_state::managed_worktree_pool(home, ctx)
         .filter(|pool| pool.parent() == Some(home))
         .and_then(|pool| pool.file_name().map(|n| n.to_string_lossy().into_owned()));
     if let Some(name) = &pool_entry {
         identify_managed_worktrees(home, &home.join(name), ctx, &mut units);
     }
+    if trace {
+        codex_trace!(
+            ctx,
+            "[codex-trace] managed worktrees units={} elapsed={:?}",
+            units.len(),
+            phase.elapsed()
+        );
+    }
+    let phase = std::time::Instant::now();
     identify_static_categories(home, ctx, pool_entry.as_deref(), &mut units);
+    if trace {
+        let after = crate::work_counters::snapshot();
+        let before = before.unwrap_or_default();
+        codex_trace!(
+            ctx,
+            "[codex-trace] static categories total_units={} elapsed={:?}",
+            units.len(),
+            phase.elapsed()
+        );
+        codex_trace!(
+            ctx,
+            "[codex-trace] total elapsed={:?} dirs_delta={} files_delta={} identification_cache_hits={} misses={} containers_reused={} identified={}",
+            trace_total.elapsed(),
+            after.dirs_listed - before.dirs_listed,
+            after.files_statted - before.files_statted,
+            after.identification_cache_hits - before.identification_cache_hits,
+            after.identification_cache_misses - before.identification_cache_misses,
+            after.containers_reused - before.containers_reused,
+            after.containers_identified - before.containers_identified
+        );
+    }
     units
 }
 
@@ -615,6 +706,17 @@ fn identify_static_categories(
     pool_entry: Option<&str>,
     out: &mut Vec<CandidateAgentUnit>,
 ) {
+    identify_static_categories_bounded(home, ctx, pool_entry, out, MAX_FOLD_ENTRIES);
+}
+
+fn identify_static_categories_bounded(
+    home: &Path,
+    ctx: &IdentifyCtx,
+    pool_entry: Option<&str>,
+    out: &mut Vec<CandidateAgentUnit>,
+    max_fold_entries: usize,
+) {
+    let trace = ctx.trace_enabled();
     let mut seen_top_level: HashSet<String> = HashSet::new();
     // Accounted for by `identify_managed_worktrees`, whose units hold its
     // bytes (or say which project worktree does).
@@ -627,7 +729,21 @@ fn identify_static_categories(
         if !ctx.exists(&path) {
             continue;
         }
-        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, MAX_FOLD_ENTRIES);
+        let fold_started = std::time::Instant::now();
+        let fold_before = trace.then(crate::work_counters::snapshot);
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, max_fold_entries);
+        if trace {
+            let after = crate::work_counters::snapshot();
+            let before = fold_before.unwrap_or_default();
+            codex_trace!(
+                ctx,
+                "[codex-trace] static fold {} elapsed={:?} dirs_delta={} files_delta={} truncated={truncated}",
+                path.display(),
+                fold_started.elapsed(),
+                after.dirs_listed - before.dirs_listed,
+                after.files_statted - before.files_statted
+            );
+        }
         let mut unit = AgentUnitBuilder::new(CODEX_TOOL_ID, entry.category, path)
             .relative_path(entry.rel)
             .bytes(bytes)
@@ -658,6 +774,7 @@ fn identify_static_categories(
 
     let mut residual_bytes = 0u64;
     let mut residual_mtime = 0u64;
+    let mut residual_truncated = false;
     let mut residual_names: Vec<String> = Vec::new();
     for e in ctx.list(home) {
         let name = e.name;
@@ -672,30 +789,49 @@ fn identify_static_categories(
         {
             continue;
         }
-        let (bytes, mtime, _truncated) = ctx.folded_bytes(&home.join(&name), MAX_FOLD_ENTRIES);
+        let path = home.join(&name);
+        let fold_started = std::time::Instant::now();
+        let fold_before = trace.then(crate::work_counters::snapshot);
+        let (bytes, mtime, truncated) = ctx.folded_bytes(&path, max_fold_entries);
+        residual_truncated |= truncated;
+        if trace {
+            let after = crate::work_counters::snapshot();
+            let before = fold_before.unwrap_or_default();
+            codex_trace!(
+                ctx,
+                "[codex-trace] residual {} {} elapsed={:?} dirs_delta={} files_delta={}",
+                if e.is_dir { "directory" } else { "file" },
+                path.display(),
+                fold_started.elapsed(),
+                after.dirs_listed - before.dirs_listed,
+                after.files_statted - before.files_statted
+            );
+        }
         residual_bytes += bytes;
         residual_mtime = residual_mtime.max(mtime);
         residual_names.push(name);
     }
     if !residual_names.is_empty() {
         residual_names.sort();
-        out.push(
-            AgentUnitBuilder::new(
-                CODEX_TOOL_ID,
-                AgentCategory::Unclassified,
-                home.to_path_buf(),
-            )
-            .relative_path("(unclassified residual)")
-            .bytes(residual_bytes)
-            .mtime_max(residual_mtime)
-            .project_link(ProjectLinkState::NotApplicable)
-            .action(AgentActionCapability::None)
-            .note(format!(
-                "entries with no specific rule in this adapter: {}",
-                residual_names.join(", ")
-            ))
-            .build(),
-        );
+        let mut aggregate = AgentUnitBuilder::new(
+            CODEX_TOOL_ID,
+            AgentCategory::Unclassified,
+            home.to_path_buf(),
+        )
+        .relative_path("(unclassified residual)")
+        .bytes(residual_bytes)
+        .mtime_max(residual_mtime)
+        .project_link(ProjectLinkState::NotApplicable)
+        .action(AgentActionCapability::None)
+        .note(format!(
+            "entries with no specific rule in this adapter: {}",
+            residual_names.join(", ")
+        ));
+        if residual_truncated {
+            aggregate = aggregate
+                .incomplete("residual directory fold incomplete; total may be an undercount");
+        }
+        out.push(aggregate.build());
     }
 }
 
@@ -714,6 +850,28 @@ mod tests {
     fn touch(path: &Path, content: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    fn run_static_bounded(home: &Path, max_fold_entries: usize) -> Vec<CandidateAgentUnit> {
+        let cache = IdentificationCache::disabled();
+        let ctx = IdentifyCtx::new(1, &cache);
+        let mut units = Vec::new();
+        identify_static_categories_bounded(home, &ctx, None, &mut units, max_fold_entries);
+        units
+    }
+
+    #[test]
+    fn bounded_residual_fold_marks_the_aggregate_incomplete() {
+        let home = tempfile::tempdir().unwrap();
+        touch(&home.path().join(".tmp/nested/one"), b"one");
+        touch(&home.path().join(".tmp/nested/two"), b"two");
+        let units = run_static_bounded(home.path(), 1);
+        let residual = units
+            .iter()
+            .find(|unit| unit.relative_path() == "(unclassified residual)")
+            .expect("residual aggregate");
+        assert!(!residual.complete());
+        assert!(residual.note().unwrap().contains("undercount"));
     }
 
     fn write_index(home: &Path, rows: &[(&Path, &Path)]) {
