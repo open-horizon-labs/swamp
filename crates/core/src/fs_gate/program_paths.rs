@@ -81,13 +81,15 @@ pub(super) fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
         // Tool-managed removal's simulator runtimes (#177). Not migrated for
         // the detector's own `simctl list devices -j` yet (#199).
         Program::Xcrun => vec![PathBuf::from("/usr/bin/xcrun")],
+        // The system curl only: a Homebrew or user curl is not consulted.
+        Program::Curl => vec![PathBuf::from("/usr/bin/curl")],
         _ => Vec::new(),
     }
 }
 
 /// Whether `program` is migrated to this facility.
 fn migrated(program: Program) -> bool {
-    matches!(program, Program::Brew | Program::Mise)
+    matches!(program, Program::Brew | Program::Mise | Program::Curl)
 }
 
 #[cfg(feature = "testing")]

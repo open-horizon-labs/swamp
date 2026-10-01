@@ -62,6 +62,7 @@ pub struct MatrixEntry {
 
 const DAEMON_RECORDS: &str =
     "daemon records are not paths: nothing to move to Trash; `docker buildx prune` acts on them";
+const MODEL_FOLDERS: &str = "Space on a repo folder or manifest moves that exact path to Trash; the confirm says which bytes stay in a shared blobs/ folder";
 const STORE_FOLDERS: &str = "Space on a folder moves that exact path to Trash; the confirm says a running Claude Code session breaks if its scratch goes";
 const PROJECT_TRASH: &str = "TUI Trash for project-local outputs, test output and intermediates; anything else: no cleanup rule, Space marks that exact path on its own row and the confirm says what the adapter could not establish";
 
@@ -380,6 +381,23 @@ pub const MATRIX: &[MatrixEntry] = &[
         ],
         operation_granularity: "one whole store directory",
         actions: STORE_FOLDERS,
+    },
+    MatrixEntry {
+        id: "model-stores",
+        name: "Model caches (Hugging Face hub, Ollama)",
+        status: Status::Implemented,
+        families: &[RoleFamily::SharedStore, RoleFamily::Residual],
+        known_layouts: &[
+            "Hugging Face hub cache (HF_HUB_CACHE, else HF_HOME/hub, else ~/.cache/huggingface/hub): one unit per models--, datasets--, spaces-- repo folder, plus the hub's shared blobs/ folder",
+            "Ollama model store (OLLAMA_MODELS, else ~/.ollama/models): one unit per manifests/<registry>/<namespace>/<model>/<tag>, plus blobs/",
+        ],
+        attribution_limits: &[
+            "a blob two revisions, two repos or two tags share is counted once, under the first repo or tag by path, and the others say so",
+            "what a model is comes only from files already on disk (README front matter, config.json, safetensors and GGUF headers, Ollama's config blob); a field none of them states is absent",
+            "last use is the file access time of the largest weight file (Ollama: the model layer), with swamp's own header read set aside; neither tool records use",
+        ],
+        operation_granularity: "one repo folder or one manifest",
+        actions: MODEL_FOLDERS,
     },
 ];
 

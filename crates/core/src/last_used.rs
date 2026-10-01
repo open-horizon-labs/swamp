@@ -532,6 +532,9 @@ pub(crate) fn probe(path: &Path, sources: &[LastUseSource], now: u64) -> UnitLas
             // Read where its plist reads already happen
             // (`consumer_wiring::attach_build_output_associations`), not here.
             LastUseSource::XcodeDerivedDataPlist => {}
+            // Joined from the adapter's units after identification
+            // (`build_adapters::model_stores::attach_last_read`).
+            LastUseSource::AdapterStated => {}
         }
     }
     let mut last_used = resolve_at(tool_native, atime, now);

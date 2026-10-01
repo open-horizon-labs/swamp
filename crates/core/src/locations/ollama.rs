@@ -10,7 +10,14 @@
 //! about the way Hugging Face's cache has.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LastUseDecl, LastUseSource,
+    LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory, StoreAnchor,
+};
+
+/// The model store: this detector's only `models` location.
+const MODELS: StoreAnchor = StoreAnchor::Categorized {
+    category: StorageCategory::Models,
+    suffix: &[],
 };
 
 pub const OLLAMA_DETECTOR_ID: &str = "ollama";
@@ -32,6 +39,22 @@ impl Detector for OllamaDetector {
 
     fn version_note(&self) -> &'static str {
         "Ollama FAQ, current stable ~/.ollama layout"
+    }
+
+    /// The model store, identified model by model
+    /// (`build_adapters::model_stores`).
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::OllamaModels,
+            anchor: MODELS,
+        }]
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: MODELS,
+            source: LastUseSource::AdapterStated,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
