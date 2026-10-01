@@ -80,7 +80,7 @@ impl StoreDir {
         }
         let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
         let dir = PathBuf::from(home).join(".local/share/swamp");
-        refuse_real_user_default("store", &dir, Resolve::Write);
+        refuse_real_user_default("store", &dir);
         StoreDir(dir)
     }
 
@@ -990,41 +990,35 @@ impl TextFile<'_> {
     }
 }
 
-/// Test-only hermeticity guard. A test process (`cfg(test)`, or a swamp
-/// child spawned with `SWAMP_TEST_MODE=1`) that falls through to a per-user
-/// default location (store, observe log, LaunchAgents directory) outside the
-/// system temp directory panics instead of touching it: test fixtures once
-/// appended thousands of lines to the maintainer's real
-/// `~/Library/Logs/swamp/observe.log`. A test points `HOME` at a temp dir or
-/// sets the override (`SWAMP_DIR`, `SWAMP_LOG_DIR`,
-/// `SWAMP_LAUNCH_AGENTS_DIR`). A normal run never sets `SWAMP_TEST_MODE`, so
-/// the guard costs it one environment read. `Resolve::Display` (a path
-/// only printed, as in `schedule status`) is checked in a test child but
-/// not in an in-process unit test, which may render the default; every
-/// write site uses `Resolve::Write`.
+/// Test-only hermeticity guard, at every place swamp is about to write
+/// to a per-user default location (store, observe log, LaunchAgents
+/// directory). A test process (`cfg(test)`, or any process with
+/// `SWAMP_TEST_MODE=1`, which in-process tests also set) whose write
+/// would land outside the system temp directory panics instead: test
+/// fixtures once appended thousands of lines to the maintainer's real
+/// `~/Library/Logs/swamp/observe.log`. A test points `HOME` (and, on
+/// Linux, `XDG_STATE_HOME`/`XDG_DATA_HOME`) at a temp dir or sets the
+/// override (`SWAMP_DIR`, `SWAMP_LOG_DIR`, `SWAMP_LAUNCH_AGENTS_DIR`).
+///
+/// Only writes are refused. A path that is merely resolved to be shown
+/// (`schedule status`, the systemd unit text naming the log) is not:
+/// the Linux runner's real `~/.local/state/swamp` printed by a systemd
+/// unit test is not a write (CI run 36876775575). Compiled out of a
+/// shipped build.
 #[cfg(not(any(test, feature = "testing")))]
-pub(crate) fn refuse_real_user_default(_what: &str, _path: &Path, _resolve: Resolve) {}
+pub(crate) fn refuse_real_user_default(_what: &str, _path: &Path) {}
 
 /// See the shipped no-op above: the check exists only in test builds.
 #[cfg(any(test, feature = "testing"))]
-pub(crate) fn refuse_real_user_default(what: &str, path: &Path, resolve: Resolve) {
+pub(crate) fn refuse_real_user_default(what: &str, path: &Path) {
     let child = std::env::var_os("SWAMP_TEST_MODE").is_some_and(|v| v == "1");
-    let test_mode = child || (cfg!(test) && resolve == Resolve::Write);
-    if test_mode && !is_under_temp(path) {
+    if (child || cfg!(test)) && !is_under_temp(path) {
         panic!(
             "test hermeticity: the {what} resolved to the real user location {}; \
              set HOME to a temp dir or the override variable",
             path.display()
         );
     }
-}
-
-/// Why a default location is being resolved; see
-/// [`refuse_real_user_default`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Resolve {
-    Display,
-    Write,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -1054,7 +1048,7 @@ pub fn launch_agent_plist() -> io::Result<PathBuf> {
         None => {
             let dir = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
                 .join("Library/LaunchAgents");
-            refuse_real_user_default("LaunchAgents directory", &dir, Resolve::Write);
+            refuse_real_user_default("LaunchAgents directory", &dir);
             dir
         }
     };
@@ -1144,7 +1138,7 @@ impl LogFile<'_> {
 /// Appends one line and syncs it.
 pub fn append_line(file: LogFile<'_>, line: &str) -> io::Result<()> {
     let path = file.path()?;
-    refuse_real_user_default("observe log", &path, Resolve::Write);
+    refuse_real_user_default("observe log", &path);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
