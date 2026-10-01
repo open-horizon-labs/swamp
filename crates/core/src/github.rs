@@ -984,38 +984,6 @@ pub fn observe_all_forced(
         .collect();
     let mut notes: Vec<String> = Vec::new();
 
-    if let Err(reason) = responder.is_ready() {
-        let msg = format!("github: unavailable ({reason})");
-        notes.push(msg.clone());
-        for input in inputs {
-            let key = (
-                input.worktree_id.to_string(),
-                input.branch.unwrap_or("").to_string(),
-                input.tip_sha.to_string(),
-            );
-            if cache.get(&key).is_some_and(|r| r.merged_status == "yes") {
-                continue; // terminal: keep the merged row.
-            }
-            cache.insert(
-                key,
-                facts_to_row(
-                    input.worktree_id,
-                    input.branch.unwrap_or(""),
-                    input.tip_sha,
-                    observed_at,
-                    &GithubFacts::unknown(Some(msg.clone())),
-                ),
-            );
-        }
-        let rows: Vec<CacheRow> = cache.into_values().collect();
-        let _ = write_cache(&path, &rows);
-        return ObserveSummary {
-            calls_made: 0,
-            worktrees_enriched: 0,
-            notes,
-        };
-    }
-
     struct PendingGroup {
         owner: String,
         repo: String,
@@ -1057,6 +1025,40 @@ pub fn observe_all_forced(
     }
 
     if groups.is_empty() {
+        return ObserveSummary {
+            calls_made: 0,
+            worktrees_enriched: 0,
+            notes,
+        };
+    }
+
+    // Asked only when a row needs a call: a warm pass whose every row is
+    // fresh spawns nothing at all, not even `gh auth status`.
+    if let Err(reason) = responder.is_ready() {
+        let msg = format!("github: unavailable ({reason})");
+        notes.push(msg.clone());
+        for input in inputs {
+            let key = (
+                input.worktree_id.to_string(),
+                input.branch.unwrap_or("").to_string(),
+                input.tip_sha.to_string(),
+            );
+            if cache.get(&key).is_some_and(|r| r.merged_status == "yes") {
+                continue; // terminal: keep the merged row.
+            }
+            cache.insert(
+                key,
+                facts_to_row(
+                    input.worktree_id,
+                    input.branch.unwrap_or(""),
+                    input.tip_sha,
+                    observed_at,
+                    &GithubFacts::unknown(Some(msg.clone())),
+                ),
+            );
+        }
+        let rows: Vec<CacheRow> = cache.into_values().collect();
+        let _ = write_cache(&path, &rows);
         return ObserveSummary {
             calls_made: 0,
             worktrees_enriched: 0,
@@ -1176,6 +1178,8 @@ pub mod test_support {
         pub unready_reason: Option<String>,
         pub batches: Mutex<HashMap<(String, String), Result<RepoBatchResult, String>>>,
         pub calls: Mutex<u32>,
+        /// `is_ready` calls (the `gh auth status` spawn in production).
+        pub ready_checks: Mutex<u32>,
     }
 
     impl FakeResponder {
@@ -1189,6 +1193,7 @@ pub mod test_support {
 
     impl GithubResponder for FakeResponder {
         fn is_ready(&self) -> Result<(), String> {
+            *self.ready_checks.lock().unwrap() += 1;
             match &self.unready_reason {
                 Some(r) => Err(r.clone()),
                 None => Ok(()),
@@ -1324,6 +1329,55 @@ mod tests {
                 merged_at: Some("2026-01-01T00:00:00Z".to_string()),
                 pr_number: Some(42)
             }
+        );
+    }
+
+    /// Tempting wrong patch: keep probing readiness (`gh auth status`,
+    /// one spawn) before looking at the cache, so a warm pass whose rows
+    /// are all fresh still spawns. A second pass over the same tips makes
+    /// no readiness check and no call, and reads back identical facts.
+    #[test]
+    fn a_warm_pass_over_fresh_rows_spawns_nothing() {
+        let responder = FakeResponder::default();
+        responder.set_batch(
+            "acme",
+            "widgets",
+            RepoBatchResult {
+                default_branch: Some("main".to_string()),
+                branches: HashMap::from([(
+                    "feature".to_string(),
+                    BranchResult {
+                        exists: true,
+                        pr: Some(pr(7, PrState::Open)),
+                        merged_at: None,
+                    },
+                )]),
+            },
+        );
+        let inputs = vec![EnrichInput {
+            worktree_id: "wt1",
+            tip_sha: "sha1",
+            branch: Some("feature"),
+            owner: "acme",
+            repo: "widgets",
+        }];
+        let tmp = tempfile::tempdir().unwrap();
+        observe_all(&responder, tmp.path(), 0, &inputs, 1000, 3600, 20, 4);
+        assert_eq!(*responder.ready_checks.lock().unwrap(), 1);
+        assert_eq!(*responder.calls.lock().unwrap(), 1);
+        let (before, _) = read_cached(tmp.path(), 0, &inputs, 1900, 3600);
+        let warm = observe_all(&responder, tmp.path(), 0, &inputs, 1900, 3600, 20, 4);
+        assert_eq!(warm.calls_made, 0);
+        assert_eq!(
+            *responder.ready_checks.lock().unwrap(),
+            1,
+            "readiness re-probed"
+        );
+        assert_eq!(*responder.calls.lock().unwrap(), 1);
+        let (after, _) = read_cached(tmp.path(), 0, &inputs, 1900, 3600);
+        assert_eq!(
+            format!("{:?}", before["wt1"]),
+            format!("{:?}", after["wt1"])
         );
     }
 
