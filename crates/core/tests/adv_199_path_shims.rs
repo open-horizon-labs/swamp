@@ -52,5 +52,36 @@ fn path_shims_never_run_and_only_the_program_dir_supplies_fakes() {
     for p in Program::ALL.iter().filter(|p| **p != Program::Git) {
         assert_eq!(exe_of(*p), None, "{p:?} reached outside the fake directory");
     }
+
+    // And a real spawn: the fake `df` in the program directory runs, the
+    // PATH shims never do. `id` has no fake, so it is not available, and a
+    // bare-name fallback would run the shim and fail here.
+    let log = shims.path().join("ran.log");
+    for p in Program::ALL {
+        let f = shim_dir.join(p.binary());
+        std::fs::write(
+            &f,
+            format!(
+                "#!/bin/sh\necho shim-{} >> \"{}\"\n",
+                p.binary(),
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let df = fakes.path().join("df");
+    std::fs::write(
+        &df,
+        format!("#!/bin/sh\necho fake-df >> \"{}\"\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&df, std::fs::Permissions::from_mode(0o755)).unwrap();
+    use swamp_core::fs_gate::spawn::run;
+    let t = std::time::Duration::from_secs(10);
+    assert!(run(Program::Df, ["-k", "/"], t).unwrap().success());
+    assert!(run(Program::Id, ["-u"], t).is_err(), "id is not available");
+    let ran = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(ran, "fake-df\n", "what ran: {ran:?}");
     unsafe { std::env::remove_var("SWAMP_TEST_PROGRAM_DIR") };
 }
