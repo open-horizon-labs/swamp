@@ -185,11 +185,33 @@ pub fn find_target(view: &ReclaimView, id: &Path) -> Result<ReclaimTarget, Strin
                 continue;
             };
             if path == id {
-                let mut t = base(path, true);
+                let mut t = base(path.clone(), true);
                 t.bytes = c.bytes.map(|b| b.max(0) as u64);
                 t.last_used_text = c.last_used.fact(view.observed_at);
                 t.manager_lines = c.manager.iter().map(|q| q.line()).collect();
                 t.hold = c.hold.as_ref().map(hold_line);
+                // A model folder: what it costs to get back and what a
+                // move leaves behind (bytes in a shared blobs/ folder).
+                if let Some(m) = model_at(r, &path) {
+                    t.regeneration_class = crate::reclaim::class_from_consequence(&m.regeneration);
+                    t.regeneration_words = m.regeneration.clone();
+                    t.regeneration_source = "the model's own row".to_string();
+                    t.notes = m.facts.clone();
+                }
+                return Ok(t);
+            }
+        }
+        // An Ollama tag's manifest: a file, listed under the store.
+        for m in &r.models {
+            if Path::new(&m.path) == id {
+                let mut t = base(id.to_path_buf(), false);
+                t.listed_folders = 0;
+                t.bytes = Some(m.bytes);
+                t.regeneration_class = crate::reclaim::class_from_consequence(&m.regeneration);
+                t.regeneration_words = m.regeneration.clone();
+                t.regeneration_source = "the model's own row".to_string();
+                t.last_used_text = m.last_read.clone();
+                t.notes = m.facts.clone();
                 return Ok(t);
             }
         }
@@ -198,6 +220,14 @@ pub fn find_target(view: &ReclaimView, id: &Path) -> Result<ReclaimTarget, Strin
         "{} is not a row of the Reclaim view from the last observation",
         id.display()
     ))
+}
+
+fn model_at<'a>(
+    r: &'a crate::reclaim::ReclaimRow,
+    path: &Path,
+) -> Option<&'a crate::build_adapters::model_stores::ModelRow> {
+    let shown = crate::build_adapters::model_stores::shown_path(path);
+    r.models.iter().find(|m| m.path == shown)
 }
 
 /// What the entry at the path was when it was reviewed: enough to tell,

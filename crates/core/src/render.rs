@@ -1046,6 +1046,7 @@ fn render_container_section(
         // numbers follow on their own line.
         let consequence = match (&f.consequence, f.other_consequences) {
             (Some(c), 0) => c.clone(),
+            (Some(c), 1) => format!("{c} (and 1 other consequence inside)"),
             (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
             (None, _) => "consequence not established".to_string(),
         };

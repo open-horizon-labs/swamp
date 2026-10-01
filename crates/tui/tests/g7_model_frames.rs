@@ -55,6 +55,19 @@ fn fx() -> Fx {
     st.extend(json.as_bytes());
     st.extend(vec![0u8; 8000]);
     std::fs::write(repo.join("blobs/w"), st).unwrap();
+    // Read by a program since it was written, as a loaded model is.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(repo.join("blobs/w")).unwrap();
+        let at = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs((m.mtime().max(m.ctime()) + 60) as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(repo.join("blobs/w"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(at))
+            .unwrap();
+    }
     for (n, b) in [
         ("config.json", "c"),
         ("README.md", "r"),
@@ -255,4 +268,177 @@ fn drawing_reads_no_file_and_starts_no_process() {
     });
     assert_eq!(work.header_bytes_read, 0);
     assert_eq!(work.subprocess_spawns, 0);
+}
+
+/// Audit item 4. Tempting wrong patch: the confirm and the detail pane
+/// give the repo folder's size and say nothing of the shared blob it
+/// leaves behind; Ollama tags only in JSON. The hub repo's confirm says
+/// what stays, and an Ollama tag is a row of its own in Reclaim and
+/// External with what it is and that its layers stay.
+#[test]
+fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
+    let f = fx();
+    // A repo whose weights live in the hub's shared blobs/.
+    let repo = f.hub.join("models--org--shared");
+    std::fs::create_dir_all(repo.join("blobs")).unwrap();
+    std::fs::create_dir_all(repo.join("refs")).unwrap();
+    std::fs::create_dir_all(f.hub.join("blobs/ab")).unwrap();
+    std::fs::write(f.hub.join("blobs/ab/big"), vec![1u8; 300_000]).unwrap();
+    symlink("../../blobs/ab/big", repo.join("blobs/w")).unwrap();
+    std::fs::write(repo.join("refs/main"), REV).unwrap();
+    let mut dirs = vec![
+        FoldedDir {
+            path: repo.clone(),
+            allocated_total: 4096,
+            mtime_max: 5,
+            complete: true,
+        },
+        FoldedDir {
+            path: f.hub.join("blobs"),
+            allocated_total: 307_200,
+            mtime_max: 5,
+            complete: true,
+        },
+        FoldedDir {
+            path: f.hub.join("models--mkrausio--EmoWhisper-AnS-Small-v0.1"),
+            allocated_total: 40_960,
+            mtime_max: 5,
+            complete: true,
+        },
+    ];
+    dirs.push(FoldedDir {
+        path: f.hub.clone(),
+        allocated_total: 352_256,
+        mtime_max: 5,
+        complete: true,
+    });
+    let idx = FoldedIndex::from_dirs(dirs);
+    let none = swamp_core::fs_events::EventCoverage::untrusted();
+    let cache = ContainerCache::disabled();
+    let cards = CardCache::default();
+    let c = BuildContainer::shared_store_of(
+        "model-stores",
+        f.hub.clone(),
+        BuildStoreKind::HuggingFaceHub,
+    );
+    let mut ints = model_stores::Adapter.identify(
+        &c,
+        &BuildCtx::new(1_000, &idx, &none, &cache).with_cards(&cards),
+    );
+    // An Ollama store with one tag.
+    let o = f.root.join("ollama");
+    let lib = o.join("manifests/registry.ollama.ai/library/qwen3");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::create_dir_all(o.join("blobs")).unwrap();
+    let a = format!("sha256-{}", "a".repeat(64));
+    let cfg = format!("sha256-{}", "c".repeat(64));
+    std::fs::write(o.join("blobs").join(&a), vec![3u8; 50_000]).unwrap();
+    std::fs::write(o.join("blobs").join(&cfg), r#"{"model_format":"gguf","model_family":"qwen3","model_type":"751.63M","file_type":"Q4_K_M"}"#).unwrap();
+    std::fs::write(lib.join("0.6b"), format!(r#"{{"config":{{"mediaType":"x","digest":"sha256:{}","size":1}},"layers":[{{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:{}","size":50000}}]}}"#, "c".repeat(64), "a".repeat(64))).unwrap();
+    let oidx = FoldedIndex::from_dirs(vec![
+        FoldedDir {
+            path: o.join("blobs"),
+            allocated_total: 61_440,
+            mtime_max: 5,
+            complete: true,
+        },
+        FoldedDir {
+            path: o.clone(),
+            allocated_total: 65_536,
+            mtime_max: 5,
+            complete: true,
+        },
+    ]);
+    let oc =
+        BuildContainer::shared_store_of("model-stores", o.clone(), BuildStoreKind::OllamaModels);
+    ints.extend(model_stores::Adapter.identify(
+        &oc,
+        &BuildCtx::new(1_000, &oidx, &none, &cache).with_cards(&cards),
+    ));
+    let mut hub = hub_unit(&f);
+    hub.children.push(UnitChild {
+        kind: ChildKind::Entry,
+        name: "models--org--shared".into(),
+        bytes: Some(4096),
+        measure: ChildMeasure::Complete,
+        mtime_max: 0,
+        entries: 0,
+        not_measured: 0,
+        last_used: LastUsed::default(),
+    });
+    let mut ou = hub_unit(&f);
+    ou.path = o.clone();
+    ou.detector_name = "Ollama".into();
+    ou.bytes = 65_536;
+    ou.children = vec![];
+    let units = vec![hub, ou];
+    let view = swamp_core::reclaim::build(&swamp_core::reclaim::ReclaimInput {
+        units: &units,
+        interiors: &ints,
+        unowned: &[],
+        manager_facts: &Default::default(),
+        declared_roots: &[],
+        explicit_scope: false,
+        projects: 0,
+        observed_at: 1_000,
+    });
+    let t = swamp_core::reclaim_trash::find_target(&view, &repo).unwrap();
+    assert!(
+        t.notes
+            .iter()
+            .any(|n| n.contains("moving this folder frees about")
+                && n.contains("stays in the hub's shared blobs/")),
+        "{:?}",
+        t.notes
+    );
+    let tag = swamp_core::reclaim_trash::find_target(&view, &lib.join("0.6b")).unwrap();
+    assert!(
+        tag.notes
+            .iter()
+            .any(|n| n.contains("stay in blobs/") && n.contains("`ollama rm qwen3:0.6b`")),
+        "{:?}",
+        tag.notes
+    );
+    // The tag is a row in Reclaim and in External, with what it is.
+    let mut report = swamp_core::report::Report::empty(f.root.clone());
+    report.observed_at = 1_000;
+    for view_kind in [ViewKind::Reclaim, ViewKind::External] {
+        let mut a = App::new(report.clone(), f.root.clone());
+        a.set_external_units(units.clone());
+        a.set_store_interiors(ints.clone());
+        a.views_seen = true;
+        a.set_view(view_kind);
+        for _ in 0..4 {
+            let Some(at) = a
+                .rows()
+                .iter()
+                .position(|r| r.expandable && r.collapsed_children.is_some())
+            else {
+                break;
+            };
+            a.selected = at;
+            handle_key(&mut a, KeyCode::Right);
+        }
+        let row = a
+            .rows()
+            .into_iter()
+            .find(|r| {
+                r.label.contains("qwen3:0.6b")
+                    && r.label.contains("qwen3 · 751.63M params · Q4_K_M")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{view_kind:?}: no tag row: {:?}",
+                    a.rows().iter().map(|r| r.label.clone()).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            row.detail_lines
+                .iter()
+                .any(|l| l.contains("stay in blobs/")),
+            "{:?}",
+            row.detail_lines
+        );
+        assert!(row.unit.is_some(), "the manifest is markable");
+    }
 }

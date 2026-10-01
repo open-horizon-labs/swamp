@@ -226,7 +226,12 @@ pub(crate) fn enrich_with(
                 cards.insert(&key, e.clone());
                 Some(e)
             }
-            None => None,
+            // No fetch this pass: an older answer is kept (and stays in the
+            // cache), labelled as older; never dropped.
+            None => cards.lookup(&key, API_FORMAT).map(|mut e| {
+                e.fields.insert("stale".into(), "1".into());
+                e
+            }),
         };
         let mut b = NestedUnitBuilder::amend(u.clone());
         let Some(entry) = entry else {
@@ -274,9 +279,21 @@ pub(crate) fn enrich_with(
                 )
             });
         }
+        if let Some(sha) = entry.fields.get("sha") {
+            // Keep the revision-pinned entry wanted whether or not it is used.
+            let _ = cards.lookup(&rev_key(&store, &kind, &id, sha), API_FORMAT);
+        }
+        let older = if entry.fields.contains_key("stale") {
+            "; older than the refresh interval, a scheduled observe asks again"
+        } else {
+            ""
+        };
         b = b.evidence(
             HUB_API_EVIDENCE,
-            format!("from huggingface.co, fetched {day}: {}", parts.join(", ")),
+            format!(
+                "from huggingface.co, fetched {day}: {}{older}",
+                parts.join(", ")
+            ),
             Confidence::High,
         );
         // Pinned facts fill only what the local files did not state, and
@@ -502,6 +519,29 @@ mod tests {
         enrich_with(&mut units, &cards, 2_000, true, 0, &get);
         assert_eq!(calls.get(), 1);
         assert!(api(&units[0]).starts_with("from huggingface.co"));
+        // Past the TTL with no fetch allowed (the TUI refresh): the older
+        // answer is shown, labelled, and kept in the cache.
+        let mut units = vec![unit()];
+        enrich_with(
+            &mut units,
+            &cards,
+            1_000 + MUTABLE_TTL_SECS + 5,
+            true,
+            0,
+            &get,
+        );
+        assert!(
+            api(&units[0]).contains("older than the refresh interval"),
+            "{}",
+            api(&units[0])
+        );
+        let kept = cards.retained(&|_| false);
+        assert!(kept.contains_key("hfapi|/hub|model/org/m"));
+        assert!(
+            kept.keys().any(|k| k.contains('@')),
+            "the pinned entry was pruned"
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     /// Tempting wrong patch: building the URL from the repo id without

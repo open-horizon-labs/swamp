@@ -1010,6 +1010,7 @@ fn family_tree_children_of(
         ));
         let mut signals = vec![match (&f.consequence, f.other_consequences) {
             (Some(c), 0) => c.clone(),
+            (Some(c), 1) => format!("{c} (and 1 other consequence inside)"),
             (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
             (None, _) => "consequence not established".into(),
         }];
@@ -2279,10 +2280,17 @@ pub fn external_rows_with(
             let open = collapsed.contains(&key);
             let models = swamp_core::build_adapters::model_stores::model_rows(
                 &u.path,
-                &own_interiors,
+                interiors,
                 observed_at,
             );
             let mut children = unit_child_rows(u, observed_at, &models);
+            let tags = unlisted_models(&u.path, &models);
+            let n = tags.len();
+            children.extend(
+                tags.iter()
+                    .enumerate()
+                    .map(|(i, m)| model_tag_row(m, i + 1 == n)),
+            );
             if has_interior && children.is_empty() {
                 children =
                     family_tree_children_of(&own_interiors, observed_at, &u.path, 1, "", collapsed);
@@ -2355,6 +2363,45 @@ fn compact_signed(bytes: i64) -> String {
 /// One unit's depth-2 drilldown as inspection-only rows (#178). A folder
 /// that could not be read says so instead of showing `0B`, and the last
 /// row is the remainder that makes the rows add up to the unit's total.
+/// The models of a store that are not one of its folders (an Ollama tag
+/// is a manifest file deep in `manifests/`): rows of their own.
+fn unlisted_models<'a>(
+    store: &std::path::Path,
+    models: &'a [swamp_core::build_adapters::model_stores::ModelRow],
+) -> Vec<&'a swamp_core::build_adapters::model_stores::ModelRow> {
+    models
+        .iter()
+        .filter(|m| std::path::Path::new(&m.path).parent() != Some(store))
+        .collect()
+}
+
+/// One model that is not a folder row: its name and what it is, its
+/// size (its layers, also inside `blobs/` above), and the detail pane's
+/// facts. Marks its own path (the manifest).
+fn model_tag_row(m: &swamp_core::build_adapters::model_stores::ModelRow, last: bool) -> Row {
+    let label = match &m.about {
+        Some(a) => format!("{} · {a}", m.name),
+        None => m.name.clone(),
+    };
+    let mut row = Row::leaf(1, label, m.bytes, None);
+    row.rail = if last {
+        "└─ ".into()
+    } else {
+        "├─ ".into()
+    };
+    row.allocated = true;
+    row.cleanup_summary = Some(m.regeneration.clone());
+    row.signals = vec![
+        format!("last read {}", m.last_read),
+        "its layers are the bytes of blobs/ above, not more".to_string(),
+    ];
+    row.last_used = Some(format!("Last read: {}", m.last_read));
+    row.detail_lines = model_detail_lines(m);
+    row.unit = Some(UnitId::for_artifact(std::path::Path::new(&m.path)));
+    row.individual_only = true;
+    row
+}
+
 /// A model's lines for the detail pane: what it is, its card, revision,
 /// size, last read, how it comes back, the Hub's answer, and the facts
 /// about its bytes. Stored facts only; nothing is read here.
@@ -2526,18 +2573,25 @@ pub fn reclaim_rows(
             standing.join(" · "),
         ];
         let key = format!("reclaim-open:{}", r.path);
-        if r.children.is_empty() {
+        let tags = unlisted_models(std::path::Path::new(&r.path), &r.models);
+        if r.children.is_empty() && tags.is_empty() {
             rows.push(row);
             continue;
         }
         let open = collapsed.contains(&key);
-        let count = r.children.len();
-        let children: Vec<Row> = r
+        let count = r.children.len() + tags.len();
+        let mut children: Vec<Row> = r
             .children
             .iter()
             .enumerate()
             .map(|(i, c)| reclaim_child_row(&r.path, c, i + 1 == count))
             .collect();
+        let first = children.len();
+        children.extend(
+            tags.iter()
+                .enumerate()
+                .map(|(i, m)| model_tag_row(m, first + i + 1 == count)),
+        );
         row.expandable = true;
         row.expansion_key = Some(key);
         row.rail = if open { "▾ ".into() } else { "▸ ".into() };

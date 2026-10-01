@@ -707,6 +707,23 @@ fn tool_consequence(
         .filter(|i| i.present && i.container_id == root.container_id)
         .cloned()
         .collect();
+    // A model store speaks for itself in one sentence; each model's own
+    // revision and command are on its row below.
+    if root.adapter.as_deref() == Some("model-stores")
+        && let Some(words) = &root.consequence
+    {
+        let n = inside
+            .iter()
+            .filter(|i| i.role == crate::artifact::ArtifactRole::SharedStoreEntry)
+            .count();
+        return Some((
+            format!(
+                "{words} ({n} model{} listed below, each with its own revision and size)",
+                if n == 1 { "" } else { "s" }
+            ),
+            "model-stores".to_string(),
+        ));
+    }
     let summary = crate::build_adapters::summarize_container(&root.path, &inside);
     let family = summary
         .families
@@ -716,8 +733,13 @@ fn tool_consequence(
     let text = family.consequence.clone()?;
     let words = if family.other_consequences > 0 {
         format!(
-            "{text} (and {} other consequences inside)",
-            family.other_consequences
+            "{text} (and {} other consequence{} inside)",
+            family.other_consequences,
+            if family.other_consequences == 1 {
+                ""
+            } else {
+                "s"
+            }
         )
     } else {
         text

@@ -93,6 +93,20 @@ fn model_stores_end_to_end() {
     st.extend(json.as_bytes());
     st.extend(vec![0u8; 20_000]);
     fs::write(repo.join("blobs/weights"), st).unwrap();
+    // Loaded once since download: its access time is after its mtime.
+    {
+        use std::os::unix::fs::MetadataExt;
+        let w = repo.join("blobs/weights");
+        let m = fs::metadata(&w).unwrap();
+        let at = std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs((m.mtime().max(m.ctime()) + 60) as u64);
+        fs::File::options()
+            .write(true)
+            .open(&w)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(at))
+            .unwrap();
+    }
     for (n, b) in [
         ("README.md", "readme"),
         ("config.json", "config"),
@@ -132,14 +146,25 @@ fn model_stores_end_to_end() {
     fs::write(
         &curl,
         format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\nprintf '%s\\n200' '{{\"sha\":\"{REV}\",\"downloads\":7,\"likes\":2,\"pipeline_tag\":\"text-generation\",\"cardData\":{{\"base_model\":\"org/base\"}}}}'\n",
+            "#!/bin/sh\necho \"$@\" >> '{}'\nenv | sort >> '{}.env'\nprintf '%s\\n200' '{{\"sha\":\"{REV}\",\"downloads\":7,\"likes\":2,\"pipeline_tag\":\"text-generation\",\"cardData\":{{\"base_model\":\"org/base\"}}}}'\n",
+            log.display(),
             log.display()
         ),
     )
     .unwrap();
     fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
     // SAFETY: the only test in this binary.
-    unsafe { std::env::set_var("SWAMP_TEST_PROGRAM_DIR", &programs) };
+    unsafe {
+        std::env::set_var("SWAMP_TEST_PROGRAM_DIR", &programs);
+        // What a machine behind a proxy has set; only the https proxy, the
+        // no-proxy list and the CA bundle may reach curl.
+        std::env::set_var("HTTPS_PROXY", "http://proxy.test:3128");
+        std::env::set_var("no_proxy", "localhost");
+        std::env::set_var("SSL_CERT_FILE", "/etc/ssl/cert.pem");
+        std::env::set_var("HTTP_PROXY", "http://plain.test:80");
+        std::env::set_var("HF_TOKEN", "hf_secret_never_sent");
+        std::env::set_var("CURL_HOME", "/tmp/evil");
+    }
 
     let mut env = HashMap::new();
     env.insert("HF_HOME".to_string(), base.join("hf").display().to_string());
@@ -225,6 +250,21 @@ fn model_stores_end_to_end() {
         "{rows:#?}"
     );
     assert!(rows[0].about.as_deref().unwrap().contains("base org/base"));
+    let env = fs::read_to_string(format!("{}.env", log.display())).unwrap();
+    let names: Vec<&str> = env
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+        .collect();
+    for want in ["HTTPS_PROXY", "no_proxy", "SSL_CERT_FILE"] {
+        assert!(
+            names.contains(&want),
+            "{want} did not reach curl: {names:?}"
+        );
+    }
+    for never in ["HTTP_PROXY", "HF_TOKEN", "CURL_HOME"] {
+        assert!(!names.contains(&never), "{never} reached curl: {names:?}");
+    }
+    assert!(!env.contains("hf_secret") && !logged.contains("hf_secret"));
     let _ = observe(&s, &store, true);
     assert_eq!(calls(&log), 1, "a fresh cached answer was fetched again");
 
