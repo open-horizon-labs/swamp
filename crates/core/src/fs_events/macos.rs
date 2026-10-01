@@ -38,6 +38,9 @@ struct Collector {
     /// union and `replay_many` splits it per root afterwards.
     roots: Vec<PathBuf>,
     changes: std::collections::HashSet<PathBuf>,
+    /// Directories FSEvents could not itemize (`MustScanSubDirs`): only
+    /// the roots they touch are refused (`partition_replay`).
+    rescans: Vec<PathBuf>,
     history_done: bool,
     hard_fail: Option<RefreshRefusal>,
 }
@@ -64,12 +67,30 @@ extern "C" fn stream_callback(
     let flags = unsafe { std::slice::from_raw_parts(event_flags, num_events) };
 
     for (i, &f) in flags.iter().enumerate() {
-        if (f & fs::kFSEventStreamEventFlagMustScanSubDirs) != 0
-            || (f & fs::kFSEventStreamEventFlagEventIdsWrapped) != 0
+        // Dropped events (user or kernel queue overflow) cannot be
+        // located with confidence: the whole stream stays inconclusive.
+        if (f & fs::kFSEventStreamEventFlagEventIdsWrapped) != 0
+            || (f & fs::kFSEventStreamEventFlagUserDropped) != 0
+            || (f & fs::kFSEventStreamEventFlagKernelDropped) != 0
         {
             collector
                 .hard_fail
                 .get_or_insert(RefreshRefusal::HelperInconclusive);
+            continue;
+        }
+        if (f & fs::kFSEventStreamEventFlagMustScanSubDirs) != 0 {
+            // SAFETY: as below, `i` is in range of `paths`.
+            let cpath = unsafe { *paths.add(i) };
+            if cpath.is_null() {
+                collector
+                    .hard_fail
+                    .get_or_insert(RefreshRefusal::HelperInconclusive);
+            } else {
+                // SAFETY: FSEvents paths are NUL-terminated C strings.
+                let cstr = unsafe { CStr::from_ptr(cpath) };
+                let path = PathBuf::from(std::ffi::OsStr::from_bytes(cstr.to_bytes()));
+                collector.rescans.push(path);
+            }
             continue;
         }
         if (f & fs::kFSEventStreamEventFlagRootChanged) != 0
@@ -407,7 +428,8 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
                 .collect()
         })
         .collect();
-    let results: Vec<Result<Vec<PathBuf>, RefreshRefusal>> = std::thread::scope(|scope| {
+    type Replayed = Result<(Vec<PathBuf>, Vec<PathBuf>), RefreshRefusal>;
+    let results: Vec<Replayed> = std::thread::scope(|scope| {
         let handles: Vec<_> = groups
             .iter()
             .zip(group_roots.iter())
@@ -419,9 +441,10 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
                     let result = run_stream(roots, since_id);
                     if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
                         eprintln!(
-                            "[xtrace] fsevents group dev={dev} roots={} since={since_id} current={current} ok={} elapsed={:?}",
+                            "[xtrace] fsevents group dev={dev} roots={} since={since_id} current={current} ok={} rescans={:?} elapsed={:?}",
                             roots.len(),
                             result.is_ok(),
+                            result.as_ref().map(|(_, r)| r.len()).map_err(|e| e.as_str()),
                             started.elapsed()
                         );
                     }
@@ -444,10 +467,13 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
                     plans[i] = Some(FsEventsPlan::refuse(reason, current, Some(group.dev)));
                 }
             }
-            Ok(changes) => {
-                let per_root = super::partition_changes(roots, &changes);
-                for (&i, changed) in group.members.iter().zip(per_root) {
-                    plans[i] = Some(FsEventsPlan::ok(changed, current, Some(group.dev)));
+            Ok((changes, rescans)) => {
+                let per_root = super::partition_replay(roots, &changes, &rescans);
+                for (&i, outcome) in group.members.iter().zip(per_root) {
+                    plans[i] = Some(match outcome {
+                        Ok(changed) => FsEventsPlan::ok(changed, current, Some(group.dev)),
+                        Err(reason) => FsEventsPlan::refuse(reason, current, Some(group.dev)),
+                    });
                 }
             }
         }
@@ -467,10 +493,14 @@ fn replay_many(requests: &[FsEventsRequest]) -> Vec<FsEventsPlan> {
 /// from `since_id`. `Ok` is the complete union of implicated paths;
 /// `Err` is the one refusal every root in the group shares, because
 /// an inconclusive replay is inconclusive for all of them.
-fn run_stream(roots: &[PathBuf], since_id: u64) -> Result<Vec<PathBuf>, RefreshRefusal> {
+fn run_stream(
+    roots: &[PathBuf],
+    since_id: u64,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), RefreshRefusal> {
     let mut collector = Box::new(Collector {
         roots: roots.to_vec(),
         changes: std::collections::HashSet::new(),
+        rescans: Vec::new(),
         history_done: false,
         hard_fail: None,
     });
@@ -560,5 +590,6 @@ fn run_stream(roots: &[PathBuf], since_id: u64) -> Result<Vec<PathBuf>, RefreshR
         return Err(RefreshRefusal::HelperInconclusive);
     }
 
-    Ok(collector.changes.drain().collect())
+    let rescans = std::mem::take(&mut collector.rescans);
+    Ok((collector.changes.drain().collect(), rescans))
 }

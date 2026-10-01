@@ -576,6 +576,35 @@ impl EventCoverage {
     }
 }
 
+/// [`partition_changes`] for a replay that also reported directories
+/// FSEvents could not itemize (`MustScanSubDirs`: it coalesced or dropped
+/// events under that path). Only a root that contains such a path, or
+/// sits inside one, is refused as inconclusive; every other root in the
+/// shared stream keeps its exact change list. Refusing the whole stream
+/// for one busy cache directory is what made every unit root on the
+/// device re-walk (#181: the 1.77M-file simulator volumes among them).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn partition_replay(
+    roots: &[PathBuf],
+    changes: &[PathBuf],
+    rescans: &[PathBuf],
+) -> Vec<Result<Vec<PathBuf>, RefreshRefusal>> {
+    roots
+        .iter()
+        .zip(partition_changes(roots, changes))
+        .map(|(root, changed)| {
+            if rescans
+                .iter()
+                .any(|r| r.starts_with(root) || root.starts_with(r))
+            {
+                Err(RefreshRefusal::HelperInconclusive)
+            } else {
+                Ok(changed)
+            }
+        })
+        .collect()
+}
+
 /// Splits one shared stream's change list into one list per root: each
 /// root gets exactly the reported paths at or under it.
 ///
@@ -888,6 +917,29 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+
+    /// Tempting wrong patches: (1) refuse every root in the stream when
+    /// one directory needs a rescan (the old behaviour: one busy cache
+    /// re-walked 76 unit roots); (2) treat a rescan as an ordinary change
+    /// (the root containing it would replay a partial list as complete).
+    /// Only roots that contain the rescan path, or sit inside it, are
+    /// refused.
+    #[test]
+    fn a_rescan_refuses_only_the_roots_it_touches() {
+        let caches = PathBuf::from("/Users/u/Library/Caches");
+        let volumes = PathBuf::from("/Library/Developer/CoreSimulator/Volumes");
+        let cargo = PathBuf::from("/Users/u/.cargo");
+        let roots = vec![caches.clone(), volumes.clone(), cargo.clone()];
+        let changes = vec![cargo.join("registry"), caches.join("x")];
+        let rescans = vec![caches.join("com.apple.Safari")];
+        let out = super::partition_replay(&roots, &changes, &rescans);
+        assert_eq!(out[0], Err(RefreshRefusal::HelperInconclusive));
+        assert_eq!(out[1], Ok(Vec::new()));
+        assert_eq!(out[2], Ok(vec![cargo.join("registry")]));
+        // A rescan above a root (a dropped-events "/" rescan) refuses it.
+        let all = super::partition_replay(&roots, &changes, &[PathBuf::from("/")]);
+        assert!(all.iter().all(|r| r.is_err()));
+    }
     use super::*;
     #[cfg(target_os = "macos")]
     use std::time::Duration;
