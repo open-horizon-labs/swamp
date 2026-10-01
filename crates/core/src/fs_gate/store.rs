@@ -406,7 +406,7 @@ fn is_derived_table(name: &str) -> bool {
             "cursors" | "current" | "dirs" | "files" | "unowned" | "unowned_lists"
         | "unowned_evidence" | "docker_unowned" | "docker_unowned_lists"
         | "docker_unowned_evidence" | "dir_tracks" | "topology" | "volume_stamps"
-        | "build_stores" | "xcode_derived_data" | "declarations" | "dependency_identities"
+        | "build_stores" | "model_cards" | "xcode_derived_data" | "declarations" | "dependency_identities"
         | "git_signals" | "git_signals_values" | "cargo_replay_cache"
         | "cargo_replay_cache_lists" | "cargo_replay_cache_evidence" | "cargo_replay_cache_meta"
         | "scope" | "scope_values" | "scope_roots" | "scope_root_reasons" | "docker_meta"
@@ -511,6 +511,7 @@ fn clean_association_generation(dir: &Path) -> io::Result<()> {
         "agent_identifications.parquet",
         "agent_containers.parquet",
         "build_stores.parquet",
+        "model_cards.parquet",
     ] {
         remove_known_file(&dir.join(name))?;
     }

@@ -155,12 +155,14 @@ pub(super) fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
             in_home(&mut c, &[".docker/bin/docker", ".orbstack/bin/docker"]);
             c
         }
+        // The system curl only: a Homebrew or user curl is not consulted.
+        Program::Curl => at(&["/usr/bin"]),
     }
 }
 
 /// Whether `program` is migrated to this facility.
 fn migrated(program: Program) -> bool {
-    matches!(program, Program::Brew | Program::Mise)
+    matches!(program, Program::Brew | Program::Mise | Program::Curl)
 }
 
 #[cfg(feature = "testing")]
@@ -423,6 +425,17 @@ pub(super) fn child_env(
             }
         }
     }
+    if program == Program::Curl {
+        // A machine behind a proxy still reaches the Hub: exactly the
+        // proxy and CA-bundle variables curl reads for an https URL, in
+        // both spellings. Nothing else (no `HTTP_PROXY`: the URL is https
+        // only; no `CURL_HOME`: `-q` already ignores `.curlrc`).
+        for name in CURL_PASSTHROUGH {
+            if let Some(v) = get(name) {
+                env.push((name.to_string(), v));
+            }
+        }
+    }
     if program == Program::Xcrun
         && let Some(d) = get("DEVELOPER_DIR")
     {
@@ -465,6 +478,20 @@ fn developer_dir_ok(d: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// The variables `curl` receives from swamp's environment (docs/usage.md,
+/// "Programs swamp runs"; `g7_model_stores` checks that exactly these
+/// arrive).
+pub const CURL_PASSTHROUGH: &[&str] = &[
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+];
 
 /// Inherited variables a `Plan::Fixed` child never sees (#199): loader
 /// injection, and every variable through which git, gh, ssh or a shell
@@ -684,7 +711,10 @@ mod tests {
     fn other_programs_run_from_a_fixed_location_with_their_own_name() {
         for p in Program::ALL
             .iter()
-            .filter(|p| !matches!(p, Program::Brew | Program::Mise))
+            // curl (G7) is scrubbed like brew and mise: from scratch plus
+            // the proxy and CA variables only, so no token or `.curlrc`
+            // path reaches it.
+            .filter(|p| !matches!(p, Program::Brew | Program::Mise | Program::Curl))
         {
             match plan(*p) {
                 Ok(Plan::Fixed { exe, arg0, .. }) => {

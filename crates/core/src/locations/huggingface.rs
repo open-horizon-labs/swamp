@@ -15,7 +15,8 @@
 //! bookkeeping required.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LastUseDecl, LastUseSource,
+    LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 use std::path::PathBuf;
 
@@ -29,6 +30,13 @@ fn resolve(env: &Environment, var: &str, default: PathBuf) -> (PathBuf, Provenan
 }
 
 pub struct HuggingFaceDetector;
+
+/// The hub cache among this detector's `models` locations: every one
+/// but the legacy `datasets` cache.
+const HUB: StoreAnchor = StoreAnchor::CategorizedExcept {
+    category: StorageCategory::Models,
+    except: &[&["datasets"]],
+};
 
 impl Detector for HuggingFaceDetector {
     fn id(&self) -> &'static str {
@@ -45,6 +53,23 @@ impl Detector for HuggingFaceDetector {
 
     fn version_note(&self) -> &'static str {
         "huggingface_hub cache management guide, current stable"
+    }
+
+    /// The hub cache, identified repo by repo
+    /// (`build_adapters::model_stores`). The legacy datasets cache is the
+    /// other `models` location and holds no hub layout.
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::HuggingFaceHub,
+            anchor: HUB,
+        }]
+    }
+
+    fn last_use_sources(&self) -> &'static [LastUseDecl] {
+        &[LastUseDecl {
+            anchor: HUB,
+            source: LastUseSource::AdapterStated,
+        }]
     }
 
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
@@ -69,8 +94,8 @@ impl Detector for HuggingFaceDetector {
                 provenance: hub_prov,
                 status: LocationStatus::Resolved,
                 note: Some(
-                    "model/dataset/space cache: shared blobs, per-revision snapshot \
-                     symlinks (never followed, so blobs are counted once)"
+                    "model/dataset/space cache: one row per repo, blobs counted once; \
+                     what each model is comes from its own files"
                         .to_string(),
                 ),
             },

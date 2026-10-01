@@ -196,6 +196,46 @@ pub fn shallow_list(dir: &std::path::Path) -> ShallowListing {
     }
 }
 
+/// One entry of [`shallow_list_links`]: like [`ShallowEntry`], but a
+/// symlink is reported by name (never followed, never statted through),
+/// for a layout that is made of links (a Hugging Face snapshot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+/// [`shallow_list`], keeping symlinks as named entries. The same cap,
+/// counters and truncation report.
+pub fn shallow_list_links(dir: &std::path::Path) -> (Vec<LinkEntry>, Truncation) {
+    crate::work_counters::record_dir_listed();
+    let entries = match crate::fs_gate::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), Truncation::Complete);
+        }
+        Err(_) => return (Vec::new(), Truncation::Unreadable),
+    };
+    let mut out: Vec<LinkEntry> = Vec::new();
+    let mut truncation = Truncation::Complete;
+    for entry in entries.flatten() {
+        if out.len() >= SHALLOW_LIST_CAP {
+            truncation = Truncation::Truncated { n: out.len() };
+            break;
+        }
+        let Ok(ft) = entry.file_type() else { continue };
+        out.push(LinkEntry {
+            name: entry.file_name().to_string_lossy().to_string(),
+            is_dir: ft.is_dir(),
+            is_symlink: ft.is_symlink(),
+        });
+    }
+    crate::work_counters::record_files_statted(out.len() as u64);
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    (out, truncation)
+}
+
 /// Just the subdirectory names, the shape most callers want.
 pub fn shallow_dir_names(dir: &std::path::Path) -> Vec<String> {
     shallow_list(dir)
@@ -789,6 +829,13 @@ pub enum BuildStoreKind {
     /// A BuildKit build cache, answered by the Docker daemon rather than
     /// measured on disk.
     BuildKitCache,
+    /// A Hugging Face hub cache (`HF_HUB_CACHE`): `models--*`,
+    /// `datasets--*`, `spaces--*` repo folders of `blobs/`, `refs/` and
+    /// `snapshots/<rev>/` links.
+    HuggingFaceHub,
+    /// An Ollama model store (`OLLAMA_MODELS`): `manifests/` naming
+    /// content-addressed layers in `blobs/`.
+    OllamaModels,
 }
 
 impl BuildStoreKind {
@@ -824,6 +871,8 @@ impl BuildStoreKind {
             Self::XcodeDeveloperDiskImages => "xcode-developer-disk-images",
             Self::SimulatorSystemSupport => "simulator-system-support",
             Self::BuildKitCache => "buildkit-cache",
+            Self::HuggingFaceHub => "huggingface-hub",
+            Self::OllamaModels => "ollama-models",
         }
     }
 
@@ -865,6 +914,8 @@ impl BuildStoreKind {
         Self::XcodeDeveloperDiskImages,
         Self::SimulatorSystemSupport,
         Self::BuildKitCache,
+        Self::HuggingFaceHub,
+        Self::OllamaModels,
     ];
 }
 
@@ -912,6 +963,11 @@ pub enum LastUseSource {
     /// Cargo's last-use tracker, a SQLite database read read-only. The
     /// cargo home is `up` path components above the location.
     CargoGlobalCache { table: CargoCacheTable, up: usize },
+    /// The store's build adapter states each entry's last read (a model
+    /// cache: the access time of the largest weight file, with swamp's
+    /// own header read set aside). Declaring it keeps the store's
+    /// depth-2 rows; the value is joined from the adapter's units.
+    AdapterStated,
 }
 
 /// One declaration: which of a detector's locations records its last use

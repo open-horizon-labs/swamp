@@ -81,6 +81,11 @@ pub enum Program {
     /// `tmutil listlocalsnapshots /`: names of the local snapshots
     /// (read-only; deleting one is not a shape).
     Tmutil,
+    /// One read-only GET of the Hugging Face Hub's public model, dataset
+    /// or space API (`crate::hub_api`), in a scheduled `observe` only and
+    /// only when the user turned it on. From `/usr/bin/curl`, never
+    /// `PATH`; `-q` first so no `.curlrc` applies; no header is sent.
+    Curl,
 }
 
 impl Program {
@@ -104,6 +109,7 @@ impl Program {
         Program::Loginctl,
         Program::Diskutil,
         Program::Tmutil,
+        Program::Curl,
     ];
 
     /// The program's file name (its fixed locations are
@@ -127,6 +133,7 @@ impl Program {
             Program::Loginctl => "loginctl",
             Program::Diskutil => "diskutil",
             Program::Tmutil => "tmutil",
+            Program::Curl => "curl",
         }
     }
 
@@ -196,6 +203,10 @@ enum Slot {
     ShowProperties,
     /// This process's own uid, decimal (`systemd_user::linger`).
     OwnUid,
+    /// `https://huggingface.co/api/{models,datasets,spaces}/<id>`, the id
+    /// one or two segments of `[A-Za-z0-9._-]` (no `..`): the only URL
+    /// `crate::hub_api` asks for.
+    HubApiUrl,
 }
 
 /// Every argument shape [`run`] accepts, per program. An allow-list: an
@@ -326,7 +337,41 @@ fn shapes(program: Program) -> &'static [&'static [Slot]] {
             &[Lit("info"), Lit("-plist"), Lit("/System/Volumes/Data")],
         ],
         Program::Tmutil => &[&[Lit("listlocalsnapshots"), Lit("/")]],
+        Program::Curl => &[&[
+            Lit("-q"),
+            Lit("-sS"),
+            Lit("--proto"),
+            Lit("=https"),
+            Lit("--max-time"),
+            Lit("10"),
+            Lit("--max-filesize"),
+            Lit("1048576"),
+            Lit("-w"),
+            Lit("\n%{http_code}"),
+            HubApiUrl,
+        ]],
     }
+}
+
+/// Whether `a` is a Hugging Face Hub API URL [`crate::hub_api`] builds.
+pub(crate) fn hub_api_url(a: &str) -> bool {
+    let Some(rest) = ["models/", "datasets/", "spaces/"].iter().find_map(|k| {
+        a.strip_prefix("https://huggingface.co/api/")?
+            .strip_prefix(k)
+    }) else {
+        return false;
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    (1..=2).contains(&segs.len())
+        && segs.iter().all(|s| {
+            !s.is_empty()
+                && s.len() <= 96
+                && *s != "."
+                && *s != ".."
+                && !s.starts_with('-')
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
 }
 
 /// Whether `a` can be a Docker object reference (see [`Slot::DockerRef`]).
@@ -451,6 +496,7 @@ fn matches_shape(shape: &[Slot], args: &[String]) -> bool {
             Slot::SwampUnit => swamp_unit(a),
             Slot::ShowProperties => show_properties(a),
             Slot::OwnUid => digits(a) && a.parse::<u32>().ok() == Some(super::sys::current_uid()),
+            Slot::HubApiUrl => hub_api_url(a),
             Slot::DockerRefs | Slot::GraphqlFields | Slot::SwampUnits => {
                 unreachable!("handled above")
             }

@@ -216,6 +216,14 @@ const ADAPTER_SOURCES: &[(&str, &str)] = &[
     ("layout.rs", include_str!("build_adapters/layout.rs")),
     ("matrix.rs", include_str!("build_adapters/matrix.rs")),
     ("maven.rs", include_str!("build_adapters/maven.rs")),
+    (
+        "model_cards.rs",
+        include_str!("build_adapters/model_cards.rs"),
+    ),
+    (
+        "model_stores.rs",
+        include_str!("build_adapters/model_stores.rs"),
+    ),
     ("mod.rs", include_str!("build_adapters/mod.rs")),
     ("node.rs", include_str!("build_adapters/node.rs")),
     ("python.rs", include_str!("build_adapters/python.rs")),
@@ -333,6 +341,62 @@ pub(crate) fn save_units(
     // A failed write is a cache that misses next pass, which re-identifies:
     // the slow answer, never a wrong one.
     let _ = crate::assoc_store::BuildStoreTable::open(store_dir).save(&cache, observed_at);
+}
+
+/// The model-card cache as last stored. An entry whose stored field
+/// rows are only the empty placeholder is a real, field-less answer (a
+/// card with nothing in it, a negative network answer), kept as such.
+pub(crate) fn load_cards(
+    store_dir: &Path,
+) -> HashMap<String, crate::build_adapters::model_cards::CardEntry> {
+    crate::assoc_store::ModelCardTable::open(store_dir)
+        .load()
+        .into_iter()
+        .map(|(key, cached)| {
+            let fields = cached
+                .rows
+                .iter()
+                .filter(|r| r.first().is_some_and(|f| !f.is_empty()))
+                .map(|r| (r[0].clone(), r.get(1).cloned().unwrap_or_default()))
+                .collect();
+            (
+                key,
+                crate::build_adapters::model_cards::CardEntry {
+                    fingerprint: cached.fingerprint,
+                    at: cached.observed_at,
+                    fields,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Writes the model-card cache. A failed write is a cache that misses
+/// next pass, which parses again: the slow answer, never a wrong one.
+pub(crate) fn save_cards(
+    store_dir: &Path,
+    entries: HashMap<String, crate::build_adapters::model_cards::CardEntry>,
+    observed_at: u64,
+) {
+    let cache: HashMap<String, crate::assoc_store::CachedRows> = entries
+        .into_iter()
+        .map(|(k, e)| {
+            let mut rows: Vec<Vec<String>> =
+                e.fields.into_iter().map(|(f, v)| vec![f, v]).collect();
+            if rows.is_empty() {
+                rows.push(vec![String::new(), String::new()]);
+            }
+            (
+                k,
+                crate::assoc_store::CachedRows {
+                    fingerprint: e.fingerprint,
+                    observed_at: e.at,
+                    rows,
+                },
+            )
+        })
+        .collect();
+    let _ = crate::assoc_store::ModelCardTable::open(store_dir).save(&cache, observed_at);
 }
 
 fn opt(v: &Option<String>) -> Option<String> {

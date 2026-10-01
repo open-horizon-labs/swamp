@@ -144,17 +144,40 @@ fn refused(path: &Path, what: &str) -> io::Error {
 /// backstop for a swap between the two calls. Symlinks are followed: a
 /// symlinked manifest is read, a symlink to a FIFO is not.
 fn open_regular(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_with(path, true)
+}
+
+/// [`open_regular`], or with `follow == false` a symlink at `path` is
+/// refused by the `lstat` and by `O_NOFOLLOW` on the open (a swap
+/// between the two). The parent directories are the caller's to check.
+fn open_regular_with(path: &Path, follow: bool) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let meta = std::fs::metadata(path)?;
+    let meta = if follow {
+        std::fs::metadata(path)?
+    } else {
+        std::fs::symlink_metadata(path)?
+    };
     if !meta.is_file() {
         return Err(refused(path, "not a regular file"));
     }
     if is_dataless(&meta) {
         return Err(refused(path, "a dataless file provider placeholder"));
     }
+    // Linux: a content read that must not move the access time it is
+    // about to report opens with `O_NOATIME` (allowed for the file's
+    // owner; anything else is refused rather than read with it moving).
+    #[cfg(target_os = "linux")]
+    let no_atime = libc::O_NOATIME;
+    #[cfg(not(target_os = "linux"))]
+    let no_atime = 0;
+    let flags = if follow {
+        libc::O_NONBLOCK
+    } else {
+        libc::O_NONBLOCK | libc::O_NOFOLLOW | no_atime
+    };
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(flags)
         .open(path)?;
     if !file.metadata()?.is_file() {
         return Err(refused(path, "not a regular file"));
@@ -166,8 +189,12 @@ fn open_regular(path: &Path) -> io::Result<std::fs::File> {
 /// file is read: a FIFO, socket, device or dataless placeholder is an
 /// error, never a wait (see [`open_regular`]).
 pub fn bounded_read(path: impl AsRef<Path>, cap: BoundedCap) -> io::Result<BoundedBytes> {
-    let _step = crate::beacon::enter("read", path.as_ref());
-    let file = open_regular(path.as_ref())?;
+    bounded_read_with(path.as_ref(), cap, true)
+}
+
+fn bounded_read_with(path: &Path, cap: BoundedCap, follow: bool) -> io::Result<BoundedBytes> {
+    let _step = crate::beacon::enter("read", path);
+    let file = open_regular_with(path, follow)?;
     // The length the `fstat` reports tells a complete file from a
     // truncated one without reading a byte past the cap.
     let len = file.metadata()?.len();
@@ -205,6 +232,19 @@ pub fn bounded_string(path: impl AsRef<Path>, cap: BoundedCap) -> io::Result<Str
 /// measures).
 pub fn bounded_read_header(path: impl AsRef<Path>, cap: BoundedCap) -> io::Result<BoundedBytes> {
     let read = bounded_read(path, cap)?;
+    crate::work_counters::record_header_bytes(read.bytes.len() as u64);
+    Ok(read)
+}
+
+/// [`bounded_read_header`] that never follows a symlink at `path`: a
+/// link is refused (`lstat`, then `O_NOFOLLOW`). For content inside a
+/// cache made of links (a Hugging Face snapshot), where a link swapped
+/// in must never be read through.
+pub fn bounded_read_header_no_follow(
+    path: impl AsRef<Path>,
+    cap: BoundedCap,
+) -> io::Result<BoundedBytes> {
+    let read = bounded_read_with(path.as_ref(), cap, false)?;
     crate::work_counters::record_header_bytes(read.bytes.len() as u64);
     Ok(read)
 }

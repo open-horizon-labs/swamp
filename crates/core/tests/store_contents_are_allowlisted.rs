@@ -59,6 +59,7 @@ const TABLES: &[&str] = &[
     // external / build-store measurement caches
     "volume_stamps.parquet",
     "build_stores.parquet",
+    "model_cards.parquet",
     "xcode_derived_data.parquet",
     "declarations.parquet",
     "dependency_identities.parquet",

@@ -100,6 +100,10 @@ pub struct GrowthConfig {
     /// Seconds of measuring one volume-pass run may take
     /// (`volume_pass_budget_secs`); what is not done resumes next run.
     pub volume_pass_budget_secs: u64,
+    /// Whether a scheduled `observe` may ask huggingface.co's public API
+    /// about the hub repos on this machine (`hf_enrich`, off by default;
+    /// `crate::hub_api`).
+    pub hf_enrich: bool,
     /// The `[scan]` table: built-in defaults, includes, excludes, and
     /// disabled detectors (#41). See `crate::scope`.
     pub scan: crate::scope::ScanConfig,
@@ -116,12 +120,33 @@ impl Default for GrowthConfig {
             min_free_bytes: None,
             volume_pass_interval_hours: DEFAULT_VOLUME_PASS_INTERVAL_HOURS,
             volume_pass_budget_secs: DEFAULT_VOLUME_PASS_BUDGET_SECS,
+            hf_enrich: false,
             scan: crate::scope::ScanConfig::default(),
         }
     }
 }
 
 impl GrowthConfig {
+    /// The effective value of one top-level key as `swamp config get`
+    /// prints it (`crate::roots::SETTABLE` names the keys).
+    pub fn value_of(&self, key: &str) -> Option<String> {
+        Some(match key {
+            "since" => self.since.clone(),
+            "retention_days" => self.retention_days.to_string(),
+            "large_file_min_bytes" => self.large_file_min_bytes.to_string(),
+            "observe_timeout_sec" => self.observe_timeout_sec.to_string(),
+            "observe_stall_secs" => self.observe_stall_secs.to_string(),
+            "min_free_bytes" => match self.min_free_bytes {
+                Some(n) => n.to_string(),
+                None => "unset (the greater of 1 GiB and 1% of the volume)".to_string(),
+            },
+            "volume_pass_interval_hours" => self.volume_pass_interval_hours.to_string(),
+            "volume_pass_budget_secs" => self.volume_pass_budget_secs.to_string(),
+            "hf_enrich" => if self.hf_enrich { "on" } else { "off" }.to_string(),
+            _ => return None,
+        })
+    }
+
     /// The file contents that reproduce this configuration, every key
     /// written out with its meaning, so `config init` leaves something a
     /// human can edit.
@@ -148,6 +173,9 @@ observe_stall_secs = {}\n\
 volume_pass_interval_hours = {}\n\
 # Seconds one volume-pass run may measure before it stops and resumes at the next observe.\n\
 volume_pass_budget_secs = {}\n\
+# Ask huggingface.co's public API about each Hugging Face hub repo here (downloads, likes,\n\
+# license) during scheduled observes: one read-only request per repo, cached. Off by default.\n\
+hf_enrich = {}\n\
 {}",
             self.since,
             self.retention_days,
@@ -160,6 +188,7 @@ volume_pass_budget_secs = {}\n\
             },
             self.volume_pass_interval_hours,
             self.volume_pass_budget_secs,
+            self.hf_enrich,
             self.scan.to_toml_table(),
         )
     }
@@ -182,6 +211,7 @@ struct RawConfig {
     min_free_bytes: Option<u64>,
     volume_pass_interval_hours: u64,
     volume_pass_budget_secs: u64,
+    hf_enrich: bool,
     scan: crate::scope::ScanConfig,
 }
 
@@ -197,6 +227,7 @@ impl Default for RawConfig {
             min_free_bytes: d.min_free_bytes,
             volume_pass_interval_hours: d.volume_pass_interval_hours,
             volume_pass_budget_secs: d.volume_pass_budget_secs,
+            hf_enrich: d.hf_enrich,
             scan: d.scan,
         }
     }
@@ -213,6 +244,7 @@ impl From<RawConfig> for GrowthConfig {
             min_free_bytes: r.min_free_bytes,
             volume_pass_interval_hours: r.volume_pass_interval_hours,
             volume_pass_budget_secs: r.volume_pass_budget_secs,
+            hf_enrich: r.hf_enrich,
             scan: r.scan,
         }
     }
