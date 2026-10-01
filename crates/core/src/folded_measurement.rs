@@ -1695,6 +1695,160 @@ mod tests {
         testing::clear();
     }
 
+    /// Audit round 2 setup: a unit holding one staged sealed volume (a
+    /// subfolder answered as a read-only mount), walked once at 1_000.
+    fn rev2_sealed_unit(tmp: &Path) -> (PathBuf, PathBuf, crate::fs_gate::fs_space::VolumeStamp) {
+        use crate::fs_gate::fs_space::{VolumeStamp, testing};
+        let unit = crate::fs_gate::canonicalize(tmp).unwrap().join("Volumes");
+        let sealed = unit.join("iOS_1");
+        std::fs::create_dir_all(sealed.join("a")).unwrap();
+        std::fs::write(sealed.join("a/big"), crate::fs_gate::settle::noise(65_536)).unwrap();
+        testing::set(
+            &unit,
+            VolumeStamp {
+                device: 1,
+                read_only: false,
+                total_blocks: 1000,
+                root_ino: 2,
+                root_mtime: 1,
+            },
+        );
+        let stamp = VolumeStamp {
+            device: 2,
+            read_only: true,
+            total_blocks: 4_000,
+            root_ino: 2,
+            root_mtime: 1_000,
+        };
+        testing::set(&sealed, stamp);
+        crate::fs_gate::settle::settle();
+        (unit, sealed, stamp)
+    }
+
+    fn rev2_unit(o: UnitObservation) -> FoldedUnit {
+        let UnitObservation::Unit(u) = o else {
+            panic!("not measured")
+        };
+        u
+    }
+
+    /// Audit round 2. Tempting wrong patch (the shipped one): re-stamp the
+    /// sealed volume's stored row with the replaying pass's time, so the
+    /// time the 1.77M files were actually walked is lost and nothing can
+    /// say how old the measurement is (`--full` no longer re-walks it).
+    #[test]
+    fn rev2_a_vouched_replay_keeps_the_time_the_volume_was_walked() {
+        use crate::fs_events::EventCoverage;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, _sealed, _) = rev2_sealed_unit(tmp.path());
+        let none = EventCoverage::untrusted();
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let vouched = EventCoverage::trusted(unit.clone(), Vec::new(), 0);
+        let (again, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 9_000, &vouched, true, false);
+        assert!(rev2_unit(again).reused);
+        let rows = crate::growth::volume_stamps_for(store.path(), &unit.display().to_string());
+        crate::fs_gate::fs_space::testing::clear();
+        assert_eq!(
+            rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
+            vec![1_000],
+            "the stored volume row no longer says when it was walked"
+        );
+    }
+
+    /// Audit round 2. Tempting wrong patches: vouch on the volumes' stamps
+    /// alone (ignoring the folder's own ctime), or keep vouching after a
+    /// volume is unmounted (its mount point is then an empty folder on the
+    /// parent volume). After each mutation the unit is not vouched for and
+    /// an observe with no window equals a store-less fresh walk.
+    #[test]
+    fn rev2_sealed_vouching_stops_on_chmod_and_unmount_and_matches_a_fresh_walk() {
+        use crate::fs_events::EventCoverage;
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, sealed, _) = rev2_sealed_unit(tmp.path());
+        let none = EventCoverage::untrusted();
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        assert!(sealed_only_unchanged(Some(store.path()), &unit));
+
+        // Permissions flipped on the folder: its ctime moves.
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::fs_gate::settle::settle();
+        let vouched_after_chmod = sealed_only_unchanged(Some(store.path()), &unit);
+        let golden = |at: u64| {
+            let (o, _) = observe_unit_with_dirs(None, &unit, &[], at, &none, false, false);
+            let u = rev2_unit(o);
+            (u.bytes, u.mtime_max, u.complete)
+        };
+        let (o, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &none, false, false);
+        let o = rev2_unit(o);
+        assert_eq!((o.bytes, o.mtime_max, o.complete), golden(2_000));
+
+        // Unmounted: the stamp now says the parent volume.
+        crate::fs_gate::fs_space::testing::set(
+            &sealed,
+            crate::fs_gate::fs_space::VolumeStamp {
+                device: 1,
+                read_only: false,
+                total_blocks: 1000,
+                root_ino: 77,
+                root_mtime: 5,
+            },
+        );
+        let vouched_after_unmount = sealed_only_unchanged(Some(store.path()), &unit);
+        let (o, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 3_000, &none, false, false);
+        let o = rev2_unit(o);
+        let g = golden(3_000);
+        crate::fs_gate::fs_space::testing::clear();
+        assert!(
+            !vouched_after_chmod,
+            "vouched after the folder's mode changed"
+        );
+        assert!(!vouched_after_unmount, "vouched with a volume unmounted");
+        assert_eq!((o.bytes, o.mtime_max, o.complete), g);
+    }
+
+    /// Audit round 2. Tempting wrong patch: a vouched replay reports the
+    /// stored bytes as complete. A volume with an unreadable folder was a
+    /// lower bound when walked and stays labelled one when replayed.
+    #[test]
+    fn rev2_an_unreadable_sealed_volume_replays_as_a_lower_bound() {
+        use crate::fs_events::EventCoverage;
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, sealed, _) = rev2_sealed_unit(tmp.path());
+        std::fs::create_dir_all(sealed.join("root_only/x")).unwrap();
+        std::fs::set_permissions(sealed.join("root_only"), std::fs::Permissions::from_mode(0))
+            .unwrap();
+        let none = EventCoverage::untrusted();
+        let (first, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let vouched = sealed_only_unchanged(Some(store.path()), &unit);
+        let cov = EventCoverage::trusted(unit.clone(), Vec::new(), 0);
+        let (again, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &cov, true, false);
+        std::fs::set_permissions(
+            sealed.join("root_only"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::fs_gate::fs_space::testing::clear();
+        let (first, again) = (rev2_unit(first), rev2_unit(again));
+        assert!(!first.complete);
+        assert!(vouched);
+        assert!(again.reused);
+        assert!(!again.complete, "a lower bound replayed as complete");
+        assert_eq!(again.bytes, first.bytes);
+    }
+
     /// A different exclusion set describes different bytes, so it must
     /// not be answered from a measurement taken under the old one.
     #[test]

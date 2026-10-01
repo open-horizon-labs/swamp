@@ -1361,6 +1361,39 @@ mod tests {
         assert_eq!(last_log_outcome(&log).map(|o| o.observed_at), Some(7));
     }
 
+    /// Audit round 2. The test above no longer reaches a failed rotation:
+    /// with three rotated files a directory at `observe.log.1` is simply
+    /// renamed to `.2`, so `rotate_if_full(..)?` passes it. Here the log's
+    /// directory is read-only, so every rename fails while the full log
+    /// itself stays writable. Tempting wrong patch: return the rotation
+    /// note as an error from `append_line`.
+    #[test]
+    fn rev2_a_read_only_log_dir_still_appends_to_the_full_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("observe.log");
+        let mut full = vec![b'x'; store::LOG_CAP_BYTES as usize];
+        full.push(b'\n');
+        fs::write(&log, full).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = RunOutcome {
+            observed_at: 7,
+            wall_ms: 1,
+            walked_total: 1,
+            projects: 1,
+            mode: "full".to_string(),
+            outcome: "ok".to_string(),
+        };
+        let r = append_log(&log, &outcome);
+        let rotated = dir.join("observe.log.1").exists();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!rotated, "the setup was meant to make rotation fail");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(last_log_outcome(&log).map(|o| o.observed_at), Some(7));
+    }
+
     /// Docs match code: the log cap and rotated-file count in the usage
     /// guide are the constants, and the architecture page no longer
     /// states the subfolder-replay rules this release replaced.
