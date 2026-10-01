@@ -25,6 +25,22 @@ fn st_header(tensors: &[(&str, &str, &[u64])]) -> Vec<u8> {
     b
 }
 
+/// Marks a file as read since its last change (access time after its
+/// mtime), as a model a program has loaded is: only then does swamp read
+/// its header without moving the access time it reports.
+fn used(p: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::symlink_metadata(p).unwrap();
+    let at = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs((m.mtime().max(m.ctime()) + 60) as u64);
+    fs::File::options()
+        .write(true)
+        .open(p)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_accessed(at))
+        .unwrap();
+}
+
 fn allocated(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     crate::fs_gate::symlink_metadata(p).map_or(0, |m| m.blocks() * 512)
@@ -58,6 +74,7 @@ fn hub_fixture(readme: &str) -> Hub {
         st_header(&[("w", "BF16", &[1000, 1000]), ("b", "BF16", &[1000])]),
     )
     .unwrap();
+    used(&a.join("blobs/h-weights"));
     fs::write(a.join("blobs/h-tok"), "{}").unwrap();
     fs::write(a.join("blobs/h-part.incomplete"), vec![0u8; 9000]).unwrap();
     fs::write(a.join("refs/main"), REV1).unwrap();
@@ -89,6 +106,7 @@ fn hub_fixture(readme: &str) -> Hub {
         st_header(&[("x", "F32", &[64, 64])]),
     )
     .unwrap();
+    used(&root.join("blobs/ab/abhash"));
     fs::write(root.join("blobs/cd/loose"), vec![1u8; 5000]).unwrap();
     for (name, rev) in [("models--org--b", REV3), ("models--org--c", REV3)] {
         let r = root.join(name);
@@ -209,7 +227,7 @@ fn blobs_are_counted_once_and_units_sum_to_the_store() {
             .allocated_total
             + shared
     );
-    assert!(text_of(b).contains("moving this repo folder leaves those bytes there"));
+    assert!(text_of(b).contains("stays in the hub's shared blobs/"));
     assert!(text_of(c).contains("counted under another repo"));
     let blobs = unit(&units, "blobs");
     assert!(
@@ -292,6 +310,7 @@ fn hostile_headers_and_malformed_files_give_explicit_unknowns() {
     let mut evil = u64::MAX.to_le_bytes().to_vec();
     evil.extend(b"{}");
     fs::write(a.join("h-weights"), evil).unwrap();
+    used(&a.join("h-weights"));
     fs::write(a.join("h-config"), "{ not json").unwrap();
     let (units, w) = identify(
         BuildStoreKind::HuggingFaceHub,
@@ -526,7 +545,8 @@ fn an_unchanged_ollama_store_reads_no_manifest_twice() {
     let (_, w) = identify(BuildStoreKind::OllamaModels, &o.root, &warm);
     // The malformed manifest is re-read each pass (it produced no entry);
     // nothing else is.
-    assert_eq!(w.header_bytes_read, "{ nope".len() as u64);
+    // The malformed manifest's failure is cached too (size and mtime).
+    assert_eq!(w.header_bytes_read, 0);
 }
 
 /// Tempting wrong patch: a verdict word or an em dash in the new
@@ -1069,10 +1089,11 @@ fn adv_after_a_cache_reset_swamps_earlier_read_is_not_shown_as_use() {
         use std::os::unix::fs::MetadataExt;
         fs::symlink_metadata(&w).unwrap().atime()
     };
-    assert!(
-        moved > 1_500_000_000,
-        "APFS did not move atime on swamp's read; test is moot"
-    );
+    // Changed in the fix (reported): swamp no longer reads a weight file
+    // whose access time a read would move, so the precondition the audit
+    // relied on (APFS moving it) no longer occurs. The stronger property
+    // is asserted: the access time did not move.
+    assert_eq!(moved, 1_500_000_000, "swamp's read moved the access time");
     // Cache gone (store-format reset): a fresh pass.
     let (units, _) = identify(
         BuildStoreKind::HuggingFaceHub,
@@ -1080,8 +1101,142 @@ fn adv_after_a_cache_reset_swamps_earlier_read_is_not_shown_as_use() {
         &CardCache::default(),
     );
     let lr = ev(unit(&units, "models--org--a"), LAST_READ_EVIDENCE)[0];
+    // The time shown is the access time from before any swamp pass (the
+    // only real use this fixture has), not a time a swamp read wrote.
     assert!(
-        !lr.starts_with(&format!("{moved}|")),
+        lr.starts_with("1500000000|"),
         "swamp's own earlier read shown as the last read: {lr}"
     );
+}
+
+/// Tempting wrong patch: reading the weight header whatever its access
+/// time, so swamp's own read becomes the "last read" (APFS moves an
+/// access time not newer than the last change). Such a file is not read:
+/// no count yet, a stated reason, and its access time is unchanged.
+#[test]
+fn a_weight_file_whose_access_time_a_read_would_move_is_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let r = one_repo(
+        &root,
+        "models--org--fresh",
+        &[("model.safetensors", st_header(&[("w", "F32", &[10])]))],
+    );
+    let w = r.join("blobs/b0");
+    let before = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&w).unwrap().atime()
+    };
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let u = unit(&units, "models--org--fresh");
+    if cfg!(target_os = "macos") {
+        assert_eq!(field(u, "params"), None);
+        assert!(field(u, "params_deferred").is_none_or(|_| true));
+        assert!(text_of(u).contains("reading the weight file now would set its access time"));
+    }
+    let after = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&w).unwrap().atime()
+    };
+    assert_eq!(before, after);
+    // Once a program has read it, the count is read (from the cache's
+    // deferred entry: a miss, not a stale answer).
+    used(&w);
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    assert_eq!(
+        field(unit(&units, "models--org--fresh"), "params"),
+        Some("10")
+    );
+}
+
+/// The audit's ADV-1 and ADV-2 with weight files a program has read, so
+/// the counts are actually computed. Tempting wrong patch: summing every
+/// safetensors file, or stating 16 of 17 shards as exact.
+#[test]
+fn weight_sets_count_one_copy_and_never_a_partial_set_as_exact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let r = one_repo(
+        &root,
+        "models--mistralai--m",
+        &[
+            (
+                "consolidated.safetensors",
+                st_header(&[("w", "BF16", &[100, 10])]),
+            ),
+            (
+                "model-00001-of-00002.safetensors",
+                st_header(&[("a", "BF16", &[50, 10])]),
+            ),
+            (
+                "model-00002-of-00002.safetensors",
+                st_header(&[("b", "BF16", &[50, 10])]),
+            ),
+        ],
+    );
+    for i in 0..3 {
+        used(&r.join(format!("blobs/b{i}")));
+    }
+    let r2 = one_repo(
+        &root,
+        "models--org--idx",
+        &[
+            ("model.safetensors.index.json", br#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#.to_vec()),
+            ("model-00001-of-00002.safetensors", st_header(&[("a", "F16", &[7])])),
+            ("model-00002-of-00002.safetensors", st_header(&[("b", "F16", &[5])])),
+            ("model.fp16.safetensors", st_header(&[("x", "F16", &[12])])),
+        ],
+    );
+    for i in 1..4 {
+        used(&r2.join(format!("blobs/b{i}")));
+    }
+    let files: Vec<(String, Vec<u8>)> = (1..=17)
+        .map(|i| {
+            (
+                format!("model-{i:05}-of-00017.safetensors"),
+                st_header(&[("w", "BF16", &[1])]),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, Vec<u8>)> = files.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+    let r3 = one_repo(&root, "models--org--big", &files);
+    for i in 0..17 {
+        used(&r3.join(format!("blobs/b{i}")));
+    }
+    let r4 = one_repo(
+        &root,
+        "models--org--gap",
+        &[(
+            "model-00001-of-00003.safetensors",
+            st_header(&[("a", "F16", &[7])]),
+        )],
+    );
+    used(&r4.join("blobs/b0"));
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let m = unit(&units, "models--mistralai--m");
+    assert_eq!(
+        field(m, "params"),
+        Some("1000"),
+        "{:?}",
+        ev(m, FIELD_EVIDENCE)
+    );
+    assert!(
+        field(m, "params_note")
+            .unwrap()
+            .contains("one of 2 weight sets")
+    );
+    assert_eq!(
+        field(unit(&units, "models--org--idx"), "params"),
+        Some("12")
+    );
+    let big = unit(&units, "models--org--big");
+    assert_eq!(field(big, "params"), None);
+    assert!(
+        field(big, "params_unread")
+            .unwrap()
+            .contains("17 weight files")
+    );
+    let gap = unit(&units, "models--org--gap");
+    assert_eq!(field(gap, "params"), None);
+    assert_eq!(field(gap, "params_unread"), Some("1 of 3 shards are here"));
 }

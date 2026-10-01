@@ -116,6 +116,46 @@ struct FileFact {
     len: u64,
     atime: u64,
     mtime: u64,
+    ctime: u64,
+}
+
+impl FileFact {
+    /// Whether reading this file would set its access time, the last-read
+    /// fact swamp reports. macOS updates the access time on a read only
+    /// when it is not newer than the last change (checked on APFS: a
+    /// file read since its last write keeps its time through another
+    /// read). On Linux the read opens with `O_NOATIME` and moves nothing.
+    fn read_would_move_atime(&self) -> bool {
+        cfg!(target_os = "macos") && self.atime <= self.mtime.max(self.ctime)
+    }
+}
+
+/// Whether `p` is a real directory: present, and not a symlink.
+fn real_dir(ctx: &BuildCtx, p: &Path) -> bool {
+    ctx.stat(p)
+        .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink())
+}
+
+/// Whether every directory from `base` down to `target`'s parent is a
+/// real directory: a link resolved as text must not pass through a
+/// symlinked folder the check never saw.
+fn real_dirs_between(ctx: &BuildCtx, base: &Path, target: &Path) -> bool {
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    if !parent.starts_with(base) {
+        return false;
+    }
+    parent
+        .ancestors()
+        .take_while(|a| a.starts_with(base))
+        .all(|a| real_dir(ctx, a))
+}
+
+/// `name` with the characters a terminal or a JSON reader could be
+/// fooled by removed (folder names come from the disk).
+fn clean(name: &str) -> String {
+    model_cards::sanitize(name, 200)
 }
 
 fn file_fact(ctx: &BuildCtx, path: &Path) -> Option<FileFact> {
@@ -130,6 +170,7 @@ fn file_fact(ctx: &BuildCtx, path: &Path) -> Option<FileFact> {
         len: m.len(),
         atime: m.atime().max(0) as u64,
         mtime: m.mtime().max(0) as u64,
+        ctime: m.ctime().max(0) as u64,
     })
 }
 
@@ -208,8 +249,12 @@ struct RepoScan {
     refs: Vec<(String, String)>,
     /// Revision -> (file path inside the snapshot -> blob name).
     snapshots: BTreeMap<String, BTreeMap<String, String>>,
+    /// Revision -> its snapshot folder's mtime.
+    snapshot_mtime: BTreeMap<String, u64>,
     dangling: Vec<String>,
     outside: Vec<String>,
+    /// Folders inside the repo that are links: never followed.
+    linked: Vec<String>,
     partial_listing: bool,
 }
 
@@ -217,7 +262,18 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
     let mut s = RepoScan::default();
     let blobs_dir = repo.join("blobs");
     let shared_dir = hub_root.join("blobs");
-    let (entries, t) = ctx.list_links(&blobs_dir);
+    for sub in ["blobs", "refs", "snapshots"] {
+        let p = repo.join(sub);
+        if ctx.stat(&p).is_some_and(|m| m.file_type().is_symlink()) {
+            s.linked.push(format!("{sub}/"));
+        }
+    }
+    let listable = |p: &Path| real_dir(ctx, p);
+    let (entries, t) = if listable(&blobs_dir) {
+        ctx.list_links(&blobs_dir)
+    } else {
+        (Vec::new(), Truncation::Complete)
+    };
     s.partial_listing |= truncated(t);
     for e in entries {
         let path = blobs_dir.join(&e.name);
@@ -230,7 +286,10 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
                 continue;
             };
             match lexical_join(&blobs_dir, &target) {
-                Some(t) if t.starts_with(&shared_dir) || t.starts_with(&blobs_dir) => {
+                // Into the hub's shared folder, through real folders only.
+                Some(t)
+                    if t.starts_with(&shared_dir) && real_dirs_between(ctx, &shared_dir, &t) =>
+                {
                     match file_fact(ctx, &t) {
                         Some(f) => {
                             s.shared.insert(e.name.clone());
@@ -238,6 +297,18 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
                         }
                         None => s.dangling.push(format!("blobs/{}", e.name)),
                     }
+                }
+                // To a sibling in this repo's own blobs/: the same bytes
+                // the walk already counted in this folder, never again.
+                Some(t) if t.parent() == Some(blobs_dir.as_path()) => match file_fact(ctx, &t) {
+                    Some(f) => {
+                        s.blobs.insert(e.name, f);
+                    }
+                    None => s.dangling.push(format!("blobs/{}", e.name)),
+                },
+                Some(t) if t.starts_with(&shared_dir) => {
+                    s.linked
+                        .push(format!("blobs/{} (through a linked folder)", e.name));
                 }
                 _ => s.outside.push(format!("blobs/{}", e.name)),
             }
@@ -252,7 +323,11 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
             }
         }
     }
-    let (refs, t) = ctx.list_links(&repo.join("refs"));
+    let (refs, t) = if listable(&repo.join("refs")) {
+        ctx.list_links(&repo.join("refs"))
+    } else {
+        (Vec::new(), Truncation::Complete)
+    };
     s.partial_listing |= truncated(t);
     for r in refs.iter().filter(|r| !r.is_dir && !r.is_symlink) {
         let p = repo.join("refs").join(&r.name);
@@ -260,9 +335,30 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
             s.refs.push((r.name.clone(), rev));
         }
     }
-    let (revs, t) = ctx.list_links(&repo.join("snapshots"));
+    let (revs, t) = if listable(&repo.join("snapshots")) {
+        ctx.list_links(&repo.join("snapshots"))
+    } else {
+        (Vec::new(), Truncation::Complete)
+    };
     s.partial_listing |= truncated(t);
-    for rev in revs.iter().filter(|r| r.is_dir).take(MAX_REVISIONS) {
+    // Which revisions are read when there are more than the bound: those
+    // a ref names first, then the newest by the folder's own mtime; never
+    // directory or lexical order.
+    let named: BTreeSet<&str> = s.refs.iter().map(|(_, r)| r.as_str()).collect();
+    let mut order: Vec<(&crate::locations::LinkEntry, bool, u64)> = revs
+        .iter()
+        .filter(|r| r.is_dir)
+        .map(|r| {
+            use crate::fs_gate::MetadataExt;
+            let mtime = ctx
+                .stat(&repo.join("snapshots").join(&r.name))
+                .map_or(0, |m| m.mtime().max(0) as u64);
+            (r, named.contains(r.name.as_str()), mtime)
+        })
+        .collect();
+    order.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+    for (rev, _, mtime) in order.iter().take(MAX_REVISIONS) {
+        s.snapshot_mtime.insert(rev.name.clone(), *mtime);
         let mut files = BTreeMap::new();
         let mut queue = vec![(repo.join("snapshots").join(&rev.name), String::new(), 0)];
         while let Some((dir, prefix, depth)) = queue.pop() {
@@ -322,8 +418,9 @@ fn ref_cached(ctx: &BuildCtx, hub_root: &Path, path: &Path) -> Option<String> {
     }
     // Ref reads are 40 bytes and never wait for the budget: a repo's
     // revision is part of its identity, not an enrichment.
-    let text = ctx.manifest(path).filter(|t| !t.truncated)?;
-    let rev = text.text.trim();
+    let bytes = ctx.header(path, 64)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let rev = text.trim();
     let mut fields = CardFields::new();
     if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
         fields.insert("rev".into(), rev.to_string());
@@ -337,6 +434,54 @@ fn ref_cached(ctx: &BuildCtx, hub_root: &Path, path: &Path) -> Option<String> {
         },
     );
     fields.get("rev").cloned()
+}
+
+/// The safetensors files that make up one copy of the weights, and a
+/// note when the snapshot holds more than one copy. Shards
+/// `<p>-0000i-of-0000N.safetensors` are one set; every other file is its
+/// own. A transformers shard set (`model-…-of-…`) wins, then
+/// `model.safetensors`, then the largest set; the others are never added
+/// to it (Mistral's `consolidated.safetensors` beside its shards,
+/// diffusers' fp16 copies).
+fn choose_weight_set<'a>(
+    files: &'a BTreeMap<String, String>,
+    len_of: &dyn Fn(&str) -> u64,
+) -> (Vec<(&'a String, &'a String)>, Option<String>) {
+    let mut sets: BTreeMap<String, Vec<(&'a String, &'a String)>> = BTreeMap::new();
+    for (n, b) in files.iter().filter(|(n, _)| n.ends_with(".safetensors")) {
+        let stem = &n[..n.len() - ".safetensors".len()];
+        let key = match stem.rsplit_once("-of-") {
+            Some((head, total))
+                if total.len() == 5
+                    && total.bytes().all(|c| c.is_ascii_digit())
+                    && head.len() > 6
+                    && head[head.len() - 6..].starts_with('-')
+                    && head[head.len() - 5..].bytes().all(|c| c.is_ascii_digit()) =>
+            {
+                format!("{}-*-of-{total}", &head[..head.len() - 6])
+            }
+            _ => n.clone(),
+        };
+        sets.entry(key).or_default().push((n, b));
+    }
+    if sets.len() <= 1 {
+        return (sets.into_values().next().unwrap_or_default(), None);
+    }
+    let n = sets.len();
+    let pick = sets
+        .keys()
+        .find(|k| k.starts_with("model-*-of-"))
+        .or_else(|| sets.keys().find(|k| *k == "model.safetensors"))
+        .cloned()
+        .or_else(|| {
+            sets.iter()
+                .max_by_key(|(_, v)| v.iter().map(|(_, b)| len_of(b)).sum::<u64>())
+                .map(|(k, _)| k.clone())
+        })
+        .unwrap_or_default();
+    let note =
+        format!("counted from {pick}, one of {n} weight sets here (the others are not added)");
+    (sets.remove(&pick).unwrap_or_default(), Some(note))
 }
 
 fn is_tokenizer(name: &str) -> bool {
@@ -355,22 +500,33 @@ fn hub_card(
 ) -> Option<CardEntry> {
     let cards: &CardCache = ctx.cards();
     let len_of = |blob: &str| scan.blobs.get(blob).map_or(0, |f| f.len);
-    let mut weights: Vec<(&String, &String)> = files
-        .iter()
-        .filter(|(n, _)| n.ends_with(".safetensors"))
-        .collect();
-    weights.sort_by_key(|(_, b)| std::cmp::Reverse(len_of(b)));
-    weights.truncate(model_cards::MAX_WEIGHT_HEADERS);
+    let index = files.get("model.safetensors.index.json").cloned();
+    let (weights, set_note) = choose_weight_set(files, &len_of);
     let gguf = files
         .iter()
         .filter(|(n, _)| n.ends_with(".gguf"))
         .max_by_key(|(_, b)| len_of(b));
     let mut consulted: Vec<(&String, &String)> = files
         .iter()
-        .filter(|(n, _)| *n == "README.md" || *n == "config.json")
+        .filter(|(n, _)| {
+            matches!(
+                n.as_str(),
+                "README.md" | "config.json" | "model.safetensors.index.json"
+            )
+        })
         .collect();
     consulted.extend(weights.iter().copied());
     consulted.extend(gguf);
+    let index_pair = index
+        .as_ref()
+        .map(|b| ("model.safetensors.index.json".to_string(), b.clone()));
+    let largest_blob = weights
+        .iter()
+        .map(|(_, b)| *b)
+        .max_by_key(|b| len_of(b))
+        .or(gguf.map(|(_, b)| b))
+        .and_then(|b| scan.blobs.get(b));
+    let defer = largest_blob.is_some_and(FileFact::read_would_move_atime);
     let fingerprint = format!(
         "{CARD_FORMAT}|{}|tok={}",
         consulted
@@ -381,7 +537,11 @@ fn hub_card(
         files.keys().any(|n| is_tokenizer(n))
     );
     if let Some(hit) = cards.lookup(key, &fingerprint) {
-        return Some(hit);
+        // A count put off because the read would have set the access
+        // time is read once that is no longer so.
+        if !(hit.fields.contains_key("params_deferred") && !defer) {
+            return Some(hit);
+        }
     }
     // A revision with no file to read costs nothing to describe.
     if !consulted.is_empty() && !cards.try_spend() {
@@ -428,17 +588,81 @@ fn hub_card(
     }
     // The largest weight file's access time, before and after swamp's
     // own read, so a later pass can tell that read from a real use.
-    let largest = weights
-        .first()
-        .map(|(_, b)| *b)
-        .or(gguf.map(|(_, b)| b))
-        .and_then(|b| scan.blobs.get(b));
-    if let Some(f) = largest {
+    let largest = largest_blob;
+    if defer {
+        fields.insert(
+            "params_deferred".into(),
+            "not read yet: reading the weight file now would set its access time, the last-read fact shown here; it is read once the file has been opened since its last change".into(),
+        );
+    } else if let Some(f) = largest {
         fields.insert("read_blob".into(), f.path.to_string_lossy().into_owned());
         fields.insert("read_atime_before".into(), f.atime.to_string());
     }
+    // The shard set an index names, when there is one.
+    let indexed: Option<BTreeSet<String>> = index_pair.as_ref().and_then(|(_, b)| {
+        let bytes = read(b)?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        Some(
+            v.get("weight_map")?
+                .as_object()?
+                .values()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+        )
+    });
+    let mut weights = weights;
+    if let Some(set) = &indexed {
+        weights = files.iter().filter(|(n, _)| set.contains(*n)).collect();
+        if weights.len() < set.len() {
+            fields.insert(
+                "params_unread".into(),
+                format!(
+                    "{} of the {} weight files model.safetensors.index.json names are here",
+                    weights.len(),
+                    set.len()
+                ),
+            );
+            weights.clear();
+        }
+    }
+    // A shard set with shards missing gives a lower bound, not a count.
+    let expected = weights.first().and_then(|(n, _)| {
+        let stem = n.strip_suffix(".safetensors")?;
+        stem.rsplit_once("-of-")?.1.parse::<usize>().ok()
+    });
+    if indexed.is_none()
+        && let Some(e) = expected
+        && e != weights.len()
+    {
+        fields.insert(
+            "params_unread".into(),
+            format!("{} of {e} shards are here", weights.len()),
+        );
+        weights.clear();
+    }
+    let too_many = weights.len() > model_cards::MAX_WEIGHT_HEADERS;
+    if too_many {
+        fields.insert(
+            "params_unread".into(),
+            format!(
+                "{} weight files, more than the {} headers read per revision",
+                weights.len(),
+                model_cards::MAX_WEIGHT_HEADERS
+            ),
+        );
+    }
+    if let Some(n) = &set_note
+        && indexed.is_none()
+    {
+        fields.insert("params_note".into(), n.clone());
+    }
     let mut total: Option<u64> = Some(0);
     let mut dtypes: BTreeSet<String> = BTreeSet::new();
+    let weights: Vec<(&String, &String)> = if defer || too_many {
+        Vec::new()
+    } else {
+        weights
+    };
     for (name, blob) in &weights {
         match read_weights(blob).map(|b| model_cards::safetensors_header(&b)) {
             Some(model_cards::WeightHeader::Read { params, dtypes: d }) => {
@@ -468,7 +692,13 @@ fn hub_card(
         fields.insert("params".into(), t.to_string());
         fields.insert(
             "params_source".into(),
-            format!("exact, from {} safetensors header(s)", weights.len()),
+            match (&indexed, &set_note) {
+                (Some(_), _) => format!(
+                    "exact, from the {} safetensors headers model.safetensors.index.json names",
+                    weights.len()
+                ),
+                _ => format!("exact, from {} safetensors header(s)", weights.len()),
+            },
         );
         if !dtypes.is_empty() {
             fields.insert(
@@ -477,7 +707,7 @@ fn hub_card(
             );
         }
     }
-    if let Some((_, b)) = gguf
+    if let Some((_, b)) = gguf.filter(|_| !defer)
         && let Some(g) = read(b).and_then(|bytes| model_cards::gguf_header(&bytes))
     {
         if let Some(a) = g.architecture {
@@ -500,7 +730,7 @@ fn hub_card(
             );
         }
     }
-    if let Some(f) = largest
+    if let Some(f) = largest.filter(|_| !defer)
         && let Some(after) = file_fact(ctx, &f.path)
     {
         fields.insert("read_atime_after".into(), after.atime.to_string());
@@ -538,7 +768,7 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
     let mut units = vec![root_unit.build()];
     let mut scans: Vec<(String, &'static str, String, RepoScan)> = Vec::new();
     for e in entries.iter().filter(|e| e.is_dir && !e.is_symlink) {
-        if let Some((kind, id)) = hub_repo_of(&e.name) {
+        if let Some((kind, id)) = hub_repo_of(&e.name).map(|(k, id)| (k, clean(&id))) {
             let scan = scan_repo(ctx, root, &root.join(&e.name));
             scans.push((e.name.clone(), kind, id, scan));
         }
@@ -556,6 +786,7 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         }
     }
     let mut shared_charged: u64 = 0;
+    let mut newest_shared_read: u64 = 0;
     for (folder, kind, repo_id, scan) in &scans {
         let dir = root.join(folder);
         let own = ctx.folded().get(&dir);
@@ -570,6 +801,7 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
                 repo_bytes += f.allocated;
                 in_shared += f.allocated;
                 shared_charged += f.allocated;
+                newest_shared_read = newest_shared_read.max(f.atime);
             } else {
                 also_charged_elsewhere += f.allocated;
             }
@@ -582,7 +814,12 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         let rev = main
             .clone()
             .filter(|m| scan.snapshots.contains_key(m))
-            .or_else(|| scan.snapshots.keys().next_back().cloned());
+            .or_else(|| {
+                scan.snapshot_mtime
+                    .iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)))
+                    .map(|(r, _)| r.clone())
+            });
         let short = |r: &str| r.chars().take(8).collect::<String>();
         let downloadable = !scan.refs.is_empty()
             || scan
@@ -691,9 +928,13 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         }
         if in_shared > 0 {
             b = b.limit(format!(
-                "{} of this repo's size is in the hub's shared blobs/ folder: moving this repo folder leaves those bytes there",
+                "moving this folder frees about {}; {} stays in the hub's shared blobs/",
+                bytes(repo_bytes.saturating_sub(in_shared)),
                 bytes(in_shared)
             ));
+        }
+        for l in &scan.linked {
+            b = b.limit(format!("{l} is a link, not followed"));
         }
         if also_charged_elsewhere > 0 {
             b = b.limit(format!(
@@ -757,8 +998,13 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         let rest = d.allocated_total.saturating_sub(shared_charged);
         let referenced: BTreeSet<&PathBuf> = charged_to.keys().collect();
         let (mut n, mut unref_bytes, mut partial) = (0usize, 0u64, false);
-        let (subs, t) = ctx.list_links(&shared_dir);
+        let (subs, t) = if real_dir(ctx, &shared_dir) {
+            ctx.list_links(&shared_dir)
+        } else {
+            (Vec::new(), Truncation::Complete)
+        };
         partial |= truncated(t);
+        let linked_subs = subs.iter().filter(|s| s.is_symlink).count();
         for s in subs.iter().filter(|s| s.is_dir && !s.is_symlink) {
             let (files, t) = ctx.list_links(&shared_dir.join(&s.name));
             partial |= truncated(t);
@@ -775,12 +1021,25 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         let mut b = NestedUnitBuilder::new(container, ArtifactRole::Residual, shared_dir.clone())
             .is_dir(true)
             .supported_with_reason("the hub's shared blobs/ folder that repo blobs/ entries link into")
+            .evidence(
+                LAST_READ_EVIDENCE,
+                format!(
+                    "{}|newest last read of the repos whose blobs are here",
+                    newest_shared_read
+                ),
+                Confidence::Medium,
+            )
             .bytes_on_basis(rest, AccountingBasis::Allocated)
             .complete(d.complete && !partial)
             .consequence(
                 "repo folders above link into this folder; moving it leaves their links pointing at nothing until each is downloaded again",
             )
             .no_action_because("repo folders in this cache link into it");
+        if linked_subs > 0 {
+            b = b.limit(format!(
+                "{linked_subs} entr(ies) here are links: not followed, not counted"
+            ));
+        }
         b = if n == 0 {
             b.limit("every file here is linked from a repo above (counted there)")
         } else {
@@ -827,16 +1086,18 @@ fn ollama_manifest_cached(
     ctx: &BuildCtx,
     store: &Path,
     path: &Path,
-) -> Result<Vec<(String, String, u64)>, &'static str> {
+) -> Result<Vec<(String, String, u64)>, String> {
     use crate::fs_gate::MetadataExt;
     let cards = ctx.cards();
     let Some(m) = ctx.stat(path) else {
-        return Err("the manifest could not be read");
+        return Err("the manifest could not be read".into());
     };
     let key = format!("ollama|{}|{}", store.display(), path.display());
     let fingerprint = format!("{CARD_FORMAT}|{}:{}:{}", m.len(), m.mtime(), m.mtime_nsec());
     let decode = |f: &CardFields| -> Vec<(String, String, u64)> {
-        f.values()
+        f.iter()
+            .filter(|(k, _)| k.as_str() != "error")
+            .map(|(_, v)| v)
             .filter_map(|v| {
                 let mut it = v.splitn(3, '|');
                 Some((
@@ -848,16 +1109,40 @@ fn ollama_manifest_cached(
             .collect()
     };
     if let Some(hit) = cards.lookup(&key, &fingerprint) {
+        // A manifest that could not be parsed is remembered as such for
+        // its size and mtime: it does not take a read every pass.
+        if let Some(e) = hit.fields.get("error") {
+            return Err(e.clone());
+        }
         return Ok(decode(&hit.fields));
     }
     if !cards.try_spend() {
-        return Err("not yet read (this pass's new reads were used; the next observe reads it)");
+        return Err(
+            "not yet read (this pass's new reads were used; the next observe reads it)".into(),
+        );
     }
-    let Some(text) = ctx.manifest(path).filter(|m| !m.truncated) else {
-        return Err("the manifest could not be read");
-    };
-    let Some((config, layers)) = model_cards::ollama_manifest(&text.text) else {
-        return Err("the manifest is not one this reader understands");
+    let parsed = ctx
+        .header(path, 256 * 1024)
+        .ok_or("the manifest could not be read")
+        .and_then(|b| {
+            model_cards::ollama_manifest(&String::from_utf8_lossy(&b))
+                .ok_or("the manifest is not one this reader understands")
+        });
+    let (config, layers) = match parsed {
+        Ok(p) => p,
+        Err(why) => {
+            let mut fields = CardFields::new();
+            fields.insert("error".into(), why.to_string());
+            cards.insert(
+                &key,
+                CardEntry {
+                    fingerprint,
+                    at: ctx.observed_at,
+                    fields,
+                },
+            );
+            return Err(why.to_string());
+        }
     };
     let mut fields = CardFields::new();
     for (i, l) in std::iter::once(&config).chain(layers.iter()).enumerate() {
@@ -888,8 +1173,8 @@ fn ollama_config_cached(ctx: &BuildCtx, store: &Path, digest: &str) -> Option<Ca
     if !cards.try_spend() {
         return None;
     }
-    let text = ctx.manifest(&store.join("blobs").join(blob_name(digest)))?;
-    let fields = model_cards::ollama_config(&text.text);
+    let text = ctx.header(&store.join("blobs").join(blob_name(digest)), 256 * 1024)?;
+    let fields = model_cards::ollama_config(&String::from_utf8_lossy(&text));
     cards.insert(
         &key,
         CardEntry {
@@ -913,7 +1198,7 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         .no_action_because("Ollama reads every model's layers from this store");
     // manifests/<host>/<ns>/<model>/<tag>
     let mut tags: Vec<Tag> = Vec::new();
-    let mut unread: Vec<(PathBuf, String, &'static str)> = Vec::new();
+    let mut unread: Vec<(PathBuf, String, String)> = Vec::new();
     let mut partial = false;
     let manifests = root.join("manifests");
     let dirs = |p: &Path, partial: &mut bool| -> Vec<String> {
@@ -924,7 +1209,16 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
             .map(|e| e.name)
             .collect()
     };
-    for host in dirs(&manifests, &mut partial) {
+    let manifests_real = real_dir(ctx, &manifests);
+    if !manifests_real && ctx.stat(&manifests).is_some() {
+        root_unit = root_unit.limit("manifests/ is a link, not followed");
+    }
+    let hosts = if manifests_real {
+        dirs(&manifests, &mut partial)
+    } else {
+        Vec::new()
+    };
+    for host in hosts {
         for ns in dirs(&manifests.join(&host), &mut partial) {
             for model in dirs(&manifests.join(&host).join(&ns), &mut partial) {
                 let mdir = manifests.join(&host).join(&ns).join(&model);
@@ -932,7 +1226,7 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
                 partial |= truncated(t);
                 for f in files.iter().filter(|f| !f.is_dir && !f.is_symlink) {
                     let path = mdir.join(&f.name);
-                    let name = ollama_name(&host, &ns, &model, &f.name);
+                    let name = clean(&ollama_name(&host, &ns, &model, &f.name));
                     match ollama_manifest_cached(ctx, root, &path) {
                         Ok(layers) => {
                             let config = layers.first().map(|(_, d, _)| d.clone());
@@ -951,7 +1245,15 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
     }
     // Every blob on disk, one lstat each.
     let blobs_dir = root.join("blobs");
-    let (entries, t) = ctx.list_links(&blobs_dir);
+    let blobs_real = real_dir(ctx, &blobs_dir);
+    if !blobs_real && ctx.stat(&blobs_dir).is_some() {
+        root_unit = root_unit.limit("blobs/ is a link, not followed: no layer is counted");
+    }
+    let (entries, t) = if blobs_real {
+        ctx.list_links(&blobs_dir)
+    } else {
+        (Vec::new(), Truncation::Complete)
+    };
     partial |= truncated(t);
     let mut on_disk: BTreeMap<String, FileFact> = BTreeMap::new();
     let mut incomplete = (0usize, 0u64);
@@ -1040,7 +1342,7 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
                 Confidence::High,
             )
             .limit(format!(
-                "moving this manifest frees none of its {} of layers in blobs/; `ollama rm {}` removes the model and the layers no other model uses",
+                "moving this manifest frees none of its layers: the layers ({}) stay in blobs/; `ollama rm {}` removes the model and the layers no other model uses",
                 bytes(total),
                 t.name
             ));
@@ -1125,6 +1427,18 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
     units
 }
 
+/// The store a model-store unit was identified in: the path of its
+/// container's own row. A unit belongs to that store only, never to an
+/// ancestor folder that is a unit too (`~/.cache/huggingface` above the
+/// hub cache).
+fn store_of<'a>(u: &NestedArtifact, interiors: &'a [NestedArtifact]) -> Option<&'a Path> {
+    let c = u.container_id.as_deref()?;
+    interiors
+        .iter()
+        .find(|i| i.id == c && i.container_id.as_deref() == Some(c))
+        .map(|i| i.path.as_path())
+}
+
 /// One model, as the Reclaim and External views and the JSON show it:
 /// what it is, which revision or tag, its size, when its weights were
 /// last read, and what getting it back costs. Built from the stored
@@ -1167,54 +1481,62 @@ pub struct ModelRow {
 pub fn model_rows(unit_path: &Path, interiors: &[NestedArtifact], now: u64) -> Vec<ModelRow> {
     let mut rows: Vec<ModelRow> = interiors
         .iter()
-        .filter(|i| {
-            i.present
-                && i.adapter.as_deref() == Some("model-stores")
-                && i.role == ArtifactRole::SharedStoreEntry
-                && i.path.starts_with(unit_path)
-        })
-        .map(|i| {
-            let one = |src: &str| {
-                i.producer_evidence
-                    .iter()
-                    .find(|e| e.source == src)
-                    .map(|e| e.detail.clone())
-            };
-            let (last_read_at, last_read) = match last_read_of(i) {
-                Some((at, label)) => (
-                    Some(at),
-                    format!("{} ({label})", crate::last_used::format_day(at, now)),
-                ),
-                None => (None, "no record".to_string()),
-            };
-            ModelRow {
-                path: i.path.display().to_string(),
-                name: i.variant.package.clone().unwrap_or_default(),
-                kind: i.variant.configuration.clone().unwrap_or_default(),
-                revision: i.variant.version.clone(),
-                bytes: i.bytes,
-                about: one(CARD_EVIDENCE),
-                card: one(CARD_TEXT_EVIDENCE),
-                fields: i
-                    .producer_evidence
-                    .iter()
-                    .filter(|e| e.source == FIELD_EVIDENCE)
-                    .map(|e| e.detail.clone())
-                    .collect(),
-                last_read_at,
-                last_read,
-                regeneration: i
-                    .consequence
-                    .clone()
-                    .unwrap_or_else(|| "regeneration cost not established".into()),
-                revisions: one(REVISION_EVIDENCE),
-                hub: one(HUB_API_EVIDENCE),
-                facts: i.coverage.limits.clone(),
-            }
-        })
+        .filter(|i| i.present && store_of(i, interiors) == Some(unit_path))
+        .filter_map(|i| model_row_of(i, now))
         .collect();
     rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.path.cmp(&b.path)));
     rows
+}
+
+/// A path as a row shows it and as [`ModelRow::path`] holds it: control,
+/// bidi and zero-width characters removed. Views match a folder to its
+/// model through this, never through the raw bytes.
+pub fn shown_path(p: &Path) -> String {
+    model_cards::sanitize(&p.display().to_string(), 4096)
+}
+
+/// One model unit as a [`ModelRow`]; `None` for anything else.
+pub fn model_row_of(i: &NestedArtifact, now: u64) -> Option<ModelRow> {
+    if i.adapter.as_deref() != Some("model-stores") || i.role != ArtifactRole::SharedStoreEntry {
+        return None;
+    }
+    let one = |src: &str| {
+        i.producer_evidence
+            .iter()
+            .find(|e| e.source == src)
+            .map(|e| e.detail.clone())
+    };
+    let (last_read_at, last_read) = match last_read_of(i) {
+        Some((at, label)) => (
+            Some(at),
+            format!("{} ({label})", crate::last_used::format_day(at, now)),
+        ),
+        None => (None, "no record".to_string()),
+    };
+    Some(ModelRow {
+        path: shown_path(&i.path),
+        name: clean(i.variant.package.as_deref().unwrap_or_default()),
+        kind: i.variant.configuration.clone().unwrap_or_default(),
+        revision: i.variant.version.clone(),
+        bytes: i.bytes,
+        about: one(CARD_EVIDENCE),
+        card: one(CARD_TEXT_EVIDENCE),
+        fields: i
+            .producer_evidence
+            .iter()
+            .filter(|e| e.source == FIELD_EVIDENCE)
+            .map(|e| e.detail.clone())
+            .collect(),
+        last_read_at,
+        last_read,
+        regeneration: i
+            .consequence
+            .clone()
+            .unwrap_or_else(|| "regeneration cost not established".into()),
+        revisions: one(REVISION_EVIDENCE),
+        hub: one(HUB_API_EVIDENCE),
+        facts: i.coverage.limits.clone(),
+    })
 }
 
 /// The last-read fact a unit carries, as `(epoch, label)`.
@@ -1239,7 +1561,10 @@ pub fn attach_last_read(
     for u in units.iter_mut() {
         let mine: Vec<&NestedArtifact> = interiors
             .iter()
-            .filter(|i| i.adapter.as_deref() == Some("model-stores") && i.path.starts_with(&u.path))
+            .filter(|i| {
+                i.adapter.as_deref() == Some("model-stores")
+                    && store_of(i, interiors) == Some(u.path.as_path())
+            })
             .collect();
         if mine.is_empty() {
             continue;

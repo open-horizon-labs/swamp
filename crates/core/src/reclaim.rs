@@ -1110,7 +1110,7 @@ fn unit_row(
     let children: Vec<ReclaimChild> = children
         .into_iter()
         .map(|mut c| {
-            let path = u.path.join(&c.name).display().to_string();
+            let path = crate::build_adapters::model_stores::shown_path(&u.path.join(&c.name));
             if c.kind == ChildKind::Entry
                 && let Some(m) = models.iter().find(|m| m.path == path)
             {

@@ -491,7 +491,8 @@ impl<'a> BuildCtx<'a> {
 
     /// The first bytes of one named regular file, at most
     /// `min(want, model_cards::MAX_CARD_READ)`, counted as header bytes.
-    /// A symlink is refused by the gate's open.
+    /// A symlink at `path` is refused (`lstat` and `O_NOFOLLOW`); the
+    /// caller checks that no parent directory is one.
     pub fn header(&self, path: &Path, want: usize) -> Option<Vec<u8>> {
         use crate::fs_gate::read::BoundedCap;
         let cap = if want <= BoundedCap::HEADER.bytes() {
@@ -499,7 +500,7 @@ impl<'a> BuildCtx<'a> {
         } else {
             BoundedCap::MANIFEST
         };
-        let read = crate::fs_gate::read::bounded_read_header(path, cap).ok()?;
+        let read = crate::fs_gate::read::bounded_read_header_no_follow(path, cap).ok()?;
         let mut bytes = read.bytes;
         bytes.truncate(want.min(model_cards::MAX_CARD_READ));
         Some(bytes)

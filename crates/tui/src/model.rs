@@ -1170,13 +1170,7 @@ fn family_member_row(
     row.signals.extend(u.coverage.limits.iter().cloned());
     // A model's own facts: what it is leads the label and the detail pane.
     if u.adapter.as_deref() == Some("model-stores")
-        && let Some(m) = swamp_core::build_adapters::model_stores::model_rows(
-            u.path.parent().unwrap_or(&u.path),
-            std::slice::from_ref(u),
-            observed_at,
-        )
-        .into_iter()
-        .next()
+        && let Some(m) = swamp_core::build_adapters::model_stores::model_row_of(u, observed_at)
     {
         if let Some(a) = &m.about {
             row.label = format!("{} · {a}", row.label);
@@ -2444,7 +2438,8 @@ fn unit_child_rows(
             row.signals = vec![swamp_core::render::describe_unit_child(c, now)];
             if c.kind == ChildKind::Entry {
                 row.last_used = Some(c.last_used.describe(now));
-                let path = u.path.join(&c.name).display().to_string();
+                let path =
+                    swamp_core::build_adapters::model_stores::shown_path(&u.path.join(&c.name));
                 if let Some(m) = models.iter().find(|m| m.path == path) {
                     // The repo id reads better than `models--org--name`;
                     // the folder's own name stays in the detail pane.

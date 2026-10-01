@@ -54,6 +54,10 @@ pub fn sanitize(text: &str, max: usize) -> String {
             | '\u{202A}'..='\u{202E}'
             | '\u{2066}'..='\u{2069}'
             | '\u{061C}'
+            | '\u{00AD}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{2060}'
             | '\u{FEFF}' => continue,
             c => c,
         };
@@ -473,18 +477,26 @@ pub fn gguf_header(bytes: &[u8]) -> Option<GgufFacts> {
             c.string()
                 .map(|s| sanitize(&String::from_utf8_lossy(s), MAX_FIELD_CHARS))
         };
+        // A known field that cannot be read leaves the rest unreadable
+        // too: the cursor no longer knows where the next entry starts.
+        let mut got = |v: Option<String>, slot: &mut Option<String>| match v {
+            Some(v) => *slot = Some(v),
+            None => complete = false,
+        };
         match (key.as_str(), t) {
-            ("general.architecture", 8) => facts.architecture = string_of(&mut c),
-            ("general.name", 8) => facts.name = string_of(&mut c),
-            ("general.size_label", 8) => facts.size_label = string_of(&mut c),
-            ("general.file_type", 4) => facts.quantization = c.u32().map(ftype_name),
+            ("general.architecture", 8) => got(string_of(&mut c), &mut facts.architecture),
+            ("general.name", 8) => got(string_of(&mut c), &mut facts.name),
+            ("general.size_label", 8) => got(string_of(&mut c), &mut facts.size_label),
+            ("general.file_type", 4) => got(c.u32().map(ftype_name), &mut facts.quantization),
             _ => {
                 c.at = start;
                 if c.skip_value(t, 0).is_none() {
                     complete = false;
-                    break;
                 }
             }
+        }
+        if !complete {
+            break;
         }
     }
     if complete && kvs < (1 << 20) {
