@@ -943,7 +943,7 @@ mod tests {
             || {
                 let rows = ledger.all().unwrap();
                 seen.set(rows.len() == 1 && rows[0].outcome == "started");
-                return Err(anyhow::anyhow!("the daemon refused")) as Result<Moved<()>>;
+                Err(anyhow::anyhow!("the daemon refused")) as Result<Moved<()>>
             },
         );
         assert!(res.is_err() && seen.get(), "the row was not there first");
