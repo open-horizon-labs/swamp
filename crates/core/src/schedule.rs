@@ -719,7 +719,7 @@ fn lock_path(store_dir: &Path) -> PathBuf {
 /// Linux image (the CI fleet's) does not have, so a live holder read as
 /// dead and its lock was reclaimed under it.
 fn pid_alive(pid: u32) -> bool {
-    fs_gate::sys::pid_alive(pid)
+    fs_gate::pid_alive(pid)
 }
 
 /// Result of trying to take the single-flight observation lock.
