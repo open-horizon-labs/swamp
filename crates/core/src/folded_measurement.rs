@@ -315,6 +315,12 @@ pub fn measure(
         );
         return folded;
     }
+    if mounts.is_empty()
+        && let Some((folded, _)) =
+            partial_measure(store, path, exclusions, observed_at, coverage, None)
+    {
+        return folded;
+    }
     let (row, _dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
         path,
         ArtifactKind::Unknown,
@@ -440,20 +446,64 @@ fn record_folded_measurement(
     folded: &FoldedUnit,
     stamps: &[crate::walk::DirStamp],
 ) {
+    if let Some(rows) = folded_rows(path, exclusions, observed_at, folded, stamps, &[]) {
+        // A cache write that fails is a cache that will miss next time,
+        // which is the correct outcome and not worth failing a report over.
+        let _ = crate::growth::store_folded_rows(store, &path.display().to_string(), &rows);
+    }
+}
+
+/// Marks a depth-1 row whose `bytes`/`mtime_max` hold that immediate
+/// subfolder's folded total (#181). Appended to the row's exclusions
+/// digest, which only the root row is ever compared on, so a reader that
+/// predates per-child totals ignores them and a reader that knows them
+/// never mistakes a plain stamp row for a total.
+const CHILD_TOTAL_MARK: &str = "\u{2}child-total";
+
+/// The rows one folded measurement stores: one stamp row per directory it
+/// listed (plus `carried`, the stored rows of subfolders this pass
+/// replayed), the folded total on the root row and, when they provably
+/// add up to it, each immediate subfolder's own total on its row.
+///
+/// Per-child totals are recorded only when nothing in the unit has a
+/// second hard link (a link between two subfolders would be counted
+/// twice when one is replayed and the other re-walked) and when root
+/// files plus subfolder totals equal the folded total and newest mtime
+/// exactly. Anything else stores the plain rows, and the next changed
+/// pass walks the whole unit, which is always the correct answer.
+fn folded_rows(
+    path: &Path,
+    exclusions: &[PathBuf],
+    observed_at: u64,
+    folded: &FoldedUnit,
+    stamps: &[crate::walk::DirStamp],
+    carried: &[crate::growth::FoldedRow],
+) -> Option<Vec<crate::growth::FoldedRow>> {
     let unit_path = path.display().to_string();
     let digest = exclusions_digest(exclusions);
-    let mut rows: Vec<crate::growth::FoldedRow> = Vec::with_capacity(stamps.len());
+    let marked = format!("{digest}{CHILD_TOTAL_MARK}");
+    let mut rows: Vec<crate::growth::FoldedRow> = Vec::with_capacity(stamps.len() + carried.len());
     let mut saw_root = false;
+    let mut root_own: u64 = 0;
+    let mut shared = false;
+    let mut files_max: u64 = 0;
+    let mut children: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
     for stamp in stamps {
-        let rel = match stamp.path.strip_prefix(path) {
-            Ok(r) => r.display().to_string(),
-            // A stamp from outside the unit cannot be validated against
-            // the unit root later, so it is not stored -- and, since a
-            // directory the measurement listed would then go unwatched,
-            // the whole measurement is not stored either.
-            Err(_) => return,
-        };
+        // A stamp from outside the unit cannot be validated against the
+        // unit root later, so the whole measurement is not stored.
+        let rel = stamp.path.strip_prefix(path).ok()?.display().to_string();
         saw_root |= rel.is_empty();
+        shared |= stamp.shared_inode;
+        files_max = files_max.max(stamp.files_mtime_max);
+        if rel.is_empty() {
+            root_own += stamp.own_bytes;
+        } else {
+            let first = rel.split('/').next().unwrap_or(&rel).to_string();
+            let entry = children.entry(first).or_insert((0, 0));
+            entry.0 += stamp.own_bytes;
+            entry.1 = entry.1.max(stamp.files_mtime_max);
+        }
         rows.push(crate::growth::FoldedRow {
             unit_path: unit_path.clone(),
             rel_dir: rel,
@@ -469,16 +519,208 @@ fn record_folded_measurement(
     // No root stamp means the root itself was never listed (an excluded
     // or unreadable root): there is nothing to anchor a later reuse on.
     if !saw_root {
-        return;
+        return None;
     }
-    for row in rows.iter_mut().filter(|r| r.rel_dir.is_empty()) {
-        row.bytes = folded.bytes;
-        row.hardlinked = folded.hardlinked;
-        row.mtime_max = folded.mtime_max;
+    let first_carried = rows.len();
+    let mut carried_total: u64 = 0;
+    for row in carried {
+        let mut row = row.clone();
+        row.observed_at = observed_at;
+        if row.exclusions == marked {
+            carried_total += row.bytes;
+            files_max = files_max.max(row.mtime_max);
+        }
+        rows.push(row);
     }
-    // A cache write that fails is a cache that will miss next time,
-    // which is the correct outcome and not worth failing a report over.
-    let _ = crate::growth::store_folded_rows(store, &unit_path, &rows);
+    let consistent = !folded.hardlinked
+        && !shared
+        && root_own + children.values().map(|c| c.0).sum::<u64>() + carried_total == folded.bytes
+        && files_max == folded.mtime_max;
+    for (i, row) in rows.iter_mut().enumerate() {
+        if row.rel_dir.is_empty() {
+            row.bytes = folded.bytes;
+            row.hardlinked = folded.hardlinked;
+            row.mtime_max = folded.mtime_max;
+            continue;
+        }
+        if row.rel_dir.contains('/') {
+            continue;
+        }
+        if !consistent {
+            row.bytes = 0;
+            row.mtime_max = 0;
+            row.exclusions = digest.clone();
+        } else if i < first_carried
+            && let Some((bytes, mtime_max)) = children.get(&row.rel_dir)
+        {
+            row.bytes = *bytes;
+            row.mtime_max = *mtime_max;
+            row.exclusions = marked.clone();
+        }
+    }
+    Some(rows)
+}
+
+/// A changed unit, measured by re-walking only what changed (#181).
+///
+/// When this pass's event window shows changes under the unit, the whole
+/// unit used to be walked again: `~/Library/Caches` (163k files) on
+/// every pass, because some cache under it is always being written. With
+/// per-child totals stored (see [`folded_rows`]), every immediate
+/// subfolder the window vouches for -- no event at or under it since its
+/// total was taken, and its own directory stamp unchanged, so it was not
+/// replaced by a rename -- is replayed, and one walk measures the root's
+/// own files plus every other subfolder (changed, new, or not vouched
+/// for). The sum is what a full walk would have found, because nothing
+/// in the unit has a second hard link (checked again on this walk; a
+/// link found now falls back to the full walk).
+///
+/// `None` whenever that cannot be shown: no trusted window, no stored
+/// per-child totals, a changed exclusion set, nothing to replay. The
+/// caller then walks the whole unit, as before.
+fn partial_measure(
+    store: Option<&Path>,
+    path: &Path,
+    exclusions: &[PathBuf],
+    observed_at: u64,
+    coverage: &crate::fs_events::EventCoverage,
+    worktree: Option<(&str, &Path)>,
+) -> Option<(FoldedUnit, Vec<crate::report::DirRollup>)> {
+    let dir = store?;
+    let unit_path = path.display().to_string();
+    let rows = crate::growth::folded_rows_for(dir, &unit_path);
+    let root = rows.iter().find(|r| r.rel_dir.is_empty())?;
+    let digest = exclusions_digest(exclusions);
+    if root.exclusions != digest || root.hardlinked {
+        return None;
+    }
+    let marked = format!("{digest}{CHILD_TOTAL_MARK}");
+    let reused: Vec<&crate::growth::FoldedRow> = rows
+        .iter()
+        .filter(|r| !r.rel_dir.is_empty() && !r.rel_dir.contains('/') && r.exclusions == marked)
+        .filter(|r| {
+            let child = path.join(&r.rel_dir);
+            coverage.unchanged_since(&child, root.observed_at) && same_directory(&child, r)
+        })
+        .collect();
+    if reused.is_empty() {
+        return None;
+    }
+    let mut pruned = exclusions.to_vec();
+    pruned.extend(reused.iter().map(|r| path.join(&r.rel_dir)));
+    let (row, mut dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
+        path,
+        ArtifactKind::Unknown,
+        observed_at,
+        worktree,
+        &pruned,
+        true,
+    );
+    crate::work_counters::record_cache_miss();
+    if row.hardlinked {
+        return None;
+    }
+    for _ in &reused {
+        crate::work_counters::record_subtree_reused();
+    }
+    let folded = FoldedUnit {
+        reused: false,
+        bytes: row.bytes + reused.iter().map(|r| r.bytes).sum::<u64>(),
+        hardlinked: false,
+        mtime_max: reused
+            .iter()
+            .map(|r| r.mtime_max)
+            .fold(row.mtime_max, u64::max),
+        complete,
+    };
+    let in_reused = |rel: &str| {
+        reused.iter().any(|c| {
+            rel == c.rel_dir
+                || rel
+                    .strip_prefix(c.rel_dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let carried: Vec<crate::growth::FoldedRow> = rows
+        .iter()
+        .filter(|r| in_reused(&r.rel_dir))
+        .cloned()
+        .collect();
+    if complete
+        && let Some(new_rows) =
+            folded_rows(path, exclusions, observed_at, &folded, &stamps, &carried)
+    {
+        let _ = crate::growth::store_folded_rows(dir, &unit_path, &new_rows);
+    }
+    if let Some((worktree_id, _)) = worktree {
+        // The drilldown reads one row per immediate subfolder: a
+        // replayed one is its stored total, with the newest modification
+        // a full walk would have rolled up (its directories' own mtimes
+        // and its files').
+        if let Some(root_dir) = dirs.iter_mut().find(|d| d.rel_path.is_empty()) {
+            root_dir.entry_count += reused.len() as u32;
+        }
+        for child in &reused {
+            let dirs_newest = carried
+                .iter()
+                .filter(|r| {
+                    r.rel_dir == child.rel_dir
+                        || r.rel_dir
+                            .strip_prefix(child.rel_dir.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .map(|r| r.mtime_ns.div_euclid(1_000_000_000))
+                .max()
+                .unwrap_or(0);
+            let newest = dirs_newest.max(child.mtime_max as i64);
+            dirs.push(crate::report::DirRollup {
+                worktree_id: worktree_id.to_string(),
+                track: None,
+                rel_path: child.rel_dir.clone(),
+                parent_rel_path: Some(String::new()),
+                allocated_total: child.bytes,
+                own_allocated: child.bytes,
+                file_count: 0,
+                entry_count: 0,
+                symlink_count: 0,
+                mod_time_min: (newest / 60) as i32,
+                complete: true,
+                growth_bytes: None,
+            });
+        }
+    }
+    Some((folded, dirs))
+}
+
+/// The per-subfolder totals `unit`'s last measurement stored (name to
+/// bytes and newest file mtime), or `None` when it stored none (#181).
+/// The manager pass keys a stored answer on these
+/// (`manager_facts::collect`).
+pub(crate) fn child_totals(
+    store: &Path,
+    unit: &Path,
+) -> Option<std::collections::HashMap<String, (u64, u64)>> {
+    let rows = crate::growth::folded_rows_for(store, &unit.display().to_string());
+    let root = rows.iter().find(|r| r.rel_dir.is_empty())?;
+    let marked = format!("{}{CHILD_TOTAL_MARK}", root.exclusions);
+    let totals: std::collections::HashMap<String, (u64, u64)> = rows
+        .iter()
+        .filter(|r| r.exclusions == marked && !r.rel_dir.contains('/'))
+        .map(|r| (r.rel_dir.clone(), (r.bytes, r.mtime_max)))
+        .collect();
+    (!totals.is_empty()).then_some(totals)
+}
+
+/// The subfolder is still the directory its stored row describes: a
+/// directory renamed into its place under the same name brings its own
+/// change stamp, and an event window over the parent would not show it.
+fn same_directory(child: &Path, row: &crate::growth::FoldedRow) -> bool {
+    match crate::fs_gate::symlink_metadata(child) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            stamp_ns(&meta) == (row.mtime_ns, row.ctime_ns)
+        }
+        _ => false,
+    }
 }
 
 /// Access and measurement in one call, so the ordinary report path never
@@ -541,6 +783,7 @@ pub fn observe_unit_with_dirs(
     observed_at: u64,
     coverage: &crate::fs_events::EventCoverage,
     allow_reuse: bool,
+    allow_partial: bool,
 ) -> (UnitObservation, Option<Vec<crate::report::DirRollup>>) {
     let mounts = sealed_mounts_under(path);
     let exclusions = with_sealed(exclusions, &mounts);
@@ -576,6 +819,19 @@ pub fn observe_unit_with_dirs(
         UnitAccess::Absent => (UnitObservation::Absent, None),
         UnitAccess::Unreadable(why) => (UnitObservation::Unreadable(why), None),
         UnitAccess::Measurable => {
+            if allow_partial
+                && mounts.is_empty()
+                && let Some((folded, dirs)) = partial_measure(
+                    store,
+                    path,
+                    exclusions,
+                    observed_at,
+                    coverage,
+                    Some((STORE_WORKTREE_ID, path)),
+                )
+            {
+                return (UnitObservation::Unit(folded), Some(dirs));
+            }
             let (row, mut dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
                 path,
                 ArtifactKind::Unknown,
@@ -697,6 +953,9 @@ pub fn folded_bytes_bounded_stamped(
             path: dir.clone(),
             mtime_ns,
             ctime_ns,
+            own_bytes: 0,
+            files_mtime_max: 0,
+            shared_inode: false,
         });
         let mut here = 0u64;
         for entry in rd.flatten() {
@@ -960,6 +1219,161 @@ mod tests {
         assert!(
             cost.dirs_listed > 0,
             "a changed directory must be re-listed"
+        );
+    }
+
+    fn fixture(unit: &Path) {
+        let noise = crate::fs_gate::settle::noise;
+        for (rel, len) in [
+            ("a/x", 4096),
+            ("a/sub/y", 8192),
+            ("b/z", 4096),
+            ("c/w", 12288),
+            ("root-file", 4096),
+        ] {
+            let p = unit.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, noise(len)).unwrap();
+        }
+        crate::fs_gate::settle::settle();
+    }
+
+    /// The answer a fresh store gives: a full walk, nothing replayed.
+    fn golden(unit: &Path) -> (u64, u64, bool, bool, String) {
+        let fresh = tempfile::tempdir().unwrap();
+        let none = crate::fs_events::EventCoverage::untrusted();
+        let f = measure(Some(fresh.path()), unit, &[], 9_000, &none);
+        let (obs, dirs) =
+            observe_unit_with_dirs(Some(fresh.path()), unit, &[], 9_000, &none, false, false);
+        assert!(matches!(obs, UnitObservation::Unit(_)));
+        let children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 10);
+        (
+            f.bytes,
+            f.mtime_max,
+            f.hardlinked,
+            f.complete,
+            format!("{children:?}"),
+        )
+    }
+
+    fn shape(
+        f: &FoldedUnit,
+        unit: &Path,
+        dirs: Option<Vec<crate::report::DirRollup>>,
+    ) -> (u64, u64, bool, bool, String) {
+        let children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 10);
+        (
+            f.bytes,
+            f.mtime_max,
+            f.hardlinked,
+            f.complete,
+            format!("{children:?}"),
+        )
+    }
+
+    /// #181. Tempting wrong patches: (1) keep walking the whole unit
+    /// whenever any event lands under it (correct, and 163k files of
+    /// `~/Library/Caches` every pass); (2) replay the stored total of
+    /// every subfolder the window does not name, which misses a folder
+    /// renamed into place (the event is on the parent) and double-counts
+    /// a file hardlinked across two subfolders. A changed unit re-walks
+    /// only the changed subfolder, and its total, newest mtime and
+    /// depth-2 drilldown equal a fresh full walk's, pass after pass.
+    #[test]
+    fn a_changed_unit_rewalks_only_the_changed_subfolder_and_matches_a_full_walk() {
+        use crate::fs_events::EventCoverage;
+        let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("cache");
+        fixture(&unit);
+        let none = EventCoverage::untrusted();
+        let (_, dirs) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, true, true);
+        assert!(dirs.is_some());
+
+        // Pass 2: a file lands in `b`; the window names `b`.
+        std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(8192)).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 500);
+        let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &window, true, true)
+        });
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(cost.subtrees_reused, 2, "a and c are replayed");
+        // The readability probe, the root and `b`; a full walk lists six.
+        assert_eq!(
+            cost.dirs_listed, 3,
+            "only the root and b are listed: {cost:?}"
+        );
+        assert_eq!(shape(&f, &unit, dirs), golden(&unit));
+
+        // Pass 3: `a/sub` changes. `b` (re-walked on pass 2) is now
+        // replayed from the rows pass 2 wrote.
+        std::fs::write(unit.join("a/sub/more"), crate::fs_gate::settle::noise(4096)).unwrap();
+        crate::fs_gate::settle::settle();
+        let window =
+            EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("a/sub")], 1_500);
+        let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 3_000, &window, true, true)
+        });
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(cost.subtrees_reused, 2, "b and c are replayed");
+        assert_eq!(shape(&f, &unit, dirs), golden(&unit));
+
+        // The plain (non-drill) path agrees.
+        let (plain, cost) = crate::work_counters::measured(|| {
+            measure(
+                Some(store.path()),
+                &unit,
+                &[],
+                4_000,
+                &EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("c")], 2_500),
+            )
+        });
+        assert_eq!(cost.subtrees_reused, 2);
+        assert_eq!(plain.bytes, golden(&unit).0);
+
+        // A directory renamed into `c`'s place: the event is on the unit
+        // root only, so the window does not name `c`; the stamp does.
+        std::fs::rename(unit.join("c"), tmp.path().join("old-c")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("other")).unwrap();
+        std::fs::write(
+            tmp.path().join("other/big"),
+            crate::fs_gate::settle::noise(65536),
+        )
+        .unwrap();
+        crate::fs_gate::settle::settle();
+        std::fs::rename(tmp.path().join("other"), unit.join("c")).unwrap();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.clone()], 3_500);
+        let (obs, dirs) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 5_000, &window, true, true);
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(
+            shape(&f, &unit, dirs),
+            golden(&unit),
+            "a renamed-in folder was replayed"
+        );
+
+        // A hardlink across two subfolders: never summed twice.
+        std::fs::hard_link(unit.join("a/x"), unit.join("b/link")).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 4_500);
+        let (obs, dirs) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 6_000, &window, true, true);
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(
+            shape(&f, &unit, dirs),
+            golden(&unit),
+            "a hardlink was counted twice"
         );
     }
 

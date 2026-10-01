@@ -726,6 +726,9 @@ pub fn observe_external(
                     observed_at,
                     coverage,
                     reuse,
+                    // A build store's adapter identifies from every
+                    // directory row: it is walked whole on a change.
+                    false,
                 );
                 if debug_trace {
                     let after = crate::work_counters::snapshot();
@@ -755,6 +758,7 @@ pub fn observe_external(
                     observed_at,
                     coverage,
                     reuse_ok,
+                    true,
                 );
                 if debug_trace {
                     let after = crate::work_counters::snapshot();
