@@ -1615,16 +1615,14 @@ mod tests {
         use super::*;
         use crate::fs_events::EventCoverage;
 
+        type Shape = (u64, u64, bool, bool, String);
+
         fn incremental_after(
             tmp: &Path,
             unit: &Path,
             mutate: impl FnOnce(),
             events: &[PathBuf],
-        ) -> (
-            (u64, u64, bool, bool, String),
-            (u64, u64, bool, bool, String),
-            u64,
-        ) {
+        ) -> (Shape, Shape, u64) {
             let store = tempfile::tempdir().unwrap();
             let none = EventCoverage::untrusted();
             let _ = observe_unit_with_dirs(Some(store.path()), unit, &[], 1_000, &none, true, true);
@@ -1734,7 +1732,8 @@ mod tests {
                 (
                     "dir to file",
                     |u, _| {
-                        std::fs::remove_dir_all(u.join("c")).unwrap();
+                        std::fs::remove_file(u.join("c/w")).unwrap();
+                        std::fs::remove_dir(u.join("c")).unwrap();
                         std::fs::write(u.join("c"), crate::fs_gate::settle::noise(4096)).unwrap();
                     },
                     |u| vec![u.to_path_buf()],
@@ -1752,7 +1751,8 @@ mod tests {
                 (
                     "deleted and recreated",
                     |u, _| {
-                        std::fs::remove_dir_all(u.join("c")).unwrap();
+                        std::fs::remove_file(u.join("c/w")).unwrap();
+                        std::fs::remove_dir(u.join("c")).unwrap();
                         std::fs::create_dir_all(u.join("c")).unwrap();
                         std::fs::write(u.join("c/w"), crate::fs_gate::settle::noise(12288))
                             .unwrap();
