@@ -41,7 +41,35 @@ pub fn write_parquet_atomic(
     batches: impl IntoIterator<Item = Result<RecordBatch>>,
     zstd_level: i32,
 ) -> Result<()> {
-    let properties = zstd_properties(zstd_level);
+    write_parquet_atomic_with_dictionary_disabled(path, schema, batches, zstd_level, &[])
+}
+
+/// Writes one zstd Parquet file atomically, optionally disabling dictionary
+/// encoding for named UTF-8 columns whose measured contents compress better
+/// without a dictionary. The selected columns must exist and be UTF-8; this
+/// keeps caller mistakes visible while leaving every other column on Parquet's
+/// standard defaults.
+pub fn write_parquet_atomic_with_dictionary_disabled(
+    path: &Path,
+    schema: SchemaRef,
+    batches: impl IntoIterator<Item = Result<RecordBatch>>,
+    zstd_level: i32,
+    columns: &[&str],
+) -> Result<()> {
+    let mut properties = zstd_properties(zstd_level).into_builder();
+    for column in columns {
+        let field = schema
+            .field_with_name(column)
+            .with_context(|| format!("dictionary override names missing column {column}"))?;
+        if field.data_type() != &arrow_schema::DataType::Utf8 {
+            anyhow::bail!("dictionary override column {column} is not UTF-8");
+        }
+        properties = properties.set_column_dictionary_enabled(
+            parquet::schema::types::ColumnPath::from(*column),
+            false,
+        );
+    }
+    let properties = properties.build();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -110,10 +138,11 @@ pub fn retire(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, Int32Array, StringArray};
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatchReader, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
+    use std::time::Instant;
 
     /// `.oh/guardrails/column-store-parquet-zstd.md`, at run time: every
     /// column chunk the one writer produces is zstd, whatever level the
@@ -152,5 +181,285 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn normalized_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, String, i32)> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let key = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let group = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let value = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (
+                            key.is_valid(row).then(|| key.value(row).to_owned()),
+                            group.value(row).to_owned(),
+                            value.value(row),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn normalized_digest(batches: &[RecordBatch]) -> blake3::Hash {
+        let mut hash = blake3::Hasher::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                for column in batch.columns() {
+                    hash.update(format!("{:?}", column.slice(row, 1)).as_bytes());
+                    hash.update(&[0]);
+                }
+                hash.update(&[1]);
+            }
+        }
+        hash.finalize()
+    }
+
+    #[test]
+    fn dictionary_override_is_scoped_nullable_roundtrip_and_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("path", DataType::Utf8, true),
+            Field::new("kind", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = |paths: Vec<Option<String>>, kinds: Vec<&str>, values: Vec<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(paths)) as ArrayRef,
+                    Arc::new(StringArray::from(kinds)),
+                    Arc::new(Int32Array::from(values)),
+                ],
+            )
+            .unwrap()
+        };
+        let first = batch(
+            vec![Some("root/a".into()), None, Some("root/b".into())],
+            vec!["source", "source", "source"],
+            vec![1, 2, 3],
+        );
+        let empty = RecordBatch::new_empty(schema.clone());
+        let last = batch(vec![Some("root/c".into())], vec!["source"], vec![4]);
+        let path = dir.path().join("scoped.parquet");
+        write_parquet_atomic_with_dictionary_disabled(
+            &path,
+            schema.clone(),
+            [Ok(first.clone()), Ok(empty), Ok(last.clone())],
+            3,
+            &["path"],
+        )
+        .unwrap();
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        let columns = reader.metadata().row_group(0).columns();
+        assert_eq!(columns[0].dictionary_page_offset(), None);
+        assert!(columns[1].dictionary_page_offset().is_some());
+        assert!(
+            columns
+                .iter()
+                .all(|c| matches!(c.compression(), Compression::ZSTD(_)))
+        );
+        let decoded: Vec<_> = open_parquet(&path)
+            .unwrap()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            normalized_rows(&decoded),
+            normalized_rows(&[first.clone(), last.clone()])
+        );
+
+        let before = std::fs::read(&path).unwrap();
+        let failed = [
+            Ok(first.clone()),
+            Err(anyhow::anyhow!("injected iterator failure")),
+        ];
+        assert!(
+            write_parquet_atomic_with_dictionary_disabled(
+                &path,
+                schema.clone(),
+                failed,
+                3,
+                &["path"],
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(
+            write_parquet_atomic_with_dictionary_disabled(
+                &path,
+                schema.clone(),
+                [Ok(first.clone())],
+                3,
+                &["missing"],
+            )
+            .is_err()
+        );
+        assert!(
+            write_parquet_atomic_with_dictionary_disabled(
+                &path,
+                schema,
+                [Ok(first)],
+                3,
+                &["value"],
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Repeats the three measured dictionary overrides against a disposable
+    /// seed, comparing decoded rows and reporting only bytes and write time.
+    #[test]
+    #[ignore = "manual storage benchmark; requires SWAMP_COLUMN_BENCH_SEED_DIR"]
+    fn measured_dictionary_overrides_real_store_benchmark() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("SWAMP_COLUMN_BENCH_SEED_DIR").expect("seed directory path"),
+        );
+        let mut targets = Vec::new();
+        let agent_members = root.join("agent_unit_members.parquet");
+        if agent_members.is_file() {
+            targets.push(("agent_unit_members.parquet".to_owned(), "path", 9));
+        }
+        for volume in std::fs::read_dir(&root).unwrap().flatten() {
+            let volume_name = volume.file_name();
+            if !volume_name
+                .to_string_lossy()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+            {
+                continue;
+            }
+            for (base_name, base_column) in
+                [("current.parquet", "kind"), ("dirs.parquet", "rel_path")]
+            {
+                let base_path = volume.path().join(base_name);
+                if base_path.is_file() {
+                    targets.push((
+                        base_path
+                            .strip_prefix(&root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        base_column,
+                        9,
+                    ));
+                }
+            }
+            for (directory, column, level) in
+                [("deltas", "kind", 9), ("dirs_deltas", "rel_path", 3)]
+            {
+                let delta_dir = volume.path().join(directory);
+                let Ok(entries) = std::fs::read_dir(&delta_dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "parquet")
+                    {
+                        targets.push((
+                            path.strip_prefix(&root)
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned(),
+                            column,
+                            level,
+                        ));
+                    }
+                }
+            }
+        }
+        let output = tempfile::tempdir().unwrap();
+        let mut total_default_bytes = 0u64;
+        let mut total_hinted_bytes = 0u64;
+        for (index, (relative, column, level)) in targets.into_iter().enumerate() {
+            let input = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(root.join(&relative)).unwrap(),
+            )
+            .unwrap()
+            .with_batch_size(usize::MAX)
+            .build()
+            .unwrap();
+            let schema = input.schema();
+            let batches: Vec<_> = input.map(Result::unwrap).collect();
+            let expected = normalized_digest(&batches);
+            let paths = [
+                output.path().join(format!("{index}-default.parquet")),
+                output.path().join(format!("{index}-hinted.parquet")),
+            ];
+            let mut times = [Vec::new(), Vec::new()];
+            for repetition in 0..3 {
+                let order = if repetition % 2 == 0 {
+                    [0usize, 1]
+                } else {
+                    [1usize, 0]
+                };
+                for variant in order {
+                    let started = Instant::now();
+                    if variant == 0 {
+                        write_parquet_atomic(
+                            &paths[variant],
+                            schema.clone(),
+                            batches.iter().cloned().map(Ok),
+                            level,
+                        )
+                        .unwrap();
+                    } else {
+                        write_parquet_atomic_with_dictionary_disabled(
+                            &paths[variant],
+                            schema.clone(),
+                            batches.iter().cloned().map(Ok),
+                            level,
+                            &[column],
+                        )
+                        .unwrap();
+                    }
+                    times[variant].push(started.elapsed().as_millis());
+                }
+            }
+            for path in &paths {
+                let decoded: Vec<_> = open_parquet(path)
+                    .unwrap()
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                assert_eq!(normalized_digest(&decoded), expected);
+            }
+            let median = |values: &mut Vec<u128>| {
+                values.sort_unstable();
+                values[values.len() / 2]
+            };
+            let default_bytes = std::fs::metadata(&paths[0]).unwrap().len();
+            let hinted_bytes = std::fs::metadata(&paths[1]).unwrap().len();
+            total_default_bytes += default_bytes;
+            total_hinted_bytes += hinted_bytes;
+            println!(
+                "table={relative} column={column} level={level} rows={} default_bytes={default_bytes} hinted_bytes={hinted_bytes} default_median_ms={} hinted_median_ms={} repetitions=3",
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                median(&mut times[0]),
+                median(&mut times[1]),
+            );
+        }
+        println!(
+            "selected_tables_and_deltas default_total_bytes={total_default_bytes} hinted_total_bytes={total_hinted_bytes}"
+        );
     }
 }

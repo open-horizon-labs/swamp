@@ -6433,13 +6433,88 @@ fn under(rel: &str, root: &str) -> bool {
     root.is_empty() || rel == root || rel.starts_with(&format!("{root}/"))
 }
 
+/// Temporary path index for the directory rows of one artifact during an
+/// incremental resize. The persistent store remains folded; this index exists
+/// only for the duration of one call.
+#[derive(Default)]
+struct InteriorDirIndex {
+    rows: std::collections::BTreeMap<String, DirRollup>,
+    children: HashMap<String, HashSet<String>>,
+}
+
+impl InteriorDirIndex {
+    /// Insert a row and return true only when its path was previously absent.
+    fn insert(&mut self, row: DirRollup) -> bool {
+        let path = row.rel_path.clone();
+        let parent = row.parent_rel_path.clone();
+        let Some(old) = self.rows.insert(path.clone(), row) else {
+            if let Some(parent) = parent {
+                self.children.entry(parent).or_default().insert(path);
+            }
+            return true;
+        };
+        if old.parent_rel_path != parent {
+            if let Some(old_parent) = old.parent_rel_path
+                && let Some(children) = self.children.get_mut(&old_parent)
+            {
+                children.remove(&path);
+            }
+            if let Some(parent) = parent {
+                self.children.entry(parent).or_default().insert(path);
+            }
+        }
+        false
+    }
+
+    fn children_of(&self, parent: &str) -> HashSet<String> {
+        self.children.get(parent).cloned().unwrap_or_default()
+    }
+
+    /// Remove one stored directory and all descendants. BTreeMap keeps a
+    /// subtree's keys contiguous, so the work is proportional to the removed
+    /// subtree rather than every row belonging to unrelated artifacts.
+    fn remove_subtree(&mut self, root: &str) {
+        let mut paths = Vec::new();
+        if root.is_empty() {
+            paths.extend(self.rows.keys().cloned());
+        } else {
+            if self.rows.contains_key(root) {
+                paths.push(root.to_string());
+            }
+            let prefix = format!("{root}/");
+            paths.extend(
+                self.rows
+                    .range(prefix.clone()..)
+                    .take_while(|(path, _)| path.starts_with(&prefix))
+                    .map(|(path, _)| path.clone()),
+            );
+        }
+        for path in paths {
+            if let Some(row) = self.rows.remove(&path)
+                && let Some(parent) = row.parent_rel_path
+                && let Some(children) = self.children.get_mut(&parent)
+            {
+                children.remove(&path);
+            }
+            self.children.remove(&path);
+        }
+    }
+
+    fn into_rows(self) -> Vec<DirRollup> {
+        self.rows.into_values().collect()
+    }
+}
+
 /// Re-sizes a folded artifact from its stored interior rows and the
 /// directories FSEvents named, without walking the rest of it. Each
 /// changed directory is re-listed (own bytes, counts, mtime); a vanished
 /// directory drops its subtree's rows; a new subdirectory is walked and
 /// gets rows. Then the unit's rows are re-aggregated and the root row's
 /// total is its path allocation, not a deduplicated count. Returns `None` when the
-/// store has no row for the root (older store: caller re-sizes whole).
+/// store has no row for the root (older store: caller re-sizes whole). After
+/// rows are extracted, any `None` can leave this artifact's old rows out of
+/// `dirs`; the sole caller must replace the entire artifact subtree on that
+/// fallback.
 fn resize_interior(
     wt_root: &Path,
     worktree_id: &str,
@@ -6457,14 +6532,53 @@ fn resize_interior(
         .collect();
     changed_rels.sort();
     changed_rels.dedup();
+
+    // Pull the affected worktree + artifact rows out once. The old loop
+    // searched and retained the global directory vector for each changed
+    // path; a burst of events therefore multiplied changed-directory count
+    // by every directory row in the store, including unrelated worktrees.
+    // A missing artifact root still asks the caller for the established
+    // whole-artifact fallback without changing `dirs`.
+    if !dirs
+        .iter()
+        .any(|d| d.worktree_id == worktree_id && d.rel_path == rel_root)
+    {
+        return None;
+    }
+    let mut outside = Vec::with_capacity(dirs.len());
+    let mut interior = InteriorDirIndex::default();
+    let mut remaining = std::mem::take(dirs).into_iter();
+    while let Some(row) = remaining.next() {
+        if row.worktree_id == worktree_id && under(&row.rel_path, rel_root) {
+            if !interior.insert(row) {
+                // Duplicate path rows violate the index key. Leave repair to
+                // the same complete artifact walk used for a missing root;
+                // retain every unrelated row while returning.
+                outside.extend(interior.into_rows());
+                outside.extend(remaining);
+                *dirs = outside;
+                return None;
+            }
+        } else {
+            outside.push(row);
+        }
+    }
+    *dirs = outside;
+
     for rel_c in &changed_rels {
         let abs = wt_root.join(rel_c);
         let Ok(meta) = crate::fs_gate::symlink_metadata(&abs) else {
             // Gone: its whole subtree with it.
-            dirs.retain(|d| !(d.worktree_id == worktree_id && under(&d.rel_path, rel_c)));
+            interior.remove_subtree(rel_c);
             continue;
         };
         if meta.file_type().is_symlink() || !meta.is_dir() {
+            // The artifact root itself no longer denotes a directory. Its
+            // stored interior cannot describe the current path; force the
+            // caller's full artifact resize instead of retaining stale rows.
+            if rel_c == rel_root {
+                return None;
+            }
             continue;
         }
         let measured = crate::walk::measure_directory(&abs).ok()?;
@@ -6484,16 +6598,12 @@ fn resize_interior(
             .collect();
         mtime_max = mtime_max.max(dir_mtime.max(0) as u64);
         // Children the store knows that are no longer on disk.
-        let stored_children: HashSet<String> = dirs
-            .iter()
-            .filter(|d| d.worktree_id == worktree_id && d.parent_rel_path.as_deref() == Some(rel_c))
-            .map(|d| d.rel_path.clone())
-            .collect();
+        let stored_children = interior.children_of(rel_c);
         for gone in stored_children
             .iter()
             .filter(|c| !on_disk_subdirs.contains(c.as_str()))
         {
-            dirs.retain(|d| !(d.worktree_id == worktree_id && under(&d.rel_path, gone)));
+            interior.remove_subtree(gone);
         }
         // Subdirectories on disk the store has never seen: walk them.
         for new_rel in on_disk_subdirs
@@ -6510,8 +6620,12 @@ fn resize_interior(
             for r in &rows {
                 mtime_max = mtime_max.max((r.mod_time_min as i64 * 60).max(0) as u64);
             }
-            dirs.retain(|d| !(d.worktree_id == worktree_id && under(&d.rel_path, new_rel)));
-            dirs.extend(rows);
+            interior.remove_subtree(new_rel);
+            for row in rows {
+                if !interior.insert(row) {
+                    return None;
+                }
+            }
         }
         // This directory's own row.
         let parent_rel_path = if rel_c.is_empty() {
@@ -6538,21 +6652,12 @@ fn resize_interior(
             complete: true,
             growth_bytes: None,
         };
-        if let Some(existing) = dirs
-            .iter_mut()
-            .find(|d| d.worktree_id == worktree_id && &d.rel_path == rel_c)
-        {
-            *existing = row;
-        } else {
-            dirs.push(row);
-        }
+        // A row for this path normally exists; insert also handles a new
+        // changed directory if the prior store lacked its own row.
+        interior.insert(row);
     }
     // Re-aggregate this unit's rows; the root row's total is the unit.
-    let mut interior: Vec<DirRollup> = dirs
-        .iter()
-        .filter(|d| d.worktree_id == worktree_id && under(&d.rel_path, rel_root))
-        .cloned()
-        .collect();
+    let mut interior = interior.into_rows();
     if interior.is_empty() {
         return None;
     }
@@ -6570,7 +6675,6 @@ fn resize_interior(
         }
         return None;
     };
-    dirs.retain(|d| !(d.worktree_id == worktree_id && under(&d.rel_path, rel_root)));
     dirs.extend(interior);
     Some((root_total, mtime_max, saw_hardlink))
 }
@@ -7799,6 +7903,341 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     #[allow(unused_imports)]
     use std::fs::{self, File};
+
+    /// A repeatable stress fixture for `resize_interior`'s selection and
+    /// re-aggregation cost. Run with `cargo test -p swamp-core --lib
+    /// bench_resize_interior_many_changes -- --ignored --nocapture`.
+    /// Setup and the full-walk oracle are outside the timed section.
+    #[test]
+    #[ignore = "manual incremental resize benchmark"]
+    fn bench_resize_interior_many_changes() {
+        use super::*;
+        use std::time::Instant;
+
+        const CHANGED: usize = 1_000;
+        const UNRELATED: usize = 10_000;
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("repo");
+        let artifact = worktree.join("target");
+        let worktree_id = "target-worktree";
+        fs::create_dir_all(&artifact).unwrap();
+        let root_file = artifact.join("root-payload");
+        fs::write(&root_file, vec![b'r'; 4096]).unwrap();
+        let mut changed = Vec::with_capacity(CHANGED);
+        for i in 0..CHANGED {
+            let child = artifact.join(format!("unit-{i:04}"));
+            fs::create_dir_all(&child).unwrap();
+            fs::write(child.join("payload"), vec![b'a'; 4096]).unwrap();
+            changed.push(child);
+        }
+        crate::fs_gate::settle::settle();
+        let (before_row, mut dirs) = crate::walk::resize_artifact_with_dirs(
+            &artifact,
+            ArtifactKind::Cache,
+            1_000,
+            Some((worktree_id, &worktree)),
+        );
+        assert!(before_row.bytes > 0);
+
+        for (i, child) in changed.iter().enumerate() {
+            fs::write(
+                child.join("payload"),
+                vec![b'b'; if i % 10 == 0 { 8192 } else { 4096 }],
+            )
+            .unwrap();
+        }
+        fs::write(&root_file, vec![b'R'; 8192]).unwrap();
+        crate::fs_gate::settle::settle();
+
+        // Rows from other worktrees and a sibling artifact catch accidental
+        // replacement or cross-worktree aggregation while stressing the
+        // old implementation's repeated global-vector scans.
+        let mut outside = Vec::with_capacity(UNRELATED + 2);
+        outside.push(DirRollup {
+            worktree_id: worktree_id.to_string(),
+            track: None,
+            rel_path: "dist".into(),
+            parent_rel_path: Some(String::new()),
+            allocated_total: 77,
+            own_allocated: 77,
+            file_count: 1,
+            entry_count: 1,
+            symlink_count: 0,
+            mod_time_min: 1,
+            complete: true,
+            growth_bytes: None,
+        });
+        for i in 0..UNRELATED {
+            outside.push(DirRollup {
+                worktree_id: format!("other-{i}"),
+                track: None,
+                rel_path: format!("unrelated/{i}"),
+                parent_rel_path: Some("unrelated".into()),
+                allocated_total: i as u64,
+                own_allocated: i as u64,
+                file_count: 1,
+                entry_count: 1,
+                symlink_count: 0,
+                mod_time_min: 1,
+                complete: true,
+                growth_bytes: None,
+            });
+        }
+        dirs.extend(outside);
+        let mut changed: Vec<PathBuf> = changed;
+        changed.push(artifact.clone());
+        let started = Instant::now();
+        let got = resize_interior(&worktree, worktree_id, "target", &changed, &mut dirs)
+            .expect("stored root row permits an interior resize");
+        let elapsed = started.elapsed();
+
+        let (expected_row, mut expected_dirs) = crate::walk::resize_artifact_with_dirs(
+            &artifact,
+            ArtifactKind::Cache,
+            2_000,
+            Some((worktree_id, &worktree)),
+        );
+        crate::report::aggregate_dir_totals(&mut expected_dirs, &std::collections::HashSet::new());
+        let actual: HashMap<_, _> = dirs
+            .iter()
+            .filter(|d| d.worktree_id == worktree_id && under(&d.rel_path, "target"))
+            .map(|d| {
+                (
+                    d.rel_path.clone(),
+                    (
+                        d.own_allocated,
+                        d.allocated_total,
+                        d.file_count,
+                        d.entry_count,
+                        d.symlink_count,
+                        d.complete,
+                    ),
+                )
+            })
+            .collect();
+        let expected: HashMap<_, _> = expected_dirs
+            .iter()
+            .map(|d| {
+                (
+                    d.rel_path.clone(),
+                    (
+                        d.own_allocated,
+                        d.allocated_total,
+                        d.file_count,
+                        d.entry_count,
+                        d.symlink_count,
+                        d.complete,
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(got.0, expected_row.local_bytes.max(expected_row.bytes));
+        assert_eq!(actual, expected, "incremental rows must match a full walk");
+        assert_eq!(
+            dirs.iter()
+                .find(|d| d.rel_path == "dist")
+                .unwrap()
+                .allocated_total,
+            77,
+            "the sibling artifact must remain unchanged"
+        );
+        assert_eq!(
+            dirs.iter()
+                .filter(|d| d.worktree_id.starts_with("other-"))
+                .count(),
+            UNRELATED,
+            "rows from other worktrees must remain unchanged"
+        );
+        eprintln!(
+            "[benchmark] resize_interior changed_dirs={} unrelated_rows={UNRELATED} total_rows={} elapsed={elapsed:?}",
+            CHANGED + 1,
+            dirs.len()
+        );
+    }
+
+    #[test]
+    fn resize_interior_matches_full_walk_for_mixed_changes_and_preserves_siblings() {
+        use super::*;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("repo");
+        let artifact = worktree.join("target");
+        let worktree_id = "target-worktree";
+        let sibling_worktree_id = "other-worktree";
+        fs::create_dir_all(artifact.join("alpha/nested/old")).unwrap();
+        fs::create_dir_all(artifact.join("gone/deep")).unwrap();
+        fs::create_dir_all(artifact.join("rename-me/deep")).unwrap();
+        fs::write(artifact.join("root-payload"), vec![b'r'; 4096]).unwrap();
+        fs::write(artifact.join("alpha/nested/old/payload"), vec![b'a'; 4096]).unwrap();
+        fs::write(artifact.join("gone/deep/payload"), vec![b'g'; 8192]).unwrap();
+        fs::write(artifact.join("rename-me/deep/payload"), vec![b'm'; 6144]).unwrap();
+        crate::fs_gate::settle::settle();
+
+        let (_, mut dirs) = crate::walk::resize_artifact_with_dirs(
+            &artifact,
+            ArtifactKind::Cache,
+            1_000,
+            Some((worktree_id, &worktree)),
+        );
+        dirs.push(DirRollup {
+            worktree_id: worktree_id.to_string(),
+            track: None,
+            rel_path: "dist".into(),
+            parent_rel_path: Some(String::new()),
+            allocated_total: 77,
+            own_allocated: 77,
+            file_count: 1,
+            entry_count: 1,
+            symlink_count: 0,
+            mod_time_min: 1,
+            complete: true,
+            growth_bytes: None,
+        });
+        // Same relative path as rows in the resized artifact, under a
+        // sibling worktree, must remain completely untouched.
+        dirs.push(DirRollup {
+            worktree_id: sibling_worktree_id.to_string(),
+            track: None,
+            rel_path: "target/alpha".into(),
+            parent_rel_path: Some("target".into()),
+            allocated_total: 123,
+            own_allocated: 123,
+            file_count: 9,
+            entry_count: 10,
+            symlink_count: 1,
+            mod_time_min: 2,
+            complete: true,
+            growth_bytes: None,
+        });
+
+        fs::write(artifact.join("root-payload"), vec![b'R'; 16384]).unwrap();
+        fs::create_dir_all(artifact.join("alpha/nested/new/deeper")).unwrap();
+        fs::write(
+            artifact.join("alpha/nested/new/deeper/payload"),
+            vec![b'n'; 12288],
+        )
+        .unwrap();
+        fs::create_dir_all(artifact.join("new-top")).unwrap();
+        fs::write(artifact.join("new-top/payload"), vec![b't'; 4096]).unwrap();
+        fs::remove_dir_all(artifact.join("gone")).unwrap();
+        fs::rename(artifact.join("rename-me"), artifact.join("renamed")).unwrap();
+        crate::fs_gate::settle::settle();
+
+        let shape = |rows: &[DirRollup], keep: &dyn Fn(&DirRollup) -> bool| {
+            rows.iter()
+                .filter(|row| keep(row))
+                .map(|row| {
+                    (
+                        (row.worktree_id.clone(), row.rel_path.clone()),
+                        (
+                            row.parent_rel_path.clone(),
+                            row.own_allocated,
+                            row.allocated_total,
+                            row.file_count,
+                            row.entry_count,
+                            row.symlink_count,
+                            row.mod_time_min,
+                            row.complete,
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+        let outside_before = shape(&dirs, &|row| {
+            !(row.worktree_id == worktree_id && under(&row.rel_path, "target"))
+        });
+
+        let changed = vec![
+            worktree.join("target/alpha/nested/new/deeper"),
+            artifact.join("gone"),
+            artifact.join("rename-me/deep"), // stale child event after rename
+            artifact.clone(),
+            artifact.join("alpha"),
+            artifact.join("alpha/nested"),
+            artifact.join("alpha/nested/new"),
+            artifact.join("new-top"),
+        ];
+        let got = resize_interior(&worktree, worktree_id, "target", &changed, &mut dirs)
+            .expect("known interior rows permit the resize");
+
+        let (expected_row, mut expected_dirs) = crate::walk::resize_artifact_with_dirs(
+            &artifact,
+            ArtifactKind::Cache,
+            2_000,
+            Some((worktree_id, &worktree)),
+        );
+        crate::report::aggregate_dir_totals(&mut expected_dirs, &std::collections::HashSet::new());
+        assert_eq!(got.0, expected_row.local_bytes.max(expected_row.bytes));
+        assert_eq!(
+            shape(&dirs, &|row| row.worktree_id == worktree_id
+                && under(&row.rel_path, "target")),
+            shape(&expected_dirs, &|_| true),
+            "root files, nested creation, deletion, and rename must match a full walk"
+        );
+        assert_eq!(
+            shape(&dirs, &|row| {
+                !(row.worktree_id == worktree_id && under(&row.rel_path, "target"))
+            }),
+            outside_before,
+            "the sibling artifact and same-relative-path worktree rows must be unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resize_interior_refuses_a_changed_artifact_root_that_became_a_symlink() {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = tmp.path().join("repo");
+        let artifact = worktree.join("target");
+        let worktree_id = "target-worktree";
+        fs::create_dir_all(artifact.join("debug")).unwrap();
+        fs::write(artifact.join("debug/output"), b"content").unwrap();
+        let (_, mut dirs) = crate::walk::resize_artifact_with_dirs(
+            &artifact,
+            ArtifactKind::Cache,
+            1_000,
+            Some((worktree_id, &worktree)),
+        );
+        dirs.push(DirRollup {
+            worktree_id: worktree_id.to_string(),
+            track: None,
+            rel_path: "dist".into(),
+            parent_rel_path: Some(String::new()),
+            allocated_total: 77,
+            own_allocated: 77,
+            file_count: 1,
+            entry_count: 1,
+            symlink_count: 0,
+            mod_time_min: 1,
+            complete: true,
+            growth_bytes: None,
+        });
+        let moved = worktree.join("old-target");
+        fs::rename(&artifact, &moved).unwrap();
+        symlink(&moved, &artifact).unwrap();
+
+        let result = resize_interior(
+            &worktree,
+            worktree_id,
+            "target",
+            std::slice::from_ref(&artifact),
+            &mut dirs,
+        );
+        assert!(
+            result.is_none(),
+            "a symlink root requires the full fallback"
+        );
+        assert_eq!(
+            dirs.iter()
+                .find(|d| d.worktree_id == worktree_id && d.rel_path == "dist")
+                .map(|d| d.allocated_total),
+            Some(77),
+            "the sibling artifact row must survive the fallback request"
+        );
+    }
 
     /// The tempting wrong patch: a manager-fact row whose kind this build
     /// does not know (written by a newer swamp) fails the whole read. It is

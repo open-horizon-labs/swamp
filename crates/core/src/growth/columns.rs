@@ -114,11 +114,12 @@ fn write_rows(path: &Path, rows: &[StoredRow]) -> Result<()> {
             Arc::new(StringArray::from(ecosystem)),
         ],
     )?;
-    crate::fs_gate::columns::write_parquet_atomic(
+    crate::fs_gate::columns::write_parquet_atomic_with_dictionary_disabled(
         path,
         schema,
         std::iter::once(Ok(batch)),
         super::ARTIFACT_ZSTD_LEVEL,
+        &["kind"],
     )
 }
 
@@ -282,11 +283,12 @@ pub(super) fn write_dir_rows(path: &Path, rows: &[StoredDirRow], zstd_level: i32
             Arc::new(UInt64Array::from(observed_at)),
         ],
     )?;
-    crate::fs_gate::columns::write_parquet_atomic(
+    crate::fs_gate::columns::write_parquet_atomic_with_dictionary_disabled(
         path,
         schema,
         std::iter::once(Ok(batch)),
         zstd_level,
+        &["rel_path"],
     )
 }
 
@@ -3199,11 +3201,14 @@ pub(crate) fn write_agent_member_rows(path: &Path, rows: &[StoredAgentMemberRow]
             )),
         ],
     )?;
-    crate::fs_gate::columns::write_parquet_atomic(
+    crate::fs_gate::columns::write_parquet_atomic_with_dictionary_disabled(
         path,
         schema,
         std::iter::once(Ok(batch)),
         super::ARTIFACT_ZSTD_LEVEL,
+        // Small membership tables can be larger without a dictionary. Keep
+        // their defaults; the sampled large table benefits from plain paths.
+        if rows.len() >= 4_096 { &["path"] } else { &[] },
     )
 }
 
