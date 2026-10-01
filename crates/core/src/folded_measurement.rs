@@ -1846,8 +1846,11 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let (unit, sealed, _) = rev2_sealed_unit(tmp.path());
         std::fs::create_dir_all(sealed.join("root_only/x")).unwrap();
-        std::fs::set_permissions(sealed.join("root_only"), std::fs::Permissions::from_mode(0))
-            .unwrap();
+        std::fs::set_permissions(
+            sealed.join("root_only"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
         let none = EventCoverage::untrusted();
         let (first, _) =
             observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
