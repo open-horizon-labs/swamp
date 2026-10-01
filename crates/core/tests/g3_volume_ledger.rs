@@ -2562,3 +2562,59 @@ fn a_resumed_cycle_reuses_its_system_facts() {
     };
     assert_eq!(keep(comparable(&slow.rows())), keep(expected));
 }
+
+/// Audit (v0.8.0 perf, round 2). Splits a pass with a slow folder and
+/// returns the setup after its first, unfinished run at `NOW + 1`.
+fn rev2_open_cycle(probe: FakeProbe) -> Setup {
+    let mut s = Setup::new();
+    s.probe = probe;
+    many_small_folders(&s.fs, 300);
+    s.fs.slow_under("/Users/me/d", Duration::from_millis(20));
+    let first = s.run_at(NOW + 1, true, Duration::from_millis(2_000), Some(0));
+    assert!(
+        !ran(&first).complete,
+        "the budget was meant to split the pass"
+    );
+    s
+}
+
+/// Audit round 2. Tempting wrong patch: treat "a row exists for each of
+/// the three methods" as "all three answered", so a `tmutil` that timed
+/// out on the cycle's first run (machine under load) is replayed as
+/// not-measured for up to an hour instead of being asked again on the
+/// next resume. A failure may be shown, but it must not be cached.
+#[test]
+fn rev2_a_query_that_failed_is_asked_again_on_resume() {
+    let mut probe = good_probe();
+    probe.snapshots = Err(ProbeError::TimedOut("tmutil"));
+    let mut s = rev2_open_cycle(probe);
+    let before = s.probe.calls.load(Ordering::SeqCst);
+    s.probe.snapshots = good_probe().snapshots;
+    let _ = s.run_at(NOW + 60, true, Duration::from_millis(2_000), Some(0));
+    assert!(
+        s.probe.calls.load(Ordering::SeqCst) > before,
+        "a failed tmutil answer was reused instead of asked again"
+    );
+    assert!(
+        !s.rows()
+            .iter()
+            .any(|r| r.method.starts_with("tmutil") && r.bytes.is_none() && r.note.is_some()),
+        "the timed-out snapshot row is still shown after tmutil answered"
+    );
+}
+
+/// Audit round 2. Tempting wrong patch: compare against the cycle start
+/// only, so facts are reused for the whole (24 h) cycle. At one hour the
+/// resume asks again.
+#[test]
+fn rev2_resumed_facts_an_hour_old_are_asked_again() {
+    let s = rev2_open_cycle(good_probe());
+    let before = s.probe.calls.load(Ordering::SeqCst);
+    let _ = s.run_at(
+        NOW + 1 + swamp_core::volume_ledger::system::FACTS_REUSE_SECS,
+        true,
+        Duration::from_millis(2_000),
+        Some(0),
+    );
+    assert_eq!(s.probe.calls.load(Ordering::SeqCst), before + 3);
+}
