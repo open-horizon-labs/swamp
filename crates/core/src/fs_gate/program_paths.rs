@@ -799,6 +799,35 @@ mod tests {
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// Auditor: the directory the candidate lives in must be trusted too,
+    /// not only the link target's. A world-writable `/usr/local/bin` lets
+    /// another user point `docker` at any trusted binary (an interpreter
+    /// that then reads a file named by the first argument from the
+    /// inherited working directory). Tempting wrong patch (the head):
+    /// checking the candidate directory only to pick the PATH head.
+    #[test]
+    fn audit_a_link_in_a_world_writable_candidate_dir_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let exe = real.join("sh");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = open.join("docker");
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+        let got = resolve_strict(&[link]);
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            got.is_err(),
+            "accepted a link planted in a world-writable dir: {got:?}"
+        );
+    }
+
     #[test]
     fn mise_gets_its_state_dirs_and_nothing_else_of_mise() {
         let parent: Vec<(String, String)> = [
