@@ -1240,3 +1240,161 @@ fn weight_sets_count_one_copy_and_never_a_partial_set_as_exact() {
     assert_eq!(field(gap, "params"), None);
     assert_eq!(field(gap, "params_unread"), Some("1 of 3 shards are here"));
 }
+
+/// REV2-1 (audit/v080-g7b). A repo with no weight file (a README and a
+/// config only: a partial `--include` download, a dataset card): the
+/// last-read fallback is the largest blob, which is the README swamp
+/// itself reads for the card. On APFS a fresh file's access time is not
+/// newer than its change, so that read moves it, and swamp's own read is
+/// shown as the user's last use. Tempting wrong patch: guarding only the
+/// weight file with `read_would_move_atime` while the fallback still
+/// takes the atime of any blob, including ones swamp just read.
+#[test]
+fn rev2_a_readme_swamp_reads_is_not_shown_as_last_use() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let mut readme = String::from("---\nlicense: mit\n---\n\nA card.\n");
+    readme.push_str(&"x".repeat(20_000));
+    let r = one_repo(
+        &root,
+        "models--org--cardonly",
+        &[
+            ("README.md", readme.into_bytes()),
+            ("config.json", br#"{"model_type":"bert"}"#.to_vec()),
+        ],
+    );
+    let readme_blob = r.join("blobs/b0");
+    // Downloaded long ago, never opened since (atime before mtime).
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&readme_blob)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_accessed(old))
+        .unwrap();
+    // First pass reads the README for the card; a second pass (cache
+    // reset, or any re-parse) then takes the last read from the blobs.
+    let _ = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let after = fs::symlink_metadata(&readme_blob).unwrap().atime();
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let lr = ev(unit(&units, "models--org--cardonly"), LAST_READ_EVIDENCE);
+    assert!(
+        after == 1_500_000_000 || lr.iter().all(|l| !l.starts_with(&format!("{after}|"))),
+        "swamp's own README read is shown as the last read: {lr:?}"
+    );
+}
+
+/// REV2-2 (audit/v080-g7b). docs/usage.md says of a weight file swamp
+/// does not read: "the row says the count is \"not read yet\" and why".
+/// The reason is only a `params_deferred` field; the text report and the
+/// TUI render a row's `about`, `last_read`, `regeneration`, `revisions`,
+/// `hub` and `facts`, never `fields`, so the row shows no count and no
+/// reason (seen on the real binary: `whisper · float32`, nothing else).
+/// Tempting wrong patch: storing the reason as a field and calling it
+/// shown because the JSON evidence carries it.
+#[test]
+fn rev2_a_deferred_count_says_not_read_yet_on_the_row() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    one_repo(
+        &root,
+        "models--org--fresh",
+        &[("model.safetensors", st_header(&[("w", "F32", &[10])]))],
+    );
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let rows = model_rows(&root, &units, 2_000_000_000);
+    let row = rows.iter().find(|r| r.name == "org/fresh").unwrap();
+    let shown = format!("{:?} {:?}", row.about, row.facts);
+    assert!(
+        shown.contains("not read yet"),
+        "the rendered parts of the row do not say the count is not read yet: {shown}"
+    );
+}
+
+/// REV2-3 (audit/v080-g7b). `read_would_move_atime` compares the access
+/// time with `max(mtime, ctime)`, but APFS moves it on a read only when it
+/// is not newer than the *mtime* (checked on this Mac: a file with
+/// mtime < atime < ctime keeps its atime through a read). A cache copied
+/// with `cp -p`, `rsync -a`, Migration Assistant or a restore has a ctime
+/// newer than every atime; a later model load does not move the atime
+/// either, so such a model stays "not read yet" for good. Tempting wrong
+/// patch: adding ctime as a precaution without checking what APFS does.
+#[test]
+fn rev2_a_copied_cache_with_a_newer_ctime_is_still_read() {
+    use std::os::unix::fs::MetadataExt;
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let r = one_repo(
+        &root,
+        "models--org--copied",
+        &[("model.safetensors", st_header(&[("w", "F32", &[10])]))],
+    );
+    let w = r.join("blobs/b0");
+    // As `rsync -a` leaves it: mtime and atime from the source (read
+    // after its last write), ctime now.
+    let m = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let a = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_100_000);
+    fs::File::options()
+        .write(true)
+        .open(&w)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(m).set_accessed(a))
+        .unwrap();
+    let meta = fs::symlink_metadata(&w).unwrap();
+    assert!(meta.ctime() > meta.atime() && meta.atime() > meta.mtime());
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    assert_eq!(
+        fs::symlink_metadata(&w).unwrap().atime(),
+        1_700_100_000,
+        "the read moved the access time"
+    );
+    assert_eq!(
+        field(unit(&units, "models--org--copied"), "params"),
+        Some("10"),
+        "a weight file APFS would not touch on a read is deferred anyway"
+    );
+}
+
+/// REV2-4 (audit/v080-g7b, seen on the real binary). An unchanged hub
+/// store's units are replayed from the last pass with their evidence,
+/// including the Hub line ("not yet fetched ..."). `hub_api::enrich`
+/// then *amends* the unit, adding the new answer beside the old line;
+/// `model_row_of` takes the first, so the row keeps saying "not yet
+/// fetched" after every later fetch (the real store's JSON held both
+/// lines for both repos after an enriching observe). Tempting wrong
+/// patch: `NestedUnitBuilder::amend(..).evidence(..)` without removing
+/// the unit's earlier `model-hub-api` evidence.
+#[test]
+fn rev2_a_replayed_unit_shows_the_new_hub_answer_not_the_old_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    one_repo(
+        &root,
+        "models--org--m",
+        &[("config.json", br#"{"model_type":"bert"}"#.to_vec())],
+    );
+    let cards = CardCache::default();
+    let (mut units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &cards);
+    // A pass that may not fetch (the TUI's refresh, or `--no-enrich`).
+    crate::hub_api::enrich_with(&mut units, &cards, 1_000, true, 0, &|_, _| {
+        Err("unreachable".into())
+    });
+    // Next pass: the store is unchanged, so the same units come back
+    // (replay) and this pass fetches.
+    crate::hub_api::enrich_with(&mut units, &cards, 2_000, true, 16, &|_, _| {
+        Err("no answer (offline or blocked)".into())
+    });
+    let rows = model_rows(&root, &units, 3_000);
+    let hub = rows[0].hub.clone().unwrap_or_default();
+    assert!(
+        hub.contains("did not answer"),
+        "the row still shows the earlier Hub line: {hub}"
+    );
+}
