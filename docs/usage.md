@@ -700,11 +700,16 @@ row; the Ollama tags under "identified interior"). Each says:
   `lstat`ed first; one that is a symlink is a fact on the row ("is a link, not
   followed") and nothing in it is listed, read or counted. Files are opened with
   `O_NOFOLLOW` (and `O_NOATIME` on Linux).
-- **Swamp's own read is not a use.** On macOS a read sets a file's access time
-  when it is not newer than the file's last change. Swamp does not read a weight
-  file in that state: the row says the count is "not read yet" and why, and the
-  next observe after a program has opened the file reads it. So the last-read
-  date shown is never one swamp's own read wrote.
+- **Swamp's own read is not a use.** The last-read date comes from a weight file
+  (the largest blob that is not the README, `config.json` or the shard index,
+  which the card pass opens). On macOS (APFS) a read sets a file's access time
+  only when it is not newer than the file's mtime, so swamp does not read a
+  weight file in that state: the row says "parameter count not read yet: no
+  program has opened this file since it was written", and a later observe reads
+  it once a program has. On Linux reads use `O_NOATIME`. Where a read does move
+  the time anyway (a network volume), the time from before swamp's read is kept
+  in the card cache and shown; after that cache is deleted, the first pass cannot
+  tell an earlier swamp read from a use.
 - **Size.** Snapshots are links into `blobs/`; each blob is counted once, and a
   blob two revisions share once. A blob two repos (or two Ollama tags) share is
   counted under the first by path, and the other says so. The models plus the
@@ -1777,13 +1782,24 @@ swamp config get hf-enrich
 swamp config set hf-enrich on     # one key; other keys, tables and comments are kept
 ```
 
-`config set` writes one top-level key (`since`, `retention_days`,
-`large_file_min_bytes`, `observe_timeout_sec`, `observe_stall_secs`,
-`min_free_bytes` (or `unset`), `volume_pass_interval_hours`,
-`volume_pass_budget_secs`, `hf_enrich`), with `-` and `_` spelled either
-way. An unknown key is refused with the list of valid ones; a value of the
-wrong kind is refused; nothing is written then. The file is edited in place
-(comments, other keys and `[scan]` stay as written) and replaced atomically.
+`config set` writes one top-level key, with `-` and `_` spelled either way.
+An unknown key is refused with the list of valid ones; a value outside the
+range the code honours is refused with that range (never clamped); nothing
+is written then. The file is edited in place (comments, other keys and
+`[scan]` stay as written) and replaced atomically.
+
+| Key | Values | What it does |
+|---|---|---|
+| `since` | 1 to 31622400 seconds (as 24h, 7d, 30m) | how far back growth is measured by default |
+| `retention_days` | 1 to 3650 days | days of history kept in the store |
+| `large_file_min_bytes` | 1 to 9223372036854775807 bytes | files at least this large are tracked individually |
+| `observe_timeout_sec` | 60 to 86400 seconds | watchdog budget for one observe |
+| `observe_stall_secs` | 30 to 86400 seconds | stop an observe with no progress for this long |
+| `min_free_bytes` | 0 to 9223372036854775807 bytes (0 disables; unset: the default) | refuse to observe below this much free space |
+| `volume_pass_interval_hours` | 0 to 8760 hours (0: only `observe --volume`) | hours between volume passes |
+| `volume_pass_budget_secs` | 5 to 86400 seconds | seconds one volume-pass run may measure |
+| `hf_enrich` | on, off | ask huggingface.co about each hub repo during scheduled observes (off by default) |
+
 `[scan]` roots are `add-root` / `remove-root`.
 
 `config init` writes a file only if none exists. Defaults:

@@ -1648,8 +1648,13 @@ fn main() -> Result<()> {
                 }
                 ConfigAction::List => {
                     let cfg = swamp_core::growth::load_config_checked(&dir)?;
-                    for (k, _, what) in swamp_core::roots::SETTABLE {
-                        safe_println!("{k} = {}  # {what}", cfg.value_of(k).unwrap_or_default());
+                    for s in swamp_core::roots::SETTABLE {
+                        safe_println!(
+                            "{} = {}  # {}",
+                            s.key,
+                            cfg.value_of(s.key).unwrap_or_default(),
+                            s.what
+                        );
                     }
                 }
                 ConfigAction::RemoveRoot { path: typed } => {

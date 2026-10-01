@@ -179,7 +179,7 @@ pub(crate) fn enrich_with(
         };
         if !enabled {
             *u = NestedUnitBuilder::amend(u.clone())
-                .evidence(HUB_API_EVIDENCE, "off", Confidence::High)
+                .replace_evidence(HUB_API_EVIDENCE, "off")
                 .build();
             continue;
         }
@@ -235,24 +235,16 @@ pub(crate) fn enrich_with(
         };
         let mut b = NestedUnitBuilder::amend(u.clone());
         let Some(entry) = entry else {
-            b = b.evidence(
-                HUB_API_EVIDENCE,
-                format!(
+            b = b.replace_evidence(HUB_API_EVIDENCE, format!(
                     "not yet fetched from huggingface.co (a pass asks at most {MAX_FETCHES_PER_PASS} times, and only a scheduled or CLI observe asks; the next one does)"
-                ),
-                Confidence::High,
-            );
+                ));
             *u = b.build();
             continue;
         };
         let day = crate::last_used::format_day(entry.at, now);
         let status = entry.fields.get("status").cloned().unwrap_or_default();
         if status != "ok" {
-            b = b.evidence(
-                HUB_API_EVIDENCE,
-                format!("huggingface.co did not answer for {id}: {status} (asked {day}; asked again after a day)"),
-                Confidence::High,
-            );
+            b = b.replace_evidence(HUB_API_EVIDENCE, format!("huggingface.co did not answer for {id}: {status} (asked {day}; asked again after a day)"));
             *u = b.build();
             continue;
         }
@@ -288,13 +280,12 @@ pub(crate) fn enrich_with(
         } else {
             ""
         };
-        b = b.evidence(
+        b = b.replace_evidence(
             HUB_API_EVIDENCE,
             format!(
                 "from huggingface.co, fetched {day}: {}{older}",
                 parts.join(", ")
             ),
-            Confidence::High,
         );
         // Pinned facts fill only what the local files did not state, and
         // only for the revision this machine holds.

@@ -813,55 +813,96 @@ pub enum KeyKind {
     Duration,
 }
 
-/// Every top-level key `swamp config set` may write, with its kind and
-/// one line on what it does. `[scan]` is edited by `add-root` /
-/// `remove-root` and by hand, never here.
-pub const SETTABLE: &[(&str, KeyKind, &str)] = &[
-    (
-        "since",
-        KeyKind::Duration,
-        "how far back growth is measured by default",
-    ),
-    (
-        "retention_days",
-        KeyKind::Count,
-        "days of history kept in the store",
-    ),
-    (
-        "large_file_min_bytes",
-        KeyKind::Count,
-        "files at least this large are tracked individually",
-    ),
-    (
-        "observe_timeout_sec",
-        KeyKind::Count,
-        "watchdog budget for one observe",
-    ),
-    (
-        "observe_stall_secs",
-        KeyKind::Count,
-        "stop an observe with no progress for this long (minimum 30)",
-    ),
-    (
-        "min_free_bytes",
-        KeyKind::CountOrUnset,
-        "refuse to observe below this much free space (0 disables; unset: the default)",
-    ),
-    (
-        "volume_pass_interval_hours",
-        KeyKind::Count,
-        "hours between volume passes",
-    ),
-    (
-        "volume_pass_budget_secs",
-        KeyKind::Count,
-        "seconds one volume-pass run may measure",
-    ),
-    (
-        "hf_enrich",
-        KeyKind::Switch,
-        "ask huggingface.co about each hub repo during scheduled observes (off by default)",
-    ),
+/// One key `swamp config set` may write: its kind, the range of values
+/// the code actually honours (a value outside is refused, never silently
+/// clamped), and what it does. `docs/usage.md`'s key table is checked
+/// against this list.
+#[derive(Debug, Clone, Copy)]
+pub struct Settable {
+    pub key: &'static str,
+    pub kind: KeyKind,
+    /// Inclusive bounds for numbers, in the key's own unit.
+    pub min: u64,
+    pub max: u64,
+    pub unit: &'static str,
+    pub what: &'static str,
+}
+
+/// Every top-level key `swamp config set` may write. `[scan]` is edited
+/// by `add-root` / `remove-root` and by hand, never here.
+pub const SETTABLE: &[Settable] = &[
+    Settable {
+        key: "since",
+        kind: KeyKind::Duration,
+        min: 1,
+        max: 366 * 86_400,
+        unit: "seconds (as 24h, 7d, 30m)",
+        what: "how far back growth is measured by default",
+    },
+    Settable {
+        key: "retention_days",
+        kind: KeyKind::Count,
+        min: 1,
+        max: 3650,
+        unit: "days",
+        what: "days of history kept in the store",
+    },
+    Settable {
+        key: "large_file_min_bytes",
+        kind: KeyKind::Count,
+        min: 1,
+        max: u64::MAX >> 1,
+        unit: "bytes",
+        what: "files at least this large are tracked individually",
+    },
+    Settable {
+        key: "observe_timeout_sec",
+        kind: KeyKind::Count,
+        min: 60,
+        max: 86_400,
+        unit: "seconds",
+        what: "watchdog budget for one observe",
+    },
+    Settable {
+        key: "observe_stall_secs",
+        kind: KeyKind::Count,
+        min: crate::growth::MIN_OBSERVE_STALL_SECS,
+        max: 86_400,
+        unit: "seconds",
+        what: "stop an observe with no progress for this long",
+    },
+    Settable {
+        key: "min_free_bytes",
+        kind: KeyKind::CountOrUnset,
+        min: 0,
+        max: u64::MAX >> 1,
+        unit: "bytes (0 disables; unset: the default)",
+        what: "refuse to observe below this much free space",
+    },
+    Settable {
+        key: "volume_pass_interval_hours",
+        kind: KeyKind::Count,
+        min: 0,
+        max: 8760,
+        unit: "hours (0: only `observe --volume`)",
+        what: "hours between volume passes",
+    },
+    Settable {
+        key: "volume_pass_budget_secs",
+        kind: KeyKind::Count,
+        min: 5,
+        max: 86_400,
+        unit: "seconds",
+        what: "seconds one volume-pass run may measure",
+    },
+    Settable {
+        key: "hf_enrich",
+        kind: KeyKind::Switch,
+        min: 0,
+        max: 1,
+        unit: "on or off",
+        what: "ask huggingface.co about each hub repo during scheduled observes (off by default)",
+    },
 ];
 
 /// The key as stored (`hf-enrich` and `hf_enrich` are the same key).
@@ -869,14 +910,14 @@ pub fn settable_key(typed: &str) -> Result<&'static str, String> {
     let k = typed.trim().replace('-', "_");
     SETTABLE
         .iter()
-        .find(|(name, _, _)| *name == k)
-        .map(|(name, _, _)| *name)
+        .find(|s| s.key == k)
+        .map(|s| s.key)
         .ok_or_else(|| {
             format!(
                 "{typed} is not a key `swamp config set` writes; valid keys: {}",
                 SETTABLE
                     .iter()
-                    .map(|(n, _, _)| *n)
+                    .map(|s| s.key)
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -889,11 +930,13 @@ pub fn settable_key(typed: &str) -> Result<&'static str, String> {
 /// (`hf_enrich = true`), or `<key> removed` for `unset`.
 pub fn set_key(store: &StoreDir, typed_key: &str, typed_value: &str) -> Result<String, RootError> {
     let key = settable_key(typed_key).map_err(RootError::Config)?;
-    let kind = SETTABLE
+    let spec = SETTABLE
         .iter()
-        .find(|(n, _, _)| *n == key)
-        .map(|(_, k, _)| *k)
-        .unwrap_or(KeyKind::Count);
+        .find(|s| s.key == key)
+        .copied()
+        .ok_or_else(|| RootError::Config(format!("{key} is not settable")))?;
+    let kind = spec.kind;
+    let range = format!("{} to {} {}", spec.min, spec.max, spec.unit);
     let v = typed_value.trim();
     let bad = |want: &str| {
         RootError::Config(format!(
@@ -910,12 +953,12 @@ pub fn set_key(store: &StoreDir, typed_key: &str, typed_value: &str) -> Result<S
             if kind == KeyKind::CountOrUnset && v == "unset" {
                 None
             } else {
-                let n: i64 = v
+                let n: u64 = v
                     .parse()
                     .ok()
-                    .filter(|n| *n >= 0)
-                    .ok_or_else(|| bad("a whole number of 0 or more"))?;
-                Some(Value::from(n))
+                    .filter(|n| (spec.min..=spec.max).contains(n))
+                    .ok_or_else(|| bad(&format!("a whole number from {range}")))?;
+                Some(Value::from(n as i64))
             }
         }
         KeyKind::Duration => {
@@ -984,6 +1027,31 @@ mod set_key_tests {
         assert!(cfg.hf_enrich);
         assert_eq!(cfg.since, "24h");
         assert_eq!(cfg.scan.include, vec!["~/src".to_string()]);
+    }
+
+    /// Every settable key is in docs/usage.md's key table with its range,
+    /// and the table names no other key. Tempting wrong patch: a doc list
+    /// kept by hand beside the validator.
+    #[test]
+    fn the_usage_key_table_is_the_validator_table() {
+        let doc = include_str!("../../../docs/usage.md");
+        let rows: Vec<&str> = doc
+            .lines()
+            .skip_while(|l| !l.starts_with("| Key | Values |"))
+            .skip(2)
+            .take_while(|l| l.starts_with('|'))
+            .collect();
+        assert_eq!(rows.len(), SETTABLE.len(), "{rows:?}");
+        for (row, s) in rows.iter().zip(SETTABLE) {
+            let want = match s.kind {
+                KeyKind::Switch => format!("| `{}` | on, off | {} |", s.key, s.what),
+                _ => format!(
+                    "| `{}` | {} to {} {} | {} |",
+                    s.key, s.min, s.max, s.unit, s.what
+                ),
+            };
+            assert_eq!(*row, want);
+        }
     }
 
     /// Tempting wrong patch: writing whatever was typed and letting the

@@ -116,17 +116,24 @@ struct FileFact {
     len: u64,
     atime: u64,
     mtime: u64,
-    ctime: u64,
 }
 
 impl FileFact {
     /// Whether reading this file would set its access time, the last-read
-    /// fact swamp reports. macOS updates the access time on a read only
-    /// when it is not newer than the last change (checked on APFS: a
-    /// file read since its last write keeps its time through another
-    /// read). On Linux the read opens with `O_NOATIME` and moves nothing.
+    /// fact swamp reports.
+    ///
+    /// macOS (APFS): a read sets the access time only when it is not newer
+    /// than the *mtime* (checked on this machine with real files: atime
+    /// newer than mtime but older than ctime survives a read, so a cache
+    /// copied with `cp -p`/`rsync -a`, whose ctime is newer than all, is
+    /// still read). ctime plays no part.
+    ///
+    /// Linux: Linux `relatime` would update when atime <= mtime, atime <=
+    /// ctime, or atime is more than 24 h old (mount(8), `relatime`), but
+    /// swamp's content reads open with `O_NOATIME` (and refuse rather than
+    /// read without it), so a read moves nothing and nothing is deferred.
     fn read_would_move_atime(&self) -> bool {
-        cfg!(target_os = "macos") && self.atime <= self.mtime.max(self.ctime)
+        cfg!(target_os = "macos") && self.atime <= self.mtime
     }
 }
 
@@ -170,7 +177,6 @@ fn file_fact(ctx: &BuildCtx, path: &Path) -> Option<FileFact> {
         len: m.len(),
         atime: m.atime().max(0) as u64,
         mtime: m.mtime().max(0) as u64,
-        ctime: m.ctime().max(0) as u64,
     })
 }
 
@@ -208,6 +214,14 @@ fn add_card_evidence(mut b: NestedUnitBuilder, fields: &CardFields) -> NestedUni
     }
     if let Some(text) = fields.get("card_text") {
         b = b.evidence(CARD_TEXT_EVIDENCE, text.clone(), Confidence::High);
+    }
+    // Why a count is absent is a fact on the row, not only a field.
+    if fields.contains_key("params_deferred") {
+        b = b.limit(
+            "parameter count not read yet: no program has opened this file since it was written (swamp does not read it, so its last-read time stays yours)",
+        );
+    } else if let Some(why) = fields.get("params_unread") {
+        b = b.limit(format!("parameter count not read: {why}"));
     }
     for (k, v) in fields {
         if k == "card_text" || k.starts_with("read_") || k.starts_with("api_") {
@@ -482,6 +496,14 @@ fn choose_weight_set<'a>(
     let note =
         format!("counted from {pick}, one of {n} weight sets here (the others are not added)");
     (sets.remove(&pick).unwrap_or_default(), Some(note))
+}
+
+/// A file the card pass opens for its text (never a last-read source).
+fn is_card_file(name: &str) -> bool {
+    matches!(
+        name,
+        "README.md" | "config.json" | "model.safetensors.index.json"
+    )
 }
 
 fn is_tokenizer(name: &str) -> bool {
@@ -981,8 +1003,22 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
                 }
             }
         }
+        // Never a file the card pass reads (README, config, the shard
+        // index): swamp's own read of it would be the time shown.
+        let card_blobs: BTreeSet<&String> = scan
+            .snapshots
+            .values()
+            .flat_map(|files| files.iter())
+            .filter(|(n, _)| is_card_file(n))
+            .map(|(_, blob)| blob)
+            .collect();
         if !b.has_evidence(LAST_READ_EVIDENCE)
-            && let Some(f) = scan.blobs.values().max_by_key(|f| f.len)
+            && let Some(f) = scan
+                .blobs
+                .iter()
+                .filter(|(name, _)| !card_blobs.contains(name))
+                .map(|(_, f)| f)
+                .max_by_key(|f| f.len)
         {
             b = b.evidence(
                 LAST_READ_EVIDENCE,

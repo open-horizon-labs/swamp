@@ -1131,7 +1131,13 @@ fn a_weight_file_whose_access_time_a_read_would_move_is_not_read() {
     let u = unit(&units, "models--org--fresh");
     if cfg!(target_os = "macos") {
         assert_eq!(field(u, "params"), None);
-        assert!(field(u, "params_deferred").is_none_or(|_| true));
+        assert!(field(u, "params_deferred").is_some_and(|v| v.starts_with("not read yet")));
+        assert!(
+            u.coverage
+                .limits
+                .iter()
+                .any(|l| l.starts_with("parameter count not read yet"))
+        );
         assert!(text_of(u).contains("reading the weight file now would set its access time"));
     }
     let after = {
@@ -1397,4 +1403,53 @@ fn rev2_a_replayed_unit_shows_the_new_hub_answer_not_the_old_line() {
         hub.contains("did not answer"),
         "the row still shows the earlier Hub line: {hub}"
     );
+}
+
+/// Restores the original ADV-13 coverage for volumes where a read does
+/// move the access time (network volumes, strictatime): the card cache
+/// keeps the time from before swamp's read, and a re-parse of the same
+/// revision (a new snapshot file) still shows the user's time, not
+/// swamp's. Simulated by setting the access time after the first pass.
+/// Tempting wrong patch: dropping the before/after correction because
+/// APFS seldom needs it.
+#[test]
+fn where_a_read_moves_the_access_time_the_users_time_survives_a_reparse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let r = one_repo(
+        &root,
+        "models--org--nfs",
+        &[("model.safetensors", st_header(&[("w", "F32", &[3])]))],
+    );
+    let w = r.join("blobs/b0");
+    used(&w);
+    let user = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&w).unwrap().atime()
+    };
+    let cards = CardCache::default();
+    let _ = identify(BuildStoreKind::HuggingFaceHub, &root, &cards);
+    // The volume moved the access time on swamp's read.
+    let key = hub_card_key(&root, "models--org--nfs", REV1);
+    let mut e = cards.peek(&key).unwrap();
+    let swamp_read = user + 1000;
+    e.fields
+        .insert("read_atime_after".into(), swamp_read.to_string());
+    let mut stored = cards.retained(&|_| false);
+    stored.insert(key, e);
+    fs::File::options()
+        .write(true)
+        .open(&w)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_accessed(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(swamp_read as u64),
+        ))
+        .unwrap();
+    let (units, _) = identify(
+        BuildStoreKind::HuggingFaceHub,
+        &root,
+        &CardCache::from_entries(stored, 64),
+    );
+    let lr = ev(unit(&units, "models--org--nfs"), LAST_READ_EVIDENCE)[0];
+    assert!(lr.starts_with(&format!("{user}|")), "{lr}");
 }
