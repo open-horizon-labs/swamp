@@ -10,7 +10,7 @@ impl FsEventsSource for Baseline {
     fn replay(&self, _: &FsEventsRequest) -> FsEventsPlan {
         panic!("full observation must not replay history")
     }
-    fn anchor_before_full(&self, root: &Path) -> Option<(u64, u64)> {
+    fn anchor_before_full(&self, root: &Path) -> Option<(u64, u64, Option<String>)> {
         self.0.fetch_add(1, Ordering::SeqCst);
         // If the hook moves after the walk this file is absent from its total.
         std::fs::write(
@@ -20,7 +20,11 @@ impl FsEventsSource for Baseline {
         .unwrap();
         // #197: the walk that follows must see this file's allocation.
         swamp_core::fs_gate::settle::settle();
-        Some((71, std::fs::metadata(root).unwrap().dev()))
+        Some((
+            71,
+            std::fs::metadata(root).unwrap().dev(),
+            Some("fixture-history".to_string()),
+        ))
     }
 }
 
@@ -67,6 +71,10 @@ fn full_anchor_precedes_walk_and_is_not_published_until_commit() {
     swamp_core::fs_gate::settle::settle();
     checkpoint.unwrap().commit().unwrap();
     assert_eq!(read_fsevents_anchor(&dir).event_id, Some(71));
+    assert_eq!(
+        read_fsevents_anchor(&dir).device_uuid.as_deref(),
+        Some("fixture-history")
+    );
     assert_eq!(
         source.0.load(Ordering::SeqCst),
         2,

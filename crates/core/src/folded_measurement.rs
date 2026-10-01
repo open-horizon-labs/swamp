@@ -502,10 +502,20 @@ fn record_folded_measurement(
     folded: &FoldedUnit,
     stamps: &[crate::walk::DirStamp],
 ) {
+    let started = std::time::Instant::now();
     if let Some(rows) = folded_rows(path, exclusions, observed_at, folded, stamps, &[]) {
+        let folded_elapsed = started.elapsed();
         // A cache write that fails is a cache that will miss next time,
         // which is the correct outcome and not worth failing a report over.
         let _ = crate::growth::store_folded_rows(store, &path.display().to_string(), &rows);
+        if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            eprintln!(
+                "[xtrace] record_folded {} rows={} fold={folded_elapsed:?} write={:?}",
+                path.display(),
+                rows.len(),
+                started.elapsed().saturating_sub(folded_elapsed)
+            );
+        }
     }
 }
 
@@ -753,18 +763,44 @@ fn partial_measure(
         return None;
     }
     let marked = format!("{digest}{CHILD_TOTAL_MARK}");
-    let reused: Vec<&crate::growth::FoldedRow> = rows
+    let debug_trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let mut reused: Vec<&crate::growth::FoldedRow> = Vec::new();
+    for r in rows
         .iter()
         .filter(|r| !r.rel_dir.is_empty() && !r.rel_dir.contains('/') && r.exclusions == marked)
+    {
         // A subfolder holding a linked file is walked: a link made or
         // removed elsewhere changes its count without an event under it.
-        .filter(|r| !r.hardlinked)
-        .filter(|r| {
+        let reason = if r.hardlinked {
+            Some("linked")
+        } else {
             let child = path.join(&r.rel_dir);
-            coverage.unchanged_since(&child, root.observed_at) && same_directory(&child, r)
-        })
-        .collect();
-    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            let unchanged = coverage.unchanged_since(&child, root.observed_at);
+            if !unchanged {
+                if debug_trace {
+                    eprintln!(
+                        "[xtrace] child {} freshness stored_at={} reason={}",
+                        child.display(),
+                        root.observed_at,
+                        coverage.unchanged_since_trace_reason(&child, root.observed_at)
+                    );
+                }
+                Some("coverage-changed-or-unproven")
+            } else if !same_directory(&child, r) {
+                Some("directory-stamp-changed-or-missing")
+            } else {
+                reused.push(r);
+                None
+            }
+        };
+        if debug_trace && let Some(reason) = reason {
+            eprintln!(
+                "[xtrace] child {} skip={reason}",
+                path.join(&r.rel_dir).display()
+            );
+        }
+    }
+    if debug_trace {
         let marked_n = rows
             .iter()
             .filter(|r| !r.rel_dir.is_empty() && !r.rel_dir.contains('/') && r.exclusions == marked)
@@ -778,8 +814,36 @@ fn partial_measure(
     if reused.is_empty() {
         return None;
     }
+    // A linked child can force the whole-unit fallback after a partial walk.
+    // If almost all recorded directory rows are in the walked remainder,
+    // measure once in full instead: replay would save little work but risks
+    // doing that large remainder twice. This only chooses more measurement;
+    // it never relaxes coverage or hardlink accounting.
+    let linked_remainder = rows.iter().any(|r| {
+        !r.rel_dir.is_empty() && !r.rel_dir.contains('/') && r.exclusions == marked && r.hardlinked
+    });
+    if linked_remainder {
+        let replayed_names: std::collections::HashSet<&str> =
+            reused.iter().map(|r| r.rel_dir.as_str()).collect();
+        let replayed_rows = rows
+            .iter()
+            .filter(|r| replayed_names.contains(r.rel_dir.split('/').next().unwrap_or("")))
+            .count();
+        if replayed_rows.saturating_mul(16) < rows.len() {
+            if debug_trace {
+                eprintln!(
+                    "[xtrace] partial {}: full walk selected; linked remainder and only {replayed_rows}/{} rows replayable",
+                    path.display(),
+                    rows.len()
+                );
+            }
+            return None;
+        }
+    }
     let mut pruned = exclusions.to_vec();
     pruned.extend(reused.iter().map(|r| path.join(&r.rel_dir)));
+    let walk_started = std::time::Instant::now();
+    let walk_before = debug_trace.then(crate::work_counters::snapshot);
     let (row, mut dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
         path,
         ArtifactKind::Unknown,
@@ -788,6 +852,31 @@ fn partial_measure(
         &pruned,
         true,
     );
+    if debug_trace {
+        let after = crate::work_counters::snapshot();
+        let before = walk_before.unwrap();
+        let mut walked_children: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for stamp in &stamps {
+            if let Ok(rel) = stamp.path.strip_prefix(path)
+                && let Some(child) = rel.components().next()
+            {
+                *walked_children
+                    .entry(child.as_os_str().to_string_lossy().into_owned())
+                    .or_default() += 1;
+            }
+        }
+        eprintln!(
+            "[xtrace] partial walk {} reused_children={} walked_dirs={} elapsed={:?} dirs_delta={} files_delta={} walked_child_stamps={:?}",
+            path.display(),
+            reused.len(),
+            stamps.len(),
+            walk_started.elapsed(),
+            after.dirs_listed - before.dirs_listed,
+            after.files_statted - before.files_statted,
+            walked_children
+        );
+    }
     crate::work_counters::record_cache_miss();
     // A linked file in the walked part may share its inode with a
     // replayed subfolder unless every one of its links was walked here:
@@ -1156,13 +1245,26 @@ pub fn folded_bytes_bounded_stamped(
             pending: false,
         });
         let mut here = 0u64;
-        for entry in rd.flatten() {
+        for entry in rd {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    truncated = true;
+                    continue;
+                }
+            };
             seen += 1;
             if seen > max_entries {
                 truncated = true;
                 break;
             }
-            let Ok(m) = entry.metadata() else { continue };
+            let m = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(_) => {
+                    truncated = true;
+                    continue;
+                }
+            };
             here += 1;
             mtime_max = mtime_max.max(mtime_secs(&m));
             if m.is_dir() && !m.file_type().is_symlink() {
@@ -1599,6 +1701,52 @@ mod tests {
             shape(&f, &unit, dirs),
             golden(&unit),
             "a hardlink was counted twice"
+        );
+    }
+
+    #[test]
+    fn a_large_linked_remainder_is_measured_once_and_matches_a_full_walk() {
+        use crate::fs_events::EventCoverage;
+        let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("cache");
+        std::fs::create_dir_all(unit.join("small")).unwrap();
+        std::fs::write(unit.join("small/file"), b"small").unwrap();
+        for i in 0..100 {
+            let dir = unit.join(format!("large/dir-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("file"), crate::fs_gate::settle::noise(4096)).unwrap();
+        }
+        // The unvisited alias makes the partial walk unable to prove
+        // its link accounting, so the old path walked the large tree twice.
+        std::fs::hard_link(
+            unit.join("large/dir-0/file"),
+            tmp.path().join("outside-link"),
+        )
+        .unwrap();
+        crate::fs_gate::settle::settle();
+        let _ = observe_unit_with_dirs(
+            Some(store.path()),
+            &unit,
+            &[],
+            1_000,
+            &EventCoverage::untrusted(),
+            true,
+            true,
+        );
+        let window =
+            EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("large")], 500);
+        let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &window, true, true)
+        });
+        let UnitObservation::Unit(folded) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(shape(&folded, &unit, dirs), golden(&unit));
+        assert!(
+            cost.dirs_listed <= 110,
+            "large remainder walked more than once: {cost:?}"
         );
     }
 

@@ -190,6 +190,11 @@ impl VolumeFs for RealFs {
             .into_iter()
             .filter(|m| keep_mount(&m.path, &m.fs_type, m.local))
             .map(|m| {
+                // DeviceFS exposes simulator contents through a virtual
+                // filesystem; its synthetic statfs capacity is not host use.
+                if let Some(view) = virtual_mount_view(m.path.clone(), &m.fs_type) {
+                    return view;
+                }
                 // Network, FUSE and automounter filesystems are decided
                 // from the mount table alone: their paths are never
                 // touched (a stalled server would hang the `statfs`).
@@ -264,6 +269,16 @@ pub fn keep_mount(path: &Path, fs_type: &str, local: bool) -> bool {
                 | "overlay"
                 | "squashfs"
         )
+}
+
+fn virtual_mount_view(path: PathBuf, fs_type: &str) -> Option<MountView> {
+    fs_type
+        .eq_ignore_ascii_case("devicefs")
+        .then_some(MountView {
+            path,
+            kind: MountKind::Virtual,
+            used: None,
+        })
 }
 
 /// Filesystem types that are never local storage this pass may touch.
@@ -550,7 +565,9 @@ impl PlanCtx<'_> {
             // task of its own, measured from its own device.
             if !(view.kind == MountKind::SameContainer && cfg!(target_os = "linux")) {
                 let mut row = mount_row(&view, self.now);
-                row.method = METHOD_LISTING.to_string();
+                if view.kind != MountKind::Virtual {
+                    row.method = METHOD_LISTING.to_string();
+                }
                 self.plan.notes.push(row);
                 return;
             }
@@ -1864,4 +1881,30 @@ pub fn run_after_observation(
         min_free: config.min_free_bytes,
         workers: WORKERS,
     })
+}
+
+#[cfg(test)]
+mod mount_tests {
+    use super::*;
+
+    #[test]
+    fn devicefs_mount_is_a_nonzero_unmeasured_virtual_row() {
+        let path = PathBuf::from("/Users/test/Library/Developer/CoreDevice/DeviceFS");
+        let view = virtual_mount_view(path.clone(), "DeviceFS")
+            .expect("DeviceFS must be classified from mount-table metadata");
+        let row = mount_row(&view, 123);
+
+        assert_eq!(view.kind, MountKind::Virtual);
+        assert_eq!(view.used, None);
+        assert_eq!(row.path, super::super::key_of(&path));
+        assert_eq!(
+            row.bytes, None,
+            "synthetic capacity must not become host usage"
+        );
+        assert_eq!(row.exactness, Exactness::NotMeasured);
+        assert_eq!(row.method, "mount table");
+        assert!(row.note.as_deref().is_some_and(|n| {
+            n.contains("virtual filesystem") && n.contains("not verified as host storage")
+        }));
+    }
 }

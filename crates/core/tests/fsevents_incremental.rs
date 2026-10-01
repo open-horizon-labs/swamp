@@ -60,6 +60,7 @@ impl FsEventsSource for RefusingSource {
             changed_dirs: Vec::new(),
             current_event_id: 999,
             device: Some(1),
+            device_uuid: None,
             live: false,
             consume: None,
         }
@@ -80,6 +81,7 @@ fn incremental_plan(changed: Vec<PathBuf>, event_id: u64) -> FsEventsPlan {
         changed_dirs: changed,
         current_event_id: event_id,
         device: Some(1),
+        device_uuid: None,
         live: false,
         consume: None,
     }

@@ -285,6 +285,8 @@ pub enum MountKind {
     SameContainer,
     /// A network share: not on this disk at all.
     Remote,
+    /// A virtual filesystem whose reported capacity is not host storage.
+    Virtual,
     /// Mounted on another device, not in the mount table.
     Unknown,
 }
@@ -321,6 +323,11 @@ pub fn mount_row(m: &MountView, measured_at: u64) -> Row {
             Exactness::NotMeasured,
             "a network share: not on this disk, not measured",
         ),
+        (MountKind::Virtual, _) => (
+            None,
+            Exactness::NotMeasured,
+            "a virtual filesystem: contents are not verified as host storage and are not added",
+        ),
         (MountKind::Unknown, _) => (
             None,
             Exactness::NotMeasured,
@@ -335,7 +342,11 @@ pub fn mount_row(m: &MountView, measured_at: u64) -> Row {
         entries: None,
         unreadable: 0,
         measured_at,
-        method: "statfs".to_string(),
+        method: if m.kind == MountKind::Virtual {
+            "mount table".to_string()
+        } else {
+            "statfs".to_string()
+        },
         exactness,
         note: Some(note.to_string()),
     }

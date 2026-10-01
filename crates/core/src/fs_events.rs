@@ -216,6 +216,10 @@ pub struct FsEventsState {
     /// recorded. A root that now resolves to a different device makes the
     /// stored id meaningless.
     pub device: Option<u64>,
+    /// FSEvents stream UUID for this device. Missing UUIDs from older
+    /// stores deliberately force one full observation before reuse.
+    #[serde(default)]
+    pub device_uuid: Option<String>,
     /// `now()` (whole seconds) as of the observation that recorded
     /// `event_id`. See [`RefreshRefusal::TooSoon`].
     pub last_observed_at: Option<u64>,
@@ -252,6 +256,9 @@ pub struct UnitRootCursor {
     /// The device the root lived on then. A root that now resolves to a
     /// different device makes the stored id meaningless.
     pub device: Option<u64>,
+    /// FSEvents stream identity; changes when the event history is reset.
+    #[serde(default)]
+    pub device_uuid: Option<String>,
     /// `now()` (whole seconds) as of the pass that recorded `event_id`.
     /// This is the instant the next window opens from, and the floor
     /// [`EventCoverage::unchanged_since`] compares stored rows against.
@@ -298,6 +305,8 @@ pub struct FsEventsPlan {
     /// `current_event_id` so the next call can detect a root that moved
     /// to a different volume.
     pub device: Option<u64>,
+    /// FSEvents stream identity to persist with the new event cursor.
+    pub device_uuid: Option<String>,
     /// The changes came from a live stream (`watch`), not a replay of the
     /// persisted log, so the replay-lag floor (`TooSoon`) does not apply:
     /// a live event is the change, not a query that might predate it.
@@ -321,6 +330,7 @@ impl FsEventsPlan {
             changed_dirs,
             current_event_id,
             device,
+            device_uuid: None,
             live: true,
             consume: None,
         }
@@ -349,6 +359,7 @@ impl FsEventsPlan {
             changed_dirs: Vec::new(),
             current_event_id,
             device,
+            device_uuid: None,
             live: false,
             consume: None,
         }
@@ -368,6 +379,7 @@ impl FsEventsPlan {
             changed_dirs,
             current_event_id,
             device,
+            device_uuid: None,
             live: false,
             consume: None,
         }
@@ -385,9 +397,9 @@ pub trait FsEventsSource: Send + Sync {
     fn replay(&self, request: &FsEventsRequest) -> FsEventsPlan;
 
     /// Cheap pre-walk baseline, without replaying history. Returns
-    /// (event ID, device). Persist only after the full measurement succeeds.
+    /// (event ID, device, FSEvents stream UUID). Persist only after the full measurement succeeds.
     /// Unsupported/live-only sources have no persistent baseline to offer.
-    fn anchor_before_full(&self, _root: &Path) -> Option<(u64, u64)> {
+    fn anchor_before_full(&self, _root: &Path) -> Option<(u64, u64, Option<String>)> {
         None
     }
 
@@ -573,6 +585,62 @@ impl EventCoverage {
             let in_window = w.canonical_root.join(rel);
             !w.changed.iter().any(|c| c.starts_with(&in_window))
         })
+    }
+
+    /// A bounded explanation for trace output when a caller's freshness
+    /// check fails. This mirrors [`Self::unchanged_since`] without changing
+    /// its decision; at most one changed path is included as a sample.
+    pub(crate) fn unchanged_since_trace_reason(&self, path: &Path, stored_at: u64) -> String {
+        let mut covering = 0usize;
+        let mut stale = 0usize;
+        let mut latest_since = 0u64;
+        let mut fresh = 0usize;
+        let mut changed_count = 0usize;
+        let mut changed_sample: Option<PathBuf> = None;
+
+        for window in &self.windows {
+            let Ok(rel) = path.strip_prefix(&window.root) else {
+                continue;
+            };
+            covering += 1;
+            if stored_at < window.since_observed_at {
+                stale += 1;
+                latest_since = latest_since.max(window.since_observed_at);
+                continue;
+            }
+
+            fresh += 1;
+            let in_window = window.canonical_root.join(rel);
+            let mut changed_here = 0usize;
+            for changed in &window.changed {
+                if changed.starts_with(&in_window) {
+                    changed_here += 1;
+                    if changed_sample.is_none() {
+                        changed_sample = Some(changed.clone());
+                    }
+                }
+            }
+            changed_count += changed_here;
+            if changed_here == 0 {
+                return format!("unchanged covering_windows={covering}");
+            }
+        }
+
+        if covering == 0 {
+            "no-covering-window".to_string()
+        } else if fresh == 0 {
+            format!(
+                "stored-observation-predates-window stored_at={stored_at} latest_since={latest_since} windows_started_after_observation={stale}"
+            )
+        } else {
+            format!(
+                "changed-descendant covering_windows={fresh} matching_events={changed_count} sample={}",
+                changed_sample
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unavailable".to_string())
+            )
+        }
     }
 }
 
@@ -973,6 +1041,142 @@ mod tests {
         );
     }
 
+    /// Real-provider experiment for the cache's hard-link transition
+    /// boundary. FSEvents is opened without `FileEvents`; this records
+    /// whether adding an external hard link and then writing through that
+    /// alias invalidates a directory-level replay rooted at the original
+    /// file's parent. Keep the two operations in separate replay windows
+    /// so the output distinguishes link creation from content mutation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "explicit real macOS FSEvents hard-link transition experiment"]
+    fn fsevents_replay_experiment_records_hardlink_transitions() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("watched");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let source_file = root.join("source.bin");
+        std::fs::write(&source_file, vec![0x5a; 4096]).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let source_file = root.join("source.bin");
+        let alias = std::fs::canonicalize(outside).unwrap().join("alias.bin");
+
+        let source = macos::MacOsFsEventsSource;
+        let (event_id, device, device_uuid) = source
+            .anchor_before_full(&root)
+            .expect("macOS FSEvents history and UUID must be available for this experiment");
+        let mut since = FsEventsState {
+            event_id: Some(event_id),
+            device: Some(device),
+            device_uuid,
+            ..FsEventsState::default()
+        };
+
+        // The initial file creation is outside the experiment. Drain any
+        // delayed event before creating the alias, then require a quiet
+        // replay so it cannot act as a false positive for either phase.
+        let mut quiet_windows = 0;
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_millis(500));
+            let baseline = source.replay(&FsEventsRequest {
+                root: root.clone(),
+                since: since.clone(),
+                swamp_dir: None,
+                excluded: Vec::new(),
+            });
+            assert!(
+                baseline.incremental,
+                "baseline replay refused: {:?}",
+                baseline.refusal
+            );
+            since.event_id = Some(baseline.current_event_id);
+            if baseline.changed_dirs.is_empty() {
+                quiet_windows += 1;
+                if quiet_windows == 3 {
+                    break;
+                }
+            } else {
+                quiet_windows = 0;
+                eprintln!(
+                    "[fsevents-hardlink-experiment] operation=baseline_drain changed_dirs={:?}",
+                    baseline.changed_dirs
+                );
+            }
+        }
+        assert_eq!(
+            quiet_windows, 3,
+            "initial events did not settle before the experiment"
+        );
+
+        let root_before = std::fs::metadata(&root).unwrap();
+        std::fs::hard_link(&source_file, &alias).unwrap();
+        let root_after_link = std::fs::metadata(&root).unwrap();
+        assert_eq!(root_before.mtime(), root_after_link.mtime());
+        assert_eq!(root_before.mtime_nsec(), root_after_link.mtime_nsec());
+
+        // Give fseventsd a chance to persist this operation before replay.
+        std::thread::sleep(Duration::from_secs(1));
+        let link_plan = source.replay(&FsEventsRequest {
+            root: root.clone(),
+            since: since.clone(),
+            swamp_dir: None,
+            excluded: Vec::new(),
+        });
+        assert!(
+            link_plan.incremental,
+            "link replay refused: {:?}",
+            link_plan.refusal
+        );
+        let link_coverage = EventCoverage::trusted(root.clone(), link_plan.changed_dirs.clone(), 0);
+        let link_invalidated = !link_coverage.unchanged_since(&root, 0);
+        eprintln!(
+            "[fsevents-hardlink-experiment] operation=external_link changed_dirs={:?} source_nlink={} coverage_invalidated={link_invalidated}",
+            link_plan.changed_dirs,
+            std::fs::metadata(&source_file).unwrap().nlink()
+        );
+        assert_eq!(std::fs::metadata(&source_file).unwrap().nlink(), 2);
+        since.event_id = Some(link_plan.current_event_id);
+
+        // The alias is outside the replay root; only the shared inode's
+        // content changes. The watched root's directory stamps should
+        // remain stable, exactly the cache guard at issue.
+        let root_before_write = std::fs::metadata(&root).unwrap();
+        std::fs::write(&alias, vec![0xa5; 8192]).unwrap();
+        assert_eq!(std::fs::metadata(&source_file).unwrap().len(), 8192);
+        let root_after_write = std::fs::metadata(&root).unwrap();
+        assert_eq!(root_before_write.mtime(), root_after_write.mtime());
+        assert_eq!(
+            root_before_write.mtime_nsec(),
+            root_after_write.mtime_nsec()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+
+        let write_started = Instant::now();
+        let write_plan = source.replay(&FsEventsRequest {
+            root: root.clone(),
+            since,
+            swamp_dir: None,
+            excluded: Vec::new(),
+        });
+        assert!(
+            write_plan.incremental,
+            "write replay refused: {:?}",
+            write_plan.refusal
+        );
+        let write_coverage =
+            EventCoverage::trusted(root.clone(), write_plan.changed_dirs.clone(), 0);
+        let write_invalidated = !write_coverage.unchanged_since(&root, 0);
+        eprintln!(
+            "[fsevents-hardlink-experiment] operation=write_through_external_alias changed_dirs={:?} elapsed={:?} coverage_invalidated={write_invalidated}",
+            write_plan.changed_dirs,
+            write_started.elapsed()
+        );
+    }
+
     #[test]
     fn a_platform_without_a_backend_always_refuses_and_names_which_kind() {
         let source = UnsupportedPlatformSource;
@@ -981,6 +1185,7 @@ mod tests {
             since: FsEventsState {
                 event_id: Some(1),
                 device: Some(1),
+                device_uuid: None,
                 last_observed_at: Some(1),
                 rules_version: 0,
                 unit_root: None,
@@ -1109,6 +1314,34 @@ mod tests {
         assert!(
             !coverage.unchanged_since(&PathBuf::from("/somewhere/else"), 1_000),
             "a path outside the root is not covered at all"
+        );
+    }
+
+    #[test]
+    fn freshness_trace_reason_distinguishes_missing_stale_and_changed_windows() {
+        let root = PathBuf::from("/Library/Developer");
+        let child = root.join("CoreSimulator");
+        let missing = EventCoverage::untrusted();
+        assert_eq!(
+            missing.unchanged_since_trace_reason(&child, 100),
+            "no-covering-window"
+        );
+
+        let stale = EventCoverage::trusted(root.clone(), Vec::new(), 101);
+        let stale_reason = stale.unchanged_since_trace_reason(&child, 100);
+        assert!(stale_reason.contains("stored-observation-predates-window"));
+        assert!(stale_reason.contains("stored_at=100"));
+        assert!(stale_reason.contains("latest_since=101"));
+
+        let changed_path = child.join("Devices/changed");
+        let changed = EventCoverage::trusted(root, vec![changed_path.clone()], 99);
+        assert!(
+            changed
+                .unchanged_since_trace_reason(&child, 100)
+                .contains(&format!(
+                    "changed-descendant covering_windows=1 matching_events=1 sample={}",
+                    changed_path.display()
+                ))
         );
     }
 

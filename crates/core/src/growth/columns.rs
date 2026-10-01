@@ -4498,6 +4498,7 @@ table! {
         family: String,
         event_id: Option<u64>,
         device: Option<u64>,
+        device_uuid: Option<String>,
         observed_at: Option<u64>,
         rules_version: Option<u32>,
     }

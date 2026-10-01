@@ -56,12 +56,15 @@ impl EventBus {
         use crate::consumers::*;
         let mut bus = EventBus::new();
         for c in [
+            // Docker starts its daemon snapshot here before the blocking
+            // filesystem walk is polled. It joins that owned prefetch at
+            // ProjectsGrouped, where project facts are finally available.
+            Box::new(DockerConsumer::default()) as Box<dyn Consumer>,
             Box::new(WalkConsumer::default()) as Box<dyn Consumer>,
             Box::new(ProjectsConsumer),
             Box::new(SignalsConsumer),
             Box::new(EcosystemConsumer),
             Box::new(GithubConsumer::default()),
-            Box::new(DockerConsumer),
             Box::new(AssemblyGate::default()),
             Box::new(CargoConsumer::default()),
             Box::new(GrowthConsumer),

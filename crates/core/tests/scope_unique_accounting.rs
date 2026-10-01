@@ -106,6 +106,7 @@ fn initial_source(roots: &[PathBuf]) -> CannedSource {
         changed_dirs: Vec::new(),
         current_event_id: 1,
         device,
+        device_uuid: None,
         live: false,
         consume: None,
     })

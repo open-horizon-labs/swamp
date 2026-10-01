@@ -227,6 +227,166 @@ struct Candidate {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct DeviceFsUnitCoverage {
+    unit_key: String,
+    mounts: Vec<PathBuf>,
+}
+
+/// Stable namespace in the existing overlap marker table. The length
+/// prefix makes unit keys unambiguous even though both unit keys and
+/// absolute paths contain punctuation.
+pub(crate) fn mount_marker_prefix(unit_key: &str) -> String {
+    format!("devicefs-mount:v1:{}:{unit_key}:", unit_key.len())
+}
+
+/// The latest mount-coverage transition for this external unit, if any.
+/// Growth history before this timestamp has a different filesystem
+/// boundary and is not comparable to the current measurement.
+pub(crate) fn mount_coverage_floor(marks: &HashMap<String, (u32, u64)>, unit_key: &str) -> u64 {
+    let prefix = mount_marker_prefix(unit_key);
+    marks
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(_, (_, changed_at))| *changed_at)
+        .max()
+        .unwrap_or(0)
+}
+
+fn devicefs_unit_coverage(
+    automatic_scope: bool,
+    candidates: &[(Candidate, PathBuf)],
+    mounts: &[crate::fs_gate::fs_space::MountPoint],
+) -> Vec<DeviceFsUnitCoverage> {
+    candidates
+        .iter()
+        .map(|(candidate, root)| {
+            let unit_key = unit_key(
+                &candidate.detector_id,
+                candidate.category,
+                device_of(root),
+                root,
+            );
+            let mut nested: Vec<PathBuf> = mounts
+                .iter()
+                .filter(|mount| automatic_scope && mount.fs_type.eq_ignore_ascii_case("devicefs"))
+                .map(|mount| mount.path.clone())
+                .filter(|path| path != root && path.starts_with(root))
+                .collect();
+            nested.sort();
+            nested.dedup();
+            DeviceFsUnitCoverage {
+                unit_key,
+                mounts: nested,
+            }
+        })
+        .collect()
+}
+
+/// Mark DeviceFS exclusion on/off for each external unit in this pass.
+/// Entries remain after unmount or an explicit-scope switch, so a 1→0
+/// transition invalidates comparisons across that measurement boundary.
+fn update_devicefs_mount_marks(
+    marks: &mut HashMap<String, (u32, u64)>,
+    units: &[DeviceFsUnitCoverage],
+    observed_at: u64,
+) {
+    for unit in units {
+        let prefix = mount_marker_prefix(&unit.unit_key);
+        let current: HashSet<String> = unit
+            .mounts
+            .iter()
+            .map(|path| format!("{prefix}{}", path.display()))
+            .collect();
+
+        let previous: Vec<String> = marks
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in previous {
+            if current.contains(&key) {
+                continue;
+            }
+            if let Some((present, changed_at)) = marks.get_mut(&key)
+                && *present != 0
+            {
+                *present = 0;
+                *changed_at = observed_at;
+            }
+        }
+
+        for key in current {
+            match marks.get_mut(&key) {
+                Some((present, _)) if *present == 1 => {}
+                Some((present, changed_at)) => {
+                    *present = 1;
+                    *changed_at = observed_at;
+                }
+                None => {
+                    marks.insert(key, (1, observed_at));
+                }
+            }
+        }
+    }
+}
+
+fn append_coverage_note(existing: &mut Option<String>, addition: impl AsRef<str>) {
+    let addition = addition.as_ref();
+    *existing = Some(match existing.take() {
+        Some(note) if !note.is_empty() => format!("{note}; {addition}"),
+        _ => addition.to_string(),
+    });
+}
+
+fn devicefs_unit_notes(
+    units: &[DeviceFsUnitCoverage],
+    marks: &HashMap<String, (u32, u64)>,
+    observed_at: u64,
+    since_secs: u64,
+) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    let mut by_unit: HashMap<String, Vec<String>> = HashMap::new();
+    let mut report_notes = Vec::new();
+    for unit in units {
+        for path in &unit.mounts {
+            let note = format!(
+                "not measured: virtual mounted filesystem at {}; outside this host-storage measurement",
+                path.display()
+            );
+            by_unit
+                .entry(unit.unit_key.clone())
+                .or_default()
+                .push(note.clone());
+            report_notes.push(note);
+        }
+        let prefix = mount_marker_prefix(&unit.unit_key);
+        let transition_note = marks
+            .iter()
+            .filter(|(key, (present, changed_at))| {
+                key.starts_with(&prefix)
+                    && *changed_at > 0
+                    && changed_at.saturating_add(since_secs) > observed_at
+                    && (*present == 0 || *present == 1)
+            })
+            .map(|(key, _)| {
+                let path = key.strip_prefix(&prefix).unwrap_or(key);
+                let state = marks.get(key).map(|(present, _)| *present).unwrap_or(0);
+                format!(
+                    "mounted filesystem coverage changed at {path} ({}); growth is not compared across that change",
+                    if state == 1 { "excluded from host measurement" } else { "no longer excluded from this measurement" }
+                )
+            });
+        for note in transition_note {
+            by_unit
+                .entry(unit.unit_key.clone())
+                .or_default()
+                .push(note.clone());
+            report_notes.push(note);
+        }
+    }
+    (by_unit, report_notes)
+}
+
 /// A candidate that was actually measured this pass, keyed by its
 /// growth-store row key, holding what `discover_and_measure` needs to
 /// build the final `ExternalUnit` after growth annotation.
@@ -249,6 +409,297 @@ struct MeasuredUnit {
     children: Vec<crate::drilldown::UnitChild>,
     /// When the sealed volumes replayed inside it were walked.
     sealed_walked_at: Option<u64>,
+}
+
+/// Inputs fixed on the report thread before an independent external-unit
+/// measurement is handed to a worker. Candidate reduction remains ordered.
+struct ParallelExternalMeasure {
+    idx: usize,
+    path: PathBuf,
+    exclusions: Vec<PathBuf>,
+    want_children: bool,
+    reuse_ok: bool,
+    size_hint: u64,
+}
+
+struct ParallelExternalResult {
+    path: PathBuf,
+    observation: crate::folded_measurement::UnitObservation,
+    child_dirs: Option<Vec<crate::report::DirRollup>>,
+    elapsed: std::time::Duration,
+}
+
+fn external_measure_worker_limit() -> usize {
+    // The two-worker experiment did not show a reliable end-to-end gain;
+    // retain the opt-in for controlled diagnostics, but default to the
+    // original serial behavior to avoid competing with the walk pool.
+    match std::env::var("SWAMP_EXTERNAL_MEASURE_WORKERS") {
+        Ok(value) => value.parse::<usize>().unwrap_or(1).clamp(1, 2),
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(std::env::VarError::NotUnicode(_)) => 1,
+    }
+}
+
+fn external_measure_trace_enabled() -> bool {
+    std::env::var("SWAMP_EXTERNAL_MEASURE_TRACE")
+        .is_ok_and(|value| value != "0" && !value.is_empty())
+}
+
+fn select_independent_external_jobs(
+    mut eligible: Vec<ParallelExternalMeasure>,
+) -> Vec<ParallelExternalMeasure> {
+    eligible.sort_by_key(|job| std::cmp::Reverse(job.size_hint));
+    let mut selected: Vec<ParallelExternalMeasure> = Vec::new();
+    for job in eligible {
+        if selected
+            .iter()
+            .any(|chosen| job.path.starts_with(&chosen.path) || chosen.path.starts_with(&job.path))
+        {
+            continue;
+        }
+        selected.push(job);
+    }
+    selected
+}
+
+fn measure_independent_external_jobs(
+    jobs: Vec<ParallelExternalMeasure>,
+    worker_limit: usize,
+    store: Option<&Path>,
+    observed_at: u64,
+    coverage: &crate::fs_events::EventCoverage,
+) -> (HashMap<usize, ParallelExternalResult>, usize) {
+    let started = std::time::Instant::now();
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(jobs));
+    let results = std::sync::Mutex::new(HashMap::new());
+    // A measured external pass owns its counter sink on this thread. Scoped
+    // workers must inherit it so traversal work remains attributable to the
+    // caller, just like the directory-walk pool.
+    let counters = crate::work_counters::current();
+    std::thread::scope(|scope| {
+        let worker_count = worker_limit.min(
+            queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+        );
+        let handles: Vec<_> = (0..worker_count)
+            .map(|_| {
+                let queue = &queue;
+                let results = &results;
+                let counters = counters.clone();
+                scope.spawn(move || {
+                    crate::work_counters::install(counters);
+                    loop {
+                        let job = queue
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .pop_front();
+                        let Some(job) = job else { break };
+                        let measurement_started = std::time::Instant::now();
+                        let path = job.path.clone();
+                        let (observation, child_dirs) = if job.want_children {
+                            crate::folded_measurement::observe_unit_with_dirs(
+                                store,
+                                &job.path,
+                                &job.exclusions,
+                                observed_at,
+                                coverage,
+                                job.reuse_ok,
+                                true,
+                            )
+                        } else {
+                            (
+                                crate::folded_measurement::observe_unit(
+                                    store,
+                                    &job.path,
+                                    &job.exclusions,
+                                    observed_at,
+                                    coverage,
+                                ),
+                                None,
+                            )
+                        };
+                        let result = ParallelExternalResult {
+                            path,
+                            observation,
+                            child_dirs,
+                            elapsed: measurement_started.elapsed(),
+                        };
+                        results
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(job.idx, result);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("external measurement worker panicked");
+        }
+    });
+    let results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let worker_count = worker_limit.min(results.len());
+    if std::env::var("SWAMP_TRACE").is_ok_and(|value| value != "0" && !value.is_empty())
+        || external_measure_trace_enabled()
+    {
+        eprintln!(
+            "[xtrace] independent external measurements workers={} elapsed={:?}; per-unit work-counter deltas include concurrent work; stage wall time is exact",
+            worker_count,
+            started.elapsed()
+        );
+        for result in results.values() {
+            eprintln!(
+                "[xtrace] parallel unit {} elapsed={:?}",
+                result.path.display(),
+                result.elapsed
+            );
+        }
+    }
+    (results, worker_count)
+}
+
+#[cfg(test)]
+mod parallel_measurement_tests {
+    use super::*;
+    use crate::folded_measurement::{FoldedUnit, UnitObservation};
+
+    fn job(idx: usize, path: PathBuf, size_hint: u64) -> ParallelExternalMeasure {
+        ParallelExternalMeasure {
+            idx,
+            path,
+            exclusions: Vec::new(),
+            want_children: true,
+            reuse_ok: true,
+            size_hint,
+        }
+    }
+
+    fn folded(observation: &UnitObservation) -> &FoldedUnit {
+        let UnitObservation::Unit(unit) = observation else {
+            panic!("fixture path was not measurable")
+        };
+        unit
+    }
+
+    fn dir_facts(dirs: Option<&[crate::report::DirRollup]>) -> Vec<(String, u64, u64, u32, bool)> {
+        let mut facts: Vec<_> = dirs
+            .unwrap_or_default()
+            .iter()
+            .map(|dir| {
+                (
+                    dir.rel_path.clone(),
+                    dir.allocated_total,
+                    dir.own_allocated,
+                    dir.entry_count,
+                    dir.complete,
+                )
+            })
+            .collect();
+        facts.sort();
+        facts
+    }
+
+    #[test]
+    fn selector_queues_all_disjoint_jobs_and_skips_overlapping_roots() {
+        let root = PathBuf::from("/fixture/large");
+        let jobs = vec![
+            job(1, root.clone(), 100),
+            job(2, root.join("nested"), 90),
+            job(3, PathBuf::from("/fixture/caches"), 80),
+            job(4, PathBuf::from("/fixture/homebrew"), 70),
+        ];
+        let selected = select_independent_external_jobs(jobs);
+        assert_eq!(selected.len(), 3, "all non-overlapping jobs stay queued");
+        assert_eq!(selected[0].idx, 1);
+        assert_eq!(selected[1].idx, 3);
+        assert_eq!(selected[2].idx, 4);
+        assert!(selected.iter().all(|left| selected.iter().all(|right| {
+            left.idx == right.idx
+                || (!left.path.starts_with(&right.path) && !right.path.starts_with(&left.path))
+        })));
+    }
+
+    #[test]
+    fn two_workers_match_serial_fold_children_hardlinks_and_persisted_rows() {
+        let roots = tempfile::tempdir().unwrap();
+        let serial_store = tempfile::tempdir().unwrap();
+        let parallel_store = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..3 {
+            let root = roots.path().join(format!("unit-{i}"));
+            std::fs::create_dir_all(root.join("nested")).unwrap();
+            std::fs::write(root.join("nested/payload"), vec![b'a' + i as u8; 4096]).unwrap();
+            paths.push(root);
+        }
+        std::fs::hard_link(
+            paths[0].join("nested/payload"),
+            paths[1].join("nested/shared"),
+        )
+        .unwrap();
+        crate::fs_gate::settle::settle();
+
+        let coverage = crate::fs_events::EventCoverage::untrusted();
+        let (oracle, serial_work) = crate::work_counters::measured(|| {
+            let mut oracle = HashMap::new();
+            for (idx, path) in paths.iter().enumerate() {
+                let (observation, dirs) = crate::folded_measurement::observe_unit_with_dirs(
+                    Some(serial_store.path()),
+                    path,
+                    &[],
+                    1_000,
+                    &coverage,
+                    true,
+                    true,
+                );
+                oracle.insert(idx, (observation, dirs));
+            }
+            oracle
+        });
+
+        let jobs = paths
+            .iter()
+            .enumerate()
+            .map(|(idx, path)| job(idx, path.clone(), 100 - idx as u64))
+            .collect();
+        let ((parallel, workers), parallel_work) = crate::work_counters::measured(|| {
+            measure_independent_external_jobs(
+                jobs,
+                2,
+                Some(parallel_store.path()),
+                1_000,
+                &coverage,
+            )
+        });
+        assert_eq!(workers, 2, "three queued roots are serviced by two workers");
+        assert_eq!(parallel.len(), paths.len(), "the queue drains every job");
+        assert!(serial_work.dirs_listed > 0 && serial_work.files_statted > 0);
+        assert_eq!(parallel_work.dirs_listed, serial_work.dirs_listed);
+        assert_eq!(parallel_work.files_statted, serial_work.files_statted);
+
+        for (idx, path) in paths.iter().enumerate() {
+            let (expected_observation, expected_dirs) = oracle.get(&idx).unwrap();
+            let actual = parallel.get(&idx).unwrap();
+            let expected = folded(expected_observation);
+            let actual_fold = folded(&actual.observation);
+            assert_eq!(actual_fold.bytes, expected.bytes);
+            assert_eq!(actual_fold.hardlinked, expected.hardlinked);
+            assert_eq!(actual_fold.complete, expected.complete);
+            assert_eq!(actual_fold.mtime_max, expected.mtime_max);
+            assert_eq!(
+                dir_facts(actual.child_dirs.as_deref()),
+                dir_facts(expected_dirs.as_deref())
+            );
+            assert_eq!(
+                crate::growth::folded_rows_for(serial_store.path(), &path.display().to_string()),
+                crate::growth::folded_rows_for(parallel_store.path(), &path.display().to_string())
+            );
+        }
+        assert!(folded(&parallel[&0].observation).hardlinked);
+        assert!(folded(&parallel[&1].observation).hardlinked);
+    }
 }
 
 /// A project worktree the report already measured, handed to the
@@ -482,6 +933,9 @@ pub fn observe_external(
     since_secs: u64,
     coverage: &crate::fs_events::EventCoverage,
 ) -> Result<ExternalObservation> {
+    let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
+    let trace_started = std::time::Instant::now();
+    let mut trace_mark = trace_started;
     // Authorized scope only -- never raw detector candidates. The
     // review's `excluded_agent_home_must_not_be_scanned` counterexample
     // was exactly this loop reading `scope.detectors` and so never
@@ -489,7 +943,7 @@ pub fn observe_external(
     // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
     let detectors = crate::locations::Registry::with_builtins();
     let (candidates, out_of_scope) = authorized_candidates(scope);
-    let (candidates, out_of_scope, partial_containers) =
+    let (candidates, mut out_of_scope, partial_containers) =
         expand_containers(candidates, out_of_scope, scope, &detectors);
     // Detector display names, captured from the authorized scope before
     // the candidates are consumed: a coverage note for an unreadable
@@ -517,6 +971,48 @@ pub fn observe_external(
             }
             canon_candidates.push((c, canonical));
         }
+    }
+    // DeviceFS is a virtual mount (the developer simulator device image
+    // view), not host-owned external storage. In automatic host scope it
+    // is explicitly unmeasured; never recurse through its potentially
+    // enormous metadata tree or report its synthetic byte count as host
+    // storage. Explicit command roots retain their ordinary semantics.
+    let devicefs_units = devicefs_unit_coverage(
+        !scope.explicit,
+        &canon_candidates,
+        &crate::fs_gate::fs_space::mount_points(),
+    );
+    out_of_scope.extend(
+        devicefs_units
+            .iter()
+            .flat_map(|unit| unit.mounts.iter().cloned()),
+    );
+    out_of_scope.sort();
+    out_of_scope.dedup();
+
+    // Persist coverage transitions before any growth annotation. If the
+    // marker cannot be written, fail this external observation rather
+    // than recording a changed filesystem boundary against old history.
+    let mut overlap_marks = swamp_dir
+        .map(crate::growth::read_overlap_marks)
+        .unwrap_or_default();
+    let overlap_marks_before_devicefs = overlap_marks.clone();
+    update_devicefs_mount_marks(&mut overlap_marks, &devicefs_units, observed_at);
+    if let Some(dir) = swamp_dir
+        && observe
+        && overlap_marks != overlap_marks_before_devicefs
+    {
+        crate::growth::write_overlap_marks(dir, &overlap_marks)?;
+    }
+    let (devicefs_notes_by_unit, devicefs_report_notes) =
+        devicefs_unit_notes(&devicefs_units, &overlap_marks, observed_at, since_secs);
+    if trace {
+        eprintln!(
+            "[xtrace] candidate authorization/expansion/canonicalization candidates={} elapsed={:?}",
+            canon_candidates.len(),
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
     }
 
     // Which of these locations are machine-wide build stores, and which
@@ -634,9 +1130,111 @@ pub fn observe_external(
     let previous_children: HashMap<String, Vec<crate::drilldown::UnitChild>> = swamp_dir
         .map(crate::growth::previous_unit_children)
         .unwrap_or_default();
+    if trace {
+        eprintln!(
+            "[xtrace] build-store/cache/coverage setup containers={} elapsed={:?}",
+            store_containers.len(),
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
+    }
     let mut sources_by_key: HashMap<String, Vec<crate::locations::LastUseSource>> = HashMap::new();
     // What an incomplete fold's rows would show as children this pass.
     let mut lower_children: HashMap<String, Vec<crate::drilldown::UnitChild>> = HashMap::new();
+
+    // Measure at most two large, independent ordinary roots together.
+    // All inputs are derived from the same candidate set and event window
+    // as the serial path; only the folds overlap. Reduction below remains
+    // in `order`, so remainders and ownership retain their existing rules.
+    let worker_limit = external_measure_worker_limit();
+    let mut parallel_jobs = Vec::new();
+    if worker_limit > 1 {
+        let mut path_counts: HashMap<PathBuf, usize> = HashMap::new();
+        for (_, path) in &canon_candidates {
+            *path_counts.entry(path.clone()).or_default() += 1;
+        }
+        let mut eligible = Vec::new();
+        for &idx in &order {
+            if remainder_roles.contains_key(&idx) || store_containers.contains_key(&idx) {
+                continue;
+            }
+            let (candidate, canonical) = &canon_candidates[idx];
+            if path_counts.get(canonical) != Some(&1) {
+                continue;
+            }
+            let device = device_of(canonical);
+            let key = unit_key(
+                &candidate.detector_id,
+                candidate.category,
+                device,
+                canonical,
+            );
+            let size_hint = swamp_dir
+                .and_then(|dir| last_known_external(dir, &key).ok().flatten())
+                .map(|(bytes, _)| bytes)
+                .unwrap_or(0);
+            // Avoid dispatch overhead for ordinary small units; the hint
+            // is historical metadata, never a freshness or reuse signal.
+            if size_hint < 16 * 1024 * 1024 {
+                continue;
+            }
+            let mut exclusions: Vec<PathBuf> = canon_candidates
+                .iter()
+                .enumerate()
+                .filter(|(j, (_, other_path))| {
+                    *j != idx && other_path != canonical && other_path.starts_with(canonical)
+                })
+                .map(|(_, (_, path))| path.clone())
+                .collect();
+            let inside_worktrees: Vec<&(PathBuf, u64)> = canonical_worktrees
+                .iter()
+                .filter(|(path, _)| *path != *canonical && path.starts_with(canonical))
+                .collect();
+            exclusions.extend(inside_worktrees.iter().map(|(path, _)| path.clone()));
+            exclusions.extend(
+                out_of_scope
+                    .iter()
+                    .filter(|path| *path != canonical && path.starts_with(canonical))
+                    .cloned(),
+            );
+            exclusions.sort();
+            exclusions.dedup();
+            let sources = last_use_decls.get(&idx).cloned().unwrap_or_default();
+            let unit_id = crate::growth::external_unit_table_id(
+                &candidate.detector_id,
+                category_str(candidate.category),
+                canonical,
+            );
+            let want_children = crate::drilldown::wants_children(
+                candidate.category == StorageCategory::Unclassified,
+                !sources.is_empty(),
+                swamp_dir
+                    .and_then(|dir| last_known_external(dir, &key).ok().flatten())
+                    .map(|(bytes, _)| bytes),
+            );
+            let known_children = previous_children.get(&unit_id).filter(|c| !c.is_empty());
+            eligible.push(ParallelExternalMeasure {
+                idx,
+                path: canonical.clone(),
+                exclusions,
+                want_children,
+                reuse_ok: known_children.is_some() || !want_children,
+                size_hint,
+            });
+        }
+        parallel_jobs = select_independent_external_jobs(eligible);
+    }
+    let mut parallel_results = HashMap::new();
+    if parallel_jobs.len() > 1 {
+        let (results, _workers_launched) = measure_independent_external_jobs(
+            parallel_jobs,
+            worker_limit,
+            swamp_dir,
+            observed_at,
+            coverage,
+        );
+        parallel_results = results;
+    }
 
     for idx in order {
         let (candidate, canonical) = &canon_candidates[idx];
@@ -736,88 +1334,100 @@ pub fn observe_external(
         }
         let before = debug_trace.then(crate::work_counters::snapshot);
         let started = std::time::Instant::now();
-        let (observation, child_dirs) = match store_containers.get(&idx) {
-            Some(container) => {
-                let reuse = probe.can_reuse(container) && reuse_ok;
-                let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
-                    swamp_dir,
-                    &canonical,
-                    &nested_exclusions,
-                    observed_at,
-                    coverage,
-                    reuse,
-                    // A build store's adapter identifies from every
-                    // directory row: it is walked whole on a change.
-                    false,
+        let (observation, child_dirs) = if let Some(result) = parallel_results.remove(&idx) {
+            if debug_trace {
+                eprintln!(
+                    "[xtrace] parallel measurement {} elapsed={:?}; per-worker counter deltas overlap",
+                    canonical.display(),
+                    result.elapsed
                 );
-                if debug_trace {
-                    let after = crate::work_counters::snapshot();
-                    let before = before.unwrap();
-                    eprintln!(
-                        "[xtrace] store {} can_reuse={reuse} dirs_delta={} files_delta={} elapsed={:?}",
-                        canonical.display(),
-                        after.dirs_listed - before.dirs_listed,
-                        after.files_statted - before.files_statted,
-                        started.elapsed()
-                    );
-                }
-                if let crate::folded_measurement::UnitObservation::Unit(_) = &obs {
-                    measured_stores.push((idx, dirs.is_none()));
-                }
-                let for_children = if want_children { dirs.clone() } else { None };
-                if let Some(dirs) = dirs {
-                    store_dirs.extend(crate::build_stores::folded_dirs(&canonical, dirs));
-                }
-                (obs, for_children)
             }
-            None if want_children => {
-                let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
-                    swamp_dir,
-                    &canonical,
-                    &nested_exclusions,
-                    observed_at,
-                    coverage,
-                    reuse_ok,
-                    true,
-                );
-                if debug_trace {
-                    let after = crate::work_counters::snapshot();
-                    let before = before.unwrap();
-                    eprintln!(
-                        "[xtrace] drill  {} dirs_delta={} files_delta={} elapsed={:?}",
-                        canonical.display(),
-                        after.dirs_listed - before.dirs_listed,
-                        after.files_statted - before.files_statted,
-                        started.elapsed()
+            (result.observation, result.child_dirs)
+        } else {
+            match store_containers.get(&idx) {
+                Some(container) => {
+                    let reuse = probe.can_reuse(container) && reuse_ok;
+                    let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
+                        swamp_dir,
+                        &canonical,
+                        &nested_exclusions,
+                        observed_at,
+                        coverage,
+                        reuse,
+                        // A build store's adapter identifies from every
+                        // directory row: it is walked whole on a change.
+                        false,
                     );
+                    if debug_trace {
+                        let after = crate::work_counters::snapshot();
+                        let before = before.unwrap();
+                        eprintln!(
+                            "[xtrace] store {} can_reuse={reuse} dirs_delta={} files_delta={} elapsed={:?}",
+                            canonical.display(),
+                            after.dirs_listed - before.dirs_listed,
+                            after.files_statted - before.files_statted,
+                            started.elapsed()
+                        );
+                    }
+                    if let crate::folded_measurement::UnitObservation::Unit(_) = &obs {
+                        measured_stores.push((idx, dirs.is_none()));
+                    }
+                    let for_children = if want_children { dirs.clone() } else { None };
+                    if let Some(dirs) = dirs {
+                        store_dirs.extend(crate::build_stores::folded_dirs(&canonical, dirs));
+                    }
+                    (obs, for_children)
                 }
-                (obs, dirs)
-            }
-            None => {
-                let obs = crate::folded_measurement::observe_unit(
-                    swamp_dir,
-                    &canonical,
-                    &nested_exclusions,
-                    observed_at,
-                    coverage,
-                );
-                if debug_trace {
-                    let after = crate::work_counters::snapshot();
-                    let before = before.unwrap();
-                    eprintln!(
-                        "[xtrace] plain  {} dirs_delta={} files_delta={} elapsed={:?}",
-                        canonical.display(),
-                        after.dirs_listed - before.dirs_listed,
-                        after.files_statted - before.files_statted,
-                        started.elapsed()
+                None if want_children => {
+                    let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
+                        swamp_dir,
+                        &canonical,
+                        &nested_exclusions,
+                        observed_at,
+                        coverage,
+                        reuse_ok,
+                        true,
                     );
+                    if debug_trace {
+                        let after = crate::work_counters::snapshot();
+                        let before = before.unwrap();
+                        eprintln!(
+                            "[xtrace] drill  {} dirs_delta={} files_delta={} elapsed={:?}",
+                            canonical.display(),
+                            after.dirs_listed - before.dirs_listed,
+                            after.files_statted - before.files_statted,
+                            started.elapsed()
+                        );
+                    }
+                    (obs, dirs)
                 }
-                (obs, None)
+                None => {
+                    let obs = crate::folded_measurement::observe_unit(
+                        swamp_dir,
+                        &canonical,
+                        &nested_exclusions,
+                        observed_at,
+                        coverage,
+                    );
+                    if debug_trace {
+                        let after = crate::work_counters::snapshot();
+                        let before = before.unwrap();
+                        eprintln!(
+                            "[xtrace] plain  {} dirs_delta={} files_delta={} elapsed={:?}",
+                            canonical.display(),
+                            after.dirs_listed - before.dirs_listed,
+                            after.files_statted - before.files_statted,
+                            started.elapsed()
+                        );
+                    }
+                    (obs, None)
+                }
             }
         };
         // The drilldown of this pass's own rows, or (for a replayed unit)
         // the one stored with them. Only for a unit that was measured at
         // all; an unclassified root under the threshold is one row.
+        let drill_started = std::time::Instant::now();
         let children: Vec<crate::drilldown::UnitChild> = match &observation {
             crate::folded_measurement::UnitObservation::Unit(folded) if want_children => {
                 let big_enough = crate::drilldown::worth_listing(!sources.is_empty(), folded.bytes);
@@ -836,6 +1446,14 @@ pub fn observe_external(
             }
             _ => Vec::new(),
         };
+        if debug_trace && want_children {
+            eprintln!(
+                "[xtrace] drilldown {} rows={} elapsed={:?}",
+                canonical.display(),
+                children.len(),
+                drill_started.elapsed()
+            );
+        }
         let row = match observation {
             // Genuinely absent: no candidate this pass. If it was
             // measured before, this observation's own owned sweep
@@ -923,13 +1541,22 @@ pub fn observe_external(
             },
         );
     }
+    if trace {
+        eprintln!(
+            "[xtrace] measurement loop measured={} incomplete={} elapsed={:?}",
+            observed.len(),
+            unmeasured.len(),
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
+    }
 
     // Only the regions this pass actually measured completely may be
     // swept for disappearances, and only in this family's rows. A root
     // that was excluded, whose detector was disabled, or that could not
     // be read contributes nothing here, so nothing under it is
     // tombstoned (`.oh/guardrails/history-sweeps-are-owned.md`).
-    let notes: Vec<String> = partial_containers
+    let mut notes: Vec<String> = partial_containers
         .iter()
         .map(|p| {
             format!(
@@ -938,6 +1565,7 @@ pub fn observe_external(
             )
         })
         .collect();
+    notes.extend(devicefs_report_notes.iter().cloned());
     let ownership = crate::growth::ObservationOwnership::new(
         crate::growth::KeyFamily::External,
         meta_by_key.values().map(|m| m.path.clone()).collect(),
@@ -981,6 +1609,14 @@ pub fn observe_external(
         }
         None => HashMap::new(),
     };
+    if trace {
+        eprintln!(
+            "[xtrace] growth annotation rows={} elapsed={:?}",
+            observed.len(),
+            trace_mark.elapsed()
+        );
+        trace_mark = std::time::Instant::now();
+    }
 
     let consumers_by_key = swamp_dir
         .map(load_all_consumers)
@@ -1058,6 +1694,14 @@ pub fn observe_external(
         retention_days,
         since_secs,
     )?;
+    if trace {
+        eprintln!(
+            "[xtrace] build-store interiors/history units={} elapsed={:?} total={:?}",
+            interiors.len(),
+            trace_mark.elapsed(),
+            trace_started.elapsed()
+        );
+    }
     if let Some(dir) = swamp_dir
         && observe
         && !containers.is_empty()
@@ -1082,9 +1726,6 @@ pub fn observe_external(
         crate::build_stores::save_units(dir, &this_pass, carried, observed_at);
     }
 
-    let overlap_marks: HashMap<String, (u32, u64)> = swamp_dir
-        .map(crate::growth::read_overlap_marks)
-        .unwrap_or_default();
     let mut overlap_marks_next: HashMap<String, (u32, u64)> = overlap_marks.clone();
     for (
         key,
@@ -1106,6 +1747,23 @@ pub fn observe_external(
     {
         let (mut growth_bytes, regrowth_count) =
             annotations.get(&key).copied().unwrap_or((None, 0));
+        let mount_floor = mount_coverage_floor(&overlap_marks, &key);
+        let mut coverage_note = None;
+        if mount_floor > 0 && mount_floor.saturating_add(since_secs) > observed_at {
+            // Read-only reports compute markers in memory too; keep their
+            // displayed growth consistent even though they cannot persist
+            // the transition for the next pass.
+            growth_bytes = None;
+            coverage_note = Some(
+                "mounted filesystem coverage changed; growth is not compared across that change"
+                    .to_string(),
+            );
+        }
+        if let Some(mount_notes) = devicefs_notes_by_unit.get(&key) {
+            for note in mount_notes {
+                append_coverage_note(&mut coverage_note, note);
+            }
+        }
         // A worktree registered or unregistered inside this unit moves its
         // bytes with nothing on disk changing: not growth. Growth is not
         // shown while the change is still inside the growth window.
@@ -1116,14 +1774,11 @@ pub fn observe_external(
             None => 0,
         };
         overlap_marks_next.insert(key.clone(), (overlap_now, changed_at));
-        let mut coverage_note = None;
         if changed_at > 0 && changed_at.saturating_add(since_secs) > observed_at {
             growth_bytes = None;
-            coverage_note = Some(
-                "worktrees inside this unit changed what it counts: a coverage change, so \
-                 growth is not shown until it is out of the growth window"
-                    .to_string(),
-            );
+            let worktree_note = "worktrees inside this unit changed what it counts: a coverage change, so \
+                 growth is not shown until it is out of the growth window";
+            append_coverage_note(&mut coverage_note, worktree_note);
         }
         let consumers = consumers_by_key.get(&key).cloned().unwrap_or_default();
         let mut evidence = consumers_evidence(&consumers);
@@ -1424,6 +2079,101 @@ pub(crate) fn dissociate_consumer(swamp_dir: &Path, key: &str, label: &str) -> R
 /// consumer association never duplicates the unit).
 pub fn total_bytes(units: &[ExternalUnit]) -> u64 {
     units.iter().map(|u| u.bytes).sum()
+}
+
+#[cfg(test)]
+mod devicefs_coverage_tests {
+    use super::*;
+    use std::fs;
+
+    fn candidate(path: &Path) -> Candidate {
+        Candidate {
+            detector_id: "developer-home".into(),
+            detector_name: "Developer".into(),
+            category: StorageCategory::Unclassified,
+            provenance: Provenance::BuiltinConvention,
+            path: path.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn automatic_external_walk_excludes_nested_devicefs_but_explicit_scope_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Library/Developer");
+        let mount = root.join("CoreDevice/DeviceFS");
+        fs::create_dir_all(&mount).unwrap();
+        fs::write(root.join("host-file"), vec![b'h'; 4096]).unwrap();
+        fs::write(mount.join("virtual-file"), vec![b'v'; 64 * 1024]).unwrap();
+        let candidate = candidate(&root);
+        let candidates = vec![(candidate, root.clone())];
+        let mounts = vec![crate::fs_gate::fs_space::MountPoint {
+            path: mount.clone(),
+            fs_type: "DeviceFS".into(),
+            local: true,
+        }];
+
+        let automatic = devicefs_unit_coverage(true, &candidates, &mounts);
+        assert_eq!(automatic.len(), 1);
+        assert_eq!(automatic[0].mounts, vec![mount.clone()]);
+        let explicit = devicefs_unit_coverage(false, &candidates, &mounts);
+        assert_eq!(explicit.len(), 1);
+        assert!(explicit[0].mounts.is_empty());
+        let mut marks = HashMap::new();
+        update_devicefs_mount_marks(&mut marks, &automatic, 100);
+        update_devicefs_mount_marks(&mut marks, &explicit, 200);
+        assert_eq!(mount_coverage_floor(&marks, &explicit[0].unit_key), 200);
+        assert!(marks.values().all(|(excluded, _)| *excluded == 0));
+
+        let coverage = crate::fs_events::EventCoverage::untrusted();
+        let measured_with_mount =
+            crate::folded_measurement::observe_unit(None, &root, &[], 1_000, &coverage);
+        let measured_without_mount = crate::folded_measurement::observe_unit(
+            None,
+            &root,
+            &automatic[0].mounts,
+            1_000,
+            &coverage,
+        );
+        let bytes = |observation| match observation {
+            crate::folded_measurement::UnitObservation::Unit(unit) => unit.bytes,
+            _ => panic!("fixture external root should be measurable"),
+        };
+        assert!(
+            bytes(measured_without_mount) < bytes(measured_with_mount),
+            "the shared external exclusion must prevent traversal bytes under DeviceFS"
+        );
+    }
+
+    #[test]
+    fn devicefs_mount_markers_record_appearance_stability_and_disappearance() {
+        let mount = PathBuf::from("/Users/test/Library/Developer/CoreDevice/DeviceFS");
+        let unit_key = "unit-key".to_string();
+        let mounted = DeviceFsUnitCoverage {
+            unit_key: unit_key.clone(),
+            mounts: vec![mount.clone()],
+        };
+        let absent = DeviceFsUnitCoverage {
+            unit_key: unit_key.clone(),
+            mounts: Vec::new(),
+        };
+        let marker = format!("{}{}", mount_marker_prefix(&unit_key), mount.display());
+        let mut marks = HashMap::new();
+
+        update_devicefs_mount_marks(&mut marks, &[mounted.clone()], 100);
+        assert_eq!(marks[&marker], (1, 100));
+        assert_eq!(mount_coverage_floor(&marks, &unit_key), 100);
+
+        update_devicefs_mount_marks(&mut marks, &[mounted], 200);
+        assert_eq!(marks[&marker], (1, 100), "stable presence keeps its time");
+
+        update_devicefs_mount_marks(&mut marks, &[absent.clone()], 300);
+        assert_eq!(marks[&marker], (0, 300));
+        let (notes, _) = devicefs_unit_notes(&[absent.clone()], &marks, 300, 3_600);
+        assert!(notes[&unit_key][0].contains("no longer excluded from this measurement"));
+
+        update_devicefs_mount_marks(&mut marks, &[absent], 400);
+        assert_eq!(marks[&marker], (0, 300), "stable absence keeps its time");
+    }
 }
 
 #[cfg(test)]

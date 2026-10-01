@@ -36,6 +36,9 @@
 
 #![allow(unsafe_code)]
 
+// Read-only OS mount metadata, surfaced with the filesystem-space facts.
+pub use super::sys::{MountPoint, mount_points};
+
 use std::path::Path;
 
 /// Bytes an unprivileged process can still write to the filesystem

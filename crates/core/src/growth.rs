@@ -1507,6 +1507,7 @@ fn read_fsevents_state(dir: &Path) -> FsEventsState {
             "walk" => {
                 state.event_id = r.event_id;
                 state.device = r.device;
+                state.device_uuid = r.device_uuid;
                 state.last_observed_at = r.observed_at;
                 state.rules_version = r.rules_version.unwrap_or(0);
             }
@@ -1514,6 +1515,7 @@ fn read_fsevents_state(dir: &Path) -> FsEventsState {
                 state.unit_root = Some(crate::fs_events::UnitRootCursor {
                     event_id: r.event_id,
                     device: r.device,
+                    device_uuid: r.device_uuid,
                     observed_at: r.observed_at,
                 });
             }
@@ -1543,6 +1545,7 @@ fn write_cursor_table(dir: &Path, state: &FsEventsState) -> Result<()> {
         family: "walk".to_string(),
         event_id: state.event_id,
         device: state.device,
+        device_uuid: state.device_uuid.clone(),
         observed_at: state.last_observed_at,
         rules_version: Some(state.rules_version),
     }];
@@ -1551,6 +1554,7 @@ fn write_cursor_table(dir: &Path, state: &FsEventsState) -> Result<()> {
             family: "unit_root".to_string(),
             event_id: u.event_id,
             device: u.device,
+            device_uuid: u.device_uuid.clone(),
             observed_at: u.observed_at,
             rules_version: None,
         });
@@ -5633,7 +5637,7 @@ pub fn replay_unit_roots(
         for r in roots {
             out.outcomes.push((r.clone(), "full_forced".to_string()));
             let canonical = crate::fs_gate::canonicalize(r).unwrap_or_else(|_| r.clone());
-            if let Some((event_id, device)) = source.anchor_before_full(&canonical)
+            if let Some((event_id, device, device_uuid)) = source.anchor_before_full(&canonical)
                 && event_id != 0
             {
                 out.staged.push((
@@ -5641,6 +5645,7 @@ pub fn replay_unit_roots(
                     UnitRootCursor {
                         event_id: Some(event_id),
                         device: Some(device),
+                        device_uuid,
                         observed_at: Some(observed_at),
                     },
                 ));
@@ -5654,6 +5659,7 @@ pub fn replay_unit_roots(
         canonical: PathBuf,
         dir: PathBuf,
         device: Option<u64>,
+        device_uuid: Option<String>,
         since: Option<u64>,
         too_soon: bool,
         device_mismatch: bool,
@@ -5690,6 +5696,7 @@ pub fn replay_unit_roots(
             since: FsEventsState {
                 event_id: prev.event_id,
                 device: prev.device,
+                device_uuid: prev.device_uuid.clone(),
                 last_observed_at: prev.observed_at,
                 rules_version: crate::ecosystem::RULES_VERSION,
                 unit_root: None,
@@ -5702,6 +5709,7 @@ pub fn replay_unit_roots(
             canonical,
             dir,
             device: Some(device),
+            device_uuid: prev.device_uuid,
             since: prev.observed_at,
             too_soon,
             device_mismatch,
@@ -5772,6 +5780,7 @@ pub fn replay_unit_roots(
             UnitRootCursor {
                 event_id: Some(plan.current_event_id),
                 device: s.device.or(plan.device),
+                device_uuid: plan.device_uuid.clone().or(s.device_uuid),
                 observed_at: Some(observed_at),
             },
         ));
@@ -5929,7 +5938,7 @@ pub fn stage_tracked_reaching(
         let anchor = observe
             .then(|| source.anchor_before_full(&root))
             .flatten()
-            .filter(|(event_id, _)| *event_id != 0);
+            .filter(|(event_id, _, _)| *event_id != 0);
         let reason = if force_full {
             "full_forced"
         } else {
@@ -5953,9 +5962,10 @@ pub fn stage_tracked_reaching(
             topology: to_stored_worktrees(&result.discovered),
             unowned: result.attribution.unowned.clone(),
             state: anchor
-                .map(|(event_id, device)| FsEventsState {
+                .map(|(event_id, device, device_uuid)| FsEventsState {
                     event_id: Some(event_id),
                     device: Some(device),
+                    device_uuid,
                     last_observed_at: Some(observed_at),
                     rules_version: crate::ecosystem::RULES_VERSION,
                     unit_root: None,
@@ -5992,7 +6002,7 @@ pub fn stage_tracked_reaching(
     let t_replay = std::time::Instant::now();
     let plan = source.replay(&FsEventsRequest {
         root: root.clone(),
-        since: prev_state,
+        since: prev_state.clone(),
         swamp_dir: Some(swamp_dir.to_path_buf()),
         excluded: excluded.to_vec(),
     });
@@ -6153,6 +6163,11 @@ pub fn stage_tracked_reaching(
         state: Some(FsEventsState {
             event_id: Some(plan.current_event_id),
             device: plan.device,
+            device_uuid: plan.device_uuid.clone().or_else(|| {
+                (plan.device == prev_state.device)
+                    .then(|| prev_state.device_uuid.clone())
+                    .flatten()
+            }),
             last_observed_at: Some(observed_at),
             rules_version: crate::ecosystem::RULES_VERSION,
             // The unit-root half of this file belongs to
@@ -7586,6 +7601,11 @@ fn volume_stamps_path(swamp_dir: &Path) -> PathBuf {
     external_dir(swamp_dir).join("volume_stamps.parquet")
 }
 
+/// Parallel external-unit walks may update different units' sealed-mount
+/// rows at once. The table is replaced wholesale, so keep its read-modify-
+/// write atomic within this process.
+static VOLUME_STAMPS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The stored sealed-mount stamps for `unit_path`; empty on a miss.
 pub fn volume_stamps_for(swamp_dir: &Path, unit_path: &str) -> Vec<columns::StoredVolumeStampRow> {
     columns::read_volume_stamp_rows(&volume_stamps_path(swamp_dir))
@@ -7601,6 +7621,9 @@ pub fn store_volume_stamps(
     unit_path: &str,
     rows: &[columns::StoredVolumeStampRow],
 ) -> Result<()> {
+    let _guard = VOLUME_STAMPS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = external_dir(swamp_dir);
     store::StoreDir::at(&dir)?.create()?;
     let path = volume_stamps_path(swamp_dir);
@@ -7611,6 +7634,67 @@ pub fn store_volume_stamps(
         .collect();
     all.extend(rows.iter().cloned());
     columns::write_volume_stamp_rows(&path, &all)
+}
+
+#[cfg(test)]
+mod volume_stamp_write_tests {
+    use super::*;
+
+    fn stamp(unit_path: &str, mount_path: &str, observed_at: u64) -> columns::StoredVolumeStampRow {
+        columns::StoredVolumeStampRow {
+            unit_path: unit_path.to_string(),
+            mount_path: mount_path.to_string(),
+            device: observed_at,
+            total_blocks: observed_at + 1,
+            root_ino: observed_at + 2,
+            root_mtime: observed_at as i64,
+            bytes: observed_at + 3,
+            hardlinked: false,
+            mtime_max: observed_at + 4,
+            complete: true,
+            observed_at,
+        }
+    }
+
+    #[test]
+    fn concurrent_volume_stamp_replacements_preserve_other_units() {
+        let store = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (unit, mount, at) in [("unit-a", "mount-a", 10), ("unit-b", "mount-b", 20)] {
+                let barrier = barrier.clone();
+                let path = store.path().to_path_buf();
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    store_volume_stamps(&path, unit, &[stamp(unit, mount, at)]).unwrap();
+                }));
+            }
+            barrier.wait();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        assert_eq!(
+            volume_stamps_for(store.path(), "unit-a"),
+            vec![stamp("unit-a", "mount-a", 10)]
+        );
+        assert_eq!(
+            volume_stamps_for(store.path(), "unit-b"),
+            vec![stamp("unit-b", "mount-b", 20)]
+        );
+
+        store_volume_stamps(store.path(), "unit-a", &[stamp("unit-a", "mount-a2", 30)]).unwrap();
+        assert_eq!(
+            volume_stamps_for(store.path(), "unit-a"),
+            vec![stamp("unit-a", "mount-a2", 30)]
+        );
+        assert_eq!(
+            volume_stamps_for(store.path(), "unit-b"),
+            vec![stamp("unit-b", "mount-b", 20)]
+        );
+    }
 }
 
 /// Which family of rows in the shared external current table an
@@ -7781,6 +7865,25 @@ fn external_history_index(dir: &Path, retention_days: u64, now: u64) -> Result<H
     Ok(index)
 }
 
+// A mount exclusion changes what this key measures, not how much storage was
+// deleted. Keep historical rows, but never compare across that scope boundary.
+fn external_growth_since(
+    history: &[(u64, u64, bool)],
+    bytes_now: u64,
+    target_time: u64,
+    scope_floor: u64,
+) -> Option<i64> {
+    if scope_floor > target_time {
+        return None;
+    }
+    let comparable: Vec<_> = history
+        .iter()
+        .copied()
+        .filter(|(at, _, _)| *at >= scope_floor)
+        .collect();
+    growth_since(&comparable, bytes_now, target_time)
+}
+
 /// Persists this pass's external-unit observations (current + reverse
 /// delta, same layout as the artifact store) and returns
 /// `(key -> (growth_bytes, regrowth_count))` for the caller to annotate
@@ -7823,10 +7926,16 @@ pub fn observe_and_annotate_external(
 
     let target_time = observed_at.saturating_sub(since_secs);
     let history_index = external_history_index(&dir, retention_days, observed_at)?;
+    let scope_marks = read_overlap_marks(swamp_dir);
     let mut annotations: HashMap<String, (Option<i64>, u32)> = HashMap::new();
     for obs in observed {
         let history = history_index.get(&obs.key).cloned().unwrap_or_default();
-        let growth = growth_since(&history, obs.bytes, target_time);
+        let growth = external_growth_since(
+            &history,
+            obs.bytes,
+            target_time,
+            crate::external::mount_coverage_floor(&scope_marks, &obs.key),
+        );
         let regrowth = table.row(&obs.key).map(|r| r.regrowth_count()).unwrap_or(0);
         annotations.insert(obs.key.clone(), (growth, regrowth));
     }
@@ -7886,11 +7995,17 @@ pub fn annotate_readonly_external(
         .collect();
     let target_time = observed_at.saturating_sub(since_secs);
     let history_index = external_history_index(&dir, retention_days, observed_at)?;
+    let scope_marks = read_overlap_marks(swamp_dir);
     let mut out = HashMap::new();
     for key in keys {
         let history = history_index.get(key).cloned().unwrap_or_default();
         let bytes_now = current.get(key).map(|r| r.bytes()).unwrap_or(0);
-        let growth = growth_since(&history, bytes_now, target_time);
+        let growth = external_growth_since(
+            &history,
+            bytes_now,
+            target_time,
+            crate::external::mount_coverage_floor(&scope_marks, key),
+        );
         let regrowth = current.get(key).map(|r| r.regrowth_count()).unwrap_or(0);
         out.insert(key.clone(), (growth, regrowth));
     }
@@ -7903,6 +8018,123 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     #[allow(unused_imports)]
     use std::fs::{self, File};
+
+    #[test]
+    fn external_mount_scope_floor_survives_persistence_and_readonly_annotation() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("host");
+        let key = external_row_key("developer", "cache", 1, &path.display().to_string());
+        let ownership = ObservationOwnership::new(KeyFamily::External, vec![path.clone()]);
+        let obs = |bytes| ObservedExternal {
+            key: key.clone(),
+            detector_id: "developer".into(),
+            category: "cache".into(),
+            device: 1,
+            path: path.display().to_string(),
+            bytes,
+            hardlinked: false,
+        };
+        observe_and_annotate_external(
+            tmp.path(),
+            &[obs(22_000_000_000)],
+            &HashSet::new(),
+            &ownership,
+            100,
+            30,
+            10,
+        )
+        .unwrap();
+        let mark_key = format!("{}/DeviceFS", crate::external::mount_marker_prefix(&key));
+        write_overlap_marks(tmp.path(), &HashMap::from([(mark_key.clone(), (1, 200))])).unwrap();
+        let annotations = observe_and_annotate_external(
+            tmp.path(),
+            &[obs(1_000)],
+            &HashSet::new(),
+            &ownership,
+            200,
+            30,
+            100,
+        )
+        .unwrap();
+        assert_eq!(annotations[&key].0, None);
+        assert_eq!(
+            peek_external_current(tmp.path(), &key).unwrap().unwrap().0,
+            1_000
+        );
+        let annotations =
+            annotate_readonly_external(tmp.path(), std::slice::from_ref(&key), 200, 30, 100)
+                .unwrap();
+        assert_eq!(annotations[&key].0, None);
+        let annotations = observe_and_annotate_external(
+            tmp.path(),
+            &[obs(1_100)],
+            &HashSet::new(),
+            &ownership,
+            210,
+            30,
+            10,
+        )
+        .unwrap();
+        assert_eq!(annotations[&key].0, Some(100));
+        write_overlap_marks(tmp.path(), &HashMap::from([(mark_key, (0, 300))])).unwrap();
+        let annotations = observe_and_annotate_external(
+            tmp.path(),
+            &[obs(2_000)],
+            &HashSet::new(),
+            &ownership,
+            300,
+            30,
+            100,
+        )
+        .unwrap();
+        assert_eq!(annotations[&key].0, None);
+        assert_eq!(
+            annotate_readonly_external(tmp.path(), &[key.clone()], 300, 30, 100).unwrap()[&key].0,
+            None
+        );
+        // Earlier samples remain history; only comparisons across scopes are refused.
+        let history = external_history_index(&external_dir(tmp.path()), 30, 300).unwrap();
+        assert!(
+            history[&key]
+                .iter()
+                .any(|(_, bytes, _)| *bytes == 22_000_000_000)
+        );
+    }
+
+    #[test]
+    fn external_scope_transition_never_looks_like_reclaimed_bytes() {
+        let history = vec![
+            (100, 22_000_000_000, true),
+            (200, 1_000, true),
+            (300, 1_100, true),
+        ];
+        assert_eq!(
+            super::external_growth_since(&history, 1_200, 150, 200),
+            None
+        );
+        assert_eq!(
+            super::external_growth_since(&history, 1_200, 200, 200),
+            Some(200)
+        );
+        assert_eq!(
+            super::external_growth_since(&history, 1_200, 300, 200),
+            Some(100)
+        );
+        // A second scope transition (mount removal) excludes the first scope too.
+        assert_eq!(
+            super::external_growth_since(&history, 30_000, 250, 300),
+            None
+        );
+        assert_eq!(
+            super::external_growth_since(&history, 1_200, 300, 300),
+            Some(100)
+        );
+        assert_eq!(
+            super::external_growth_since(&history[..1], 1_200, 300, 200),
+            None
+        );
+    }
 
     /// A repeatable stress fixture for `resize_interior`'s selection and
     /// re-aggregation cost. Run with `cargo test -p swamp-core --lib
