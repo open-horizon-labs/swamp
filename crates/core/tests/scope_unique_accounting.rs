@@ -531,7 +531,16 @@ fn a_known_missing_root_does_not_block_an_observed_set_reconciliation() {
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&project).unwrap();
     git(&project, &["init", "-q"]);
-    fs::write(project.join("payload"), vec![b'z'; 12 * 1024]).unwrap();
+    // Incompressible, and settled once before observing: on ZFS a
+    // freshly written, compressible file has no blocks until its commit,
+    // so the observation and the expected figure (read later) disagreed
+    // (CI run 36882714289: 9728 against 71168).
+    fs::write(
+        project.join("payload"),
+        swamp_core::fs_gate::settle::noise(12 * 1024),
+    )
+    .unwrap();
+    swamp_core::fs_gate::settle::settle();
     let roots = vec![project.clone(), absent.clone()];
     let scope = make_scope(&home, &roots);
     let store = tempfile::tempdir().unwrap();

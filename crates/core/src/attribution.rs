@@ -417,6 +417,24 @@ fn now_secs() -> i64 {
 /// whose blocks may not be assigned yet is still counted at exactly that
 /// figure and recorded in the work counters as pending (see
 /// [`allocation_of`]).
+/// Whether `meta` is a recent file whose blocks the filesystem has not
+/// assigned yet (#197): what [`allocated_bytes`] counts for it may still
+/// rise at writeback, with no further change event.
+pub(crate) fn allocation_pending(meta: &fs::Metadata) -> bool {
+    let reported = meta.blocks() * 512;
+    if reported >= ALLOCATION_UNIT || meta.blocks() == 0 {
+        return false;
+    }
+    allocation_of(
+        meta.file_type().is_file(),
+        meta.size(),
+        meta.blocks(),
+        meta.mtime(),
+        now_secs(),
+    )
+    .pending
+}
+
 pub(crate) fn allocated_bytes(meta: &fs::Metadata) -> u64 {
     let reported = meta.blocks() * 512;
     // Only a file under one unit can be pending: keep the clock read and
