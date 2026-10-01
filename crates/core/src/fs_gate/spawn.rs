@@ -1322,10 +1322,19 @@ mod tests {
         assert!(grand > 0, "grandchild never started");
         // SAFETY: getpgid only reads.
         let pgid = unsafe { libc::getpgid(grand) };
-        assert!(
+        // The parent registers the group right after `spawn` returns, but
+        // the child can fork and write its pid file before that (#203: the
+        // scan raced the registration on a loaded runner). Wait for the
+        // registration itself, bounded; never for a fixed time.
+        let registered = |p: i32| {
             LIVE.iter()
-                .any(|s| s.load(std::sync::atomic::Ordering::SeqCst) == pgid)
-        );
+                .any(|s| s.load(std::sync::atomic::Ordering::SeqCst) == p)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !registered(pgid) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(registered(pgid), "the child's group was never registered");
         // What the TUI cancel, the exit hook and the signal handler run.
         kill_registered(|p| p == pgid);
         let out = rx
