@@ -1,10 +1,18 @@
 //! v0.8.0 G6 verification: the review's open-file snapshot cannot run
 //! (no `lsof` on PATH). One test in its own process, so PATH cannot leak.
 
+/// macOS only: that platform's probe is `lsof`. Linux reads `/proc` and
+/// never runs `lsof` (`platform::OccupancyProbe::Procfs`), so with `lsof`
+/// absent its confirm rightly says nothing; the Linux "could not check"
+/// line is covered by `occupancy::tests::procfs_a_foreign_pid_namespace_or_missing_proc_is_unknown`
+/// (Unknown, never free) and `reclaim_trash::tests::occupancy_is_tri_state_lines_never_silence_for_unknown`
+/// (Unknown becomes a line).
+///
 /// Tempting wrong patch: an open-file probe that could not start reads as
 /// "nothing holds it" (no line), so the confirm is silent exactly when
 /// swamp did not look. Missing `lsof` is said on the confirm; it is a line,
 /// never a refusal.
+#[cfg(target_os = "macos")]
 #[test]
 fn adv_b_a_review_without_lsof_says_it_could_not_check_and_still_offers_the_move() {
     let tmp = tempfile::tempdir().unwrap();
