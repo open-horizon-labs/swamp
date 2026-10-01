@@ -489,17 +489,19 @@ impl<'a> BuildCtx<'a> {
         crate::fs_gate::read_link(path).ok()
     }
 
-    /// The first bytes of one named regular file (a weight file's
-    /// header), at most [`model_cards::MAX_CARD_READ`], counted as
-    /// header bytes. A symlink is refused by the gate's open.
-    pub fn header(&self, path: &Path) -> Option<Vec<u8>> {
-        let read = crate::fs_gate::read::bounded_read_header(
-            path,
-            crate::fs_gate::read::BoundedCap::MANIFEST,
-        )
-        .ok()?;
+    /// The first bytes of one named regular file, at most
+    /// `min(want, model_cards::MAX_CARD_READ)`, counted as header bytes.
+    /// A symlink is refused by the gate's open.
+    pub fn header(&self, path: &Path, want: usize) -> Option<Vec<u8>> {
+        use crate::fs_gate::read::BoundedCap;
+        let cap = if want <= BoundedCap::HEADER.bytes() {
+            BoundedCap::header_at_most(want)
+        } else {
+            BoundedCap::MANIFEST
+        };
+        let read = crate::fs_gate::read::bounded_read_header(path, cap).ok()?;
         let mut bytes = read.bytes;
-        bytes.truncate(model_cards::MAX_CARD_READ);
+        bytes.truncate(want.min(model_cards::MAX_CARD_READ));
         Some(bytes)
     }
 

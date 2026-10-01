@@ -150,6 +150,8 @@ fn last_read(fact: &FileFact, card: Option<&CardEntry>, file_name: &str) -> (u64
             .fields
             .get("read_atime_before")
             .and_then(|b| b.parse::<u64>().ok())
+        // A read that did not move the access time left nothing to set aside.
+        && before != fact.atime
     {
         return (
             before,
@@ -386,7 +388,27 @@ fn hub_card(
         return None;
     }
     let mut fields = CardFields::new();
-    let read = |blob: &str| scan.blobs.get(blob).and_then(|f| ctx.header(&f.path));
+    let read = |blob: &str| {
+        scan.blobs
+            .get(blob)
+            .and_then(|f| ctx.header(&f.path, model_cards::MAX_CARD_READ))
+    };
+    // A safetensors header: the 64 KiB a header usually fits in, and the
+    // full bound only when its length prefix says it needs more.
+    let read_weights = |blob: &str| -> Option<Vec<u8>> {
+        let f = scan.blobs.get(blob)?;
+        let first = ctx.header(&f.path, 64 * 1024)?;
+        let claimed = first
+            .get(..8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])))?;
+        if claimed.saturating_add(8) <= first.len() as u64 || first.len() < 64 * 1024 {
+            return Some(first);
+        }
+        if claimed.saturating_add(8) > model_cards::MAX_CARD_READ as u64 {
+            return Some(first);
+        }
+        ctx.header(&f.path, claimed as usize + 8)
+    };
     if let Some(b) = files.get("README.md")
         && let Some(bytes) = read(b)
     {
@@ -418,7 +440,7 @@ fn hub_card(
     let mut total: Option<u64> = Some(0);
     let mut dtypes: BTreeSet<String> = BTreeSet::new();
     for (name, blob) in &weights {
-        match read(blob).map(|b| model_cards::safetensors_header(&b)) {
+        match read_weights(blob).map(|b| model_cards::safetensors_header(&b)) {
             Some(model_cards::WeightHeader::Read { params, dtypes: d }) => {
                 total = total.and_then(|t| t.checked_add(params));
                 dtypes.extend(d);
@@ -641,6 +663,11 @@ fn hub(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
             ),
             Confidence::High,
         );
+        if scan.snapshots.is_empty() && !scan.refs.is_empty() {
+            b = b.limit(
+                "no snapshot: a ref is recorded but no file of that revision is here (a download that did not finish, or one whose files were removed)",
+            );
+        }
         if scan.incomplete.0 > 0 {
             b = b.limit(format!(
                 "incomplete download: {} .incomplete file(s), {}",

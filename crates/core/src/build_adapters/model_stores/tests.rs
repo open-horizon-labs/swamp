@@ -564,3 +564,68 @@ fn no_unit_text_carries_a_verdict_word_or_em_dash() {
         );
     }
 }
+
+/// Not a test: the numbers in the CHANGELOG. Read-only over this
+/// machine's real caches (`HF_HUB_CACHE`/`~/.cache/huggingface/hub`,
+/// `OLLAMA_MODELS`/`~/.ollama/models`); prints sizes, the "what it is"
+/// lines, and the cold and warm identification times.
+/// `cargo test -p swamp-core --lib -- --ignored measure_real_model_caches --nocapture`
+#[test]
+#[ignore]
+fn measure_real_model_caches() {
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    for (kind, root) in [
+        (
+            BuildStoreKind::HuggingFaceHub,
+            home.join(".cache/huggingface/hub"),
+        ),
+        (BuildStoreKind::OllamaModels, home.join(".ollama/models")),
+    ] {
+        if crate::fs_gate::symlink_metadata(&root).is_err() {
+            continue;
+        }
+        let cards = CardCache::default();
+        let t = std::time::Instant::now();
+        let (units, cold) = identify(kind, &root, &cards);
+        let cold_t = t.elapsed();
+        let warm_cards = CardCache::from_entries(cards.retained(&|_| false), 64);
+        let t = std::time::Instant::now();
+        let (_, warm) = identify(kind, &root, &warm_cards);
+        let warm_t = t.elapsed();
+        let total = folded(&root).get(&root).map_or(0, |d| d.allocated_total);
+        println!(
+            "{}: store {} B; cold {:?} ({} header bytes, {} stats, {} listings); warm {:?} ({} header bytes, {} stats)",
+            root.display(),
+            total,
+            cold_t,
+            cold.header_bytes_read,
+            cold.files_statted,
+            cold.dirs_listed,
+            warm_t,
+            warm.header_bytes_read,
+            warm.files_statted
+        );
+        for m in model_rows(&root, &units, crate::entities::now()) {
+            println!(
+                "  {} {:?} {} B | {} | last read {} | {}",
+                m.name,
+                m.revision,
+                m.bytes,
+                m.about.as_deref().unwrap_or("-"),
+                m.last_read,
+                m.regeneration
+            );
+            for f in &m.facts {
+                println!("      {f}");
+            }
+        }
+        for u in units.iter().filter(|u| u.role == ArtifactRole::Residual) {
+            println!(
+                "  [{}] {} B {:?}",
+                u.path.display(),
+                u.bytes,
+                u.coverage.limits
+            );
+        }
+    }
+}
