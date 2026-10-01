@@ -479,7 +479,9 @@ fn developer_dir_ok(d: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The variables `curl` receives from swamp's environment.
+/// The variables `curl` receives from swamp's environment (docs/usage.md,
+/// "Programs swamp runs"; `g7_model_stores` checks that exactly these
+/// arrive).
 pub const CURL_PASSTHROUGH: &[&str] = &[
     "HTTPS_PROXY",
     "https_proxy",
@@ -709,7 +711,10 @@ mod tests {
     fn other_programs_run_from_a_fixed_location_with_their_own_name() {
         for p in Program::ALL
             .iter()
-            .filter(|p| !matches!(p, Program::Brew | Program::Mise))
+            // curl (G7) is scrubbed like brew and mise: from scratch plus
+            // the proxy and CA variables only, so no token or `.curlrc`
+            // path reaches it.
+            .filter(|p| !matches!(p, Program::Brew | Program::Mise | Program::Curl))
         {
             match plan(*p) {
                 Ok(Plan::Fixed { exe, arg0, .. }) => {
