@@ -629,3 +629,45 @@ fn measure_real_model_caches() {
         }
     }
 }
+
+/// Docs match code: every bound `docs/usage.md` states for model caches
+/// is the constant the code uses. Tempting wrong patch: changing a cap
+/// in code and leaving the documented number behind.
+#[test]
+fn usage_doc_states_the_bounds_the_code_uses() {
+    let doc = include_str!("../../../../../docs/usage.md");
+    let section =
+        &doc[doc.find("### Model caches").unwrap()..doc.find("### The Reclaim view").unwrap()];
+    for needle in [
+        format!("At most {}\n  new parses", model_cards::NEW_PARSES_PER_PASS),
+        format!("at most {} characters", model_cards::MAX_CARD_TEXT_CHARS),
+        format!(
+            "At most {} requests per observe",
+            crate::hub_api::MAX_FETCHES_PER_PASS
+        ),
+        format!(
+            "fetched again after {} days",
+            crate::hub_api::MUTABLE_TTL_SECS / 86_400
+        ),
+        "kept for a day".to_string(),
+        format!("{} MiB at most", model_cards::MAX_CARD_READ / (1024 * 1024)),
+        "`associations/model_cards.parquet`".to_string(),
+        "`hf_enrich = true`".to_string(),
+    ] {
+        assert!(
+            section.contains(&needle),
+            "docs/usage.md Model caches lacks {needle:?}"
+        );
+    }
+    assert_eq!(crate::hub_api::NEGATIVE_TTL_SECS, 86_400);
+    assert!(crate::hub_api::OFF_LINE.contains("`hf_enrich = true`"));
+    assert!(
+        doc.contains("hf_enrich = false"),
+        "the config block names the key"
+    );
+    assert!(
+        crate::growth::GrowthConfig::default()
+            .to_toml()
+            .contains("hf_enrich = false")
+    );
+}

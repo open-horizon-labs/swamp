@@ -640,11 +640,7 @@ pub fn summary_line(f: &CardFields) -> Option<String> {
         parts.push(format!("base {b}"));
     }
     if parts.is_empty() {
-        if let Some(l) = get("library_name") {
-            parts.push(l);
-        } else {
-            return None;
-        }
+        parts.push(get("library_name")?);
     }
     Some(parts.join(" · "))
 }

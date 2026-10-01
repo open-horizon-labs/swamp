@@ -441,6 +441,7 @@ fn an_unlistable_cellar_is_a_coverage_note_not_silence() {
         &[],
         None,
         false,
+        false,
         1_000,
         30,
         3600,
