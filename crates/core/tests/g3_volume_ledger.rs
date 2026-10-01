@@ -2516,3 +2516,49 @@ fn the_audit_picks_five_distinct_folders_when_there_are_enough_and_rotates_by_da
     assert_eq!(day1[0], day2[0], "the largest is always audited");
     assert_ne!(day1, day2, "the rest rotate with the day");
 }
+
+/// #181. Tempting wrong patch: ask `diskutil` twice and `tmutil` once on
+/// every run that resumes an open cycle. The resumed runs reuse the facts
+/// the cycle's first run took, and the finished ledger equals a pass that
+/// asked every time.
+#[test]
+fn a_resumed_cycle_reuses_its_system_facts() {
+    let fast = Setup::new();
+    many_small_folders(&fast.fs, 300);
+    assert!(ran(&fast.pass()).complete);
+    let expected = comparable(&fast.rows());
+
+    let slow = Setup::new();
+    many_small_folders(&slow.fs, 300);
+    slow.fs.slow_under("/Users/me/d", Duration::from_millis(20));
+    let mut runs = 0;
+    loop {
+        runs += 1;
+        assert!(runs < 200);
+        let outcome = slow.run_at(NOW + runs, true, Duration::from_millis(2_000), Some(0));
+        if ran(&outcome).complete {
+            break;
+        }
+    }
+    assert!(runs >= 2, "the budget was meant to split the pass");
+    assert_eq!(
+        slow.probe.calls.load(Ordering::SeqCst),
+        3,
+        "resumed runs asked the system again"
+    );
+    let stalled = |rows: &[Row]| -> HashSet<String> {
+        rows.iter()
+            .filter(|r| r.method == "over_budget" || r.method == "stuck")
+            .map(|r| {
+                r.path
+                    .trim_end_matches("/(files directly here)")
+                    .to_string()
+            })
+            .collect()
+    };
+    let skip = stalled(&slow.rows());
+    let keep = |v: Vec<(String, Option<u64>, Option<u64>)>| -> Vec<_> {
+        v.into_iter().filter(|r| !skip.contains(&r.0)).collect()
+    };
+    assert_eq!(keep(comparable(&slow.rows())), keep(expected));
+}

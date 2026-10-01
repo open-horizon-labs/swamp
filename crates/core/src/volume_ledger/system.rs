@@ -364,6 +364,39 @@ const M_SNAP: &str = "tmutil listlocalsnapshots /";
 
 /// Asks the three questions and turns each answer, or each failure, into
 /// rows. On a platform without APFS nothing is asked and nothing is said.
+/// How long system facts taken at the start of an open cycle are reused
+/// by the runs that resume it, in seconds.
+pub const FACTS_REUSE_SECS: u64 = 3600;
+
+/// The system facts an earlier run of this same open cycle stored, when
+/// all three queries answered then and the oldest answer is under
+/// [`FACTS_REUSE_SECS`] old: a resume does not ask `diskutil` twice and
+/// `tmutil` once again for the same cycle (#181). What a query could not
+/// say is kept as it was said, with its time, for at most that long.
+pub(crate) fn reuse_within_cycle(
+    prev_rows: &[Row],
+    data_volume_used: Option<u64>,
+    cycle_started_at: u64,
+    now: u64,
+) -> Option<SystemFacts> {
+    let rows: Vec<Row> = prev_rows
+        .iter()
+        .filter(|r| [M_APFS, M_INFO, M_SNAP].contains(&r.method.as_str()))
+        .cloned()
+        .collect();
+    let all_answered = [M_APFS, M_INFO, M_SNAP]
+        .iter()
+        .all(|m| rows.iter().any(|r| r.method == *m));
+    let fresh = rows.iter().all(|r| {
+        r.measured_at >= cycle_started_at
+            && now.saturating_sub(r.measured_at) < FACTS_REUSE_SECS
+    });
+    (all_answered && fresh).then_some(SystemFacts {
+        rows,
+        data_volume_used,
+    })
+}
+
 pub fn collect(probe: &dyn SystemProbe, now: u64) -> SystemFacts {
     let mut facts = SystemFacts::default();
 
