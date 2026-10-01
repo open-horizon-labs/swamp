@@ -247,6 +247,8 @@ struct MeasuredUnit {
     last_use_sources: Vec<crate::locations::LastUseSource>,
     /// The depth-2 drilldown taken (or replayed) this pass.
     children: Vec<crate::drilldown::UnitChild>,
+    /// When the sealed volumes replayed inside it were walked.
+    sealed_walked_at: Option<u64>,
 }
 
 /// A project worktree the report already measured, handed to the
@@ -917,6 +919,7 @@ pub fn observe_external(
                 overlap,
                 last_use_sources: sources,
                 children,
+                sealed_walked_at: row.sealed_walked_at,
             },
         );
     }
@@ -1097,6 +1100,7 @@ pub fn observe_external(
             overlap,
             last_use_sources,
             children,
+            sealed_walked_at,
         },
     ) in meta_by_key
     {
@@ -1148,7 +1152,7 @@ pub fn observe_external(
             consumers,
             // The overlap is two numbers now; the sentence is rendered
             // from them (`ExternalUnit::overlap_note`).
-            note: coverage_note,
+            note: with_walked_note(coverage_note, sealed_walked_at),
             evidence,
             bytes_counted_elsewhere: overlap.map_or(0, |(_, b)| b),
             overlap_count: overlap.map_or(0, |(n, _)| n as u32),
@@ -1621,4 +1625,19 @@ mod consumer_sidecar_tests {
             vec!["kept"]
         );
     }
+}
+
+/// The coverage note plus, for a unit whose read-only volumes were
+/// replayed from their stamps, when those volumes were actually walked:
+/// their bytes are that walk's, not this pass's (#181).
+fn with_walked_note(note: Option<String>, walked_at: Option<u64>) -> Option<String> {
+    let Some(at) = walked_at else { return note };
+    let walked = format!(
+        "read-only volumes inside walked {}; unchanged since (their stamps)",
+        crate::last_used::format_day(at, crate::entities::now())
+    );
+    Some(match note {
+        Some(n) => format!("{n}; {walked}"),
+        None => walked,
+    })
 }

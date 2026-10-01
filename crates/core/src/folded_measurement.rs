@@ -89,6 +89,10 @@ pub struct FoldedUnit {
     /// are-not-storage-changes.md`) -- a folder going unreadable for one
     /// pass is coverage shrinking, not the unit shrinking.
     pub complete: bool,
+    /// The oldest time a sealed volume inside was actually walked, when
+    /// this measurement replayed one from its stamp (#181): the bytes are
+    /// that walk's, so the report says when it was.
+    pub sealed_walked_at: Option<u64>,
 }
 
 // ---------------------------------------------------------------------
@@ -181,6 +185,8 @@ struct SealedPart {
     mtime_max: u64,
     complete: bool,
     reused: bool,
+    /// When this volume was last actually walked: kept across replays.
+    walked_at: u64,
     dirs: Vec<crate::report::DirRollup>,
 }
 
@@ -202,6 +208,7 @@ fn reuse_sealed(
         mtime_max: row.mtime_max,
         complete: row.complete,
         reused: true,
+        walked_at: row.observed_at,
         dirs: Vec::new(),
     })
 }
@@ -236,6 +243,7 @@ fn walk_sealed(
         mtime_max: row.mtime_max,
         complete,
         reused: false,
+        walked_at: observed_at,
         dirs,
     }
 }
@@ -299,7 +307,8 @@ fn sealed_parts(
             hardlinked: part.hardlinked,
             mtime_max: part.mtime_max,
             complete: part.complete,
-            observed_at,
+            // The time the volume was walked, not this replay's.
+            observed_at: part.walked_at,
         });
         parts.push(part);
     }
@@ -317,6 +326,13 @@ fn add_sealed(folded: &mut FoldedUnit, parts: &[SealedPart]) {
         folded.mtime_max = folded.mtime_max.max(p.mtime_max);
         folded.complete &= p.complete;
         folded.reused &= p.reused;
+        if p.reused {
+            folded.sealed_walked_at = Some(
+                folded
+                    .sealed_walked_at
+                    .map_or(p.walked_at, |w| w.min(p.walked_at)),
+            );
+        }
     }
 }
 
@@ -375,6 +391,7 @@ pub fn measure(
     // call has no worktree, so it cannot be used to detect an
     // unreadable subdirectory the way the Source-tree walk does.
     let folded = FoldedUnit {
+        sealed_walked_at: None,
         reused: false,
         bytes: row.bytes,
         hardlinked: row.hardlinked,
@@ -458,6 +475,7 @@ pub fn reuse_folded_measurement(
         return None;
     }
     Some(FoldedUnit {
+        sealed_walked_at: None,
         reused: true,
         bytes: root.bytes,
         hardlinked: root.hardlinked,
@@ -785,6 +803,7 @@ fn partial_measure(
         crate::work_counters::record_subtree_reused();
     }
     let folded = FoldedUnit {
+        sealed_walked_at: None,
         reused: false,
         bytes: row.bytes + reused.iter().map(|r| r.bytes).sum::<u64>(),
         hardlinked: row.hardlinked,
@@ -1009,6 +1028,7 @@ pub fn observe_unit_with_dirs(
             );
             crate::work_counters::record_cache_miss();
             let mut folded = FoldedUnit {
+                sealed_walked_at: None,
                 reused: false,
                 bytes: row.bytes,
                 hardlinked: row.hardlinked,
