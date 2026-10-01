@@ -317,11 +317,32 @@ fn adv_b_two_instances_racing_one_move_never_double_move_or_lose_a_row() {
         let res: Vec<_> = hands.into_iter().map(|h| h.join().unwrap()).collect();
         let ok = res.iter().filter(|r| r.is_ok()).count();
         assert_eq!(ok, 1, "round {round}: {res:?}");
-        let in_trash = std::fs::read_dir(&f.trash).map(|d| d.count()).unwrap_or(0);
+        // Linux lays the Trash out as files/ + info/ (the freedesktop
+        // spec): the moved item is the one entry under files/.
+        #[cfg(target_os = "linux")]
+        let items = f.trash.join("files");
+        #[cfg(not(target_os = "linux"))]
+        let items = f.trash.clone();
+        let in_trash = std::fs::read_dir(&items).map(|d| d.count()).unwrap_or(0);
         assert_eq!(in_trash, 1, "round {round}");
         let o = outcomes(&f);
         assert!(!o.iter().any(|o| o == "started"), "round {round}: {o:?}");
-        assert_eq!(o.len(), 2, "round {round}: a ledger row was lost: {o:?}");
+        // The attempt that lost either refused at the recheck (the entry
+        // was already gone: nothing happened, so no row) or got as far as
+        // its started row and ended `failed`. Which one depends on timing,
+        // so the invariant is: exactly one `completed`, every other row is
+        // a final `failed:` row, and at most one row per attempt.
+        assert_eq!(
+            o.iter().filter(|o| *o == "completed").count(),
+            1,
+            "round {round}: {o:?}"
+        );
+        assert!(
+            o.iter()
+                .all(|o| o == "completed" || o.starts_with("failed:")),
+            "round {round}: {o:?}"
+        );
+        assert!((1..=2).contains(&o.len()), "round {round}: {o:?}");
     }
 }
 
