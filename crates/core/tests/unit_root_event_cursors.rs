@@ -950,3 +950,31 @@ fn a_detector_home_is_a_present_scan_root() {
         scope.roots.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
 }
+
+/// #181. Tempting wrong patch: keep dropping the built-in default roots
+/// from the unit cursors because "the walk anchors them". Only `~/src` is
+/// walked; `~/Library/Caches` is measured as an external unit, and with
+/// no cursor of its own it had no event window and was walked whole
+/// (163k files) on every pass.
+#[test]
+fn the_builtin_cache_root_gets_its_own_event_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(tmp.path()).unwrap();
+    for d in ["src", "Library/Caches", "Library/Developer"] {
+        std::fs::create_dir_all(home.join(d)).unwrap();
+    }
+    let registry = Registry::with_builtins();
+    let cfg = ScanConfig {
+        disabled_detectors: registry
+            .detectors()
+            .iter()
+            .map(|d| d.id().to_string())
+            .filter(|id| id != "builtin-defaults")
+            .collect(),
+        ..Default::default()
+    };
+    let env = Environment::fixture(home.clone(), HashMap::new(), Platform::MacOS);
+    let scope = resolve_effective_scope(&env, &cfg, &[], &registry, 1_000);
+    let roots = scope.authorized_unit_roots();
+    assert!(roots.contains(&home.join("Library/Caches")), "{roots:?}");
+}

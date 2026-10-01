@@ -635,8 +635,11 @@ impl EffectiveScope {
     /// exclusion or an explicit-root replacement removes a root's cursor
     /// exactly as it removes its units
     /// (`.oh/guardrails/discovery-consumes-effective-scope.md`). The
-    /// builtin-defaults pseudo-detector is dropped: it proposes the
-    /// configured scan roots themselves, which the walk already anchors.
+    /// builtin-defaults roots are included too: `~/Library/Caches` and
+    /// `~/Library/Developer` are measured as external units and no walk
+    /// anchors them, so without a cursor of their own they were walked
+    /// whole on every pass (#181: 163k files for Caches). A root that is
+    /// also a scan root gets both windows; either may vouch.
     pub fn authorized_unit_roots(&self) -> Vec<PathBuf> {
         let roots = if self.explicit {
             self.authorized_detector_paths_in_explicit_roots()
@@ -646,10 +649,7 @@ impl EffectiveScope {
         let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut out = Vec::new();
         for root in roots {
-            let Some(detector_id) = root.detector_id.as_deref() else {
-                continue;
-            };
-            if detector_id == crate::locations::builtin::BUILTIN_DEFAULTS_DETECTOR_ID {
+            if root.detector_id.is_none() {
                 continue;
             }
             if seen.insert(root.path.clone()) {

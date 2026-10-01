@@ -505,17 +505,30 @@ fn folded_rows(
     let mut seen: std::collections::HashSet<(String, u64, u64)> = std::collections::HashSet::new();
     let mut incomplete_buckets: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut root_incomplete = false;
     for stamp in stamps {
         // A stamp from outside the unit cannot be validated against the
         // unit root later, so the whole measurement is not stored.
-        let rel = stamp.path.strip_prefix(path).ok()?.display().to_string();
-        if stamp.incomplete {
-            // An unreadable directory: its subfolder is never replayed,
-            // and an unreadable root stores nothing.
-            if rel.is_empty() {
-                return None;
+        let Ok(rel) = stamp.path.strip_prefix(path) else {
+            if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+                eprintln!(
+                    "[xtrace] not stored: stamp {} outside {}",
+                    stamp.path.display(),
+                    path.display()
+                );
             }
-            incomplete_buckets.insert(rel.split('/').next().unwrap_or("").to_string());
+            return None;
+        };
+        let rel = rel.display().to_string();
+        if stamp.incomplete {
+            // Something here could not be read: its subfolder is never
+            // replayed. The root is re-walked on every pass anyway (an
+            // unlistable root has no listed stamp, so nothing is stored).
+            if rel.is_empty() {
+                root_incomplete = true;
+            } else {
+                incomplete_buckets.insert(rel.split('/').next().unwrap_or("").to_string());
+            }
             if stamp.mtime_ns == 0 && stamp.ctime_ns == 0 && stamp.own_bytes == 0 {
                 continue;
             }
@@ -554,6 +567,9 @@ fn folded_rows(
     // No root stamp means the root itself was never listed (an excluded
     // or unreadable root): there is nothing to anchor a later reuse on.
     if !saw_root {
+        if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            eprintln!("[xtrace] not stored: no root stamp for {}", path.display());
+        }
         return None;
     }
     let first_carried = rows.len();
@@ -573,11 +589,21 @@ fn folded_rows(
     // on its own without counting a shared file twice.
     // Every lower bound is accounted for by a subfolder that will be
     // walked again; otherwise nothing is marked.
-    let attributed = folded.complete || !incomplete_buckets.is_empty();
+    let attributed = folded.complete || root_incomplete || !incomplete_buckets.is_empty();
     let consistent = attributed
         && !root_linked
         && root_own + children.values().map(|c| c.0).sum::<u64>() + carried_total == folded.bytes
         && files_max == folded.mtime_max;
+    if !consistent && std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        eprintln!(
+            "[xtrace] subfolder totals not recorded for {}: complete={} attributed={attributed} root_linked={root_linked} parts={} total={} newest={files_max}/{}",
+            path.display(),
+            folded.complete,
+            root_own + children.values().map(|c| c.0).sum::<u64>() + carried_total,
+            folded.bytes,
+            folded.mtime_max
+        );
+    }
     for (i, row) in rows.iter_mut().enumerate() {
         if row.rel_dir.is_empty() {
             row.bytes = folded.bytes;
@@ -670,6 +696,17 @@ fn partial_measure(
             coverage.unchanged_since(&child, root.observed_at) && same_directory(&child, r)
         })
         .collect();
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        let marked_n = rows
+            .iter()
+            .filter(|r| !r.rel_dir.is_empty() && !r.rel_dir.contains('/') && r.exclusions == marked)
+            .count();
+        eprintln!(
+            "[xtrace] partial {}: {} of {marked_n} recorded subfolders replayable",
+            path.display(),
+            reused.len()
+        );
+    }
     if reused.is_empty() {
         return None;
     }
