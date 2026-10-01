@@ -186,21 +186,6 @@ pub enum Unpushed {
     Unknown,
 }
 
-/// Whether a worktree's HEAD commit is contained in another branch, found
-/// locally from the repository's own refs (no network, no `gh`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TipReach {
-    /// HEAD is an ancestor of (or equal to) this branch's tip: a short
-    /// remote-tracking name (`origin/feat`) or a local default branch.
-    Reachable(String),
-    /// HEAD is in no remote-tracking branch and not in the default
-    /// branch, every one of which was checked.
-    NotReachable,
-    /// Not established: unborn HEAD, a lookup failed, or the time/ref
-    /// budget ran out before every branch was checked.
-    Unknown,
-}
-
 /// Remote-tracking branches checked per worktree before the answer is
 /// "not established" instead of "no".
 const TIP_REF_CAP: usize = 400;
@@ -211,11 +196,11 @@ impl Repo {
     /// branch (`origin/HEAD`'s target) is checked first, then the other
     /// remote branches, then local `main`/`master`. The worktree's own current local branch is never a
     /// candidate: HEAD is trivially in it. Detached HEAD is fine.
-    pub fn tip_reachable(&self, budget: Duration) -> TipReach {
+    pub fn tip_reachable(&self, budget: Duration) -> crate::signals::TipReach {
         let repo = &self.0;
         let start = Instant::now();
         let Ok(head_id) = repo.head_id() else {
-            return TipReach::Unknown;
+            return crate::signals::TipReach::Unknown;
         };
         let head = head_id.detach();
         let own = repo
@@ -246,10 +231,10 @@ impl Repo {
             }
         }
         let Ok(platform) = repo.references() else {
-            return TipReach::Unknown;
+            return crate::signals::TipReach::Unknown;
         };
         let Ok(iter) = platform.prefixed("refs/remotes/") else {
-            return TipReach::Unknown;
+            return crate::signals::TipReach::Unknown;
         };
         let mut complete = true;
         let mut seen = 0usize;
@@ -280,13 +265,15 @@ impl Repo {
         candidates.extend(locals);
         for (name, tip) in candidates {
             if start.elapsed() >= budget {
-                return TipReach::Unknown;
+                return crate::signals::TipReach::Unknown;
             }
             if tip == head {
-                return TipReach::Reachable(name);
+                return crate::signals::TipReach::Reachable(name);
             }
             match repo.merge_base(head, tip) {
-                Ok(base) if base.detach() == head => return TipReach::Reachable(name),
+                Ok(base) if base.detach() == head => {
+                    return crate::signals::TipReach::Reachable(name);
+                }
                 Ok(_) => {}
                 // No common history: not an ancestor.
                 Err(gix::repository::merge_base::Error::NotFound { .. }) => {}
@@ -294,9 +281,9 @@ impl Repo {
             }
         }
         if complete {
-            TipReach::NotReachable
+            crate::signals::TipReach::NotReachable
         } else {
-            TipReach::Unknown
+            crate::signals::TipReach::Unknown
         }
     }
 

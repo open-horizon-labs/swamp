@@ -348,6 +348,21 @@ pub fn tip_sha(dir: &Path) -> Option<String> {
     Repo::open(dir)?.head_id_hex()
 }
 
+/// Whether a worktree's HEAD commit is contained in another branch, found
+/// locally from the repository's own refs (no network, no `gh`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TipReach {
+    /// HEAD is an ancestor of (or equal to) this branch's tip: a short
+    /// remote-tracking name (`origin/feat`) or a local default branch.
+    Reachable(String),
+    /// HEAD is in no remote-tracking branch and not in the default
+    /// branch, every one of which was checked.
+    NotReachable,
+    /// Not established: unborn HEAD, a lookup failed, or the time/ref
+    /// budget ran out before every branch was checked.
+    Unknown,
+}
+
 /// Time one worktree's local ancestry check may take before it reports
 /// "not established".
 const TIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
@@ -356,8 +371,7 @@ const TIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 /// remote-tracking branch or the default branch (local, offline; see
 /// [`crate::fs_gate::git::Repo::tip_reachable`]). Order is preserved; a
 /// repository that cannot be opened is `Unknown`, not `NotReachable`.
-pub fn tip_reach_parallel(paths: &[std::path::PathBuf]) -> Vec<crate::fs_gate::git::TipReach> {
-    use crate::fs_gate::git::TipReach;
+pub fn tip_reach_parallel(paths: &[std::path::PathBuf]) -> Vec<TipReach> {
     let one = |p: &std::path::PathBuf| match Repo::open(p) {
         Some(r) => r.tip_reachable(TIP_BUDGET),
         None => TipReach::Unknown,

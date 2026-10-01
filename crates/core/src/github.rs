@@ -1674,9 +1674,9 @@ pub fn merge_complete(
     dirty: Option<bool>,
     unpushed: Option<u32>,
     merged: &MergedStatus,
-    tip: &crate::fs_gate::git::TipReach,
+    tip: &crate::signals::TipReach,
 ) -> MergeComplete {
-    use crate::fs_gate::git::TipReach;
+    use crate::signals::TipReach;
     let merged_term = match merged {
         MergedStatus::Yes { .. } => TriState::Yes,
         MergedStatus::No => TriState::No,
@@ -1770,7 +1770,7 @@ mod merge_complete_tests {
             Some(false),
             Some(0),
             &merged,
-            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+            &crate::signals::TipReach::Reachable("origin/main".into()),
         );
         assert_eq!(mc.verdict, TriState::Yes);
         assert!(mc.terms.iter().any(|t| t == "pr=#7"));
@@ -1786,7 +1786,7 @@ mod merge_complete_tests {
             Some(true),
             Some(0),
             &merged,
-            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+            &crate::signals::TipReach::Reachable("origin/main".into()),
         );
         assert_eq!(mc.verdict, TriState::No);
         assert!(mc.terms.iter().any(|t| t == "dirty"));
@@ -1799,7 +1799,7 @@ mod merge_complete_tests {
             Some(false),
             Some(0),
             &merged,
-            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+            &crate::signals::TipReach::Reachable("origin/main".into()),
         );
         assert_eq!(mc.verdict, TriState::Unknown);
 
@@ -1811,7 +1811,7 @@ mod merge_complete_tests {
             None,
             Some(0),
             &merged_yes,
-            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+            &crate::signals::TipReach::Reachable("origin/main".into()),
         );
         assert_eq!(mc2.verdict, TriState::Unknown);
     }
@@ -1829,7 +1829,7 @@ mod merge_complete_tests {
             Some(false),
             Some(0),
             &merged,
-            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+            &crate::signals::TipReach::Reachable("origin/main".into()),
         );
         assert!(zero.terms.iter().any(|t| t == "unpushed=0"));
         assert!(!zero.terms.iter().any(|t| t == "unpushed=yes"));
@@ -1838,7 +1838,7 @@ mod merge_complete_tests {
             Some(false),
             Some(3),
             &merged,
-            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+            &crate::signals::TipReach::Reachable("origin/main".into()),
         );
         assert!(three.terms.iter().any(|t| t == "unpushed=3"));
         assert!(!three.terms.iter().any(|t| t == "unpushed=no"));
@@ -1847,7 +1847,7 @@ mod merge_complete_tests {
             Some(false),
             None,
             &merged,
-            &crate::fs_gate::git::TipReach::Reachable("origin/main".into()),
+            &crate::signals::TipReach::Reachable("origin/main".into()),
         );
         assert!(unknown.terms.iter().any(|t| t == "unpushed=unknown"));
     }

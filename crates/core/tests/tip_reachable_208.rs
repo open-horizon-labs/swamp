@@ -7,8 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use swamp_core::fs_gate::git::TipReach;
 use swamp_core::github::{MergedStatus, TriState, merge_complete};
+use swamp_core::signals::TipReach;
 
 fn git(dir: &Path, args: &[&str]) {
     swamp_core::work_counters::record_spawn();

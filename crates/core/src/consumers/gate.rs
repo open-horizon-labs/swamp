@@ -141,9 +141,7 @@ impl Consumer for AssemblyGate {
                 project.ecosystems = tags.clone();
             }
             for worktree in &mut project.worktrees {
-                let tip = tips
-                    .next()
-                    .unwrap_or(crate::fs_gate::git::TipReach::Unknown);
+                let tip = tips.next().unwrap_or(crate::signals::TipReach::Unknown);
                 let raw = signals.get(&worktree.worktree_id);
                 if let Some(sig) = raw {
                     worktree.signals = sig.rows.clone();
@@ -181,9 +179,9 @@ impl Consumer for AssemblyGate {
                     worktree.signals.push(Signal {
                         name: "tip_reachable".to_string(),
                         value: match &tip {
-                            crate::fs_gate::git::TipReach::Reachable(b) => format!("yes ({b})"),
-                            crate::fs_gate::git::TipReach::NotReachable => "no".to_string(),
-                            crate::fs_gate::git::TipReach::Unknown => "unknown".to_string(),
+                            crate::signals::TipReach::Reachable(b) => format!("yes ({b})"),
+                            crate::signals::TipReach::NotReachable => "no".to_string(),
+                            crate::signals::TipReach::Unknown => "unknown".to_string(),
                         },
                     });
                 }
