@@ -1617,6 +1617,15 @@ fn process_size(
     let mut files_mtime_max: u64 = 0;
     let mut shared_inode = false;
     let mut dir_incomplete = false;
+    // Only exclusions inside this directory can match one of its entries
+    // (an exclusion above it was pruned before this job was queued):
+    // checked once here instead of per entry, which cost a path
+    // allocation and a compare per exclusion for every file (#181).
+    let local_excluded: Vec<&PathBuf> = shared
+        .excluded
+        .iter()
+        .filter(|e| e.starts_with(&path) && **e != path)
+        .collect();
     let mut linked: Vec<(u64, u64, u64)> = Vec::new();
     let mut dir_mtime_max: i64 = own_meta.as_ref().map(|m| m.mtime()).unwrap_or(0);
     for (i, entry) in entries.enumerate() {
@@ -1628,8 +1637,11 @@ fn process_size(
             dir_incomplete = true;
             continue;
         };
-        if shared.excluded.iter().any(|e| entry.path().starts_with(e)) {
-            continue;
+        if !local_excluded.is_empty() {
+            let entry_path = entry.path();
+            if local_excluded.iter().any(|e| entry_path.starts_with(e)) {
+                continue;
+            }
         }
         let Ok(ft) = entry.file_type() else {
             shared.incomplete.store(true, Ordering::Relaxed);
