@@ -4,17 +4,18 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
-use swamp_core::fs_gate::spawn::{Program, run};
+use swamp_core::fs_gate::spawn::{ManagerCommand, run_manager};
 
-fn shim_dir() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("swamp-adv-g4a-{}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
+/// Writes a `brew` and a `mise` into `d` that record they ran (`<tag>`)
+/// and the environment they got.
+fn fakes(d: &std::path::Path, tag: &str) {
+    std::fs::create_dir_all(d).unwrap();
     for name in ["brew", "mise"] {
         let p = d.join(name);
         std::fs::write(
             &p,
             format!(
-                "#!/bin/sh\necho shim > \"{}/{name}.ran\"\nenv > \"{}/{name}.env\"\n",
+                "#!/bin/sh\necho {tag} >> \"{}/{name}.ran\"\nenv > \"{}/{name}.env\"\n",
                 d.display(),
                 d.display()
             ),
@@ -22,61 +23,71 @@ fn shim_dir() -> std::path::PathBuf {
         .unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    d
 }
 
-/// Tempting wrong patch (the PR head): `Command::new("brew")` resolves
-/// through the inherited PATH, so any earlier `brew`/`mise` on PATH is
-/// what a scheduled observe runs. Same gap as the G3 finding
-/// adv_tmutil_is_not_resolved_through_a_path_shim. Also: a poisoned
-/// parent HOMEBREW_*/MISE_*/RUSTUP_* env must not reach the child.
+/// Tempting wrong patch: `Command::new("brew")` resolves through the
+/// inherited PATH, so any earlier `brew`/`mise` on PATH is what a
+/// scheduled observe runs. The real manager commands run here (through
+/// `run_manager`, the shapes the observe pass uses), so a spawn really
+/// happens: the fake in the program directory must be what ran, the PATH
+/// shim must not have, and a poisoned HOMEBREW_*/MISE_* must not reach
+/// the child. (The previous version ran a non-shape and was refused
+/// before anything spawned, so it passed without a spawn.)
 #[test]
 fn adv_manager_spawns_do_not_resolve_through_a_path_shim_or_inherit_poisoned_env() {
-    let d = shim_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let shim = tmp.path().join("shim");
+    let fake = tmp.path().join("fake");
+    fakes(&shim, "shim");
+    fakes(&fake, "fake");
     let old = std::env::var_os("PATH").unwrap_or_default();
-    let mut path = std::ffi::OsString::from(d.as_os_str());
+    let mut path = std::ffi::OsString::from(shim.as_os_str());
     path.push(":");
     path.push(&old);
     // SAFETY: this test binary has a single test; no other thread reads env.
     unsafe {
         std::env::set_var("PATH", &path);
-        std::env::set_var("HOMEBREW_NO_AUTO_UPDATE", "");
+        std::env::set_var("SWAMP_TEST_PROGRAM_DIR", &fake);
         std::env::set_var("HOMEBREW_AUTO_UPDATE_SECS", "1");
         std::env::set_var("HOMEBREW_DEVELOPER", "1");
         std::env::set_var("MISE_YES", "1");
         std::env::set_var("MISE_DATA_DIR", "/tmp/poisoned");
     }
-    let _ = run(
-        Program::Brew,
-        ["autoremove", "--dry-run"],
-        Duration::from_secs(5),
-    );
-    let _ = run(
-        Program::Mise,
-        ["prune", "--dry-run"],
-        Duration::from_secs(5),
-    );
-    let brew_ran = d.join("brew.ran").exists();
-    let mise_ran = d.join("mise.ran").exists();
-    let env = std::fs::read_to_string(d.join("brew.env")).unwrap_or_default();
-    let menv = std::fs::read_to_string(d.join("mise.env")).unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&d);
-    let leaked: Vec<&str> = env
+    let _ = run_manager(ManagerCommand::BrewAutoremoveDryRun, Duration::from_secs(5));
+    let _ = run_manager(ManagerCommand::MisePruneToolsDryRun, Duration::from_secs(5));
+    for name in ["brew", "mise"] {
+        assert!(
+            fake.join(format!("{name}.ran")).exists(),
+            "{name}: nothing ran"
+        );
+        assert!(
+            !shim.join(format!("{name}.ran")).exists(),
+            "{name}: the PATH shim ran"
+        );
+    }
+    let brew_env = std::fs::read_to_string(fake.join("brew.env")).unwrap_or_default();
+    let mise_env = std::fs::read_to_string(fake.join("mise.env")).unwrap_or_default();
+    let leaked: Vec<&str> = brew_env
         .lines()
-        .chain(menv.lines())
+        .chain(mise_env.lines())
         .filter(|l| {
             l.starts_with("HOMEBREW_AUTO_UPDATE_SECS=")
                 || l.starts_with("HOMEBREW_DEVELOPER=")
                 || l.starts_with("MISE_YES=")
-                || l.starts_with("MISE_DATA_DIR=")
         })
         .collect();
-    assert!(
-        !brew_ran && !mise_ran,
-        "PATH shim ran: brew={brew_ran} mise={mise_ran}; poisoned env reaching the child: {leaked:?}"
-    );
     assert!(
         leaked.is_empty(),
         "poisoned env reached the child: {leaked:?}"
     );
+    // `MISE_DATA_DIR` is one of mise's own directory settings, passed to
+    // mise on purpose (`program_paths::MISE_PASSTHROUGH`: the probe must
+    // describe the store the mise unit measures) and to nothing else. The
+    // old version listed it as a leak but never spawned, so it never saw
+    // that it reaches mise by design.
+    assert!(
+        mise_env.contains("MISE_DATA_DIR=/tmp/poisoned"),
+        "{mise_env}"
+    );
+    assert!(!brew_env.contains("MISE_DATA_DIR="), "{brew_env}");
 }

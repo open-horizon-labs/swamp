@@ -294,11 +294,6 @@ const GROUPS: &[Group] = &[
               (scheduled-refresh-launchagent)",
     },
     Group {
-        path: "@core::fs_gate::spawn::Program::Kill",
-        allowed: &[(Krate::Core, &["schedule"])],
-        why: "liveness of the observation lock holder",
-    },
-    Group {
         path: "@core::fs_gate::spawn::Program::Xcrun",
         allowed: &[(Krate::Core, &["tool_removal"])],
         why: "xcrun runs only as an allow-listed detector command (`Program::named` in \

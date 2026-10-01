@@ -980,3 +980,33 @@ fn the_generic_mark_path_names_the_covering_protect_entry() {
         "{why}"
     );
 }
+
+/// Tempting wrong patch: the simulator runtime volumes row keeps saying the
+/// tool command is "not available yet", or the removal sentence sits last
+/// on the clipped signals line and is cut at the edge. The detail pane
+/// shows both ways (Trash, simctl's own command, permanent) in full at 80
+/// columns, the row knows its manager (Backspace with nothing marked opens
+/// simctl's list) and Space still marks it for Trash.
+#[test]
+fn simulator_volumes_row_says_both_removal_paths_and_both_are_reachable() {
+    let f = fx();
+    let vol = f.root.join("CoreSimulator").join("Volumes");
+    dir(&vol);
+    let mut u = unit(StorageCategory::Installation, &vol, 10, vec![]);
+    u.detector_id = "core-simulator".into();
+    let mut a = app_with(&f, vec![u], ViewKind::Reclaim);
+    select(&mut a, "Volumes");
+    let rows = a.rows();
+    assert_eq!(
+        rows[a.selected].tool,
+        Some(swamp_core::tool_removal::Manager::Simulator),
+        "Backspace with nothing marked must reach simctl's sheet"
+    );
+    for w in [80u16, 120] {
+        let s = frame(&a, w, 30);
+        assert!(s.contains("simctl's own command, permanent"), "{w}: {s}");
+        assert!(!s.contains("not available yet"), "{w}: {s}");
+    }
+    space(&mut a);
+    assert_eq!(a.marked.len(), 1, "refusal: {:?}", a.refusal_active());
+}

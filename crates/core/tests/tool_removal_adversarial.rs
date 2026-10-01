@@ -853,19 +853,26 @@ fn a_mise_earlier_on_path_is_not_used() {
     tool_removal::review_target(&host, &go(), &[]).unwrap();
     assert!(!marker.exists(), "the PATH shim ran");
     // Production candidates are a fixed list: none of them comes from PATH.
+    // The lists differ per platform (Linux adds /usr/bin and Linuxbrew), so
+    // the property is checked, not a literal list: every candidate is
+    // absolute, named `mise`, and none is under the PATH shim directory.
     let prod = ToolResolver::system();
-    for c in prod.candidates(Program::Mise) {
+    let shim_dir = sb.root.join("shim");
+    let mise = prod.candidates(Program::Mise);
+    assert!(!mise.is_empty());
+    for c in &mise {
+        assert!(c.is_absolute() && c.ends_with("mise"), "{c:?}");
         assert!(
-            ["/opt/homebrew/bin/mise", "/usr/local/bin/mise"].contains(&c.to_str().unwrap())
-                || c.ends_with(".local/bin/mise")
-                || c.ends_with(".cargo/bin/mise"),
+            !c.starts_with(&shim_dir),
+            "a PATH directory became a candidate: {c:?}"
+        );
+    }
+    for c in prod.candidates(Program::Xcrun) {
+        assert!(
+            c.is_absolute() && c.ends_with("xcrun") && !c.starts_with(&shim_dir),
             "{c:?}"
         );
     }
-    assert_eq!(
-        prod.candidates(Program::Xcrun),
-        vec![PathBuf::from("/usr/bin/xcrun")]
-    );
 }
 
 /// Tempting wrong patch: "trust the test author to point at fakes". In a

@@ -39,7 +39,14 @@ fn shim_dir(dir: &Path, counter: &Path, names: &[&str]) -> String {
         fs::set_permissions(&p, perms).unwrap();
     }
     let prev = std::env::var("PATH").unwrap_or_default();
-    unsafe { std::env::set_var("PATH", format!("{}:{prev}", dir.display())) };
+    // The fakes are reached two ways: through the test build's program
+    // directory (how swamp finds every program since #199; it never
+    // searches PATH) and, in case of a regression to a PATH lookup, first
+    // on PATH too. Either way a spawn is logged.
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{prev}", dir.display()));
+        std::env::set_var("SWAMP_TEST_PROGRAM_DIR", dir);
+    }
     prev
 }
 
@@ -254,7 +261,10 @@ fn unchanged_observations_spaced_past_the_toosoon_floor() {
         spawns_before = now;
     }
     let all_spawns = spawns(&counter);
-    unsafe { std::env::set_var("PATH", prev_path) };
+    unsafe {
+        std::env::set_var("PATH", prev_path);
+        std::env::remove_var("SWAMP_TEST_PROGRAM_DIR");
+    }
 
     println!("--- RE-REVIEW 3 COST REPORT (spaced past the TooSoon floor) ---");
     println!(

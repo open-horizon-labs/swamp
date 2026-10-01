@@ -442,25 +442,13 @@ fn probe_for_evidence(path: &Path) -> OccupancyState {
     }
 }
 
-/// Whether an `lsof` is on `PATH` at all -- present, not necessarily
-/// runnable. A present `lsof` that cannot be run is a second reader
-/// that could not answer, which is `Unknown`, exactly as on macOS.
-///
-/// A `PATH` entry that cannot be examined counts as "maybe": the second
-/// reader is then tried, and if it cannot run the answer is `Unknown`.
+/// Whether an `lsof` is present at one of its fixed locations at all --
+/// present, not necessarily runnable (`PATH` is never searched, #199). A
+/// present `lsof` that cannot be run is a second reader that could not
+/// answer, which is `Unknown`, exactly as on macOS.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn lsof_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    for dir in std::env::split_paths(&path) {
-        match crate::fs_gate::symlink_metadata(dir.join("lsof")) {
-            Ok(_) => return true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return true,
-        }
-    }
-    false
+    crate::fs_gate::program_paths::present(crate::fs_gate::spawn::Program::Lsof)
 }
 
 /// The name a current-use fact gives for where its answer came from.

@@ -339,6 +339,44 @@ pub fn fit_clauses(clauses: &[String], width: usize) -> String {
     truncate_middle(&out, width)
 }
 
+/// A keys row from whole hints joined by ` · `, shortened to fit `width`
+/// cells (counted as the main legend counts them). Hints are dropped from
+/// the right, one whole hint at a time, never cut; a hint that starts with
+/// `Esc` (the way out) is the last to go. A hint is never shown without its
+/// label, so when not even the way out fits the row is empty.
+fn fit_hints(hints: &[&str], width: usize) -> String {
+    let whole = fit_hints_once(hints, width);
+    if whole.contains("Esc") || !hints.iter().any(|h| h.starts_with("Esc")) {
+        return whole;
+    }
+    // Not even the way out fits with its aside: try each hint without its
+    // parenthesised aside (`Esc cancel (nothing is removed)`).
+    let short: Vec<&str> = hints
+        .iter()
+        .map(|h| h.split(" (").next().unwrap_or(h))
+        .collect();
+    fit_hints_once(&short, width)
+}
+
+fn fit_hints_once(hints: &[&str], width: usize) -> String {
+    let mut kept: Vec<&str> = hints.to_vec();
+    loop {
+        // The separator is the one fixed, well-known glyph row: 3 cells.
+        let cells =
+            kept.iter().map(|h| legend_cells(h)).sum::<usize>() + 3 * kept.len().saturating_sub(1);
+        if cells <= width {
+            return kept.join(" · ");
+        }
+        // Drop the last hint that is not the way out.
+        match kept.iter().rposition(|h| !h.starts_with("Esc")) {
+            Some(i) => {
+                kept.remove(i);
+            }
+            None => return String::new(),
+        }
+    }
+}
+
 /// The key legend, shortened to fit `width` cells. Ordered by what a
 /// person reaches for first: filter, view, refresh and delete come before
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
@@ -388,11 +426,30 @@ fn footer_legend(width: usize, blocked: bool, markable: bool, trash: bool) -> St
         }
         parts.push(TAIL);
         let line = parts.join("  ");
-        if line.chars().count() <= width || n == 0 {
+        if legend_cells(&line) <= width {
             return line;
+        }
+        if n == 0 {
+            // Even the two fixed hints do not fit: show whole hints only,
+            // never a hint cut mid-word.
+            let help_quit = format!("{}  {TAIL}", all_items[all_items.len() - 1]);
+            for cand in [help_quit.as_str(), TAIL] {
+                if legend_cells(cand) <= width {
+                    return cand.to_string();
+                }
+            }
+            return String::new();
         }
         n -= 1;
     }
+}
+
+/// Cells a legend line may take on a terminal. Glyphs outside ASCII (the
+/// `⌫` and the arrows) are East Asian ambiguous or font-dependent, so each
+/// is counted as two cells: a line that fits by this count fits however the
+/// terminal draws them, and a hint is dropped whole rather than cut.
+fn legend_cells(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
 /// Rows the status region always takes: what is happening, or what just
@@ -850,61 +907,73 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // The keys row is the legend for the state you are actually in, and
     // nothing else ever replaces it.
+    let fw = size.width as usize;
     let footer_text = if let Some(op) = &app.operation {
         match op.label {
-            "Reviewing" => {
-                "Esc cancel · Nothing has been changed · Next: review, then Enter to move to Trash"
-                    .to_string()
-            }
-            "Deleting" => "Esc stop after this item · moved items stay in Trash".to_string(),
-            _ => "Esc cancel".to_string(),
+            "Reviewing" => fit_hints(
+                &[
+                    "Esc cancel",
+                    "Nothing has been changed",
+                    "Next: review, then Enter to move to Trash",
+                ],
+                fw,
+            ),
+            "Deleting" => fit_hints(
+                &["Esc stop after this item", "moved items stay in Trash"],
+                fw,
+            ),
+            _ => fit_hints(&["Esc cancel"], fw),
         }
     } else if app.blocked_open {
         if app.confirm_open {
-            "↑↓ scroll · r check again · Esc back to the plan".to_string()
+            fit_hints(&["↑↓ scroll", "r check again", "Esc back to the plan"], fw)
         } else {
-            "↑↓ scroll · r check again · Esc close".to_string()
+            fit_hints(&["↑↓ scroll", "r check again", "Esc close"], fw)
         }
     } else if app.confirm_open && !app.confirm_fits(size.width, size.height) {
         // The limit is whether the whole plan (every path and warning)
         // fits the sheet, not a fixed size.
-        let long =
-            "The whole plan does not fit: enlarge the terminal or mark fewer rows · Esc back"
-                .to_string();
-        if crate::model::display_width(&long) <= size.width as usize {
+        let long = fit_hints(
+            &[
+                "The whole plan does not fit: enlarge the terminal or mark fewer rows",
+                "Esc back",
+            ],
+            fw,
+        );
+        if long.starts_with("The whole plan") {
             long
         } else {
-            "Plan does not fit · Esc back".to_string()
+            fit_hints(&["Plan does not fit", "Esc back"], fw)
         }
     } else if app.confirm_open {
-        let mut clauses = vec!["Enter confirm".to_string(), "Esc back".to_string()];
+        let mut clauses: Vec<&str> = vec!["Enter confirm", "Esc back"];
         if !app.blocked.is_empty() {
-            clauses.push("d blocked".to_string());
+            clauses.push("d blocked");
         }
         // `k` copies executables out of a build folder before a move: it
         // does nothing for a plan of Reclaim/External folders alone.
         if !app.marked.values().all(|u| u.reclaim.is_some()) {
             clauses.push(if app.keep_executables {
-                "keep executables → bin/ (k)".to_string()
+                "keep executables → bin/ (k)"
             } else {
-                "k keep executables".to_string()
+                "k keep executables"
             });
         }
-        fit_clauses(&clauses, size.width as usize)
+        fit_hints(&clauses, fw)
     } else if app.picker.is_some() {
-        fit_clauses(
+        fit_hints(
             &[
-                "↑↓ field".to_string(),
-                "←→ value".to_string(),
-                "Enter apply".to_string(),
-                "Esc cancel".to_string(),
-                "e edit as text".to_string(),
-                "0 clear".to_string(),
+                "↑↓ field",
+                "←→ value",
+                "Enter apply",
+                "Esc cancel",
+                "e edit as text",
+                "0 clear",
             ],
-            size.width as usize,
+            fw,
         )
     } else if app.editing_filter {
-        "Tab complete · Enter apply · Esc cancel".to_string()
+        fit_hints(&["Tab complete", "Enter apply", "Esc cancel"], fw)
     } else {
         footer_legend(
             size.width as usize,
@@ -1303,7 +1372,7 @@ fn draw_tool_sheet(frame: &mut Frame, sheet: &crate::tool_sheet::ToolSheet, size
     while lines.len() < rows {
         lines.push(Line::from(""));
     }
-    let keys = crate::model::truncate_middle(sheet.keys(), width);
+    let keys = fit_hints(&sheet.key_hints(), width);
     lines.push(
         Line::from(keys).style(Style::default().add_modifier(ratatui::style::Modifier::REVERSED)),
     );
@@ -2323,11 +2392,18 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect();
-    let title = format!(
-        " help · ↑↓ PgUp PgDn Home End scroll · Esc closes · {}-{} of {} ",
+    let range = format!(
+        "{}-{} of {}",
         (top + 1).min(lines.len()),
         (top + inner_h).min(lines.len()),
         lines.len()
+    );
+    let title = format!(
+        " {} ",
+        fit_hints(
+            &["help", "↑↓ PgUp PgDn Home End scroll", "Esc closes", &range],
+            usize::from(popup.width.saturating_sub(4)),
+        )
     );
     let block = Block::default().borders(Borders::ALL).title(title);
     frame.render_widget(Paragraph::new(shown).block(block), popup);

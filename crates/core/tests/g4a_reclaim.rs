@@ -1150,6 +1150,39 @@ fn removal_paths_are_only_the_ones_that_exist() {
             .text
             .contains("mise's own command")
     );
+    // The simulator runtime volumes: simctl removal and Trash both exist,
+    // so the row says both. Tempting wrong patch: the pre-G5 text
+    // "tool command, not available yet" (or hiding that the manager's
+    // command is permanent).
+    let sim = view_of(
+        &[unit(
+            "core-simulator",
+            StorageCategory::Installation,
+            "/Library/Developer/CoreSimulator/Volumes",
+            GB,
+        )],
+        &[],
+        &ManagerFacts::default(),
+        &[present_root("/h/src")],
+    );
+    let r = row(&sim, "/Library/Developer/CoreSimulator/Volumes");
+    assert_eq!(r.removal.kind, RemovalKind::TrashOrToolCommand);
+    assert!(
+        r.removal.text.contains("in the TUI") && r.removal.text.contains("simctl's own command"),
+        "{}",
+        r.removal.text
+    );
+    assert!(r.removal.text.contains("permanent"), "{}", r.removal.text);
+    assert!(
+        r.removal.tui_text.contains("Trash (Space"),
+        "{}",
+        r.removal.text
+    );
+    assert!(
+        !r.removal.text.contains("not available"),
+        "{}",
+        r.removal.text
+    );
     for p in ["/h/.cache/uv", "/h/.codex", "/h/.rustup/toolchains"] {
         assert_eq!(row(&v, p).removal.kind, RemovalKind::TrashReviewed);
         assert!(!row(&v, p).removal.text.contains("view only"));

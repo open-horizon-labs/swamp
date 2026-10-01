@@ -16,7 +16,7 @@
 "                                                                                "
 "                                                                                "
 "cannot be regenerated (local state or models; no source is recorded) · last use…"
-"Last used: no record                                                            "
+"removal: Trash (Space, then Backspace)                                          "
 "declared consumers: none found among 2 projects in 1 declared root              "
 "cost from: category default                                                     "
 "                                                                                "

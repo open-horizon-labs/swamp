@@ -1,5 +1,5 @@
 //! v0.8.0 G6 verification: the review's open-file snapshot cannot run
-//! (no `lsof` on PATH). One test in its own process, so PATH cannot leak.
+//! (no `lsof` available). One test in its own process, so PATH cannot leak.
 
 /// macOS only: that platform's probe is `lsof`. Linux reads `/proc` and
 /// never runs `lsof` (`platform::OccupancyProbe::Procfs`), so with `lsof`
@@ -22,8 +22,10 @@ fn adv_b_a_review_without_lsof_says_it_could_not_check_and_still_offers_the_move
     std::fs::write(p.join("f"), b"x").unwrap();
     let empty = root.join("empty-bin");
     std::fs::create_dir_all(&empty).unwrap();
-    // SAFETY: this process has exactly this one test.
-    unsafe { std::env::set_var("PATH", &empty) };
+    // SAFETY: this process has exactly this one test. swamp never
+    // searches PATH (#199), so "no lsof" is an empty fake-program
+    // directory, not an empty PATH.
+    unsafe { std::env::set_var("SWAMP_TEST_PROGRAM_DIR", &empty) };
     let t = swamp_core::reclaim_trash::ReclaimTarget::for_path(
         p.clone(),
         "cache",

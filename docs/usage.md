@@ -758,8 +758,9 @@ path. Each row says, as facts with their sources:
 - **The removal path that exists.** Every unit and every listed folder: Trash
   after review (Space, then Backspace in the TUI; see "Cleanup and recovery").
   A unit whose manager swamp runs removal for (mise installs, simulator
-  runtimes) also names that manager's own command (Backspace on an unmarked
-  row). JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
+  runtimes, including `/Library/Developer/CoreSimulator/Volumes`) also names
+  that manager's own command, which is permanent with no Trash (Backspace with
+  nothing marked); the text never says the command is "not available yet". JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
 
 | Storage category | Class | Words when nothing more specific exists | Source |
 |---|---|---|---|
@@ -801,7 +802,7 @@ start no process. It asks only `brew autoremove --dry-run`, `brew list --formula
 --installed-on-request`, `mise prune --dry-run` and `mise ls --global --json`,
 and reads rustup's `settings.toml`. Each command is an allow-listed shape in the
 spawn layer, counted, killed after 20 seconds (the pass after 45). The program is
-found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, and for mise `~/.local/bin`, `~/.cargo/bin` when `HOME` is absolute), never through `PATH`; a candidate must be an executable regular file (a symlink such as Homebrew's is followed) owned by root or you and not group or world writable, in a directory owned by root or you that is not world-writable and is group-writable only for the macOS `admin` group (admin members can already use sudo, so this grants nothing new; it is standard Homebrew's `/opt/homebrew/bin`), else the next is tried; the child's environment is built from scratch
+found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, and for mise `~/.local/bin`, `~/.cargo/bin` when `HOME` is absolute), never through `PATH`; a candidate must be an executable regular file (a symlink such as Homebrew's is followed) owned by root or you and not group or world writable, in a directory owned by root or you that is not world-writable and is group-writable only for the macOS `admin` group (admin members can already use sudo, so this grants nothing new; it is standard Homebrew's `/opt/homebrew/bin`), else it refuses (it is never skipped for a later one; see "Programs swamp runs, and from where"); the child's environment is built from scratch
 (only `HOME`, a fixed `PATH`, colour, pager and Homebrew auto-update/analytics/cleanup
 off, and, for mise only, the directory settings the mise detector honors and mise itself reads: `MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`, `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, so the probe describes the store the unit measures); and it runs from `/`, so a project
 directory cannot change what mise lists. Output over 1 MiB is refused. A hold (a default, a global tool, an install on request) read more than a day before the listing is `unknown` and held out, and one read hours before says so. Every quote shows
@@ -1077,8 +1078,12 @@ disk view "accounted" = developer storage + remainder units
 
 `swamp report --view reclaim` prints the first line after its headline, and its
 JSON carries `headline_relation` (`holds`); `headline.disk.accounted_check`
-carries the second. They differ when the ledger's accounted rows came from a
-different observation than the units read here, or when a unit's row was lost.
+carries the second. They differ when units on another volume are counted here but listed
+apart by the ledger, when worktrees outside the declared roots count under projects
+but not in the ledger's declared rows, when the ledger's accounted rows were measured
+at another time than the units read here, or when a unit's row was lost. The line
+names the other-volume bytes and the unexplained rest as numbers, and mentions the
+measurement time only when the two times differ.
 Whenever they differ the report prints a plain line (`disk view check: the
 ledger's accounted bytes (X) differ from developer storage plus the remainder units
 (Y) by Z`) and the Disk view repeats it on its Accounted row. (A same-path
@@ -1235,7 +1240,7 @@ same way, with no size.
   format reset leaves them alone: the ledger is a measurement, not derived from
   another table.
 - **The programs are fixed.** `diskutil` and `tmutil` run from `/usr/sbin/diskutil`
-  and `/usr/bin/tmutil`, never through `PATH`.
+  and `/usr/bin/tmutil`, never through `PATH`, like every program swamp runs.
 - **A second pass over an unchanged disk gives identical bytes but is not
   faster.** There is no event replay for the whole disk (yet), so every pass
   measures every row again; the budget bounds it instead.
@@ -1465,6 +1470,8 @@ Install and authenticate `gh` to collect GitHub facts:
 swamp observe ~/src
 swamp report ~/src --view worktrees
 ```
+
+Each worktree also carries `tip_reachable`, a fact `observe` computes from the repository's own refs, offline and without `gh`: whether the worktree's HEAD commit is contained in a remote-tracking branch (`refs/remotes/*`, `*/HEAD` excluded). A remote-tracking ref is the state at the last fetch, so the term says so: `tip_reachable=yes (origin/audit/x, as of last fetch Sep 30)`, using the time of `FETCH_HEAD` (else the ref's reflog, else `fetch time unknown`); a branch deleted on the remote since then still reads yes until the next fetch. The local `main`/`master` counts only from a linked worktree, whose own folder can be removed while the shared `.git` keeps that branch, and is named `local main, not pushed`; in a primary checkout a local branch lives in the folder's own `.git` and never counts. It is separate from `merged`, which stays the pull-request fact: a branch with no PR reads `merged=unknown` and can still read `tip_reachable=yes`. The worktree's own checked-out branch is never its own proof; a detached HEAD is judged by its commit. A repository that cannot be opened, a shallow clone where nothing was found, more than 400 remote branches, or a 2-second budget (checked at every commit of the walk) read `tip_reachable=unknown`, never `no`. A squash-merged branch reads `tip_reachable=no` because its commits are in no branch; the `merge-complete` verdict still counts a merged PR as landed.
 
 Reports use the GitHub facts the last `observe` cached. `observe` queries GitHub unless given `--no-enrich`, and reuses a cache entry that is still valid. GitHub cache validity uses the tip SHA: a worktree whose branch is already merged is terminal and is never re-enriched automatically, and every other row is refreshed after a 24-hour TTL. `observe --enrich` is the on-demand override: it refetches everything, ignoring the TTL and the merged rule.
 
@@ -1790,6 +1797,26 @@ once (loose objects and packs skipped); a repository with a FIFO, device
 or dataless file there, or with more than 50,000 entries to check, is
 reported as not measured. When your global git config could block, git
 reads repositories without it.
+
+### Programs swamp runs, and from where
+
+swamp runs a fixed set of programs, each from a fixed list of locations, **never through `PATH`**: a `git`, `docker` or `brew` placed earlier on your `PATH` (a shim, a wrapper, a checkout's `bin`) is never what swamp runs. The first location that exists is the one used, and it is checked: the program file (a symlink such as Homebrew's is followed to the real file) must be an executable owned by you or root and not group- or world-writable, and so must every directory on the way to it: the location's own directory, the directory of every link in between, and the real file's. A directory swamp runs a program from must be owned by you or root and not writable by everyone; it may be group-writable only for the macOS `admin` group, because admin members can already use sudo, so this grants no power they lack. Any other group, another owner, or any group-write on Linux refuses, and the refusal names what failed ("/opt/homebrew/bin is writable by group staff"); swamp never falls through to a later location. A program found nowhere is "not available", the same as not installed. Locations in your home (`~/.local/bin`, `~/.cargo/bin`, `~/.docker/bin`, `~/.orbstack/bin`) come after every system location and are used only when none of those has the program: any process you run can put a file there, so they are trusted about as much as your own `PATH`. `brew` and `mise` run in an environment built from scratch; the others keep your environment, because `git`, `gh` and `docker` need your credentials and contexts, except loader and hook variables (`DYLD_*`, `LD_*`, `GIT_CONFIG*`, `GIT_SSH*`, `GIT_EXEC_PATH`, `GIT_EXTERNAL_DIFF`, askpass, editor and browser variables), and with `PATH` set to the program's own directory, `/usr/bin:/bin:/usr/sbin:/sbin`, then `/opt/homebrew/bin` and `/usr/local/bin` if they pass the same directory check.
+
+| Program | macOS | Linux |
+|---|---|---|
+| `git`, `gh` | `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/home/linuxbrew/.linuxbrew/bin` |
+| `docker` | `/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`, `~/.docker/bin`, `~/.orbstack/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/home/linuxbrew/.linuxbrew/bin`, `~/.docker/bin`, `~/.orbstack/bin` |
+| `brew` | `/opt/homebrew/bin`, `/usr/local/bin` | `/home/linuxbrew/.linuxbrew/bin`, `/usr/local/bin`, `/usr/bin` |
+| `mise` | `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin` | `/usr/local/bin`, `/usr/bin`, `/home/linuxbrew/.linuxbrew/bin`, `~/.local/bin`, `~/.cargo/bin` |
+| `lsof` | `/usr/sbin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `du`, `id` | `/usr/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `df` | `/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `systemctl`, `loginctl` | (not used) | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `xcrun`, `plutil`, `defaults`, `tmutil` | `/usr/bin` | (not used) |
+| `diskutil` | `/usr/sbin` | (not used) |
+| `launchctl` | `/bin` | (not used) |
+
+`~` locations are used only when `HOME` is an absolute path.
 
 ### Full-disk guard
 
