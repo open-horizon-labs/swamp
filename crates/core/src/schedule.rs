@@ -20,10 +20,6 @@ pub const LABEL: &str = "com.open-horizon-labs.swamp.observe";
 /// Default watchdog budget for one `observe` invocation, in seconds.
 pub const DEFAULT_OBSERVE_TIMEOUT_SECS: u64 = 1800;
 
-fn env_dir(var: &str, default: PathBuf) -> PathBuf {
-    std::env::var(var).map(PathBuf::from).unwrap_or(default)
-}
-
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
 }
@@ -44,7 +40,14 @@ pub fn plist_path() -> PathBuf {
 /// store lives) or cache. A relative `$XDG_STATE_HOME` is ignored, as
 /// the spec requires. `SWAMP_LOG_DIR` still overrides both.
 pub fn log_dir() -> PathBuf {
-    env_dir("SWAMP_LOG_DIR", default_log_dir())
+    match std::env::var_os("SWAMP_LOG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let dir = default_log_dir();
+            store::refuse_real_user_default("observe log directory", &dir, store::Resolve::Display);
+            dir
+        }
+    }
 }
 
 fn default_log_dir() -> PathBuf {
@@ -1211,10 +1214,21 @@ mod tests {
     #[test]
     fn the_log_directory_follows_this_platforms_convention_and_the_override_wins() {
         let _guard = ENV_LOCK.lock().unwrap();
+        // HOME points at a temp dir: the hermeticity guard refuses a test
+        // that derives the real user's log directory.
+        let fake_home = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME");
         unsafe {
             std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::set_var("HOME", fake_home.path());
         }
         let derived = log_dir();
+        unsafe {
+            match &real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
         let text = derived.display().to_string();
         match crate::platform::Os::current() {
             crate::platform::Os::MacOs => {
@@ -1254,13 +1268,20 @@ mod tests {
     #[test]
     fn a_relative_xdg_state_home_is_ignored() {
         let _guard = ENV_LOCK.lock().unwrap();
+        let fake_home = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME");
         unsafe {
             std::env::remove_var("SWAMP_LOG_DIR");
             std::env::set_var("XDG_STATE_HOME", "relative/state");
+            std::env::set_var("HOME", fake_home.path());
         }
         let derived = log_dir();
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
+            match &real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
         }
         assert!(
             derived.is_absolute(),
@@ -1272,6 +1293,137 @@ mod tests {
             "{}",
             derived.display()
         );
+    }
+
+    /// Tempting wrong patch: truncate the log at the cap (losing the
+    /// recent history `schedule status` falls back to) or rotate into
+    /// numbered files without a limit. The log rotates into exactly three
+    /// files (`observe.log.1` to `.3`), the newest line is always in
+    /// `observe.log`, and each stays near the cap.
+    #[test]
+    fn the_observe_log_rotates_into_three_files_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("observe.log");
+        // Long lines so three caps' worth of history takes a few hundred
+        // appends (each one syncs).
+        let filler = "x".repeat(8 * 1024);
+        let cap = store::LOG_CAP_BYTES;
+        let appends = 6 * cap / (8 * 1024) + 10;
+        for i in 0..appends {
+            let outcome = RunOutcome {
+                observed_at: 1_000 + i,
+                wall_ms: 1,
+                walked_total: 1,
+                projects: 1,
+                mode: format!("full{filler}"),
+                outcome: "ok".to_string(),
+            };
+            append_log(&log, &outcome).unwrap();
+        }
+        let size = |p: &std::path::Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let rotated = tmp.path().join("observe.log.1");
+        assert!(rotated.exists(), "the log never rotated");
+        assert!(size(&log) <= cap + 9 * 1024, "{}", size(&log));
+        assert!(size(&rotated) <= cap + 9 * 1024, "{}", size(&rotated));
+        let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 4, "not exactly three rotated files");
+        assert!(tmp.path().join("observe.log.3").exists());
+        assert_eq!(
+            last_log_outcome(&log).unwrap().observed_at,
+            1_000 + appends - 1
+        );
+    }
+
+    /// Adversarial audit (audit/v080-perf). Tempting wrong patch: make
+    /// rotation a precondition of the append (`rotate_if_full(..)?`). A
+    /// rotation that cannot happen (here `observe.log.1` is a directory;
+    /// in the field a read-only or immutable `.1`) then fails every
+    /// append, and `cmd_observe` returns the error after the observation,
+    /// before `write_last_run`: every scheduled pass reports failure
+    /// forever over a log housekeeping step. Before the cap, this append
+    /// succeeded.
+    #[test]
+    fn a_rotation_that_cannot_happen_does_not_fail_the_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("observe.log");
+        // A full log of whole lines (the append starts a line of its own).
+        let mut full = vec![b'x'; store::LOG_CAP_BYTES as usize];
+        full.push(b'\n');
+        fs::write(&log, full).unwrap();
+        // With three rotated files the shift `.2 -> .3` is the step that
+        // fails: `.3` is a non-empty directory, which no rename replaces.
+        fs::write(tmp.path().join("observe.log.1"), b"one\n").unwrap();
+        fs::write(tmp.path().join("observe.log.2"), b"two\n").unwrap();
+        fs::create_dir_all(tmp.path().join("observe.log.3/keep")).unwrap();
+        let outcome = RunOutcome {
+            observed_at: 7,
+            wall_ms: 1,
+            walked_total: 1,
+            projects: 1,
+            mode: "full".to_string(),
+            outcome: "ok".to_string(),
+        };
+        let r = append_log(&log, &outcome);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(last_log_outcome(&log).map(|o| o.observed_at), Some(7));
+        assert!(
+            fs::metadata(&log).unwrap().len() > store::LOG_CAP_BYTES,
+            "the rotation was meant to fail and the append go to the full log"
+        );
+    }
+
+    /// Audit round 2. The test above no longer reaches a failed rotation:
+    /// with three rotated files a directory at `observe.log.1` is simply
+    /// renamed to `.2`, so `rotate_if_full(..)?` passes it. Here the log's
+    /// directory is read-only, so every rename fails while the full log
+    /// itself stays writable. Tempting wrong patch: return the rotation
+    /// note as an error from `append_line`.
+    #[test]
+    fn rev2_a_read_only_log_dir_still_appends_to_the_full_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("logs");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("observe.log");
+        let mut full = vec![b'x'; store::LOG_CAP_BYTES as usize];
+        full.push(b'\n');
+        fs::write(&log, full).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = RunOutcome {
+            observed_at: 7,
+            wall_ms: 1,
+            walked_total: 1,
+            projects: 1,
+            mode: "full".to_string(),
+            outcome: "ok".to_string(),
+        };
+        let r = append_log(&log, &outcome);
+        let rotated = dir.join("observe.log.1").exists();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!rotated, "the setup was meant to make rotation fail");
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(last_log_outcome(&log).map(|o| o.observed_at), Some(7));
+    }
+
+    /// Docs match code: the log cap and rotated-file count in the usage
+    /// guide are the constants, and the architecture page no longer
+    /// states the subfolder-replay rules this release replaced.
+    #[test]
+    fn docs_state_the_log_cap_and_the_current_replay_rules() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let usage = fs::read_to_string(root.join("usage.md")).unwrap();
+        assert_eq!(store::LOG_CAP_BYTES, 1024 * 1024);
+        assert!(usage.contains("reaches 1 MiB"));
+        assert_eq!(store::LOG_ROTATED_KEPT, 3);
+        assert!(usage.contains("`.2` and `.3`"));
+        let arch = fs::read_to_string(root.join("architecture.md")).unwrap();
+        for stale in [
+            "only when nothing in the unit has a second hard link",
+            "an incomplete fold is never stored",
+        ] {
+            assert!(!arch.contains(stale), "stale: {stale}");
+        }
+        assert!(arch.contains("marked as a lower bound"));
     }
 
     #[test]

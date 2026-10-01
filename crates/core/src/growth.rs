@@ -8596,6 +8596,73 @@ mod tests {
         );
     }
 
+    /// Tempting wrong patch: compaction that merges deltas but never
+    /// drops the ones past the retention window, so the store grows with
+    /// the age of the install. Six simulated months of observations
+    /// (twice a day, the artifact's size changing every time) leave
+    /// the store's peak size in the sixth month no more than a quarter
+    /// above its peak in the second.
+    #[test]
+    fn six_months_of_observes_keep_the_store_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/repo");
+        let dir = volume_dir(tmp.path(), 1);
+        let step = 12 * 3600;
+        let size = |d: &Path| -> u64 {
+            let mut total = 0;
+            let mut stack = vec![d.to_path_buf()];
+            while let Some(p) = stack.pop() {
+                for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+                    let m = e.metadata().unwrap();
+                    if m.is_dir() {
+                        stack.push(e.path());
+                    } else {
+                        total += m.len();
+                    }
+                }
+            }
+            total
+        };
+        let mut at_two_months = 0;
+        let mut at_six_months = 0;
+        let observations = 180 * 86400 / step;
+        for i in 0..observations {
+            let now = 1_000_000 + i * step;
+            let mut obs = vec![one_artifact_project(&root, 1_000 + i)];
+            observe_and_annotate(
+                &crate::bus::Stage::for_tests(),
+                tmp.path(),
+                1,
+                &mut obs,
+                now,
+                30,
+                3600,
+                &HashSet::new(),
+            )
+            .unwrap();
+            // Compaction makes the size a sawtooth: compare the peak of
+            // the second month with the peak of the sixth.
+            let day = i * step / 86400;
+            if (30..60).contains(&day) {
+                at_two_months = at_two_months.max(size(tmp.path()));
+            }
+            if day >= 150 {
+                at_six_months = at_six_months.max(size(tmp.path()));
+            }
+        }
+        assert!(at_two_months > 0);
+        assert!(
+            at_six_months <= at_two_months + at_two_months / 4,
+            "store grew from {at_two_months} B at two months to {at_six_months} B at six"
+        );
+        assert!(list_delta_files(&dir).len() <= COMPACTION_THRESHOLD + 1);
+        let oldest = history_span_secs(&dir, 1_000_000 + (observations - 1) * step).unwrap();
+        assert!(
+            oldest <= 31 * 86400 + 2 * COMPACTION_THRESHOLD as u64 * step,
+            "history older than the 30-day retention is kept: {oldest} s"
+        );
+    }
+
     #[test]
     fn delta_count_crossing_threshold_compacts() {
         let tmp = tempfile::tempdir().unwrap();

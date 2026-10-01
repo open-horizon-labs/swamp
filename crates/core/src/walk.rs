@@ -938,6 +938,22 @@ pub struct DirStamp {
     pub path: PathBuf,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
+    /// Allocated bytes of the regular files directly inside this
+    /// directory, the newest of their mtimes (seconds, 0 when none), and
+    /// whether any of them has another hard link. What
+    /// `folded_measurement` folds into per-child totals, so a later pass
+    /// can re-walk only the children an event touched (#181).
+    pub own_bytes: u64,
+    pub files_mtime_max: u64,
+    pub shared_inode: bool,
+    /// `(device, inode, allocated bytes, link count)` of each file here
+    /// with another hard link, so per-child totals can count each inode
+    /// once and a partial walk can tell whether all of an inode's links
+    /// are inside what it walked.
+    pub linked: Vec<(u64, u64, u64, u64)>,
+    /// This directory, or an entry directly in it, could not be read: the
+    /// fold under it is a lower bound.
+    pub incomplete: bool,
 }
 
 /// `attribute_parallel` that takes `carry`ed artifact rows as read (see
@@ -1558,6 +1574,18 @@ fn process_size(
         // (#65: partial/unreadable containers are incomplete coverage,
         // never a disappearance or a quiet shrink).
         shared.incomplete.store(true, Ordering::Relaxed);
+        if shared.stamp_dirs {
+            shared.dir_stamps.lock().unwrap().push(DirStamp {
+                path: path.clone(),
+                mtime_ns: 0,
+                ctime_ns: 0,
+                own_bytes: 0,
+                files_mtime_max: 0,
+                shared_inode: false,
+                linked: Vec::new(),
+                incomplete: true,
+            });
+        }
         if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
             let rel_path = rel_path_string(root, &path);
             let parent_rel_path = parent_rel_path_of(&rel_path);
@@ -1588,29 +1616,38 @@ fn process_size(
     let mut file_count: u32 = 0;
     let mut dir_count: u32 = 0;
     let mut symlink_count: u32 = 0;
-    if shared.stamp_dirs
-        && let Ok(m) = own_meta.as_ref()
-    {
-        shared.dir_stamps.lock().unwrap().push(DirStamp {
-            path: path.clone(),
-            mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
-            ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
-        });
-    }
-    let mut dir_mtime_max: i64 = own_meta.map(|m| m.mtime()).unwrap_or(0);
+    let mut files_mtime_max: u64 = 0;
+    let mut shared_inode = false;
+    let mut dir_incomplete = false;
+    // Only exclusions inside this directory can match one of its entries
+    // (an exclusion above it was pruned before this job was queued):
+    // checked once here instead of per entry, which cost a path
+    // allocation and a compare per exclusion for every file (#181).
+    let local_excluded: Vec<&PathBuf> = shared
+        .excluded
+        .iter()
+        .filter(|e| e.starts_with(&path) && **e != path)
+        .collect();
+    let mut linked: Vec<(u64, u64, u64, u64)> = Vec::new();
+    let mut dir_mtime_max: i64 = own_meta.as_ref().map(|m| m.mtime()).unwrap_or(0);
     for (i, entry) in entries.enumerate() {
         if i % 1024 == 1023 {
             crate::beacon::beat();
         }
         let Ok(entry) = entry else {
             shared.incomplete.store(true, Ordering::Relaxed);
+            dir_incomplete = true;
             continue;
         };
-        if shared.excluded.iter().any(|e| entry.path().starts_with(e)) {
-            continue;
+        if !local_excluded.is_empty() {
+            let entry_path = entry.path();
+            if local_excluded.iter().any(|e| entry_path.starts_with(e)) {
+                continue;
+            }
         }
         let Ok(ft) = entry.file_type() else {
             shared.incomplete.store(true, Ordering::Relaxed);
+            dir_incomplete = true;
             continue;
         };
         if ft.is_symlink() {
@@ -1634,6 +1671,7 @@ fn process_size(
                 Err(e) if crate::fs_gate::is_vanished_entry(&e) => continue,
                 Err(_) => {
                     shared.incomplete.store(true, Ordering::Relaxed);
+                    dir_incomplete = true;
                     continue;
                 }
             };
@@ -1652,6 +1690,13 @@ fn process_size(
             group
                 .mtime_max
                 .fetch_max(meta.mtime().max(0) as u64, Ordering::Relaxed);
+            files_mtime_max = files_mtime_max.max(meta.mtime().max(0) as u64);
+            if meta.nlink() > 1 {
+                shared_inode = true;
+                if shared.stamp_dirs {
+                    linked.push((meta.dev(), meta.ino(), allocated_bytes(&meta), meta.nlink()));
+                }
+            }
             if meta.nlink() <= 1 || group.local_seen.lock().unwrap().insert(key) {
                 group
                     .local_total
@@ -1670,6 +1715,20 @@ fn process_size(
                 shared.unowned_total.fetch_add(bytes, Ordering::Relaxed);
             }
         }
+    }
+    if shared.stamp_dirs
+        && let Ok(m) = own_meta.as_ref()
+    {
+        shared.dir_stamps.lock().unwrap().push(DirStamp {
+            path: path.clone(),
+            mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
+            ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+            own_bytes: own_allocated,
+            files_mtime_max,
+            shared_inode,
+            linked,
+            incomplete: dir_incomplete,
+        });
     }
     if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
         let rel_path = rel_path_string(root, &path);

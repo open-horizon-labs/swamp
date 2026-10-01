@@ -1496,7 +1496,17 @@ pub fn run(inputs: &PassInputs) -> Result<PassOutcome> {
     };
 
     let container = inputs.space.container();
-    let facts = system::collect(inputs.probe, now);
+    let reused_facts = if cycle_open {
+        system::reuse_within_cycle(
+            &prev_rows,
+            prev_meta.as_ref().and_then(|m| m.data_volume_used),
+            cycle_started_at,
+            now,
+        )
+    } else {
+        None
+    };
+    let facts = reused_facts.unwrap_or_else(|| system::collect(inputs.probe, now));
     let mapped: Arc<dyn VolumeFs> = Arc::new(Mapped {
         fs: inputs.fs.clone(),
         data_root: inputs.layout.data_root.clone(),

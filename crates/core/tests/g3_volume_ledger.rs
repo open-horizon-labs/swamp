@@ -2516,3 +2516,128 @@ fn the_audit_picks_five_distinct_folders_when_there_are_enough_and_rotates_by_da
     assert_eq!(day1[0], day2[0], "the largest is always audited");
     assert_ne!(day1, day2, "the rest rotate with the day");
 }
+
+/// #181. Tempting wrong patch: ask `diskutil` twice and `tmutil` once on
+/// every run that resumes an open cycle. The resumed runs reuse the facts
+/// the cycle's first run took, and the finished ledger equals a pass that
+/// asked every time.
+#[test]
+fn a_resumed_cycle_reuses_its_system_facts() {
+    let fast = Setup::new();
+    many_small_folders(&fast.fs, 300);
+    assert!(ran(&fast.pass()).complete);
+    let expected = comparable(&fast.rows());
+
+    let slow = Setup::new();
+    many_small_folders(&slow.fs, 300);
+    slow.fs.slow_under("/Users/me/d", Duration::from_millis(20));
+    let mut runs = 0;
+    loop {
+        runs += 1;
+        assert!(runs < 200);
+        let outcome = slow.run_at(NOW + runs, true, Duration::from_millis(2_000), Some(0));
+        if ran(&outcome).complete {
+            break;
+        }
+    }
+    assert!(runs >= 2, "the budget was meant to split the pass");
+    assert_eq!(
+        slow.probe.calls.load(Ordering::SeqCst),
+        3,
+        "resumed runs asked the system again"
+    );
+    let stalled = |rows: &[Row]| -> HashSet<String> {
+        rows.iter()
+            .filter(|r| r.method == "over_budget" || r.method == "stuck")
+            .map(|r| {
+                r.path
+                    .trim_end_matches("/(files directly here)")
+                    .to_string()
+            })
+            .collect()
+    };
+    let skip = stalled(&slow.rows());
+    let keep = |v: Vec<(String, Option<u64>, Option<u64>)>| -> Vec<_> {
+        v.into_iter().filter(|r| !skip.contains(&r.0)).collect()
+    };
+    assert_eq!(keep(comparable(&slow.rows())), keep(expected));
+}
+
+/// Audit (v0.8.0 perf, round 2). Splits a pass with a slow folder and
+/// returns the setup after its first, unfinished run at `NOW + 1`.
+fn rev2_open_cycle(probe: FakeProbe) -> Setup {
+    let mut s = Setup::new();
+    s.probe = probe;
+    many_small_folders(&s.fs, 300);
+    s.fs.slow_under("/Users/me/d", Duration::from_millis(20));
+    let first = s.run_at(NOW + 1, true, Duration::from_millis(2_000), Some(0));
+    assert!(
+        !ran(&first).complete,
+        "the budget was meant to split the pass"
+    );
+    s
+}
+
+/// Audit round 2. Tempting wrong patch: treat "a row exists for each of
+/// the three methods" as "all three answered", so a `tmutil` that timed
+/// out on the cycle's first run (machine under load) is replayed as
+/// not-measured for up to an hour instead of being asked again on the
+/// next resume. A failure may be shown, but it must not be cached.
+#[test]
+fn rev2_a_query_that_failed_is_asked_again_on_resume() {
+    let mut probe = good_probe();
+    probe.snapshots = Err(ProbeError::TimedOut("tmutil"));
+    let mut s = rev2_open_cycle(probe);
+    let before = s.probe.calls.load(Ordering::SeqCst);
+    s.probe.snapshots = good_probe().snapshots;
+    let _ = s.run_at(NOW + 60, true, Duration::from_millis(2_000), Some(0));
+    assert!(
+        s.probe.calls.load(Ordering::SeqCst) > before,
+        "a failed tmutil answer was reused instead of asked again"
+    );
+    assert!(
+        !s.rows()
+            .iter()
+            .any(|r| r.method.starts_with("tmutil") && r.bytes.is_none() && r.note.is_some()),
+        "the timed-out snapshot row is still shown after tmutil answered"
+    );
+}
+
+/// Audit round 2. Tempting wrong patch: compare against the cycle start
+/// only, so facts are reused for the whole (24 h) cycle. At one hour the
+/// resume asks again.
+#[test]
+fn rev2_resumed_facts_an_hour_old_are_asked_again() {
+    let s = rev2_open_cycle(good_probe());
+    let before = s.probe.calls.load(Ordering::SeqCst);
+    let _ = s.run_at(
+        NOW + 1 + swamp_core::volume_ledger::system::FACTS_REUSE_SECS,
+        true,
+        Duration::from_millis(2_000),
+        Some(0),
+    );
+    assert_eq!(s.probe.calls.load(Ordering::SeqCst), before + 3);
+}
+
+/// #181 review round 2 (a). Tempting wrong patch: reuse the cycle's
+/// Data-volume size on resume and present the estimate as of this run.
+/// When the estimate rests on a reused figure, the account says when
+/// diskutil gave it.
+#[test]
+fn an_estimate_from_reused_facts_says_when_they_were_taken() {
+    let s = rev2_open_cycle(good_probe());
+    let _ = s.run_at(NOW + 120, true, Duration::from_millis(2_000), Some(0));
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    if a.not_measured.estimate_bytes.is_some() && !a.complete {
+        let notes = a.notes.join(" | ");
+        assert!(
+            notes.contains("the estimate uses the Data volume size diskutil gave"),
+            "{notes}"
+        );
+    } else {
+        panic!(
+            "precondition: an open cycle with an estimate ({:?})",
+            a.not_measured.estimate_bytes
+        );
+    }
+}

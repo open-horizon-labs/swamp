@@ -649,6 +649,12 @@ folders, largest first, with size, modification time and last-used:
   rows, so it holds the other folders and the files directly inside. A
   hardlinked file the walk counted once but two parent folders counted
   under each appears as the signed `adjustment` row, never as missing bytes.
+- **The hard-link flag can lag.** A unit's `hardlinked` (in `--json`) is
+  what its last walk of each subfolder saw. A subfolder an observe replays
+  (no change under it) keeps that answer: a hard link made from outside the
+  unit to a file inside it fires no change there, so it is seen only when
+  that subfolder next changes. The bytes are exact either way; whether
+  another link shares them is checked when the folder changes.
 - **Not measured is not zero.** A folder the process could not list is
   shown as `not measured` (`bytes: null`); one with an unreadable folder
   below it is `partial` and its size is a lower bound. Unlisted unreadable
@@ -1894,7 +1900,7 @@ and `config init` both refuse (nonzero exit, message on stderr) on a
 `config.toml` with a malformed `[scan]` table, rather than silently
 falling back to the all-defaults scope.
 
-The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store directory; give the CLI and UI the same value (interactively or from an agent's `--json` calls) to share history. On Linux `$XDG_DATA_HOME` moves the store if it is set to an absolute path, and the schedule log defaults to `$XDG_STATE_HOME/swamp/observe.log` (`~/.local/state/swamp/observe.log`); on macOS the log defaults to `~/Library/Logs/swamp/observe.log`. `SWAMP_LOG_DIR` overrides the log directory on both. If `HOME` is unset and `SWAMP_DIR` is not given, swamp fails with a message rather than writing the store into the current directory. The observation timeout applies to `observe`, not every interactive operation.
+The file is `~/.local/share/swamp/config.toml`. `SWAMP_DIR` changes the store directory; give the CLI and UI the same value (interactively or from an agent's `--json` calls) to share history. On Linux `$XDG_DATA_HOME` moves the store if it is set to an absolute path, and the schedule log defaults to `$XDG_STATE_HOME/swamp/observe.log` (`~/.local/state/swamp/observe.log`); on macOS the log defaults to `~/Library/Logs/swamp/observe.log`. `SWAMP_LOG_DIR` overrides the log directory on both. The log is capped: when `observe.log` reaches 1 MiB it becomes `observe.log.1`, older ones shift to `.2` and `.3` (the oldest is dropped) and a new log starts, so it takes at most about 4 MiB. A log that cannot be rotated or written is reported once on stderr and never fails the observation. If `HOME` is unset and `SWAMP_DIR` is not given, swamp fails with a message rather than writing the store into the current directory. The observation timeout applies to `observe`, not every interactive operation.
 
 `swamp scope` (text and `--json`) reports which platform's conventions
 produced its roots, so a scope read on the other machine is not just a

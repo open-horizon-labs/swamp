@@ -362,6 +362,52 @@ const M_APFS: &str = "diskutil apfs list -plist";
 const M_INFO: &str = "diskutil info -plist /System/Volumes/Data";
 const M_SNAP: &str = "tmutil listlocalsnapshots /";
 
+/// How long system facts taken at the start of an open cycle are reused
+/// by the runs that resume it, in seconds.
+pub const FACTS_REUSE_SECS: u64 = 3600;
+
+/// `diskutil` answered and named no purgeable space: an answer.
+const PURGEABLE_NOT_REPORTED: &str = "diskutil did not report purgeable space";
+
+/// The summary row each query writes when it could not answer (a time-out,
+/// an error, output that did not parse): a failure, never reused.
+fn is_failed_query(r: &Row) -> bool {
+    r.note.as_deref() != Some(PURGEABLE_NOT_REPORTED)
+        && r.exactness == Exactness::NotMeasured
+        && r.entries.is_none()
+        && ["APFS volumes", "purgeable space", "local snapshots"].contains(&r.path.as_str())
+}
+
+/// The system facts an earlier run of this same open cycle stored, when
+/// all three queries answered then and the oldest answer is under
+/// [`FACTS_REUSE_SECS`] old: a resume does not ask `diskutil` twice and
+/// `tmutil` once again for the same cycle (#181). If any query failed
+/// (one `tmutil` time-out under load), all three are asked again: the
+/// queries are read together, so a failure is never cached.
+pub(crate) fn reuse_within_cycle(
+    prev_rows: &[Row],
+    data_volume_used: Option<u64>,
+    cycle_started_at: u64,
+    now: u64,
+) -> Option<SystemFacts> {
+    let rows: Vec<Row> = prev_rows
+        .iter()
+        .filter(|r| [M_APFS, M_INFO, M_SNAP].contains(&r.method.as_str()))
+        .cloned()
+        .collect();
+    let all_answered = [M_APFS, M_INFO, M_SNAP]
+        .iter()
+        .all(|m| rows.iter().any(|r| r.method == *m))
+        && !rows.iter().any(is_failed_query);
+    let fresh = rows.iter().all(|r| {
+        r.measured_at >= cycle_started_at && now.saturating_sub(r.measured_at) < FACTS_REUSE_SECS
+    });
+    (all_answered && fresh).then_some(SystemFacts {
+        rows,
+        data_volume_used,
+    })
+}
+
 /// Asks the three questions and turns each answer, or each failure, into
 /// rows. On a platform without APFS nothing is asked and nothing is said.
 pub fn collect(probe: &dyn SystemProbe, now: u64) -> SystemFacts {
@@ -491,7 +537,7 @@ pub fn collect(probe: &dyn SystemProbe, now: u64) -> SystemFacts {
                 Category::Purgeable,
                 M_INFO,
                 now,
-                "diskutil did not report purgeable space".to_string(),
+                PURGEABLE_NOT_REPORTED.to_string(),
             ),
         },
         (Ok(_), Some(Err(why))) => not_measured(

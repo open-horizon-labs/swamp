@@ -9,6 +9,8 @@ fn inspect_cargo_is_explicit_and_emits_json_for_selected_profile() {
     fs::create_dir_all(profile.join(".fingerprint")).unwrap();
     fs::write(profile.join("deps/libunknown-abc.rlib"), b"artifact").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_swamp"))
+        .env("SWAMP_TEST_MODE", "1")
+        .env("HOME", temp.path())
         .args(["inspect-cargo"])
         .arg(&profile)
         .arg("--json")

@@ -128,7 +128,11 @@ const MANAGER_PROBES: &[ManagerProbe] = &[
     ManagerProbe::BrewInstalledOnRequest,
 ];
 
-fn manager_decl(anchor: StoreAnchor, catch_all: bool) -> ManagerDecl {
+fn manager_decl(
+    anchor: StoreAnchor,
+    catch_all: bool,
+    reads: &'static [&'static str],
+) -> ManagerDecl {
     ManagerDecl {
         manager: "brew",
         display: "Homebrew",
@@ -136,6 +140,7 @@ fn manager_decl(anchor: StoreAnchor, catch_all: bool) -> ManagerDecl {
         subject: SubjectShape::FolderName,
         catch_all,
         probes: MANAGER_PROBES,
+        reads,
     }
 }
 
@@ -172,7 +177,7 @@ impl Detector for HomebrewDevToolsDetector {
     /// report about a formula joins to the unit by name; a report about
     /// one outside the allowlist belongs to `Homebrew (other)`.
     fn manager(&self) -> Option<ManagerDecl> {
-        Some(manager_decl(StoreAnchor::SoleLocation, false))
+        Some(manager_decl(StoreAnchor::SoleLocation, false, &[]))
     }
 
     fn group(&self) -> Option<&'static str> {
@@ -272,7 +277,13 @@ impl Detector for HomebrewOtherDetector {
     /// The remainder stands for every formula not measured on its own, so
     /// a report about one of them attaches to it as a whole.
     fn manager(&self) -> Option<ManagerDecl> {
-        Some(manager_decl(StoreAnchor::SoleLocation, true))
+        // The prefix as a whole changes with every service log under
+        // `var`; Homebrew's answers come from the install receipts.
+        Some(manager_decl(
+            StoreAnchor::SoleLocation,
+            true,
+            &["Cellar", "Caskroom"],
+        ))
     }
 
     fn remainder_of(&self) -> Option<super::Remainder> {
@@ -368,6 +379,7 @@ impl Detector for HomebrewDetector {
                 suffix: &["Cellar"],
             },
             true,
+            &[],
         ))
     }
 

@@ -56,6 +56,7 @@ pub struct Counters {
     pending_files: AtomicU64,
     pending_bytes: AtomicU64,
     git_dir_entries: AtomicU64,
+    subtrees_reused: AtomicU64,
 }
 
 impl Counters {
@@ -72,6 +73,7 @@ impl Counters {
             pending_allocation_files: self.pending_files.load(Ordering::Relaxed),
             pending_allocation_bytes: self.pending_bytes.load(Ordering::Relaxed),
             git_dir_entries_checked: self.git_dir_entries.load(Ordering::Relaxed),
+            subtrees_reused: self.subtrees_reused.load(Ordering::Relaxed),
         }
     }
 }
@@ -88,6 +90,7 @@ static GLOBAL: Counters = Counters {
     pending_files: AtomicU64::new(0),
     pending_bytes: AtomicU64::new(0),
     git_dir_entries: AtomicU64::new(0),
+    subtrees_reused: AtomicU64::new(0),
 };
 
 thread_local! {
@@ -159,6 +162,11 @@ pub struct WorkCounters {
     /// measure the user's tree: this is a fixed per-repository check
     /// (loose objects and packs are skipped), not a traversal.
     pub git_dir_entries_checked: u64,
+    /// Immediate subfolders of a changed external unit replayed from the
+    /// store instead of re-walked: no event under them since their stored
+    /// total (`folded_measurement`, #181).
+    #[serde(default)]
+    pub subtrees_reused: u64,
 }
 
 pub fn record_dir_listed() {
@@ -209,6 +217,11 @@ pub fn record_git_dir_entries(n: u64) {
     add(|c| &c.git_dir_entries, n);
 }
 
+/// One unit subfolder replayed rather than re-walked (#181).
+pub fn record_subtree_reused() {
+    add(|c| &c.subtrees_reused, 1);
+}
+
 /// The process-global counters. Sees every thread; a caller that wants
 /// an exact number either serializes itself or uses [`measured`].
 pub fn snapshot() -> WorkCounters {
@@ -243,6 +256,7 @@ pub fn reset() {
         &GLOBAL.pending_files,
         &GLOBAL.pending_bytes,
         &GLOBAL.git_dir_entries,
+        &GLOBAL.subtrees_reused,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -281,6 +295,7 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         git_dir_entries_checked: now
             .git_dir_entries_checked
             .saturating_sub(before.git_dir_entries_checked),
+        subtrees_reused: now.subtrees_reused.saturating_sub(before.subtrees_reused),
     }
 }
 

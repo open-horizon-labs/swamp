@@ -137,6 +137,9 @@ fn space(path: &Path) -> Option<Space> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VolumeStamp {
     pub device: u64,
+    /// Mounted read-only on a local filesystem swamp can trust not to
+    /// change underneath it ([`sealed_mount`]): a read-only network or
+    /// FUSE mount can change on the server, so it is never sealed.
     pub read_only: bool,
     pub total_blocks: u64,
     pub root_ino: u64,
@@ -163,6 +166,39 @@ pub fn volume_stamp(path: &Path) -> Option<VolumeStamp> {
 /// `MNT_RDONLY` from `<sys/mount.h>`.
 #[cfg(target_os = "macos")]
 const MNT_RDONLY: u32 = 0x0000_0001;
+/// `MNT_LOCAL` from `<sys/mount.h>`.
+#[cfg(target_os = "macos")]
+const MNT_LOCAL: u32 = 0x0000_1000;
+
+/// Whether a mount may be treated as sealed: read-only, local, and a
+/// filesystem type whose content cannot change while it stays mounted
+/// read-only (#181 review: a read-only NFS, SMB or FUSE mount can change
+/// server-side and would otherwise be replayed forever). `fstype` is the
+/// kernel's name (macOS `f_fstypename`) or, on Linux, the `f_type`
+/// magic rendered by [`linux_fstype`].
+fn sealed_mount(read_only: bool, local: bool, fstype: &str) -> bool {
+    const LOCAL_TYPES: &[&str] = &[
+        "apfs", "hfs", "cd9660", "udf", "ext2", "ext3", "ext4", "xfs", "btrfs", "squashfs",
+        "erofs", "iso9660",
+    ];
+    read_only && local && LOCAL_TYPES.contains(&fstype)
+}
+
+/// The filesystem name for a Linux `statfs` `f_type` magic, for the
+/// types [`sealed_mount`] accepts; anything else is `other`.
+#[cfg(target_os = "linux")]
+fn linux_fstype(magic: i64) -> &'static str {
+    match magic {
+        0xEF53 => "ext4",
+        0x5846_5342 => "xfs",
+        0x9123_683E => "btrfs",
+        0x7371_7368 => "squashfs",
+        0xE0F5_E1E2 => "erofs",
+        0x9660 => "iso9660",
+        0x1501_3346 => "udf",
+        _ => "other",
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn space_and_flag(path: &Path) -> Option<(Space, bool)> {
@@ -185,7 +221,15 @@ fn space_and_flag(path: &Path) -> Option<(Space, bool)> {
             total_blocks: stat.f_blocks,
             block_size,
         },
-        stat.f_flags & MNT_RDONLY != 0,
+        {
+            // SAFETY: `f_fstypename` is a NUL-terminated C array.
+            let name = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
+            sealed_mount(
+                stat.f_flags & MNT_RDONLY != 0,
+                stat.f_flags & MNT_LOCAL != 0,
+                &name.to_string_lossy(),
+            )
+        },
     ))
 }
 
@@ -214,8 +258,26 @@ fn space_and_flag(path: &Path) -> Option<(Space, bool)> {
             total_blocks: stat.f_blocks,
             block_size,
         },
-        stat.f_flag & libc::ST_RDONLY != 0,
+        stat.f_flag & libc::ST_RDONLY != 0 && linux_local_type(path),
     ))
+}
+
+/// Linux: the filesystem type behind `path`, accepted only when it is
+/// one [`sealed_mount`] treats as local (statvfs has no `MNT_LOCAL`).
+#[cfg(target_os = "linux")]
+fn linux_local_type(path: &Path) -> bool {
+    let Some(cpath) = cpath(path) else {
+        return false;
+    };
+    let mut buf: std::mem::MaybeUninit<libc::statfs> = std::mem::MaybeUninit::uninit();
+    // SAFETY: as in `space`.
+    let stat = unsafe {
+        if libc::statfs(cpath.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return false;
+        }
+        buf.assume_init()
+    };
+    sealed_mount(true, true, linux_fstype(stat.f_type as i64))
 }
 
 /// Test seam: a stamp to answer for a path instead of asking the kernel,
@@ -255,6 +317,33 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #181 review round 2 (e). Tempting wrong patch: seal on the
+    /// read-only flag alone. A read-only network or FUSE mount (or a local
+    /// one of a type not listed) is never sealed, so it is walked, not
+    /// replayed forever.
+    #[test]
+    fn only_read_only_local_mounts_of_a_known_type_are_sealed() {
+        let table = [
+            (true, true, "apfs", true),
+            (true, true, "hfs", true),
+            (true, true, "squashfs", true),
+            (false, true, "apfs", false),
+            (true, false, "apfs", false),
+            (true, false, "nfs", false),
+            (true, true, "smbfs", false),
+            (true, true, "macfuse", false),
+            (true, true, "osxfuse", false),
+            (true, true, "other", false),
+        ];
+        for (ro, local, fstype, want) in table {
+            assert_eq!(
+                sealed_mount(ro, local, fstype),
+                want,
+                "{ro} {local} {fstype}"
+            );
+        }
+    }
 
     #[test]
     fn a_real_directory_answers_with_a_plausible_figure() {

@@ -247,6 +247,8 @@ struct MeasuredUnit {
     last_use_sources: Vec<crate::locations::LastUseSource>,
     /// The depth-2 drilldown taken (or replayed) this pass.
     children: Vec<crate::drilldown::UnitChild>,
+    /// When the sealed volumes replayed inside it were walked.
+    sealed_walked_at: Option<u64>,
 }
 
 /// A project worktree the report already measured, handed to the
@@ -545,6 +547,19 @@ pub fn observe_external(
     let stored_cache = crate::build_adapters::ContainerCache::from_containers(
         previous_units.values().cloned().collect(),
     );
+    // A store holding only sealed read-only volumes whose stamps hold is
+    // vouched for without a window (`sealed_only_unchanged`).
+    let mut vouched = coverage.clone();
+    for container in store_containers.values() {
+        if crate::folded_measurement::sealed_only_unchanged(swamp_dir, &container.path) {
+            vouched.merge(crate::fs_events::EventCoverage::trusted(
+                container.path.clone(),
+                Vec::new(),
+                0,
+            ));
+        }
+    }
+    let coverage = &vouched;
     let no_rows = crate::build_adapters::FoldedIndex::default();
     let probe =
         crate::build_adapters::BuildCtx::new(observed_at, &no_rows, coverage, &stored_cache);
@@ -731,6 +746,9 @@ pub fn observe_external(
                     observed_at,
                     coverage,
                     reuse,
+                    // A build store's adapter identifies from every
+                    // directory row: it is walked whole on a change.
+                    false,
                 );
                 if debug_trace {
                     let after = crate::work_counters::snapshot();
@@ -760,6 +778,7 @@ pub fn observe_external(
                     observed_at,
                     coverage,
                     reuse_ok,
+                    true,
                 );
                 if debug_trace {
                     let after = crate::work_counters::snapshot();
@@ -900,6 +919,7 @@ pub fn observe_external(
                 overlap,
                 last_use_sources: sources,
                 children,
+                sealed_walked_at: row.sealed_walked_at,
             },
         );
     }
@@ -1080,6 +1100,7 @@ pub fn observe_external(
             overlap,
             last_use_sources,
             children,
+            sealed_walked_at,
         },
     ) in meta_by_key
     {
@@ -1131,7 +1152,7 @@ pub fn observe_external(
             consumers,
             // The overlap is two numbers now; the sentence is rendered
             // from them (`ExternalUnit::overlap_note`).
-            note: coverage_note,
+            note: with_walked_note(coverage_note, sealed_walked_at),
             evidence,
             bytes_counted_elsewhere: overlap.map_or(0, |(_, b)| b),
             overlap_count: overlap.map_or(0, |(n, _)| n as u32),
@@ -1603,5 +1624,37 @@ mod consumer_sidecar_tests {
                 .collect::<Vec<_>>(),
             vec!["kept"]
         );
+    }
+}
+
+/// The coverage note plus, for a unit whose read-only volumes were
+/// replayed from their stamps, when those volumes were actually walked:
+/// their bytes are that walk's, not this pass's (#181).
+fn with_walked_note(note: Option<String>, walked_at: Option<u64>) -> Option<String> {
+    let Some(at) = walked_at else { return note };
+    let walked = format!(
+        "read-only volumes inside walked {}; unchanged since (their stamps)",
+        crate::last_used::format_day(at, crate::entities::now())
+    );
+    Some(match note {
+        Some(n) => format!("{n}; {walked}"),
+        None => walked,
+    })
+}
+
+#[cfg(test)]
+mod walked_note_tests {
+    /// #181 review round 2. Tempting wrong patch: replay sealed volumes
+    /// and say nothing, so the unit reads as measured by this pass. The
+    /// note names when the volumes were walked, after any coverage note.
+    #[test]
+    fn a_replayed_volume_says_when_it_was_walked() {
+        let at = crate::entities::now() - 3 * 86_400;
+        let note = super::with_walked_note(Some("partial".into()), Some(at)).unwrap();
+        assert!(
+            note.starts_with("partial; read-only volumes inside walked "),
+            "{note}"
+        );
+        assert_eq!(super::with_walked_note(None, None), None);
     }
 }

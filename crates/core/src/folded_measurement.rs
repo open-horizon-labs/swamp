@@ -89,6 +89,10 @@ pub struct FoldedUnit {
     /// are-not-storage-changes.md`) -- a folder going unreadable for one
     /// pass is coverage shrinking, not the unit shrinking.
     pub complete: bool,
+    /// The oldest time a sealed volume inside was actually walked, when
+    /// this measurement replayed one from its stamp (#181): the bytes are
+    /// that walk's, so the report says when it was.
+    pub sealed_walked_at: Option<u64>,
 }
 
 // ---------------------------------------------------------------------
@@ -134,6 +138,45 @@ fn sealed_mounts_under(path: &Path) -> Vec<SealedMount> {
     out
 }
 
+/// Whether `path` holds nothing but sealed read-only mounts whose stored
+/// stamps still hold, and is itself the directory its stored root row
+/// describes (#181). Such a location cannot have changed without a new
+/// stamp: its only entries are mount points of read-only filesystems
+/// (nothing can be written inside them), and an entry added, removed or
+/// renamed moves the directory's own mtime/ctime. It is then vouched for
+/// without an event window, so a pass whose window was lost, or a store
+/// last written by another swamp, does not re-walk 1.77 million files of
+/// simulator runtimes. Any other entry, a missing stamp or a changed
+/// one: not vouched, and the usual rules apply.
+pub(crate) fn sealed_only_unchanged(store: Option<&Path>, path: &Path) -> bool {
+    let Some(dir) = store else { return false };
+    let mounts = sealed_mounts_under(path);
+    if mounts.is_empty() {
+        return false;
+    }
+    let unit_path = path.display().to_string();
+    let stored = crate::growth::volume_stamps_for(dir, &unit_path);
+    if !mounts.iter().all(|m| reuse_sealed(&stored, m).is_some()) {
+        return false;
+    }
+    let rows = crate::growth::folded_rows_for(dir, &unit_path);
+    let Some(root) = rows.iter().find(|r| r.rel_dir.is_empty()) else {
+        return false;
+    };
+    let Ok(meta) = crate::fs_gate::symlink_metadata(path) else {
+        return false;
+    };
+    if stamp_ns(&meta) != (root.mtime_ns, root.ctime_ns) {
+        return false;
+    }
+    let Ok(entries) = crate::fs_gate::read_dir(path) else {
+        return false;
+    };
+    entries
+        .map(|e| e.map(|e| e.path()))
+        .all(|p| p.is_ok_and(|p| mounts.iter().any(|m| m.path == p)))
+}
+
 /// One sealed mount's contribution, replayed from its stored stamp or
 /// walked.
 struct SealedPart {
@@ -142,6 +185,8 @@ struct SealedPart {
     mtime_max: u64,
     complete: bool,
     reused: bool,
+    /// When this volume was last actually walked: kept across replays.
+    walked_at: u64,
     dirs: Vec<crate::report::DirRollup>,
 }
 
@@ -163,6 +208,7 @@ fn reuse_sealed(
         mtime_max: row.mtime_max,
         complete: row.complete,
         reused: true,
+        walked_at: row.observed_at,
         dirs: Vec::new(),
     })
 }
@@ -197,6 +243,7 @@ fn walk_sealed(
         mtime_max: row.mtime_max,
         complete,
         reused: false,
+        walked_at: observed_at,
         dirs,
     }
 }
@@ -260,7 +307,8 @@ fn sealed_parts(
             hardlinked: part.hardlinked,
             mtime_max: part.mtime_max,
             complete: part.complete,
-            observed_at,
+            // The time the volume was walked, not this replay's.
+            observed_at: part.walked_at,
         });
         parts.push(part);
     }
@@ -278,6 +326,13 @@ fn add_sealed(folded: &mut FoldedUnit, parts: &[SealedPart]) {
         folded.mtime_max = folded.mtime_max.max(p.mtime_max);
         folded.complete &= p.complete;
         folded.reused &= p.reused;
+        if p.reused {
+            folded.sealed_walked_at = Some(
+                folded
+                    .sealed_walked_at
+                    .map_or(p.walked_at, |w| w.min(p.walked_at)),
+            );
+        }
     }
 }
 
@@ -315,6 +370,12 @@ pub fn measure(
         );
         return folded;
     }
+    if mounts.is_empty()
+        && let Some((folded, _)) =
+            partial_measure(store, path, exclusions, observed_at, coverage, None)
+    {
+        return folded;
+    }
     let (row, _dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
         path,
         ArtifactKind::Unknown,
@@ -330,21 +391,21 @@ pub fn measure(
     // call has no worktree, so it cannot be used to detect an
     // unreadable subdirectory the way the Source-tree walk does.
     let folded = FoldedUnit {
+        sealed_walked_at: None,
         reused: false,
         bytes: row.bytes,
         hardlinked: row.hardlinked,
         mtime_max: row.mtime_max,
         complete,
     };
-    // An incomplete measurement is never stored: writing it would either
-    // overwrite a good prior measurement with a smaller partial one (a
-    // fabricated shrink) or anchor a future reuse on rows that undercount
-    // the tree. The key keeps whatever it last had; the caller decides
-    // how to report this pass (`.oh/guardrails/coverage-changes-are-not-
-    // storage-changes.md`).
-    if let Some(dir) = store
-        && complete
-    {
+    // An incomplete measurement is stored only with its root row marked
+    // as a lower bound (`INCOMPLETE_MARK`), so it can never be replayed
+    // whole; its readable subfolders' totals let the next changed pass
+    // re-walk only the rest (#181: `~/Library/Caches` holds folders this
+    // process may not list, so it was walked whole every pass). The
+    // caller decides how to report this pass
+    // (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
+    if let Some(dir) = store {
         record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
     }
     let mut folded = folded;
@@ -414,6 +475,7 @@ pub fn reuse_folded_measurement(
         return None;
     }
     Some(FoldedUnit {
+        sealed_walked_at: None,
         reused: true,
         bytes: root.bytes,
         hardlinked: root.hardlinked,
@@ -440,20 +502,113 @@ fn record_folded_measurement(
     folded: &FoldedUnit,
     stamps: &[crate::walk::DirStamp],
 ) {
+    if let Some(rows) = folded_rows(path, exclusions, observed_at, folded, stamps, &[]) {
+        // A cache write that fails is a cache that will miss next time,
+        // which is the correct outcome and not worth failing a report over.
+        let _ = crate::growth::store_folded_rows(store, &path.display().to_string(), &rows);
+    }
+}
+
+/// Marks a depth-1 row whose `bytes`/`mtime_max` hold that immediate
+/// subfolder's folded total (#181). Appended to the row's exclusions
+/// digest, which only the root row is ever compared on, so a reader that
+/// predates per-child totals ignores them and a reader that knows them
+/// never mistakes a plain stamp row for a total.
+const CHILD_TOTAL_MARK: &str = "\u{2}child-total";
+
+/// Appended to the root row's digest of a measurement that was a lower
+/// bound: stored only so its complete subfolders can be replayed.
+const INCOMPLETE_MARK: &str = "\u{2}incomplete";
+
+/// The name, under a subfolder's rel_dir, of the row holding that
+/// subfolder's bytes with every hard link counted (what its directory
+/// rollups sum to, which the drilldown shows beside an adjustment row).
+/// A NUL cannot be in a file name, so this never names a real directory.
+const RAW_BYTES_ROW: &str = "\0raw";
+
+/// The rows one folded measurement stores: one stamp row per directory it
+/// listed (plus `carried`, the stored rows of subfolders this pass
+/// replayed), the folded total on the root row and, when they provably
+/// add up to it, each immediate subfolder's own total on its row.
+///
+/// Per-child totals (each hard-linked inode counted once within its
+/// subfolder) are recorded only when no inode is linked from two
+/// subfolders or from the root's own files (it would be counted twice
+/// when one side is replayed and the other re-walked), which holds
+/// exactly when root files plus subfolder totals equal the folded total;
+/// the newest mtime must match too. Anything else stores the plain rows, and the next changed
+/// pass walks the whole unit, which is always the correct answer.
+fn folded_rows(
+    path: &Path,
+    exclusions: &[PathBuf],
+    observed_at: u64,
+    folded: &FoldedUnit,
+    stamps: &[crate::walk::DirStamp],
+    carried: &[crate::growth::FoldedRow],
+) -> Option<Vec<crate::growth::FoldedRow>> {
     let unit_path = path.display().to_string();
     let digest = exclusions_digest(exclusions);
-    let mut rows: Vec<crate::growth::FoldedRow> = Vec::with_capacity(stamps.len());
+    let marked = format!("{digest}{CHILD_TOTAL_MARK}");
+    let mut rows: Vec<crate::growth::FoldedRow> = Vec::with_capacity(stamps.len() + carried.len());
     let mut saw_root = false;
+    let mut root_own: u64 = 0;
+    let mut root_linked = false;
+    let mut files_max: u64 = 0;
+    // Per immediate subfolder: bytes (each hard-linked inode once within
+    // the subfolder), newest file mtime, whether it holds a linked file.
+    let mut children: std::collections::HashMap<String, (u64, u64, bool)> =
+        std::collections::HashMap::new();
+    let mut raw: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<(String, u64, u64)> = std::collections::HashSet::new();
+    let mut incomplete_buckets: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut root_incomplete = false;
     for stamp in stamps {
-        let rel = match stamp.path.strip_prefix(path) {
-            Ok(r) => r.display().to_string(),
-            // A stamp from outside the unit cannot be validated against
-            // the unit root later, so it is not stored -- and, since a
-            // directory the measurement listed would then go unwatched,
-            // the whole measurement is not stored either.
-            Err(_) => return,
+        // A stamp from outside the unit cannot be validated against the
+        // unit root later, so the whole measurement is not stored.
+        let Ok(rel) = stamp.path.strip_prefix(path) else {
+            if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+                eprintln!(
+                    "[xtrace] not stored: stamp {} outside {}",
+                    stamp.path.display(),
+                    path.display()
+                );
+            }
+            return None;
         };
+        let rel = rel.display().to_string();
+        if stamp.incomplete {
+            // Something here could not be read: its subfolder is never
+            // replayed. The root is re-walked on every pass anyway (an
+            // unlistable root has no listed stamp, so nothing is stored).
+            if rel.is_empty() {
+                root_incomplete = true;
+            } else {
+                incomplete_buckets.insert(rel.split('/').next().unwrap_or("").to_string());
+            }
+            if stamp.mtime_ns == 0 && stamp.ctime_ns == 0 && stamp.own_bytes == 0 {
+                continue;
+            }
+        }
         saw_root |= rel.is_empty();
+        files_max = files_max.max(stamp.files_mtime_max);
+        let bucket = rel.split('/').next().unwrap_or("").to_string();
+        let mut bytes = stamp.own_bytes;
+        for (dev, ino, b, _) in &stamp.linked {
+            if !seen.insert((bucket.clone(), *dev, *ino)) {
+                bytes = bytes.saturating_sub(*b);
+            }
+        }
+        if rel.is_empty() {
+            root_own += bytes;
+            root_linked |= stamp.shared_inode;
+        } else {
+            *raw.entry(bucket.clone()).or_insert(0) += stamp.own_bytes;
+            let entry = children.entry(bucket).or_insert((0, 0, false));
+            entry.0 += bytes;
+            entry.1 = entry.1.max(stamp.files_mtime_max);
+            entry.2 |= stamp.shared_inode;
+        }
         rows.push(crate::growth::FoldedRow {
             unit_path: unit_path.clone(),
             rel_dir: rel,
@@ -469,16 +624,289 @@ fn record_folded_measurement(
     // No root stamp means the root itself was never listed (an excluded
     // or unreadable root): there is nothing to anchor a later reuse on.
     if !saw_root {
-        return;
+        if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+            eprintln!("[xtrace] not stored: no root stamp for {}", path.display());
+        }
+        return None;
     }
-    for row in rows.iter_mut().filter(|r| r.rel_dir.is_empty()) {
-        row.bytes = folded.bytes;
-        row.hardlinked = folded.hardlinked;
-        row.mtime_max = folded.mtime_max;
+    let first_carried = rows.len();
+    let mut carried_total: u64 = 0;
+    for row in carried {
+        let mut row = row.clone();
+        row.observed_at = observed_at;
+        // A subfolder's total row, not its all-links byte row below it.
+        if row.exclusions == marked && !row.rel_dir.contains('/') {
+            carried_total += row.bytes;
+            files_max = files_max.max(row.mtime_max);
+        }
+        rows.push(row);
     }
-    // A cache write that fails is a cache that will miss next time,
-    // which is the correct outcome and not worth failing a report over.
-    let _ = crate::growth::store_folded_rows(store, &unit_path, &rows);
+    // The buckets add up to the deduplicated total exactly only when no
+    // inode is linked from two of them: then a subfolder can be replayed
+    // on its own without counting a shared file twice.
+    // Every lower bound is accounted for by a subfolder that will be
+    // walked again; otherwise nothing is marked.
+    let attributed = folded.complete || root_incomplete || !incomplete_buckets.is_empty();
+    let consistent = attributed
+        && !root_linked
+        && root_own + children.values().map(|c| c.0).sum::<u64>() + carried_total == folded.bytes
+        && files_max == folded.mtime_max;
+    if !consistent && std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        eprintln!(
+            "[xtrace] subfolder totals not recorded for {}: complete={} attributed={attributed} root_linked={root_linked} parts={} total={} newest={files_max}/{}",
+            path.display(),
+            folded.complete,
+            root_own + children.values().map(|c| c.0).sum::<u64>() + carried_total,
+            folded.bytes,
+            folded.mtime_max
+        );
+    }
+    for (i, row) in rows.iter_mut().enumerate() {
+        if row.rel_dir.is_empty() {
+            row.bytes = folded.bytes;
+            row.hardlinked = folded.hardlinked;
+            row.mtime_max = folded.mtime_max;
+            // A lower bound is never replayed whole: its root row carries
+            // a digest the whole-unit reuse cannot match.
+            if !folded.complete {
+                row.exclusions = format!("{digest}{INCOMPLETE_MARK}");
+            }
+            continue;
+        }
+        if row.rel_dir.contains('/') {
+            continue;
+        }
+        if !consistent {
+            row.bytes = 0;
+            row.mtime_max = 0;
+            row.exclusions = digest.clone();
+        } else if i < first_carried
+            && !incomplete_buckets.contains(&row.rel_dir)
+            && let Some((bytes, mtime_max, linked)) = children.get(&row.rel_dir)
+        {
+            row.bytes = *bytes;
+            row.mtime_max = *mtime_max;
+            row.hardlinked = *linked;
+            row.exclusions = marked.clone();
+        }
+    }
+    if consistent {
+        for (name, (_, _, linked)) in &children {
+            if *linked && !incomplete_buckets.contains(name) {
+                rows.push(crate::growth::FoldedRow {
+                    unit_path: unit_path.clone(),
+                    rel_dir: format!("{name}/{RAW_BYTES_ROW}"),
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    bytes: raw.get(name).copied().unwrap_or(0),
+                    hardlinked: true,
+                    mtime_max: 0,
+                    observed_at,
+                    exclusions: marked.clone(),
+                });
+            }
+        }
+    }
+    Some(rows)
+}
+
+/// A changed unit, measured by re-walking only what changed (#181).
+///
+/// When this pass's event window shows changes under the unit, the whole
+/// unit used to be walked again: `~/Library/Caches` (163k files) on
+/// every pass, because some cache under it is always being written. With
+/// per-child totals stored (see [`folded_rows`]), every immediate
+/// subfolder the window vouches for -- no event at or under it since its
+/// total was taken, and its own directory stamp unchanged, so it was not
+/// replaced by a rename -- is replayed, and one walk measures the root's
+/// own files plus every other subfolder (changed, new, or not vouched
+/// for). The sum is what a full walk would have found, because nothing
+/// is linked across subfolders (the stored totals prove it for the
+/// replayed ones; a linked file in the walked part falls back to the
+/// full walk).
+///
+/// `None` whenever that cannot be shown: no trusted window, no stored
+/// per-child totals, a changed exclusion set, nothing to replay. The
+/// caller then walks the whole unit, as before.
+fn partial_measure(
+    store: Option<&Path>,
+    path: &Path,
+    exclusions: &[PathBuf],
+    observed_at: u64,
+    coverage: &crate::fs_events::EventCoverage,
+    worktree: Option<(&str, &Path)>,
+) -> Option<(FoldedUnit, Vec<crate::report::DirRollup>)> {
+    let dir = store?;
+    let unit_path = path.display().to_string();
+    let rows = crate::growth::folded_rows_for(dir, &unit_path);
+    let root = rows.iter().find(|r| r.rel_dir.is_empty())?;
+    let digest = exclusions_digest(exclusions);
+    if root.exclusions != digest && root.exclusions != format!("{digest}{INCOMPLETE_MARK}") {
+        return None;
+    }
+    let marked = format!("{digest}{CHILD_TOTAL_MARK}");
+    let reused: Vec<&crate::growth::FoldedRow> = rows
+        .iter()
+        .filter(|r| !r.rel_dir.is_empty() && !r.rel_dir.contains('/') && r.exclusions == marked)
+        // A subfolder holding a linked file is walked: a link made or
+        // removed elsewhere changes its count without an event under it.
+        .filter(|r| !r.hardlinked)
+        .filter(|r| {
+            let child = path.join(&r.rel_dir);
+            coverage.unchanged_since(&child, root.observed_at) && same_directory(&child, r)
+        })
+        .collect();
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        let marked_n = rows
+            .iter()
+            .filter(|r| !r.rel_dir.is_empty() && !r.rel_dir.contains('/') && r.exclusions == marked)
+            .count();
+        eprintln!(
+            "[xtrace] partial {}: {} of {marked_n} recorded subfolders replayable",
+            path.display(),
+            reused.len()
+        );
+    }
+    if reused.is_empty() {
+        return None;
+    }
+    let mut pruned = exclusions.to_vec();
+    pruned.extend(reused.iter().map(|r| path.join(&r.rel_dir)));
+    let (row, mut dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
+        path,
+        ArtifactKind::Unknown,
+        observed_at,
+        worktree,
+        &pruned,
+        true,
+    );
+    crate::work_counters::record_cache_miss();
+    // A linked file in the walked part may share its inode with a
+    // replayed subfolder unless every one of its links was walked here:
+    // otherwise walk the whole unit.
+    if row.hardlinked {
+        let mut seen: std::collections::HashMap<(u64, u64), u64> = std::collections::HashMap::new();
+        let mut nlinks: std::collections::HashMap<(u64, u64), u64> =
+            std::collections::HashMap::new();
+        for (dev, ino, _, n) in stamps.iter().flat_map(|s| s.linked.iter()) {
+            *seen.entry((*dev, *ino)).or_insert(0) += 1;
+            nlinks.insert((*dev, *ino), *n);
+        }
+        if seen
+            .iter()
+            .any(|(k, c)| nlinks.get(k).is_some_and(|n| c < n))
+        {
+            return None;
+        }
+    }
+    for _ in &reused {
+        crate::work_counters::record_subtree_reused();
+    }
+    let folded = FoldedUnit {
+        sealed_walked_at: None,
+        reused: false,
+        bytes: row.bytes + reused.iter().map(|r| r.bytes).sum::<u64>(),
+        hardlinked: row.hardlinked,
+        mtime_max: reused
+            .iter()
+            .map(|r| r.mtime_max)
+            .fold(row.mtime_max, u64::max),
+        complete,
+    };
+    let in_reused = |rel: &str| {
+        reused.iter().any(|c| {
+            rel == c.rel_dir
+                || rel
+                    .strip_prefix(c.rel_dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let carried: Vec<crate::growth::FoldedRow> = rows
+        .iter()
+        .filter(|r| in_reused(&r.rel_dir))
+        .cloned()
+        .collect();
+    if let Some(new_rows) = folded_rows(path, exclusions, observed_at, &folded, &stamps, &carried) {
+        let _ = crate::growth::store_folded_rows(dir, &unit_path, &new_rows);
+    }
+    if let Some((worktree_id, _)) = worktree {
+        // The drilldown reads one row per immediate subfolder: a
+        // replayed one is its stored total, with the newest modification
+        // a full walk would have rolled up (its directories' own mtimes
+        // and its files').
+        if let Some(root_dir) = dirs.iter_mut().find(|d| d.rel_path.is_empty()) {
+            root_dir.entry_count += reused.len() as u32;
+        }
+        for child in &reused {
+            let dirs_newest = carried
+                .iter()
+                .filter(|r| {
+                    r.rel_dir == child.rel_dir
+                        || r.rel_dir
+                            .strip_prefix(child.rel_dir.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+                .map(|r| r.mtime_ns.div_euclid(1_000_000_000))
+                .max()
+                .unwrap_or(0);
+            let newest = dirs_newest.max(child.mtime_max as i64);
+            let raw_name = format!("{}/{RAW_BYTES_ROW}", child.rel_dir);
+            let own = carried
+                .iter()
+                .find(|r| r.rel_dir == raw_name)
+                .map_or(child.bytes, |r| r.bytes);
+            dirs.push(crate::report::DirRollup {
+                worktree_id: worktree_id.to_string(),
+                track: None,
+                rel_path: child.rel_dir.clone(),
+                parent_rel_path: Some(String::new()),
+                allocated_total: own,
+                own_allocated: own,
+                file_count: 0,
+                entry_count: 0,
+                symlink_count: 0,
+                mod_time_min: (newest / 60) as i32,
+                complete: true,
+                growth_bytes: None,
+            });
+        }
+    }
+    Some((folded, dirs))
+}
+
+/// The per-subfolder totals `unit`'s last measurement stored (name to
+/// bytes and newest file mtime), or `None` when it stored none (#181).
+/// The manager pass keys a stored answer on these
+/// (`manager_facts::collect`).
+pub(crate) fn child_totals(
+    store: &Path,
+    unit: &Path,
+) -> Option<std::collections::HashMap<String, (u64, u64)>> {
+    let rows = crate::growth::folded_rows_for(store, &unit.display().to_string());
+    let root = rows.iter().find(|r| r.rel_dir.is_empty())?;
+    let digest = root
+        .exclusions
+        .strip_suffix(INCOMPLETE_MARK)
+        .unwrap_or(&root.exclusions);
+    let marked = format!("{digest}{CHILD_TOTAL_MARK}");
+    let totals: std::collections::HashMap<String, (u64, u64)> = rows
+        .iter()
+        .filter(|r| r.exclusions == marked && !r.rel_dir.contains('/'))
+        .map(|r| (r.rel_dir.clone(), (r.bytes, r.mtime_max)))
+        .collect();
+    (!totals.is_empty()).then_some(totals)
+}
+
+/// The subfolder is still the directory its stored row describes: a
+/// directory renamed into its place under the same name brings its own
+/// change stamp, and an event window over the parent would not show it.
+fn same_directory(child: &Path, row: &crate::growth::FoldedRow) -> bool {
+    match crate::fs_gate::symlink_metadata(child) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
+            stamp_ns(&meta) == (row.mtime_ns, row.ctime_ns)
+        }
+        _ => false,
+    }
 }
 
 /// Access and measurement in one call, so the ordinary report path never
@@ -541,6 +969,7 @@ pub fn observe_unit_with_dirs(
     observed_at: u64,
     coverage: &crate::fs_events::EventCoverage,
     allow_reuse: bool,
+    allow_partial: bool,
 ) -> (UnitObservation, Option<Vec<crate::report::DirRollup>>) {
     let mounts = sealed_mounts_under(path);
     let exclusions = with_sealed(exclusions, &mounts);
@@ -576,6 +1005,19 @@ pub fn observe_unit_with_dirs(
         UnitAccess::Absent => (UnitObservation::Absent, None),
         UnitAccess::Unreadable(why) => (UnitObservation::Unreadable(why), None),
         UnitAccess::Measurable => {
+            if allow_partial
+                && mounts.is_empty()
+                && let Some((folded, dirs)) = partial_measure(
+                    store,
+                    path,
+                    exclusions,
+                    observed_at,
+                    coverage,
+                    Some((STORE_WORKTREE_ID, path)),
+                )
+            {
+                return (UnitObservation::Unit(folded), Some(dirs));
+            }
             let (row, mut dirs, stamps, complete) = crate::walk::resize_artifact_stamped(
                 path,
                 ArtifactKind::Unknown,
@@ -586,20 +1028,21 @@ pub fn observe_unit_with_dirs(
             );
             crate::work_counters::record_cache_miss();
             let mut folded = FoldedUnit {
+                sealed_walked_at: None,
                 reused: false,
                 bytes: row.bytes,
                 hardlinked: row.hardlinked,
                 mtime_max: row.mtime_max,
                 complete,
             };
-            // Same rule as `measure`: an incomplete fold is never stored
-            // (it would overwrite a good prior measurement with a
-            // partial one), but the store's own directory rows are
-            // still handed back so the adapter can identify whatever
-            // *was* read -- best-effort, same as any other unreadable
-            // subdirectory.
+            // A build store's incomplete fold is never stored (its
+            // adapter replays the store whole); a drilled unit's is, as in
+            // `measure`, marked as a lower bound. The store's own
+            // directory rows are still handed back so the adapter can
+            // identify whatever *was* read -- best-effort, same as any
+            // other unreadable subdirectory.
             if let Some(dir) = store
-                && complete
+                && (complete || allow_partial)
             {
                 record_folded_measurement(dir, path, exclusions, observed_at, &folded, &stamps);
             }
@@ -697,6 +1140,11 @@ pub fn folded_bytes_bounded_stamped(
             path: dir.clone(),
             mtime_ns,
             ctime_ns,
+            own_bytes: 0,
+            files_mtime_max: 0,
+            shared_inode: false,
+            linked: Vec::new(),
+            incomplete: false,
         });
         let mut here = 0u64;
         for entry in rd.flatten() {
@@ -963,6 +1411,497 @@ mod tests {
         );
     }
 
+    fn fixture(unit: &Path) {
+        let noise = crate::fs_gate::settle::noise;
+        for (rel, len) in [
+            ("a/x", 4096),
+            ("a/sub/y", 8192),
+            ("b/z", 4096),
+            ("c/w", 12288),
+            ("root-file", 4096),
+        ] {
+            let p = unit.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, noise(len)).unwrap();
+        }
+        crate::fs_gate::settle::settle();
+    }
+
+    /// The answer a fresh store gives: a full walk, nothing replayed.
+    fn golden(unit: &Path) -> (u64, u64, bool, bool, String) {
+        let fresh = tempfile::tempdir().unwrap();
+        let none = crate::fs_events::EventCoverage::untrusted();
+        let f = measure(Some(fresh.path()), unit, &[], 9_000, &none);
+        let (obs, dirs) =
+            observe_unit_with_dirs(Some(fresh.path()), unit, &[], 9_000, &none, false, false);
+        assert!(matches!(obs, UnitObservation::Unit(_)));
+        let children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 10);
+        (
+            f.bytes,
+            f.mtime_max,
+            f.hardlinked,
+            f.complete,
+            format!("{children:?}"),
+        )
+    }
+
+    fn shape(
+        f: &FoldedUnit,
+        unit: &Path,
+        dirs: Option<Vec<crate::report::DirRollup>>,
+    ) -> (u64, u64, bool, bool, String) {
+        let children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 10);
+        (
+            f.bytes,
+            f.mtime_max,
+            f.hardlinked,
+            f.complete,
+            format!("{children:?}"),
+        )
+    }
+
+    /// #181. Tempting wrong patches: (1) keep walking the whole unit
+    /// whenever any event lands under it (correct, and 163k files of
+    /// `~/Library/Caches` every pass); (2) replay the stored total of
+    /// every subfolder the window does not name, which misses a folder
+    /// renamed into place (the event is on the parent) and double-counts
+    /// a file hardlinked across two subfolders. A changed unit re-walks
+    /// only the changed subfolder, and its total, newest mtime and
+    /// depth-2 drilldown equal a fresh full walk's, pass after pass.
+    #[test]
+    fn a_changed_unit_rewalks_only_the_changed_subfolder_and_matches_a_full_walk() {
+        use crate::fs_events::EventCoverage;
+        let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("cache");
+        fixture(&unit);
+        let none = EventCoverage::untrusted();
+        let (_, dirs) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, true, true);
+        assert!(dirs.is_some());
+
+        // Pass 2: a file lands in `b`; the window names `b`.
+        std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(8192)).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 500);
+        let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &window, true, true)
+        });
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(cost.subtrees_reused, 2, "a and c are replayed");
+        // The readability probe, the root and `b`; a full walk lists six.
+        assert_eq!(
+            cost.dirs_listed, 3,
+            "only the root and b are listed: {cost:?}"
+        );
+        assert_eq!(shape(&f, &unit, dirs), golden(&unit));
+
+        // Pass 3: `a/sub` changes. `b` (re-walked on pass 2) is now
+        // replayed from the rows pass 2 wrote.
+        std::fs::write(unit.join("a/sub/more"), crate::fs_gate::settle::noise(4096)).unwrap();
+        crate::fs_gate::settle::settle();
+        let window =
+            EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("a/sub")], 1_500);
+        let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 3_000, &window, true, true)
+        });
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(cost.subtrees_reused, 2, "b and c are replayed");
+        assert_eq!(shape(&f, &unit, dirs), golden(&unit));
+
+        // The plain (non-drill) path agrees.
+        let (plain, cost) = crate::work_counters::measured(|| {
+            measure(
+                Some(store.path()),
+                &unit,
+                &[],
+                4_000,
+                &EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("c")], 2_500),
+            )
+        });
+        assert_eq!(cost.subtrees_reused, 2);
+        assert_eq!(plain.bytes, golden(&unit).0);
+
+        // A directory renamed into `c`'s place: the event is on the unit
+        // root only, so the window does not name `c`; the stamp does.
+        std::fs::rename(unit.join("c"), tmp.path().join("old-c")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("other")).unwrap();
+        std::fs::write(
+            tmp.path().join("other/big"),
+            crate::fs_gate::settle::noise(65536),
+        )
+        .unwrap();
+        crate::fs_gate::settle::settle();
+        std::fs::rename(tmp.path().join("other"), unit.join("c")).unwrap();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.clone()], 3_500);
+        let (obs, dirs) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 5_000, &window, true, true);
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(
+            shape(&f, &unit, dirs),
+            golden(&unit),
+            "a renamed-in folder was replayed"
+        );
+
+        // A hardlink inside one replayed subfolder: replayed, counted once.
+        std::fs::write(
+            unit.join("a/sub/linked"),
+            crate::fs_gate::settle::noise(16384),
+        )
+        .unwrap();
+        std::fs::hard_link(unit.join("a/sub/linked"), unit.join("a/sub/linked2")).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("a")], 4_000);
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 5_500, &window, true, true);
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 5_000);
+        let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 5_800, &window, true, true)
+        });
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        // `a` holds a linked file, so it is walked (both links inside
+        // it); only `c` is replayed.
+        assert_eq!(cost.subtrees_reused, 1, "c is replayed, a is walked");
+        assert!(f.hardlinked);
+        assert_eq!(
+            shape(&f, &unit, dirs),
+            golden(&unit),
+            "an inner link was counted twice"
+        );
+
+        // A hardlink across two subfolders: never summed twice.
+        std::fs::hard_link(unit.join("a/x"), unit.join("b/link")).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 5_700);
+        let (obs, dirs) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 6_000, &window, true, true);
+        let UnitObservation::Unit(f) = obs else {
+            panic!("not measured")
+        };
+        assert_eq!(
+            shape(&f, &unit, dirs),
+            golden(&unit),
+            "a hardlink was counted twice"
+        );
+    }
+
+    /// Tempting wrong patches: (1) store nothing for a unit with an
+    /// unreadable folder, so it is walked whole every pass (the
+    /// maintainer's `~/Library/Caches`); (2) store it as a complete
+    /// measurement, so it is replayed whole as if it were exact. The
+    /// readable subfolders are replayed, the unreadable one is tried again,
+    /// the answer stays a lower bound equal to a fresh walk's, and the
+    /// stored rows are never replayed whole.
+    #[test]
+    fn a_unit_with_an_unreadable_folder_replays_its_readable_ones() {
+        use crate::fs_events::EventCoverage;
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("cache");
+        fixture(&unit);
+        std::fs::create_dir_all(unit.join("locked/inner")).unwrap();
+        std::fs::set_permissions(unit.join("locked"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let none = EventCoverage::untrusted();
+        let first = measure(Some(store.path()), &unit, &[], 1_000, &none);
+        assert!(!first.complete);
+        let quiet = EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 500);
+        assert!(
+            reuse_folded_measurement(Some(store.path()), &unit, &[], &quiet).is_none(),
+            "a lower bound was replayed whole"
+        );
+        std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(8192)).unwrap();
+        crate::fs_gate::settle::settle();
+        let window = EventCoverage::trusted(tmp.path().to_path_buf(), vec![unit.join("b")], 500);
+        let (second, cost) = crate::work_counters::measured(|| {
+            measure(Some(store.path()), &unit, &[], 2_000, &window)
+        });
+        assert_eq!(cost.subtrees_reused, 2, "a and c are replayed: {cost:?}");
+        let fresh = tempfile::tempdir().unwrap();
+        let golden = measure(Some(fresh.path()), &unit, &[], 9_000, &none);
+        std::fs::set_permissions(unit.join("locked"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            (second.bytes, second.mtime_max, second.complete),
+            (golden.bytes, golden.mtime_max, golden.complete)
+        );
+        assert!(!second.complete);
+    }
+
+    /// #181. Tempting wrong patches: (1) require an event window before
+    /// replaying a store of sealed volumes, so a lost window or another
+    /// swamp's write re-walks 1.77M simulator files; (2) vouch for any
+    /// unit whose sealed mounts hold, missing a file written beside them.
+    /// Only a directory of nothing but unchanged sealed mounts, itself
+    /// unchanged, is vouched for, and its replay equals the first walk.
+    #[test]
+    fn a_store_of_only_sealed_volumes_is_vouched_for_by_its_stamps() {
+        use crate::fs_events::EventCoverage;
+        use crate::fs_gate::fs_space::{VolumeStamp, testing};
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let unit = crate::fs_gate::canonicalize(tmp.path())
+            .unwrap()
+            .join("Volumes");
+        let sealed = unit.join("iOS_1");
+        std::fs::create_dir_all(sealed.join("a")).unwrap();
+        std::fs::write(sealed.join("a/big"), crate::fs_gate::settle::noise(65_536)).unwrap();
+        testing::set(
+            &unit,
+            VolumeStamp {
+                device: 1,
+                read_only: false,
+                total_blocks: 1000,
+                root_ino: 2,
+                root_mtime: 1,
+            },
+        );
+        let stamp = VolumeStamp {
+            device: 2,
+            read_only: true,
+            total_blocks: 4_000,
+            root_ino: 2,
+            root_mtime: 1_000,
+        };
+        testing::set(&sealed, stamp);
+        crate::fs_gate::settle::settle();
+        let none = EventCoverage::untrusted();
+        let (first, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let UnitObservation::Unit(first) = first else {
+            panic!("not measured")
+        };
+        assert!(sealed_only_unchanged(Some(store.path()), &unit));
+
+        let vouched = EventCoverage::trusted(unit.clone(), Vec::new(), 0);
+        let ((again, _), cost) = crate::work_counters::measured(|| {
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &vouched, true, false)
+        });
+        let UnitObservation::Unit(again) = again else {
+            panic!("not measured")
+        };
+        assert!(again.reused);
+        assert_eq!(cost.files_statted, 0, "{cost:?}");
+        assert_eq!(
+            (again.bytes, again.mtime_max, again.complete),
+            (first.bytes, first.mtime_max, first.complete)
+        );
+
+        // A volume replaced (new stamp): not vouched for.
+        testing::set(
+            &sealed,
+            VolumeStamp {
+                root_mtime: 2_000,
+                ..stamp
+            },
+        );
+        assert!(!sealed_only_unchanged(Some(store.path()), &unit));
+        testing::set(&sealed, stamp);
+        assert!(sealed_only_unchanged(Some(store.path()), &unit));
+        // A file beside the volumes: not vouched for.
+        std::fs::write(unit.join("loose"), b"x").unwrap();
+        assert!(!sealed_only_unchanged(Some(store.path()), &unit));
+        testing::clear();
+    }
+
+    /// Audit round 2 setup: a unit holding one staged sealed volume (a
+    /// subfolder answered as a read-only mount), walked once at 1_000.
+    fn rev2_sealed_unit(tmp: &Path) -> (PathBuf, PathBuf, crate::fs_gate::fs_space::VolumeStamp) {
+        use crate::fs_gate::fs_space::{VolumeStamp, testing};
+        let unit = crate::fs_gate::canonicalize(tmp).unwrap().join("Volumes");
+        let sealed = unit.join("iOS_1");
+        std::fs::create_dir_all(sealed.join("a")).unwrap();
+        std::fs::write(sealed.join("a/big"), crate::fs_gate::settle::noise(65_536)).unwrap();
+        testing::set(
+            &unit,
+            VolumeStamp {
+                device: 1,
+                read_only: false,
+                total_blocks: 1000,
+                root_ino: 2,
+                root_mtime: 1,
+            },
+        );
+        let stamp = VolumeStamp {
+            device: 2,
+            read_only: true,
+            total_blocks: 4_000,
+            root_ino: 2,
+            root_mtime: 1_000,
+        };
+        testing::set(&sealed, stamp);
+        crate::fs_gate::settle::settle();
+        (unit, sealed, stamp)
+    }
+
+    fn rev2_unit(o: UnitObservation) -> FoldedUnit {
+        let UnitObservation::Unit(u) = o else {
+            panic!("not measured")
+        };
+        u
+    }
+
+    /// Audit round 2. Tempting wrong patch (the shipped one): re-stamp the
+    /// sealed volume's stored row with the replaying pass's time, so the
+    /// time the 1.77M files were actually walked is lost and nothing can
+    /// say how old the measurement is (`--full` no longer re-walks it).
+    #[test]
+    fn rev2_a_vouched_replay_keeps_the_time_the_volume_was_walked() {
+        use crate::fs_events::EventCoverage;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, _sealed, _) = rev2_sealed_unit(tmp.path());
+        let none = EventCoverage::untrusted();
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let vouched = EventCoverage::trusted(unit.clone(), Vec::new(), 0);
+        let (again, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 9_000, &vouched, true, false);
+        assert!(rev2_unit(again).reused);
+        let rows = crate::growth::volume_stamps_for(store.path(), &unit.display().to_string());
+        crate::fs_gate::fs_space::testing::clear();
+        assert_eq!(
+            rows.iter().map(|r| r.observed_at).collect::<Vec<_>>(),
+            vec![1_000],
+            "the stored volume row no longer says when it was walked"
+        );
+    }
+
+    /// Audit round 2. Tempting wrong patches: vouch on the volumes' stamps
+    /// alone (ignoring the folder's own ctime), or keep vouching after a
+    /// volume is unmounted (its mount point is then an empty folder on the
+    /// parent volume). After each mutation the unit is not vouched for and
+    /// an observe with no window equals a store-less fresh walk.
+    #[test]
+    fn rev2_sealed_vouching_stops_on_chmod_and_unmount_and_matches_a_fresh_walk() {
+        use crate::fs_events::EventCoverage;
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, sealed, _) = rev2_sealed_unit(tmp.path());
+        let none = EventCoverage::untrusted();
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        assert!(sealed_only_unchanged(Some(store.path()), &unit));
+
+        // Permissions flipped on the folder: its ctime moves.
+        std::fs::set_permissions(&unit, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::fs_gate::settle::settle();
+        let vouched_after_chmod = sealed_only_unchanged(Some(store.path()), &unit);
+        let golden = |at: u64| {
+            let (o, _) = observe_unit_with_dirs(None, &unit, &[], at, &none, false, false);
+            let u = rev2_unit(o);
+            (u.bytes, u.mtime_max, u.complete)
+        };
+        let (o, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &none, false, false);
+        let o = rev2_unit(o);
+        assert_eq!((o.bytes, o.mtime_max, o.complete), golden(2_000));
+
+        // Unmounted: the stamp now says the parent volume.
+        crate::fs_gate::fs_space::testing::set(
+            &sealed,
+            crate::fs_gate::fs_space::VolumeStamp {
+                device: 1,
+                read_only: false,
+                total_blocks: 1000,
+                root_ino: 77,
+                root_mtime: 5,
+            },
+        );
+        let vouched_after_unmount = sealed_only_unchanged(Some(store.path()), &unit);
+        let (o, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 3_000, &none, false, false);
+        let o = rev2_unit(o);
+        let g = golden(3_000);
+        crate::fs_gate::fs_space::testing::clear();
+        assert!(
+            !vouched_after_chmod,
+            "vouched after the folder's mode changed"
+        );
+        assert!(!vouched_after_unmount, "vouched with a volume unmounted");
+        assert_eq!((o.bytes, o.mtime_max, o.complete), g);
+    }
+
+    /// Audit round 2. Tempting wrong patch: a vouched replay reports the
+    /// stored bytes as complete. A volume with an unreadable folder was a
+    /// lower bound when walked and stays labelled one when replayed.
+    #[test]
+    fn rev2_an_unreadable_sealed_volume_replays_as_a_lower_bound() {
+        use crate::fs_events::EventCoverage;
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, sealed, _) = rev2_sealed_unit(tmp.path());
+        std::fs::create_dir_all(sealed.join("root_only/x")).unwrap();
+        std::fs::set_permissions(
+            sealed.join("root_only"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let none = EventCoverage::untrusted();
+        let (first, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let vouched = sealed_only_unchanged(Some(store.path()), &unit);
+        let cov = EventCoverage::trusted(unit.clone(), Vec::new(), 0);
+        let (again, _) =
+            observe_unit_with_dirs(Some(store.path()), &unit, &[], 2_000, &cov, true, false);
+        std::fs::set_permissions(
+            sealed.join("root_only"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::fs_gate::fs_space::testing::clear();
+        let (first, again) = (rev2_unit(first), rev2_unit(again));
+        assert!(!first.complete);
+        assert!(vouched);
+        assert!(again.reused);
+        assert!(!again.complete, "a lower bound replayed as complete");
+        assert_eq!(again.bytes, first.bytes);
+    }
+
+    /// #181 review round 2 (f). Tempting wrong patch: drop the "every
+    /// entry is a sealed mount" check because the folder's own stamp
+    /// already moves when an entry is added. A plain folder that was there
+    /// at the first walk can change inside without moving the parent's
+    /// stamp: the unit is then not vouched for.
+    #[test]
+    fn a_plain_folder_beside_the_volumes_stops_the_vouching() {
+        use crate::fs_events::EventCoverage;
+        let _serial = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let (unit, _sealed, _) = rev2_sealed_unit(tmp.path());
+        std::fs::create_dir_all(unit.join("plain")).unwrap();
+        std::fs::write(unit.join("plain/f"), b"x").unwrap();
+        crate::fs_gate::settle::settle();
+        let none = EventCoverage::untrusted();
+        let _ = observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, false, false);
+        let before = std::fs::symlink_metadata(&unit).unwrap();
+        std::fs::write(unit.join("plain/g"), crate::fs_gate::settle::noise(65_536)).unwrap();
+        let after = std::fs::symlink_metadata(&unit).unwrap();
+        assert_eq!(
+            stamp_ns(&before),
+            stamp_ns(&after),
+            "precondition: the parent's stamp did not move"
+        );
+        let vouched = sealed_only_unchanged(Some(store.path()), &unit);
+        crate::fs_gate::fs_space::testing::clear();
+        assert!(!vouched, "a changed plain folder was vouched for");
+    }
+
     /// A different exclusion set describes different bytes, so it must
     /// not be answered from a measurement taken under the old one.
     #[test]
@@ -988,5 +1927,256 @@ mod tests {
             excluded.bytes,
             all.bytes
         );
+    }
+
+    /// Adversarial audit of #181 subfolder replay (audit/v080-perf). Each
+    /// case: pass 1 is a full walk that stores per-subfolder totals; the
+    /// disk is mutated; pass 2 gets the event window FSEvents would hand
+    /// it (directory-level events: the changed directory and its parent);
+    /// its answer must equal a fresh full walk's.
+    mod adversarial_181 {
+        use super::*;
+        use crate::fs_events::EventCoverage;
+
+        type Shape = (u64, u64, bool, bool, String);
+
+        fn incremental_after(
+            tmp: &Path,
+            unit: &Path,
+            mutate: impl FnOnce(),
+            events: &[PathBuf],
+        ) -> (Shape, Shape, u64) {
+            let store = tempfile::tempdir().unwrap();
+            let none = EventCoverage::untrusted();
+            let _ = observe_unit_with_dirs(Some(store.path()), unit, &[], 1_000, &none, true, true);
+            mutate();
+            crate::fs_gate::settle::settle();
+            let window = EventCoverage::trusted(tmp.to_path_buf(), events.to_vec(), 500);
+            let ((obs, dirs), cost) = crate::work_counters::measured(|| {
+                observe_unit_with_dirs(Some(store.path()), unit, &[], 2_000, &window, true, true)
+            });
+            let UnitObservation::Unit(f) = obs else {
+                panic!("not measured")
+            };
+            (shape(&f, unit, dirs), golden(unit), cost.subtrees_reused)
+        }
+
+        /// Tempting wrong patch: treat "no event at or under the
+        /// subfolder and its own directory stamp unchanged" as proof that
+        /// nothing it holds changed. A hard link made from OUTSIDE the
+        /// unit to a file in a replayed subfolder fires an event only
+        /// where the link was made; the file's link count changed, so a
+        /// full walk now says the unit holds hard-linked files (the
+        /// report then labels its bytes as possibly shared) while the
+        /// replay keeps the stored `hardlinked = false`.
+        #[test]
+        #[ignore = "known limit (#181): a link made from outside the unit to a file in a \
+                    replayed subfolder changes only that file's ctime and fires no event under \
+                    the unit; the bytes stay exact, only the hardlinked label lags until the \
+                    subfolder changes. Detecting it needs a stat of every replayed file."]
+        fn a_hard_link_made_from_outside_into_a_replayed_subfolder() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = tmp_path.join("cache");
+            fixture(&unit);
+            std::fs::create_dir_all(tmp_path.join("outside")).unwrap();
+            let (got, want, reused) = incremental_after(
+                &tmp_path,
+                &unit,
+                || {
+                    std::fs::hard_link(unit.join("a/x"), tmp_path.join("outside/link")).unwrap();
+                    // Something else in the unit changed, so the unit is
+                    // re-measured (partially) this pass.
+                    std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(4096))
+                        .unwrap();
+                },
+                &[tmp_path.join("outside"), unit.join("b"), unit.clone()],
+            );
+            assert!(reused > 0, "nothing was replayed");
+            assert_eq!(got, want, "replay kept the old hard-link flag");
+        }
+
+        /// The reverse: the outside link is removed; the stored flag says
+        /// hard-linked, the disk no longer does.
+        #[test]
+        fn a_hard_link_from_outside_removed_while_its_subfolder_is_replayed() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = tmp_path.join("cache");
+            fixture(&unit);
+            std::fs::create_dir_all(tmp_path.join("outside")).unwrap();
+            std::fs::hard_link(unit.join("a/x"), tmp_path.join("outside/link")).unwrap();
+            crate::fs_gate::settle::settle();
+            let (got, want, _) = incremental_after(
+                &tmp_path,
+                &unit,
+                || {
+                    std::fs::remove_file(tmp_path.join("outside/link")).unwrap();
+                    std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(4096))
+                        .unwrap();
+                },
+                &[tmp_path.join("outside"), unit.join("b"), unit.clone()],
+            );
+            assert_eq!(got, want);
+        }
+
+        /// Case-only rename on APFS (case-insensitive): the event is on
+        /// the unit root; the stored row is named `a`, the disk says `A`.
+        #[test]
+        fn a_case_only_rename_of_a_subfolder() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = tmp_path.join("cache");
+            fixture(&unit);
+            let (got, want, _) = incremental_after(
+                &tmp_path,
+                &unit,
+                || {
+                    std::fs::rename(unit.join("a"), unit.join("A")).unwrap();
+                },
+                &[unit.clone(), tmp_path.clone()],
+            );
+            assert_eq!(got, want, "a case-only rename replayed the old name");
+        }
+
+        /// Directory replaced by a file, file replaced by a directory, a
+        /// directory deleted and recreated with the same content, a
+        /// symlink to a directory put in a subfolder's place, a change 40
+        /// levels down: each must equal a full walk.
+        #[test]
+        fn replacements_and_deep_changes_equal_a_full_walk() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let noise = crate::fs_gate::settle::noise;
+            type Case = (&'static str, fn(&Path, &Path), fn(&Path) -> Vec<PathBuf>);
+            let cases: Vec<Case> = vec![
+                (
+                    "dir to file",
+                    |u, _| {
+                        std::fs::remove_file(u.join("c/w")).unwrap();
+                        std::fs::remove_dir(u.join("c")).unwrap();
+                        std::fs::write(u.join("c"), crate::fs_gate::settle::noise(4096)).unwrap();
+                    },
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "file to dir",
+                    |u, _| {
+                        std::fs::remove_file(u.join("root-file")).unwrap();
+                        std::fs::create_dir_all(u.join("root-file")).unwrap();
+                        std::fs::write(u.join("root-file/q"), crate::fs_gate::settle::noise(4096))
+                            .unwrap();
+                    },
+                    |u| vec![u.to_path_buf(), u.join("root-file")],
+                ),
+                (
+                    "deleted and recreated",
+                    |u, _| {
+                        std::fs::remove_file(u.join("c/w")).unwrap();
+                        std::fs::remove_dir(u.join("c")).unwrap();
+                        std::fs::create_dir_all(u.join("c")).unwrap();
+                        std::fs::write(u.join("c/w"), crate::fs_gate::settle::noise(12288))
+                            .unwrap();
+                    },
+                    // Coalesced: only the parent named.
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "symlink in place",
+                    |u, t| {
+                        std::fs::rename(u.join("c"), t.join("moved-c")).unwrap();
+                        std::os::unix::fs::symlink(t.join("moved-c"), u.join("c")).unwrap();
+                    },
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "moved out",
+                    |u, t| {
+                        std::fs::rename(u.join("c"), t.join("gone-c")).unwrap();
+                    },
+                    |u| vec![u.to_path_buf()],
+                ),
+                (
+                    "deep change",
+                    |u, _| {
+                        let mut d = u.join("b");
+                        for i in 0..40 {
+                            d = d.join(format!("d{i}"));
+                        }
+                        std::fs::write(d.join("deep"), crate::fs_gate::settle::noise(8192))
+                            .unwrap();
+                    },
+                    |u| {
+                        let mut d = u.join("b");
+                        for i in 0..40 {
+                            d = d.join(format!("d{i}"));
+                        }
+                        vec![d.clone(), d.parent().unwrap().to_path_buf()]
+                    },
+                ),
+            ];
+            for (name, mutate, events) in cases {
+                let tmp = tempfile::tempdir().unwrap();
+                let t = std::fs::canonicalize(tmp.path()).unwrap();
+                let unit = t.join("cache");
+                fixture(&unit);
+                let mut d = unit.join("b");
+                for i in 0..40 {
+                    d = d.join(format!("d{i}"));
+                }
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("seed"), noise(4096)).unwrap();
+                crate::fs_gate::settle::settle();
+                let ev = events(&unit);
+                let (got, want, _) = incremental_after(&t, &unit, || mutate(&unit, &t), &ev);
+                assert_eq!(got, want, "{name}");
+            }
+        }
+
+        /// Stored rows from a format that predates per-subfolder totals
+        /// (no marked rows), or a missing root row, must never be
+        /// replayed partially.
+        #[test]
+        fn rows_without_marks_or_without_a_root_are_never_replayed() {
+            let _guard = SEALED.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = tempfile::tempdir().unwrap();
+            let t = std::fs::canonicalize(tmp.path()).unwrap();
+            let unit = t.join("cache");
+            fixture(&unit);
+            let store = tempfile::tempdir().unwrap();
+            let none = EventCoverage::untrusted();
+            let _ = measure(Some(store.path()), &unit, &[], 1_000, &none);
+            let key = unit.display().to_string();
+            let rows = crate::growth::folded_rows_for(store.path(), &key);
+            let digest = exclusions_digest(&[]);
+            let old: Vec<_> = rows
+                .iter()
+                .cloned()
+                .map(|mut r| {
+                    if !r.rel_dir.is_empty() {
+                        r.exclusions = digest.clone();
+                        r.bytes = 0;
+                    }
+                    r
+                })
+                .filter(|r| !r.rel_dir.contains('\0'))
+                .collect();
+            crate::growth::store_folded_rows(store.path(), &key, &old).unwrap();
+            let window = EventCoverage::trusted(t.clone(), vec![unit.join("b")], 500);
+            assert!(
+                partial_measure(Some(store.path()), &unit, &[], 2_000, &window, None).is_none()
+            );
+            let rootless: Vec<_> = rows
+                .iter()
+                .filter(|r| !r.rel_dir.is_empty())
+                .cloned()
+                .collect();
+            crate::growth::store_folded_rows(store.path(), &key, &rootless).unwrap();
+            assert!(
+                partial_measure(Some(store.path()), &unit, &[], 2_000, &window, None).is_none()
+            );
+        }
     }
 }
