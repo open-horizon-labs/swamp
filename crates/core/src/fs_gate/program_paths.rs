@@ -52,7 +52,14 @@ pub enum Plan {
     /// `arg0` is the program's own name, so a multi-call binary reached
     /// through a link (OrbStack's `docker` -> `docker-tools`) still sees
     /// the name it dispatches on.
-    Fixed { exe: PathBuf, arg0: &'static str },
+    Fixed {
+        exe: PathBuf,
+        arg0: &'static str,
+        /// The child's `PATH`: the program's own directory, then the
+        /// system directories, then Homebrew's and `/usr/local/bin` only
+        /// when they pass the directory check.
+        path: String,
+    },
     /// Absolute executable, a from-scratch environment and a fixed
     /// working directory.
     Scrubbed(Scrubbed),
@@ -301,12 +308,28 @@ pub(super) fn resolve_strict(candidates: &[PathBuf]) -> Result<Resolved, String>
     let exe = std::fs::canonicalize(found)
         .map_err(|e| format!("{} could not be resolved: {e}", found.display()))?;
     trusted_file(&exe)?;
+    // Every directory the path passes through on its way to the file is
+    // checked: the candidate's own, each link's in a chain, the real
+    // file's. A link planted in a writable directory, pointing at a
+    // perfectly trusted binary, is still a link anyone could repoint.
+    let mut cur = found.clone();
+    for _ in 0..40 {
+        let dir = cur.parent().map(Path::to_path_buf).unwrap_or_default();
+        trusted_dir(&dir)?;
+        match std::fs::read_link(&cur) {
+            Ok(next) => {
+                cur = if next.is_absolute() {
+                    next
+                } else {
+                    dir.join(next)
+                }
+            }
+            Err(_) => break,
+        }
+    }
     let real_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     trusted_dir(&real_dir)?;
-    let path_head = match found.parent() {
-        Some(d) if trusted_dir(d).is_ok() => d.to_path_buf(),
-        _ => real_dir,
-    };
+    let path_head = found.parent().map(Path::to_path_buf).unwrap_or(real_dir);
     Ok(Resolved { exe, path_head })
 }
 
@@ -437,6 +460,58 @@ fn developer_dir_ok(d: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Inherited variables a `Plan::Fixed` child never sees (#199): loader
+/// injection, and every variable through which git, gh, ssh or a shell
+/// runs a program or reads configuration the user did not write to their
+/// own config files (a checkout's direnv or mise `[env]` can set any of
+/// them). Exact names and prefixes; everything else (credentials and
+/// contexts: `HOME`, `DOCKER_*`, `GH_TOKEN`, `XDG_*`, `SSH_AUTH_SOCK`,
+/// `TMPDIR`, `LANG`/`LC_*`) passes.
+const FIXED_REMOVED_PREFIXES: &[&str] = &["DYLD_", "LD_", "GIT_CONFIG", "GIT_SSH"];
+const FIXED_REMOVED: &[&str] = &[
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_PROXY_COMMAND",
+    "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_TEMPLATE_DIR",
+    "EDITOR",
+    "VISUAL",
+    "GH_EDITOR",
+    "BROWSER",
+    "GH_BROWSER",
+    "BASH_ENV",
+    "ENV",
+    "PERL5LIB",
+    "PERL5OPT",
+];
+
+/// Whether an inherited variable is removed for a `Plan::Fixed` child.
+pub(super) fn removed_for_fixed(key: &str) -> bool {
+    FIXED_REMOVED.contains(&key) || FIXED_REMOVED_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// A `Plan::Fixed` child's `PATH`: `head` (the program's own, checked
+/// directory), the system directories, and Homebrew's and
+/// `/usr/local/bin` only when they pass [`trusted_dir`] (gh finds git
+/// there, docker its credential helpers). Never the inherited `PATH`.
+fn fixed_path(head: &Path) -> String {
+    let mut dirs: Vec<String> = vec![head.display().to_string()];
+    for d in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        dirs.push(d.to_string());
+    }
+    for d in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        if std::fs::metadata(d).is_ok() && trusted_dir(Path::new(d)).is_ok() {
+            dirs.push(d.to_string());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    dirs.join(":")
+}
+
 /// Whether `program` is present at one of its fixed locations (or, in a
 /// test build with `SWAMP_TEST_PROGRAM_DIR`, as a fake): present, not
 /// necessarily trusted or runnable.
@@ -473,7 +548,9 @@ pub fn plan(program: Program) -> io::Result<Plan> {
         ));
     };
     if !migrated(program) {
+        let head = exe.parent().unwrap_or(Path::new("/usr/bin")).to_path_buf();
         return Ok(Plan::Fixed {
+            path: fixed_path(&head),
             exe,
             arg0: program.binary(),
         });
@@ -604,7 +681,7 @@ mod tests {
             .filter(|p| !matches!(p, Program::Brew | Program::Mise))
         {
             match plan(*p) {
-                Ok(Plan::Fixed { exe, arg0 }) => {
+                Ok(Plan::Fixed { exe, arg0, .. }) => {
                     assert!(exe.is_absolute(), "{p:?}");
                     assert_eq!(arg0, p.binary());
                 }
@@ -769,6 +846,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The variables git, gh and docker need still reach a `Plan::Fixed`
+    /// child; only the loader and exec-hook ones are removed. Tempting
+    /// wrong patch: `env_clear`, which drops `GH_TOKEN`, `DOCKER_HOST`,
+    /// `SSH_AUTH_SOCK` and makes the tools answer for nobody.
+    #[test]
+    fn fixed_children_keep_credentials_and_contexts() {
+        for k in [
+            "HOME",
+            "DOCKER_CONFIG",
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "GH_TOKEN",
+            "GH_HOST",
+            "GH_CONFIG_DIR",
+            "GITHUB_TOKEN",
+            "XDG_CONFIG_HOME",
+            "SSH_AUTH_SOCK",
+            "TMPDIR",
+            "LANG",
+            "LC_ALL",
+            "USER",
+        ] {
+            assert!(!removed_for_fixed(k), "{k} must pass");
+        }
+        for k in [
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_EXEC_PATH",
+            "GIT_SSH_COMMAND",
+            "GIT_SSH",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_ASKPASS",
+            "SSH_ASKPASS",
+            "GIT_PROXY_COMMAND",
+            "BASH_ENV",
+        ] {
+            assert!(removed_for_fixed(k), "{k} must be removed");
+        }
+        let p = fixed_path(Path::new("/opt/x/bin"));
+        assert!(
+            p.starts_with("/opt/x/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            "{p}"
+        );
     }
 
     /// A world-writable directory holding the program, or a directory

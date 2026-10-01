@@ -649,10 +649,17 @@ impl Running {
                 crate::work_counters::record_spawn();
                 Command::new(exe)
             }
-            super::program_paths::Plan::Fixed { exe, arg0 } => {
+            super::program_paths::Plan::Fixed { exe, arg0, path } => {
                 crate::work_counters::record_spawn();
                 let mut c = Command::new(exe);
-                c.arg0(arg0);
+                c.arg0(arg0).env("PATH", path);
+                for (k, _) in std::env::vars_os() {
+                    if k.to_str()
+                        .is_some_and(super::program_paths::removed_for_fixed)
+                    {
+                        c.env_remove(k);
+                    }
+                }
                 c
             }
             super::program_paths::Plan::Scrubbed(s) => {
