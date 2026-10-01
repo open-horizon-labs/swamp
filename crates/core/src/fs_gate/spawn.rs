@@ -175,8 +175,6 @@ enum Slot {
     DockerRef,
     /// One or more [`Slot::DockerRef`]s (a batched `inspect`).
     DockerRefs,
-    /// A decimal number (a pid).
-    Number,
     /// `gui/<uid>` (a launchd domain).
     LaunchdDomain,
     /// `gui/<uid>/<label>` for swamp's own label.
@@ -443,7 +441,6 @@ fn matches_shape(shape: &[Slot], args: &[String]) -> bool {
             Slot::Lit(w) => a == w,
             Slot::AbsPath => a.starts_with('/'),
             Slot::DockerRef => docker_ref(a),
-            Slot::Number => digits(a),
             Slot::LaunchdDomain => a.strip_prefix("gui/").is_some_and(digits),
             Slot::LaunchdService => a
                 .strip_prefix("gui/")
