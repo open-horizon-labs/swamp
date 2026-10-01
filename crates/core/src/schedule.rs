@@ -42,11 +42,7 @@ pub fn plist_path() -> PathBuf {
 pub fn log_dir() -> PathBuf {
     match std::env::var_os("SWAMP_LOG_DIR") {
         Some(dir) => PathBuf::from(dir),
-        None => {
-            let dir = default_log_dir();
-            store::refuse_real_user_default("observe log directory", &dir, store::Resolve::Display);
-            dir
-        }
+        None => default_log_dir(),
     }
 }
 
@@ -79,6 +75,15 @@ pub fn scheduling() -> crate::platform::Scheduling {
 
 pub fn log_file() -> PathBuf {
     log_dir().join("observe.log")
+}
+
+/// [`log_file`] for the `observe` that is about to append to it: in a
+/// test build a path outside the temp directory panics here, before the
+/// observation runs, rather than after it (`store::refuse_real_user_default`).
+pub fn log_file_for_append() -> PathBuf {
+    let path = log_file();
+    store::refuse_real_user_default("observe log", &path);
+    path
 }
 
 /// Parses a human interval (`"30m"`, `"1h"`, `"12h"`, `"1d"`, or a bare
@@ -904,7 +909,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn header_line_reports_no_schedule_when_plist_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SWAMP_LAUNCH_AGENTS_DIR points somewhere with no plist.
         let tmp = tempfile::tempdir().unwrap();
         unsafe {
@@ -926,7 +931,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn off_removes_plist_and_issues_bootout_in_test_mode() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agents = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
@@ -953,7 +958,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn off_with_no_plist_still_reports_no_schedule() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agents = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
@@ -974,7 +979,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn status_parses_a_fixture_log_and_installed_plist() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agents = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("SWAMP_LAUNCH_AGENTS_DIR", agents.path());
@@ -1028,7 +1033,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn install_with_no_roots_freezes_nothing_and_status_says_so() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agents = tempfile::tempdir().unwrap();
         let logs = tempfile::tempdir().unwrap();
         unsafe {
@@ -1081,7 +1086,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn install_with_explicit_roots_still_freezes_them() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agents = tempfile::tempdir().unwrap();
         let logs = tempfile::tempdir().unwrap();
         unsafe {
@@ -1117,7 +1122,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn install_without_a_user_manager_refuses_and_writes_nothing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agents = tempfile::tempdir().unwrap();
         let logs = tempfile::tempdir().unwrap();
         let units = tempfile::tempdir().unwrap();
@@ -1163,7 +1168,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn install_and_off_through_the_real_entry_points_use_systemd_units_only() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let agents = tempfile::tempdir().unwrap();
         let units = tempfile::tempdir().unwrap();
         let saved = std::env::var_os("XDG_RUNTIME_DIR");
@@ -1202,7 +1207,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_refuses_a_collector() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let err = install("1h", &[], true).expect_err("macOS needs no collector");
         assert!(format!("{err}").contains("FSEvents"), "{err}");
     }
@@ -1213,7 +1218,7 @@ mod tests {
     /// other's build.
     #[test]
     fn the_log_directory_follows_this_platforms_convention_and_the_override_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // HOME points at a temp dir: the hermeticity guard refuses a test
         // that derives the real user's log directory.
         let fake_home = tempfile::tempdir().unwrap();
@@ -1267,7 +1272,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_relative_xdg_state_home_is_ignored() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let fake_home = tempfile::tempdir().unwrap();
         let real_home = std::env::var_os("HOME");
         unsafe {
@@ -1424,6 +1429,59 @@ mod tests {
             assert!(!arch.contains(stale), "stale: {stale}");
         }
         assert!(arch.contains("marked as a lower bound"));
+    }
+
+    /// CI run 36876775575 (Linux). Tempting wrong patches: (1) refuse a
+    /// default log path when it is merely resolved to be shown, so every
+    /// systemd unit test that renders the log path panics on a runner
+    /// whose `XDG_STATE_HOME`/`HOME` are real; (2) drop the guard. With
+    /// `HOME` a temp dir and `XDG_STATE_HOME` the runner's real state dir,
+    /// resolving the log for display never panics, and resolving it to
+    /// append panics exactly when the platform's log would land outside
+    /// the temp dir (Linux reads `XDG_STATE_HOME`; macOS reads `HOME`).
+    #[test]
+    fn the_guard_refuses_a_real_log_only_where_it_would_be_written() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let vars = [
+            "HOME",
+            "XDG_STATE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CONFIG_HOME",
+            "SWAMP_LOG_DIR",
+        ];
+        let saved: Vec<_> = vars.iter().map(|v| (*v, std::env::var_os(v))).collect();
+        let fake_home = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+            std::env::set_var("XDG_STATE_HOME", "/home/runner/.local/state");
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("XDG_CONFIG_HOME");
+            std::env::remove_var("SWAMP_LOG_DIR");
+        }
+        let shown = std::panic::catch_unwind(log_file);
+        let appended = std::panic::catch_unwind(log_file_for_append);
+        unsafe {
+            for (k, v) in &saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let shown = shown.expect("resolving the log to show it must not panic");
+        match crate::platform::Os::current() {
+            crate::platform::Os::Linux => {
+                assert_eq!(
+                    shown,
+                    PathBuf::from("/home/runner/.local/state/swamp/observe.log")
+                );
+                assert!(appended.is_err(), "a real Linux log would be appended to");
+            }
+            crate::platform::Os::MacOs => {
+                assert!(shown.starts_with(fake_home.path()), "{}", shown.display());
+                assert!(appended.is_ok(), "a temp HOME log was refused");
+            }
+        }
     }
 
     #[test]

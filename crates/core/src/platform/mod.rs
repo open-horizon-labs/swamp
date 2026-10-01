@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn swamp_dir_overrides_every_convention() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
         env.set("SWAMP_DIR", "/explicit/store");
         env.set("HOME", "/home/dev");
@@ -618,7 +618,7 @@ mod tests {
     /// documented way to say where per-user data goes.
     #[test]
     fn the_store_directory_follows_this_platforms_convention() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
         env.set("HOME", "/home/dev");
 
@@ -644,7 +644,7 @@ mod tests {
     /// relative to the process's working directory.
     #[test]
     fn a_relative_xdg_data_home_is_ignored() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
         env.set("HOME", "/home/dev");
         env.set("XDG_DATA_HOME", "relative/share");
@@ -659,7 +659,7 @@ mod tests {
     /// vanished. A missing home is a question for the user.
     #[test]
     fn no_home_and_no_override_is_an_error_not_the_current_directory() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let env = EnvGuard::new(&["SWAMP_DIR", "HOME", "XDG_DATA_HOME"]);
         env.unset("HOME");
         let err = data_dir().expect_err("a missing HOME must not resolve to the cwd");

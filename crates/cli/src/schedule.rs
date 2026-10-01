@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use swamp_core::growth::load_config;
 use swamp_core::report::ObservationParts;
 use swamp_core::schedule::{
-    self, LockOutcome, RunOutcome, acquire_lock, append_log, log_file, write_last_run,
+    self, LockOutcome, RunOutcome, acquire_lock, append_log, write_last_run,
 };
 
 /// `swamp observe [root...]`. Exits 0 on success, on a graceful
@@ -43,7 +43,7 @@ pub fn cmd_observe(
 ) -> Result<()> {
     // Resolved before any work: a misconfigured test (the hermeticity
     // guard) fails here, not after a whole observation.
-    let log = log_file();
+    let log = schedule::log_file_for_append();
     let config = load_config(&store_dir);
     let timeout = Duration::from_secs(config.observe_timeout_sec.max(1));
     let retention_days = config.retention_days;
