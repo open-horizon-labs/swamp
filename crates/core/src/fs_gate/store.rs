@@ -408,7 +408,7 @@ fn is_derived_table(name: &str) -> bool {
             "cursors" | "current" | "dirs" | "files" | "unowned" | "unowned_lists"
         | "unowned_evidence" | "docker_unowned" | "docker_unowned_lists"
         | "docker_unowned_evidence" | "dir_tracks" | "topology" | "volume_stamps"
-        | "build_stores" | "xcode_derived_data" | "declarations" | "dependency_identities"
+        | "build_stores" | "model_cards" | "xcode_derived_data" | "declarations" | "dependency_identities"
         | "git_signals" | "git_signals_values" | "cargo_replay_cache"
         | "cargo_replay_cache_lists" | "cargo_replay_cache_evidence" | "cargo_replay_cache_meta"
         | "scope" | "scope_values" | "scope_roots" | "scope_root_reasons" | "docker_meta"
@@ -513,6 +513,7 @@ fn clean_association_generation(dir: &Path) -> io::Result<()> {
         "agent_identifications.parquet",
         "agent_containers.parquet",
         "build_stores.parquet",
+        "model_cards.parquet",
     ] {
         remove_known_file(&dir.join(name))?;
     }
@@ -1001,6 +1002,11 @@ impl TextFile<'_> {
 /// only printed, as in `schedule status`) is checked in a test child but
 /// not in an in-process unit test, which may render the default; every
 /// write site uses `Resolve::Write`.
+#[cfg(not(any(test, feature = "testing")))]
+pub(crate) fn refuse_real_user_default(_what: &str, _path: &Path, _resolve: Resolve) {}
+
+/// See the shipped no-op above: the check exists only in test builds.
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn refuse_real_user_default(what: &str, path: &Path, resolve: Resolve) {
     let child = std::env::var_os("SWAMP_TEST_MODE").is_some_and(|v| v == "1");
     let test_mode = child || (cfg!(test) && resolve == Resolve::Write);
@@ -1021,6 +1027,7 @@ pub(crate) enum Resolve {
     Write,
 }
 
+#[cfg(any(test, feature = "testing"))]
 fn is_under_temp(path: &Path) -> bool {
     let tmp = std::env::temp_dir();
     let mut roots = vec![tmp.clone()];
@@ -1141,7 +1148,9 @@ pub fn append_line(file: LogFile<'_>, line: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    rotate_if_full(&path, LOG_CAP_BYTES)?;
+    if let Some(note) = rotate_if_full(&path, LOG_CAP_BYTES) {
+        eprintln!("{note}");
+    }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1153,20 +1162,39 @@ pub fn append_line(file: LogFile<'_>, line: &str) -> io::Result<()> {
 /// The observation log's size cap. A scheduled observe every 15 minutes
 /// writes about 2 MB in two weeks (the per-root lines launchd redirects
 /// into the same file), so without a cap the log grows without bound.
-/// At the cap the log becomes `observe.log.1` (replacing an older one)
-/// and a new `observe.log` starts: at most twice the cap on disk.
+/// At the cap the log becomes `observe.log.1`, the older ones shift to
+/// `.2` and `.3` (the oldest is dropped), and a new `observe.log` starts:
+/// at most four times the cap on disk.
 pub const LOG_CAP_BYTES: u64 = 1024 * 1024;
 
-/// Renames `path` to `<path>.1` when it has reached `cap` bytes. A log
-/// that cannot be measured is left alone (the append reports the error).
-fn rotate_if_full(path: &Path, cap: u64) -> io::Result<()> {
-    match std::fs::metadata(path) {
-        Ok(m) if m.len() >= cap => {
-            let mut rotated = path.as_os_str().to_owned();
-            rotated.push(".1");
-            std::fs::rename(path, PathBuf::from(rotated))
+/// How many rotated logs are kept (`observe.log.1` ..).
+pub const LOG_ROTATED_KEPT: u32 = 3;
+
+/// Rotates `path` when it has reached `cap` bytes. Best effort: a
+/// rotation that cannot happen (a read-only directory, a rotated file
+/// that cannot be replaced) leaves the log where it is and the append
+/// goes on; the caller is told once, through the returned note.
+fn rotate_if_full(path: &Path, cap: u64) -> Option<String> {
+    let full = std::fs::metadata(path).is_ok_and(|m| m.len() >= cap);
+    if !full {
+        return None;
+    }
+    let numbered = |n: u32| {
+        let mut p = path.as_os_str().to_owned();
+        p.push(format!(".{n}"));
+        PathBuf::from(p)
+    };
+    for n in (1..LOG_ROTATED_KEPT).rev() {
+        let from = numbered(n);
+        if from.exists()
+            && let Err(e) = std::fs::rename(&from, numbered(n + 1))
+        {
+            return Some(format!("observe log not rotated ({e}); appending to it"));
         }
-        _ => Ok(()),
+    }
+    match std::fs::rename(path, numbered(1)) {
+        Ok(()) => None,
+        Err(e) => Some(format!("observe log not rotated ({e}); appending to it")),
     }
 }
 

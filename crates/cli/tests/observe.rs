@@ -768,8 +768,11 @@ fn observe_with_gh_shim(extra: &[&str]) -> String {
         .env("SWAMP_LOG_DIR", store.path())
         .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
-        .env("SWAMP_TEST_ALLOW_GH", "1")
+        // swamp never searches PATH (#199): the fake gh is reached through
+        // the test build's program directory, and PATH is shimmed too so
+        // a regression back to PATH lookup would still hit the fake.
         .env("PATH", path)
+        .env("SWAMP_TEST_PROGRAM_DIR", &shim)
         .output()
         .expect("run observe");
     assert!(

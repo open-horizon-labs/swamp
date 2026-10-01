@@ -1340,3 +1340,115 @@ fn the_first_line_counts_projects_and_tool_locations_separately() {
     );
     assert!(h.line.ends_with("across 0 tool locations"), "{}", h.line);
 }
+
+/// Adversarial audit (disk view check). Tempting wrong patch: blame every
+/// disagreement on "a different observation". Here the ledger's accounted
+/// rows were written from THIS observation (same `measured_at` as the
+/// report), and the difference comes from a unit on another volume: the
+/// ledger lists it apart (never added), the headline counts it. The
+/// sentence must not name observation age as the cause.
+#[test]
+fn adv_disk_check_does_not_blame_observation_age_when_the_observation_is_the_same() {
+    let r = report(30 * GB, &[]);
+    let units = vec![unit(
+        "uv-cache",
+        "uv",
+        StorageCategory::Cache,
+        "/Volumes/ext/uv",
+        7 * GB,
+    )];
+    let list = vec![
+        Accounted {
+            path: PathBuf::from("/h/src"),
+            bytes: 30 * GB,
+            category: LedgerCategory::Declared,
+            subset_of_enclosing: false,
+            measured_at: r.observed_at,
+            incomplete: false,
+            note: None,
+        },
+        Accounted {
+            path: PathBuf::from("/Volumes/ext/uv"),
+            bytes: 7 * GB,
+            category: LedgerCategory::Catalog,
+            subset_of_enclosing: false,
+            measured_at: r.observed_at,
+            incomplete: false,
+            note: None,
+        },
+    ];
+    let mounts = vec![MountView {
+        path: PathBuf::from("/Volumes/ext"),
+        kind: MountKind::Unknown,
+        used: None,
+    }];
+    let rows = accounted_rows(&list, &mounts);
+    let ledger = reading(rows, meta(Some(200 * GB), Some(190 * GB), r.observed_at));
+    let h = headline_of(&units, &r, &ledger, ScopeKind::Current);
+    let Disk::Measured(m) = &h.disk else { panic!() };
+    eprintln!("difference = {}", m.accounted_check.difference);
+    if let Some(s) = h.accounted_sentence() {
+        assert!(
+            !s.contains("different observation"),
+            "same observation, cause is another volume, sentence says: {s}"
+        );
+    }
+}
+
+#[test]
+fn disk_check_names_the_other_volume_and_blames_age_only_when_the_times_differ() {
+    let r = report(30 * GB, &[]);
+    let units = vec![unit(
+        "uv-cache",
+        "uv",
+        StorageCategory::Cache,
+        "/Volumes/ext/uv",
+        7 * GB,
+    )];
+    let list = vec![
+        Accounted {
+            path: PathBuf::from("/h/src"),
+            bytes: 30 * GB,
+            category: LedgerCategory::Declared,
+            subset_of_enclosing: false,
+            measured_at: r.observed_at,
+            incomplete: false,
+            note: None,
+        },
+        Accounted {
+            path: PathBuf::from("/Volumes/ext/uv"),
+            bytes: 7 * GB,
+            category: LedgerCategory::Catalog,
+            subset_of_enclosing: false,
+            measured_at: r.observed_at,
+            incomplete: false,
+            note: None,
+        },
+    ];
+    let mounts = vec![MountView {
+        path: PathBuf::from("/Volumes/ext"),
+        kind: MountKind::Unknown,
+        used: None,
+    }];
+    let rows = accounted_rows(&list, &mounts);
+    let ledger = reading(
+        rows.clone(),
+        meta(Some(200 * GB), Some(190 * GB), r.observed_at),
+    );
+    let h = headline_of(&units, &r, &ledger, ScopeKind::Current);
+    let s = h
+        .accounted_sentence()
+        .expect("a 7GB disagreement is stated");
+    // Tempting wrong patch: the fixed "may come from a different
+    // observation" clause, or no named part at all.
+    assert!(s.contains("7.0GB is on another volume"), "{s}");
+    assert!(!s.contains("different time"), "{s}");
+    // The same ledger measured at another time says so.
+    let late = reading(
+        rows,
+        meta(Some(200 * GB), Some(190 * GB), r.observed_at + 60),
+    );
+    let h2 = headline_of(&units, &r, &late, ScopeKind::Current);
+    let s2 = h2.accounted_sentence().unwrap();
+    assert!(s2.contains("different time"), "{s2}");
+}

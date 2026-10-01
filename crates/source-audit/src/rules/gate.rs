@@ -235,6 +235,7 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["attribution"]),
             (Krate::Core, &["docker"]),
             (Krate::Core, &["github"]),
+            (Krate::Core, &["hub_api"]),
             (Krate::Core, &["actions"]),
             (Krate::Core, &["schedule"]),
             (Krate::Core, &["volume_ledger"]),
@@ -291,11 +292,6 @@ const GROUPS: &[Group] = &[
         allowed: &[(Krate::Core, &["schedule"])],
         why: "the scheduled refresh is a LaunchAgent, and only `schedule` installs it \
               (scheduled-refresh-launchagent)",
-    },
-    Group {
-        path: "@core::fs_gate::spawn::Program::Kill",
-        allowed: &[(Krate::Core, &["schedule"])],
-        why: "liveness of the observation lock holder",
     },
     Group {
         path: "@core::fs_gate::spawn::Program::Xcrun",

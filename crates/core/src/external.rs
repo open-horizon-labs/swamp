@@ -408,6 +408,7 @@ pub fn discover_and_measure_with_worktrees(
         worktrees,
         swamp_dir,
         observe,
+        false,
         observed_at,
         retention_days,
         since_secs,
@@ -433,6 +434,7 @@ pub fn discover_and_measure(
         &[],
         swamp_dir,
         observe,
+        false,
         observed_at,
         retention_days,
         since_secs,
@@ -470,6 +472,9 @@ pub fn observe_external(
     worktrees: &[NestedWorktree],
     swamp_dir: Option<&Path>,
     observe: bool,
+    // Whether this pass may ask the network (`crate::hub_api`): a
+    // scheduled or CLI `observe` that enriches, never the TUI's refresh.
+    fetch: bool,
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
@@ -987,10 +992,34 @@ pub fn observe_external(
             .collect(),
     );
     let folded_rows = crate::build_adapters::FoldedIndex::from_dirs(store_dirs);
+    // The pass-through enrichment cache: read once, consulted by every
+    // card parse, written back with only what is still wanted.
+    let cards = crate::build_adapters::model_cards::CardCache::from_entries(
+        swamp_dir
+            .map(crate::build_stores::load_cards)
+            .unwrap_or_default(),
+        crate::build_adapters::model_cards::NEW_PARSES_PER_PASS,
+    );
     let build_ctx =
-        crate::build_adapters::BuildCtx::new(observed_at, &folded_rows, coverage, &replay_cache);
+        crate::build_adapters::BuildCtx::new(observed_at, &folded_rows, coverage, &replay_cache)
+            .with_cards(&cards);
+    let identified_stores: Vec<String> = containers
+        .iter()
+        .filter(|c| !build_ctx.can_reuse(c))
+        .map(|c| format!("|{}|", c.path.display()))
+        .collect();
     let mut interiors =
         crate::build_adapters::identify_all(&adapters, &[], &containers, &build_ctx);
+    if observe {
+        let hf_enrich = swamp_dir.is_some_and(|d| crate::growth::load_config(d).hf_enrich);
+        crate::hub_api::enrich(&mut interiors, &cards, observed_at, hf_enrich, fetch);
+    }
+    if let Some(dir) = swamp_dir
+        && observe
+    {
+        let kept = cards.retained(&|k| !identified_stores.iter().any(|p| k.contains(p.as_str())));
+        crate::build_stores::save_cards(dir, kept, observed_at);
+    }
     crate::report::nested_decision_evidence(&mut interiors, observed_at, true);
     let identified: Vec<crate::build_stores::IdentifiedStore> = measured_stores
         .iter()
@@ -1221,6 +1250,13 @@ pub fn observe_external(
         }
     }
 
+    // A model store's entries say when each was last read; its drilldown
+    // rows take that fact from the adapter (the store declared it so).
+    crate::build_adapters::model_stores::attach_last_read(
+        &mut units,
+        &interiors,
+        crate::entities::now(),
+    );
     // A store's own row is the external unit, and its history is the
     // external unit's: the same bytes on the same observation, never a
     // second key.

@@ -1010,6 +1010,7 @@ fn family_tree_children_of(
         ));
         let mut signals = vec![match (&f.consequence, f.other_consequences) {
             (Some(c), 0) => c.clone(),
+            (Some(c), 1) => format!("{c} (and 1 other consequence inside)"),
             (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
             (None, _) => "consequence not established".into(),
         }];
@@ -1168,6 +1169,15 @@ fn family_member_row(
         ),
     ];
     row.signals.extend(u.coverage.limits.iter().cloned());
+    // A model's own facts: what it is leads the label and the detail pane.
+    if u.adapter.as_deref() == Some("model-stores")
+        && let Some(m) = swamp_core::build_adapters::model_stores::model_row_of(u, observed_at)
+    {
+        if let Some(a) = &m.about {
+            row.label = format!("{} · {a}", row.label);
+        }
+        row.detail_lines.extend(model_detail_lines(&m));
+    }
     // Every present path is one the person may move to Trash. A path no
     // cleanup rule covers is marked one at a time, and its confirm lists
     // what swamp did not establish about it.
@@ -2268,7 +2278,19 @@ pub fn external_rows_with(
         if has_interior || !u.children.is_empty() {
             let key = format!("store-open:{}", u.path.display());
             let open = collapsed.contains(&key);
-            let mut children = unit_child_rows(u, observed_at);
+            let models = swamp_core::build_adapters::model_stores::model_rows(
+                &u.path,
+                interiors,
+                observed_at,
+            );
+            let mut children = unit_child_rows(u, observed_at, &models);
+            let tags = unlisted_models(&u.path, &models);
+            let n = tags.len();
+            children.extend(
+                tags.iter()
+                    .enumerate()
+                    .map(|(i, m)| model_tag_row(m, i + 1 == n)),
+            );
             if has_interior && children.is_empty() {
                 children =
                     family_tree_children_of(&own_interiors, observed_at, &u.path, 1, "", collapsed);
@@ -2341,7 +2363,85 @@ fn compact_signed(bytes: i64) -> String {
 /// One unit's depth-2 drilldown as inspection-only rows (#178). A folder
 /// that could not be read says so instead of showing `0B`, and the last
 /// row is the remainder that makes the rows add up to the unit's total.
-fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row> {
+/// The models of a store that are not one of its folders (an Ollama tag
+/// is a manifest file deep in `manifests/`): rows of their own.
+fn unlisted_models<'a>(
+    store: &std::path::Path,
+    models: &'a [swamp_core::build_adapters::model_stores::ModelRow],
+) -> Vec<&'a swamp_core::build_adapters::model_stores::ModelRow> {
+    models
+        .iter()
+        .filter(|m| std::path::Path::new(&m.path).parent() != Some(store))
+        .collect()
+}
+
+/// One model that is not a folder row: its name and what it is, its
+/// size (its layers, also inside `blobs/` above), and the detail pane's
+/// facts. Marks its own path (the manifest).
+fn model_tag_row(m: &swamp_core::build_adapters::model_stores::ModelRow, last: bool) -> Row {
+    let label = match &m.about {
+        Some(a) => format!("{} · {a}", m.name),
+        None => m.name.clone(),
+    };
+    let mut row = Row::leaf(1, label, m.bytes, None);
+    row.rail = if last {
+        "└─ ".into()
+    } else {
+        "├─ ".into()
+    };
+    row.allocated = true;
+    row.cleanup_summary = Some(m.regeneration.clone());
+    row.signals = vec![
+        format!("last read {}", m.last_read),
+        "its layers are the bytes of blobs/ above, not more".to_string(),
+    ];
+    row.last_used = Some(format!("Last read: {}", m.last_read));
+    row.detail_lines = model_detail_lines(m);
+    row.unit = Some(UnitId::for_artifact(std::path::Path::new(&m.path)));
+    row.individual_only = true;
+    row
+}
+
+/// A model's lines for the detail pane: what it is, its card, revision,
+/// size, last read, how it comes back, the Hub's answer, and the facts
+/// about its bytes. Stored facts only; nothing is read here.
+fn model_detail_lines(m: &swamp_core::build_adapters::model_stores::ModelRow) -> Vec<String> {
+    let mut out = vec![format!(
+        "what it is: {}",
+        m.about.as_deref().unwrap_or("no field stated in its files")
+    )];
+    if let Some(c) = &m.card {
+        out.push(format!("card: {c}"));
+    }
+    out.push(format!(
+        "{} {}{}",
+        m.kind,
+        m.name,
+        m.revision
+            .as_deref()
+            .map(|r| format!("@{r}"))
+            .unwrap_or_default()
+    ));
+    if let Some(r) = &m.revisions {
+        out.push(r.clone());
+    }
+    out.push(format!("last read: {}", m.last_read));
+    out.push(format!("regeneration: {}", m.regeneration));
+    match m.hub.as_deref() {
+        Some("off") => out.push(swamp_core::hub_api::OFF_LINE.to_string()),
+        Some(h) => out.push(h.to_string()),
+        None => {}
+    }
+    out.extend(m.fields.iter().map(|f| format!("field {f}")));
+    out.extend(m.facts.iter().cloned());
+    out
+}
+
+fn unit_child_rows(
+    u: &swamp_core::external::ExternalUnit,
+    now: u64,
+    models: &[swamp_core::build_adapters::model_stores::ModelRow],
+) -> Vec<Row> {
     use swamp_core::drilldown::{ChildKind, ChildMeasure};
     use swamp_core::reclaim_trash::{child_not_markable, row_path};
     let count = u.children.len();
@@ -2385,6 +2485,19 @@ fn unit_child_rows(u: &swamp_core::external::ExternalUnit, now: u64) -> Vec<Row>
             row.signals = vec![swamp_core::render::describe_unit_child(c, now)];
             if c.kind == ChildKind::Entry {
                 row.last_used = Some(c.last_used.describe(now));
+                let path =
+                    swamp_core::build_adapters::model_stores::shown_path(&u.path.join(&c.name));
+                if let Some(m) = models.iter().find(|m| m.path == path) {
+                    // The repo id reads better than `models--org--name`;
+                    // the folder's own name stays in the detail pane.
+                    row.label = match &m.about {
+                        Some(a) => format!("{} · {a}", m.name),
+                        None => m.name.clone(),
+                    };
+                    row.cleanup_summary = Some(m.regeneration.clone());
+                    row.detail_lines.extend(model_detail_lines(m));
+                    row.detail_lines.push(format!("folder: {}", c.name));
+                }
             }
             match row_path(&u.path.display().to_string(), Some((c.kind, &c.name))) {
                 Some(path) => row.unit = Some(UnitId::for_artifact(&path)),
@@ -2435,9 +2548,11 @@ pub fn reclaim_rows(
         row.signals = vec![
             r.regeneration.words.clone(),
             format!("last used {}", r.last_used_text),
-            r.removal.text.clone(),
         ];
-        row.last_used = Some(format!("Last used: {}", r.last_used_text));
+        // The signals line is cut at the edge; the removal paths that
+        // exist are a decision fact, so they get their own detail line
+        // (the last-used fact is already in the signals above).
+        row.last_used = None;
         row.mtime_max = r
             .children
             .iter()
@@ -2452,20 +2567,31 @@ pub fn reclaim_rows(
         if standing.is_empty() {
             standing.push(format!("cost from: {}", r.regeneration.source));
         }
-        row.detail_lines = vec![r.consumers.summary.clone(), standing.join(" · ")];
+        row.detail_lines = vec![
+            format!("removal: {}", r.removal.tui_text),
+            r.consumers.summary.clone(),
+            standing.join(" · "),
+        ];
         let key = format!("reclaim-open:{}", r.path);
-        if r.children.is_empty() {
+        let tags = unlisted_models(std::path::Path::new(&r.path), &r.models);
+        if r.children.is_empty() && tags.is_empty() {
             rows.push(row);
             continue;
         }
         let open = collapsed.contains(&key);
-        let count = r.children.len();
-        let children: Vec<Row> = r
+        let count = r.children.len() + tags.len();
+        let mut children: Vec<Row> = r
             .children
             .iter()
             .enumerate()
             .map(|(i, c)| reclaim_child_row(&r.path, c, i + 1 == count))
             .collect();
+        let first = children.len();
+        children.extend(
+            tags.iter()
+                .enumerate()
+                .map(|(i, m)| model_tag_row(m, first + i + 1 == count)),
+        );
         row.expandable = true;
         row.expansion_key = Some(key);
         row.rail = if open { "▾ ".into() } else { "▸ ".into() };

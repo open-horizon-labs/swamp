@@ -593,6 +593,8 @@ time stays in the JSON. A unit that declares no source shows no record.
 | Xcode DerivedData | tool-native: each project folder's `info.plist` `LastAccessedDate` | the existing bounded `plutil` read; a project shows its own, the unit the newest | yes |
 | CoreSimulator devices | not implemented | `device.plist` has no last-booted key on this machine (keys seen: `deviceType`, `isDeleted`, `isEphemeral`, `name`, `runtime`, `runtimePolicy`, `state`, `UDID`; no device was booted) | unverified |
 | Docker and OrbStack | build-cache entries keep the daemon's own `last_used` (an existing fact); images and volumes report none | the daemon | existing |
+| Hugging Face hub repos | file access time | the largest weight blob of the revision shown (the `model-stores` adapter; neither huggingface_hub nor transformers records use), with swamp's own header read set aside | yes: Sep 29 for the one model on this machine |
+| Ollama models | file access time | the model layer blob (`application/vnd.ollama.image.model`); Ollama records no use | yes: Aug 30 for `qwen3:0.6b` |
 | npm `_cacache`, Gradle | not implemented | | unverified |
 | everything else | no record | | |
 
@@ -659,6 +661,97 @@ folders, largest first, with size, modification time and last-used:
   view's row opens (`Enter`) onto them; the selected row's detail line
   carries the last-used fact.
 
+### Model caches
+
+The Hugging Face hub cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`, else
+`~/.cache/huggingface/hub`) and the Ollama store (`OLLAMA_MODELS`, else
+`~/.ollama/models`) are listed one model at a time, in Reclaim (`models` under
+the store's row, and each repo folder's row) and in External (each repo folder's
+row; the Ollama tags under "identified interior"). Each says:
+
+```text
+   968.9MB  mkrausio/EmoWhisper-AnS-Small-v0.1@e613edc6  (model)  whisper · 241.7M params · float32
+      last read: Sep 29 (file access time of model.safetensors)
+      regeneration: downloaded again from huggingface.co (mkrausio/EmoWhisper-AnS-Small-v0.1@e613edc6) when needed; size 968.9MB
+      main -> e613edc6; 1 revision(s): e613edc6; 10 file(s) in the shown revision; 10 blob(s)
+      moving this folder frees about 1.9MB; 967.0MB stays in the hub's shared blobs/
+   522.7MB  qwen3:0.6b  (ollama model)  qwen3 · 751.63M params · Q4_K_M
+      regeneration: downloaded again with `ollama pull qwen3:0.6b` when needed, if the registry has it (a model made with `ollama create` exists only here); size 522.7MB
+      moving this manifest frees none of its layers: the layers (522.7MB) stay in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses
+```
+
+- **What it is** comes only from files already on disk: the model card's YAML
+  front matter (`pipeline_tag`, `library_name`, `license`, `base_model`, `tags`,
+  `language`), `config.json` (`model_type`, `architectures`, `torch_dtype`), the
+  `*.safetensors` header (an 8-byte length and a JSON table of dtypes and shapes:
+  the parameter count is exact, and no tensor is read; it counts one copy of the
+  weights: the set `model.safetensors.index.json` names, else one shard set
+  `<name>-0000i-of-0000N`, else one file, with a note when the snapshot holds
+  other copies such as Mistral's `consolidated.safetensors` or diffusers' fp16
+  files; a set with shards missing or more than 16 files gives no count, with the
+  reason), a `.gguf` header
+  (`general.architecture`, `general.name`, quantization; the count when every
+  tensor entry fits in the read), and Ollama's config blob (family, Ollama's own
+  parameter-size label, quantization). A field none of them states is absent. The
+  card's first paragraph is in the detail pane, with control, bidirectional and
+  zero-width characters removed and at most 400 characters.
+- **Never read through a link.** Every folder of the layout (`blobs/`, `refs/`,
+  `snapshots/`, the hub's `blobs/<xx>/`, Ollama's `blobs/` and `manifests/`) is
+  `lstat`ed first; one that is a symlink is a fact on the row ("is a link, not
+  followed") and nothing in it is listed, read or counted. Files are opened with
+  `O_NOFOLLOW` (and `O_NOATIME` on Linux).
+- **Swamp's own read is not a use.** The last-read date comes from a weight file
+  (the largest blob that is not the README, `config.json` or the shard index,
+  which the card pass opens). On macOS (APFS) a read sets a file's access time
+  only when it is not newer than the file's mtime, so swamp does not read a
+  weight file in that state: the row says "parameter count not read yet: no
+  program has opened this file since it was written", and a later observe reads
+  it once a program has. On Linux reads use `O_NOATIME`. Where a read does move
+  the time anyway (a network volume), the time from before swamp's read is kept
+  in the card cache and shown; after that cache is deleted, the first pass cannot
+  tell an earlier swamp read from a use.
+- **Size.** Snapshots are links into `blobs/`; each blob is counted once, and a
+  blob two revisions share once. A blob two repos (or two Ollama tags) share is
+  counted under the first by path, and the other says so. The models plus the
+  store's own `blobs/` row add up to the store. Incomplete downloads
+  (`*.incomplete`, Ollama `-partial`), links that point at nothing, links that
+  leave the cache (never followed, not counted), a ref with no snapshot, and blobs
+  "not referenced by any manifest" are facts on the row.
+- **Regeneration.** A repo with a ref or a revision hash says it is downloaded
+  again from huggingface.co at that revision; one with neither (made locally)
+  keeps "cannot be regenerated (no source recorded)". An Ollama tag names its
+  `ollama pull`.
+- **Trash.** A repo folder or a manifest can be marked like any row (in the TUI,
+  an Ollama tag is its own row under its store in Reclaim and External). The
+  confirm and the detail pane say what stays: "moving this folder frees about X;
+  Y stays in the hub's shared blobs/", and for a manifest that its layers stay in
+  `blobs/` (`ollama rm` is the tool's own removal). A row belongs to its own
+  store only: `~/.cache/huggingface` above the hub cache lists no models.
+- **Cost.** Every content read goes through a cache in the store
+  (`associations/model_cards.parquet`), keyed by what cannot change under the key:
+  a revision's files (name, blob and size), a manifest's size and modification
+  time, a config blob's digest. A revision is parsed once; a later observe over
+  unchanged files reads no file content (only listings and `lstat`). At most 64
+  new parses happen per observe; the rest say "not yet read" until the next one. A
+  weight file costs 64 KiB of header (1 MiB at most when its header is larger).
+  On this machine the cold pass read 67,043 bytes and took 4.6 ms for the hub
+  cache and 1,348 bytes in 0.7 ms for Ollama; the warm pass read 0 bytes (0.9 ms
+  and 0.3 ms, debug build). The TUI reads only what observe stored.
+- **Hub facts (off by default).** With `swamp config set hf-enrich on`
+  (`hf_enrich = true` in `config.toml`), a scheduled or CLI `swamp observe` asks
+  `https://huggingface.co/api/models/<id>` (or `datasets/`, `spaces/`) once per
+  repo with `/usr/bin/curl` (allow-listed, 10 s timeout, 1 MiB at most, no header
+  and no token sent: `HF_TOKEN` is never passed, because a token on curl's
+  command line is visible to every process; a gated or private repo shows as
+  "did not answer"; behind a proxy, curl gets `HTTPS_PROXY`, `ALL_PROXY`,
+  `NO_PROXY` (either case) and `SSL_CERT_FILE`/`CURL_CA_BUNDLE`, nothing else), and the row says `from huggingface.co, fetched <date>`:
+  downloads, likes, last modified, whether the revision here is the Hub's current
+  one, and, for that revision only, the pipeline tag, library, license and base
+  model where the local files did not say. Facts tied to a revision are never
+  fetched again; the counts are fetched again after 7 days; a failure (404, gated,
+  offline) is kept for a day. At most 16 requests per observe. The TUI's own
+  refresh never asks the network; `report` never does.
+
 ### The Reclaim view
 
 ```bash
@@ -691,8 +784,9 @@ path. Each row says, as facts with their sources:
 - **The removal path that exists.** Every unit and every listed folder: Trash
   after review (Space, then Backspace in the TUI; see "Cleanup and recovery").
   A unit whose manager swamp runs removal for (mise installs, simulator
-  runtimes) also names that manager's own command (Backspace on an unmarked
-  row). JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
+  runtimes, including `/Library/Developer/CoreSimulator/Volumes`) also names
+  that manager's own command, which is permanent with no Trash (Backspace with
+  nothing marked); the text never says the command is "not available yet". JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
 
 | Storage category | Class | Words when nothing more specific exists | Source |
 |---|---|---|---|
@@ -700,7 +794,7 @@ path. Each row says, as facts with their sources:
 | downloads, cache | download | downloaded or derived again by the tool on next use | npm, pip, uv, Cargo and Gradle document their caches as refilled on use |
 | build-output | rebuild | rebuilt by the tool's build command | the tool's own build command |
 | environments | not established | recreating restores what the manifest names, not data added later | an emulator's apps and data are not in a manifest |
-| local-state, models | not regenerable | cannot be regenerated | state a tool wrote for the user; a model's source may be gone |
+| local-state, models | not regenerable | cannot be regenerated | state a tool wrote for the user; a model's source may be gone. A Hugging Face or Ollama store says more per model (see "Model caches") |
 | unclassified | not established | no detector says what is inside | none |
 | standalone-cargo-target | rebuild | rebuild with `cargo build` | Cargo's own consequence, stated on the row |
 
@@ -734,7 +828,7 @@ start no process. It asks only `brew autoremove --dry-run`, `brew list --formula
 --installed-on-request`, `mise prune --dry-run` and `mise ls --global --json`,
 and reads rustup's `settings.toml`. Each command is an allow-listed shape in the
 spawn layer, counted, killed after 20 seconds (the pass after 45). The program is
-found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, and for mise `~/.local/bin`, `~/.cargo/bin` when `HOME` is absolute), never through `PATH`; a candidate must be an executable regular file (a symlink such as Homebrew's is followed) owned by root or you and not group or world writable, in a directory owned by root or you that is not world-writable and is group-writable only for the macOS `admin` group (admin members can already use sudo, so this grants nothing new; it is standard Homebrew's `/opt/homebrew/bin`), else the next is tried; the child's environment is built from scratch
+found at a fixed absolute path (`/opt/homebrew/bin`, `/usr/local/bin`, and for mise `~/.local/bin`, `~/.cargo/bin` when `HOME` is absolute), never through `PATH`; a candidate must be an executable regular file (a symlink such as Homebrew's is followed) owned by root or you and not group or world writable, in a directory owned by root or you that is not world-writable and is group-writable only for the macOS `admin` group (admin members can already use sudo, so this grants nothing new; it is standard Homebrew's `/opt/homebrew/bin`), else it refuses (it is never skipped for a later one; see "Programs swamp runs, and from where"); the child's environment is built from scratch
 (only `HOME`, a fixed `PATH`, colour, pager and Homebrew auto-update/analytics/cleanup
 off, and, for mise only, the directory settings the mise detector honors and mise itself reads: `MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`, `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, so the probe describes the store the unit measures); and it runs from `/`, so a project
 directory cannot change what mise lists. Output over 1 MiB is refused. A hold (a default, a global tool, an install on request) read more than a day before the listing is `unknown` and held out, and one read hours before says so. Every quote shows
@@ -1010,8 +1104,12 @@ disk view "accounted" = developer storage + remainder units
 
 `swamp report --view reclaim` prints the first line after its headline, and its
 JSON carries `headline_relation` (`holds`); `headline.disk.accounted_check`
-carries the second. They differ when the ledger's accounted rows came from a
-different observation than the units read here, or when a unit's row was lost.
+carries the second. They differ when units on another volume are counted here but listed
+apart by the ledger, when worktrees outside the declared roots count under projects
+but not in the ledger's declared rows, when the ledger's accounted rows were measured
+at another time than the units read here, or when a unit's row was lost. The line
+names the other-volume bytes and the unexplained rest as numbers, and mentions the
+measurement time only when the two times differ.
 Whenever they differ the report prints a plain line (`disk view check: the
 ledger's accounted bytes (X) differ from developer storage plus the remainder units
 (Y) by Z`) and the Disk view repeats it on its Accounted row. (A same-path
@@ -1168,7 +1266,7 @@ same way, with no size.
   format reset leaves them alone: the ledger is a measurement, not derived from
   another table.
 - **The programs are fixed.** `diskutil` and `tmutil` run from `/usr/sbin/diskutil`
-  and `/usr/bin/tmutil`, never through `PATH`.
+  and `/usr/bin/tmutil`, never through `PATH`, like every program swamp runs.
 - **A second pass over an unchanged disk gives identical bytes but is not
   faster.** There is no event replay for the whole disk (yet), so every pass
   measures every row again; the budget bounds it instead.
@@ -1398,6 +1496,8 @@ Install and authenticate `gh` to collect GitHub facts:
 swamp observe ~/src
 swamp report ~/src --view worktrees
 ```
+
+Each worktree also carries `tip_reachable`, a fact `observe` computes from the repository's own refs, offline and without `gh`: whether the worktree's HEAD commit is contained in a remote-tracking branch (`refs/remotes/*`, `*/HEAD` excluded). A remote-tracking ref is the state at the last fetch, so the term says so: `tip_reachable=yes (origin/audit/x, as of last fetch Sep 30)`, using the time of `FETCH_HEAD` (else the ref's reflog, else `fetch time unknown`); a branch deleted on the remote since then still reads yes until the next fetch. The local `main`/`master` counts only from a linked worktree, whose own folder can be removed while the shared `.git` keeps that branch, and is named `local main, not pushed`; in a primary checkout a local branch lives in the folder's own `.git` and never counts. It is separate from `merged`, which stays the pull-request fact: a branch with no PR reads `merged=unknown` and can still read `tip_reachable=yes`. The worktree's own checked-out branch is never its own proof; a detached HEAD is judged by its commit. A repository that cannot be opened, a shallow clone where nothing was found, more than 400 remote branches, or a 2-second budget (checked at every commit of the walk) read `tip_reachable=unknown`, never `no`. A squash-merged branch reads `tip_reachable=no` because its commits are in no branch; the `merge-complete` verdict still counts a merged PR as landed.
 
 Reports use the GitHub facts the last `observe` cached. `observe` queries GitHub unless given `--no-enrich`, and reuses a cache entry that is still valid. GitHub cache validity uses the tip SHA: a worktree whose branch is already merged is terminal and is never re-enriched automatically, and every other row is refreshed after a 24-hour TTL. `observe --enrich` is the on-demand override: it refetches everything, ignoring the TTL and the merged rule.
 
@@ -1677,7 +1777,30 @@ TUI's own Trash move, or a human's own shell command).
 swamp config show
 swamp config path
 swamp config init
+swamp config list                 # every key `set` writes, its effective value and meaning
+swamp config get hf-enrich
+swamp config set hf-enrich on     # one key; other keys, tables and comments are kept
 ```
+
+`config set` writes one top-level key, with `-` and `_` spelled either way.
+An unknown key is refused with the list of valid ones; a value outside the
+range the code honours is refused with that range (never clamped); nothing
+is written then. The file is edited in place (comments, other keys and
+`[scan]` stay as written) and replaced atomically.
+
+| Key | Values | What it does |
+|---|---|---|
+| `since` | 1 to 31622400 seconds (as 24h, 7d, 30m) | how far back growth is measured by default |
+| `retention_days` | 1 to 3650 days | days of history kept in the store |
+| `large_file_min_bytes` | 1 to 9223372036854775807 bytes | files at least this large are tracked individually |
+| `observe_timeout_sec` | 60 to 86400 seconds | watchdog budget for one observe |
+| `observe_stall_secs` | 30 to 86400 seconds | stop an observe with no progress for this long |
+| `min_free_bytes` | 0 to 9223372036854775807 bytes (0 disables; unset: the default) | refuse to observe below this much free space |
+| `volume_pass_interval_hours` | 0 to 8760 hours (0: only `observe --volume`) | hours between volume passes |
+| `volume_pass_budget_secs` | 5 to 86400 seconds | seconds one volume-pass run may measure |
+| `hf_enrich` | on, off | ask huggingface.co about each hub repo during scheduled observes (off by default) |
+
+`[scan]` roots are `add-root` / `remove-root`.
 
 `config init` writes a file only if none exists. Defaults:
 
@@ -1690,6 +1813,7 @@ observe_stall_secs = 300
 # min_free_bytes = 1073741824   # unset: the greater of 1 GiB and 1% of the volume; 0 disables
 volume_pass_interval_hours = 24 # a plain `observe` runs the volume pass when the last is older; 0 = only `observe --volume`
 volume_pass_budget_secs = 120   # one run of the volume pass measures for at most this long
+hf_enrich = false               # true: a scheduled or CLI observe asks huggingface.co about each hub repo (see "Model caches")
 
 [scan]
 defaults = true
@@ -1722,6 +1846,27 @@ once (loose objects and packs skipped); a repository with a FIFO, device
 or dataless file there, or with more than 50,000 entries to check, is
 reported as not measured. When your global git config could block, git
 reads repositories without it.
+
+### Programs swamp runs, and from where
+
+swamp runs a fixed set of programs, each from a fixed list of locations, **never through `PATH`**: a `git`, `docker` or `brew` placed earlier on your `PATH` (a shim, a wrapper, a checkout's `bin`) is never what swamp runs. The first location that exists is the one used, and it is checked: the program file (a symlink such as Homebrew's is followed to the real file) must be an executable owned by you or root and not group- or world-writable, and so must every directory on the way to it: the location's own directory, the directory of every link in between, and the real file's. A directory swamp runs a program from must be owned by you or root and not writable by everyone; it may be group-writable only for the macOS `admin` group, because admin members can already use sudo, so this grants no power they lack. Any other group, another owner, or any group-write on Linux refuses, and the refusal names what failed ("/opt/homebrew/bin is writable by group staff"); swamp never falls through to a later location. A program found nowhere is "not available", the same as not installed. Locations in your home (`~/.local/bin`, `~/.cargo/bin`, `~/.docker/bin`, `~/.orbstack/bin`) come after every system location and are used only when none of those has the program: any process you run can put a file there, so they are trusted about as much as your own `PATH`. `brew`, `mise` and `curl` run in an environment built from scratch (`curl`, only for the opt-in Hugging Face lookup, additionally gets exactly `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `all_proxy`, `NO_PROXY`, `no_proxy`, `SSL_CERT_FILE` and `CURL_CA_BUNDLE` when set, so a machine behind a proxy works; never `HTTP_PROXY`, `CURL_HOME` or any token); the others keep your environment, because `git`, `gh` and `docker` need your credentials and contexts, except loader and hook variables (`DYLD_*`, `LD_*`, `GIT_CONFIG*`, `GIT_SSH*`, `GIT_EXEC_PATH`, `GIT_EXTERNAL_DIFF`, askpass, editor and browser variables), and with `PATH` set to the program's own directory, `/usr/bin:/bin:/usr/sbin:/sbin`, then `/opt/homebrew/bin` and `/usr/local/bin` if they pass the same directory check.
+
+| Program | macOS | Linux |
+|---|---|---|
+| `git`, `gh` | `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/home/linuxbrew/.linuxbrew/bin` |
+| `docker` | `/usr/local/bin`, `/opt/homebrew/bin`, `/usr/bin`, `~/.docker/bin`, `~/.orbstack/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin`, `/home/linuxbrew/.linuxbrew/bin`, `~/.docker/bin`, `~/.orbstack/bin` |
+| `brew` | `/opt/homebrew/bin`, `/usr/local/bin` | `/home/linuxbrew/.linuxbrew/bin`, `/usr/local/bin`, `/usr/bin` |
+| `mise` | `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin` | `/usr/local/bin`, `/usr/bin`, `/home/linuxbrew/.linuxbrew/bin`, `~/.local/bin`, `~/.cargo/bin` |
+| `lsof` | `/usr/sbin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `du`, `id` | `/usr/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `df` | `/bin` | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `systemctl`, `loginctl` | (not used) | `/usr/bin`, `/usr/local/bin`, `/bin`, `/usr/sbin`, `/sbin` |
+| `xcrun`, `plutil`, `defaults`, `tmutil` | `/usr/bin` | (not used) |
+| `diskutil` | `/usr/sbin` | (not used) |
+| `launchctl` | `/bin` | (not used) |
+| `curl` | `/usr/bin` | `/usr/bin` |
+
+`~` locations are used only when `HOME` is an absolute path.
 
 ### Full-disk guard
 

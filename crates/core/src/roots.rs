@@ -795,3 +795,296 @@ pub fn declared_summary(roots: &[DeclaredRoot]) -> Option<String> {
     }
     Some(out)
 }
+
+// ---------------------------------------------------------------------
+// `swamp config set / get / list`
+// ---------------------------------------------------------------------
+
+/// What kind of value a settable key takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// `on`/`off` (also `true`/`false`).
+    Switch,
+    /// A non-negative whole number.
+    Count,
+    /// A whole number, or `unset` to remove the key (its default applies).
+    CountOrUnset,
+    /// A duration: `24h`, `7d`, `30m`, or seconds.
+    Duration,
+}
+
+/// One key `swamp config set` may write: its kind, the range of values
+/// the code actually honours (a value outside is refused, never silently
+/// clamped), and what it does. `docs/usage.md`'s key table is checked
+/// against this list.
+#[derive(Debug, Clone, Copy)]
+pub struct Settable {
+    pub key: &'static str,
+    pub kind: KeyKind,
+    /// Inclusive bounds for numbers, in the key's own unit.
+    pub min: u64,
+    pub max: u64,
+    pub unit: &'static str,
+    pub what: &'static str,
+}
+
+/// Every top-level key `swamp config set` may write. `[scan]` is edited
+/// by `add-root` / `remove-root` and by hand, never here.
+pub const SETTABLE: &[Settable] = &[
+    Settable {
+        key: "since",
+        kind: KeyKind::Duration,
+        min: 1,
+        max: 366 * 86_400,
+        unit: "seconds (as 24h, 7d, 30m)",
+        what: "how far back growth is measured by default",
+    },
+    Settable {
+        key: "retention_days",
+        kind: KeyKind::Count,
+        min: 1,
+        max: 3650,
+        unit: "days",
+        what: "days of history kept in the store",
+    },
+    Settable {
+        key: "large_file_min_bytes",
+        kind: KeyKind::Count,
+        min: 1,
+        max: u64::MAX >> 1,
+        unit: "bytes",
+        what: "files at least this large are tracked individually",
+    },
+    Settable {
+        key: "observe_timeout_sec",
+        kind: KeyKind::Count,
+        min: 60,
+        max: 86_400,
+        unit: "seconds",
+        what: "watchdog budget for one observe",
+    },
+    Settable {
+        key: "observe_stall_secs",
+        kind: KeyKind::Count,
+        min: crate::growth::MIN_OBSERVE_STALL_SECS,
+        max: 86_400,
+        unit: "seconds",
+        what: "stop an observe with no progress for this long",
+    },
+    Settable {
+        key: "min_free_bytes",
+        kind: KeyKind::CountOrUnset,
+        min: 0,
+        max: u64::MAX >> 1,
+        unit: "bytes (0 disables; unset: the default)",
+        what: "refuse to observe below this much free space",
+    },
+    Settable {
+        key: "volume_pass_interval_hours",
+        kind: KeyKind::Count,
+        min: 0,
+        max: 8760,
+        unit: "hours (0: only `observe --volume`)",
+        what: "hours between volume passes",
+    },
+    Settable {
+        key: "volume_pass_budget_secs",
+        kind: KeyKind::Count,
+        min: 5,
+        max: 86_400,
+        unit: "seconds",
+        what: "seconds one volume-pass run may measure",
+    },
+    Settable {
+        key: "hf_enrich",
+        kind: KeyKind::Switch,
+        min: 0,
+        max: 1,
+        unit: "on or off",
+        what: "ask huggingface.co about each hub repo during scheduled observes (off by default)",
+    },
+];
+
+/// The key as stored (`hf-enrich` and `hf_enrich` are the same key).
+pub fn settable_key(typed: &str) -> Result<&'static str, String> {
+    let k = typed.trim().replace('-', "_");
+    SETTABLE
+        .iter()
+        .find(|s| s.key == k)
+        .map(|s| s.key)
+        .ok_or_else(|| {
+            format!(
+                "{typed} is not a key `swamp config set` writes; valid keys: {}",
+                SETTABLE
+                    .iter()
+                    .map(|s| s.key)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+/// Sets one top-level key in config.toml, keeping every other key,
+/// table and comment as written. The value is checked before anything
+/// is written; the write is atomic. Returns the line now in the file
+/// (`hf_enrich = true`), or `<key> removed` for `unset`.
+pub fn set_key(store: &StoreDir, typed_key: &str, typed_value: &str) -> Result<String, RootError> {
+    let key = settable_key(typed_key).map_err(RootError::Config)?;
+    let spec = SETTABLE
+        .iter()
+        .find(|s| s.key == key)
+        .copied()
+        .ok_or_else(|| RootError::Config(format!("{key} is not settable")))?;
+    let kind = spec.kind;
+    let range = format!("{} to {} {}", spec.min, spec.max, spec.unit);
+    let v = typed_value.trim();
+    let bad = |want: &str| {
+        RootError::Config(format!(
+            "{key} takes {want}, not {typed_value:?}; nothing was written"
+        ))
+    };
+    let value: Option<Value> = match kind {
+        KeyKind::Switch => match v.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" => Some(Value::from(true)),
+            "off" | "false" | "no" => Some(Value::from(false)),
+            _ => return Err(bad("on or off")),
+        },
+        KeyKind::Count | KeyKind::CountOrUnset => {
+            if kind == KeyKind::CountOrUnset && v == "unset" {
+                None
+            } else {
+                let n: u64 = v
+                    .parse()
+                    .ok()
+                    .filter(|n| (spec.min..=spec.max).contains(n))
+                    .ok_or_else(|| bad(&format!("a whole number from {range}")))?;
+                Some(Value::from(n as i64))
+            }
+        }
+        KeyKind::Duration => {
+            crate::growth::parse_duration_secs(v)
+                .ok_or_else(|| bad("a duration such as 24h, 7d or 30m"))?;
+            Some(Value::from(v))
+        }
+    };
+    let _lock = store
+        .lock_config_edits()
+        .map_err(|e| RootError::Io(format!("locking config.toml: {e}")))?;
+    let original = config_text(store)?;
+    let mut doc = parse(&original)?;
+    let line = match value {
+        Some(val) => {
+            let shown = format!("{key} = {val}");
+            match doc.get_mut(key).and_then(|i| i.as_value_mut()) {
+                // Keep the comment and spacing around the old value.
+                Some(old) => {
+                    let decor = old.decor().clone();
+                    *old = val;
+                    *old.decor_mut() = decor;
+                }
+                None => {
+                    doc.insert(key, Item::Value(val));
+                }
+            }
+            shown.replace("  ", " ")
+        }
+        None => {
+            doc.remove(key);
+            format!("{key} removed (its default applies)")
+        }
+    };
+    write(store, &doc, uses_crlf(&original))?;
+    Ok(line)
+}
+
+#[cfg(test)]
+mod set_key_tests {
+    use super::*;
+
+    fn store_with(text: &str) -> (tempfile::TempDir, StoreDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), text).unwrap();
+        let s = StoreDir::at(tmp.path()).unwrap();
+        (tmp, s)
+    }
+
+    /// Tempting wrong patch: re-serializing the whole config from the
+    /// parsed struct, which drops the person's comments and their
+    /// `[scan]` table layout.
+    #[test]
+    fn set_keeps_comments_other_keys_and_tables() {
+        let text = "# mine\nsince = \"7d\" # a week\n\n[scan]\n# roots\ninclude = [\"~/src\"]\n";
+        let (tmp, s) = store_with(text);
+        assert_eq!(set_key(&s, "hf-enrich", "on").unwrap(), "hf_enrich = true");
+        assert_eq!(set_key(&s, "since", "24h").unwrap(), "since = \"24h\"");
+        let after = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            after.contains("# mine") && after.contains("# a week") && after.contains("# roots"),
+            "{after}"
+        );
+        assert!(after.contains("include = [\"~/src\"]"), "{after}");
+        let cfg = crate::growth::load_config_checked(tmp.path()).unwrap();
+        assert!(cfg.hf_enrich);
+        assert_eq!(cfg.since, "24h");
+        assert_eq!(cfg.scan.include, vec!["~/src".to_string()]);
+    }
+
+    /// Every settable key is in docs/usage.md's key table with its range,
+    /// and the table names no other key. Tempting wrong patch: a doc list
+    /// kept by hand beside the validator.
+    #[test]
+    fn the_usage_key_table_is_the_validator_table() {
+        let doc = include_str!("../../../docs/usage.md");
+        let rows: Vec<&str> = doc
+            .lines()
+            .skip_while(|l| !l.starts_with("| Key | Values |"))
+            .skip(2)
+            .take_while(|l| l.starts_with('|'))
+            .collect();
+        assert_eq!(rows.len(), SETTABLE.len(), "{rows:?}");
+        for (row, s) in rows.iter().zip(SETTABLE) {
+            let want = match s.kind {
+                KeyKind::Switch => format!("| `{}` | on, off | {} |", s.key, s.what),
+                _ => format!(
+                    "| `{}` | {} to {} {} | {} |",
+                    s.key, s.min, s.max, s.unit, s.what
+                ),
+            };
+            assert_eq!(*row, want);
+        }
+    }
+
+    /// Tempting wrong patch: writing whatever was typed and letting the
+    /// next observe fail on it.
+    #[test]
+    fn unknown_keys_and_bad_values_write_nothing() {
+        let (tmp, s) = store_with("since = \"7d\"\n");
+        let e = set_key(&s, "hf_enrichh", "on").unwrap_err().to_string();
+        assert!(
+            e.contains("valid keys: since") && e.contains("hf_enrich"),
+            "{e}"
+        );
+        assert!(set_key(&s, "hf_enrich", "maybe").is_err());
+        assert!(set_key(&s, "retention_days", "-3").is_err());
+        assert!(set_key(&s, "since", "soon").is_err());
+        assert!(set_key(&s, "scan", "x").is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            "since = \"7d\"\n"
+        );
+        assert_eq!(
+            set_key(&s, "min_free_bytes", "0").unwrap(),
+            "min_free_bytes = 0"
+        );
+        assert!(
+            set_key(&s, "min_free_bytes", "unset")
+                .unwrap()
+                .contains("removed")
+        );
+        assert!(
+            !std::fs::read_to_string(tmp.path().join("config.toml"))
+                .unwrap()
+                .contains("min_free")
+        );
+    }
+}

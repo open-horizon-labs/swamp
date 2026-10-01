@@ -2654,6 +2654,7 @@ pub fn observe_scope(
             &nested_worktrees,
             store_dir,
             observe,
+            enrich,
             observed_at,
             retention_days,
             since_secs,

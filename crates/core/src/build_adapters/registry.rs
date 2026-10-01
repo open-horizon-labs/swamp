@@ -12,7 +12,8 @@
 
 use super::BuildAdapter;
 use super::{
-    android, cargo, docker_buildkit, go, gradle, maven, node, python, tool_stores, xcode_swift,
+    android, cargo, docker_buildkit, go, gradle, maven, model_stores, node, python, tool_stores,
+    xcode_swift,
 };
 
 pub struct Registry {
@@ -41,6 +42,7 @@ impl Registry {
                 Box::new(xcode_swift::Adapter),
                 Box::new(docker_buildkit::Adapter),
                 Box::new(tool_stores::Adapter),
+                Box::new(model_stores::Adapter),
             ],
         }
     }

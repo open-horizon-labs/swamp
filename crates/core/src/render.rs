@@ -1046,6 +1046,7 @@ fn render_container_section(
         // numbers follow on their own line.
         let consequence = match (&f.consequence, f.other_consequences) {
             (Some(c), 0) => c.clone(),
+            (Some(c), 1) => format!("{c} (and 1 other consequence inside)"),
             (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
             (None, _) => "consequence not established".to_string(),
         };
@@ -1819,6 +1820,10 @@ pub fn render_view_external_with(
                 "    inside (identification only -- no cleanup is offered here):{section}"
             );
         }
+        let models = crate::build_adapters::model_stores::model_rows(&u.path, &inside, observed_at);
+        for line in model_lines(&models) {
+            let _ = writeln!(out, "    {line}");
+        }
     }
     let _ = writeln!(
         out,
@@ -1826,6 +1831,55 @@ pub fn render_view_external_with(
         human_bytes(total),
         sorted.len()
     );
+    out
+}
+
+/// A model store's models, one block each: name, revision or tag, size
+/// and what it is; then when its weights were last read, what getting
+/// it back costs, its revisions, the Hub's answer, and the facts about
+/// its bytes. When Hub facts are off, one line says how to turn them on.
+pub fn model_lines(models: &[crate::build_adapters::model_stores::ModelRow]) -> Vec<String> {
+    let mut out = Vec::new();
+    if models.is_empty() {
+        return out;
+    }
+    out.push(format!(
+        "models ({}), largest first; what each is comes from its own files:",
+        models.len()
+    ));
+    for m in models {
+        let rev = m
+            .revision
+            .as_deref()
+            .map(|r| format!("@{r}"))
+            .unwrap_or_default();
+        out.push(format!(
+            "  {:>10}  {}{rev}  ({})  {}",
+            human_bytes(m.bytes),
+            m.name,
+            m.kind,
+            m.about
+                .as_deref()
+                .unwrap_or("what it is: no field stated in its files")
+        ));
+        out.push(format!("      last read: {}", m.last_read));
+        out.push(format!("      regeneration: {}", m.regeneration));
+        if let Some(r) = &m.revisions {
+            out.push(format!("      {r}"));
+        }
+        if let Some(c) = &m.card {
+            out.push(format!("      card: {c}"));
+        }
+        if let Some(h) = m.hub.as_deref().filter(|h| *h != "off") {
+            out.push(format!("      {h}"));
+        }
+        for f in &m.facts {
+            out.push(format!("      {f}"));
+        }
+    }
+    if models.iter().any(|m| m.hub.as_deref() == Some("off")) {
+        out.push(crate::hub_api::OFF_LINE.to_string());
+    }
     out
 }
 

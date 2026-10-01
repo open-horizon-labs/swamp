@@ -54,6 +54,8 @@ pub mod jvm_common;
 pub mod layout;
 pub mod matrix;
 pub mod maven;
+pub mod model_cards;
+pub mod model_stores;
 pub mod node;
 pub mod python;
 pub mod registry;
@@ -315,6 +317,8 @@ pub struct BuildCtx<'a> {
     coverage: &'a EventCoverage,
     cache: &'a ContainerCache,
     daemon: Option<&'a crate::docker::DockerFacts>,
+    cards: Option<&'a model_cards::CardCache>,
+    own_cards: model_cards::CardCache,
 }
 
 impl<'a> BuildCtx<'a> {
@@ -330,7 +334,21 @@ impl<'a> BuildCtx<'a> {
             coverage,
             cache,
             daemon: None,
+            cards: None,
+            own_cards: model_cards::CardCache::default(),
         }
+    }
+
+    /// The pass-through enrichment cache this pass reads and fills
+    /// (`model_cards::CardCache`). Without one, a pass-local cache with
+    /// the per-pass budget stands in, so nothing is ever unbounded.
+    pub fn with_cards(mut self, cards: &'a model_cards::CardCache) -> Self {
+        self.cards = Some(cards);
+        self
+    }
+
+    pub fn cards(&self) -> &model_cards::CardCache {
+        self.cards.unwrap_or(&self.own_cards)
     }
 
     /// The Docker daemon's answers this pass (already fetched, cached and
@@ -451,6 +469,41 @@ impl<'a> BuildCtx<'a> {
     pub fn stat(&self, path: &Path) -> Option<crate::fs_gate::Metadata> {
         crate::work_counters::record_files_statted(1);
         crate::fs_gate::symlink_metadata(path).ok()
+    }
+
+    /// A single-level listing that names symlinks instead of skipping
+    /// them (never following one), for a layout made of links.
+    pub fn list_links(
+        &self,
+        dir: &Path,
+    ) -> (
+        Vec<crate::locations::LinkEntry>,
+        crate::locations::Truncation,
+    ) {
+        crate::locations::shallow_list_links(dir)
+    }
+
+    /// The text of one named symlink, never followed.
+    pub fn link_text(&self, path: &Path) -> Option<PathBuf> {
+        crate::work_counters::record_files_statted(1);
+        crate::fs_gate::read_link(path).ok()
+    }
+
+    /// The first bytes of one named regular file, at most
+    /// `min(want, model_cards::MAX_CARD_READ)`, counted as header bytes.
+    /// A symlink at `path` is refused (`lstat` and `O_NOFOLLOW`); the
+    /// caller checks that no parent directory is one.
+    pub fn header(&self, path: &Path, want: usize) -> Option<Vec<u8>> {
+        use crate::fs_gate::read::BoundedCap;
+        let cap = if want <= BoundedCap::HEADER.bytes() {
+            BoundedCap::header_at_most(want)
+        } else {
+            BoundedCap::MANIFEST
+        };
+        let read = crate::fs_gate::read::bounded_read_header_no_follow(path, cap).ok()?;
+        let mut bytes = read.bytes;
+        bytes.truncate(want.min(model_cards::MAX_CARD_READ));
+        Some(bytes)
     }
 
     /// A bounded read of one named manifest.
@@ -769,6 +822,22 @@ impl NestedUnitBuilder {
             confidence: c,
         });
         self
+    }
+
+    /// Replaces every evidence row from `source` with one row: for an
+    /// enrichment that recomputes a summary it already wrote.
+    pub fn replace_evidence(mut self, source: &str, detail: impl Into<String>) -> Self {
+        self.unit.producer_evidence.retain(|e| e.source != source);
+        self.evidence(source, detail, Confidence::High)
+    }
+
+    /// Whether evidence from `source` was already added: for an
+    /// adapter with a preferred source and a fallback.
+    pub fn has_evidence(&self, source: &str) -> bool {
+        self.unit
+            .producer_evidence
+            .iter()
+            .any(|e| e.source == source)
     }
 
     /// What it would cost to get these bytes back, in the ecosystem's

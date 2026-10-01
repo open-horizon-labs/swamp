@@ -175,7 +175,11 @@ pub fn cmd_observe(
                 mode,
                 outcome: "ok".to_string(),
             };
-            append_log(&log, &outcome)?;
+            if let Err(e) = append_log(&log, &outcome) {
+                // The observation is recorded in the store either way; a
+                // log that cannot be written is said once, not a failure.
+                eprintln!("observe log not written: {e:#}");
+            }
             write_last_run(&store_dir, &outcome)?;
             // The observation is over: its lock is released before the volume
             // pass starts, and the pass takes its own (`volume-pass.lock`), so
@@ -196,7 +200,11 @@ pub fn cmd_observe(
                 mode: "full".to_string(),
                 outcome: format!("error({e})"),
             };
-            append_log(&log, &outcome)?;
+            if let Err(e) = append_log(&log, &outcome) {
+                // The observation is recorded in the store either way; a
+                // log that cannot be written is said once, not a failure.
+                eprintln!("observe log not written: {e:#}");
+            }
             let _ = write_last_run(&store_dir, &outcome);
             drop(lock);
             eprintln!("observe failed: {e}");
@@ -216,7 +224,11 @@ pub fn cmd_observe(
             if let Some((_, path, _)) = &stuck {
                 let _ = schedule::record_stalled(&store_dir, path, now);
             }
-            append_log(&log, &outcome)?;
+            if let Err(e) = append_log(&log, &outcome) {
+                // The observation is recorded in the store either way; a
+                // log that cannot be written is said once, not a failure.
+                eprintln!("observe log not written: {e:#}");
+            }
             let _ = write_last_run(&store_dir, &outcome);
             // Released before exiting so the next observation (and the
             // TUI's first-run scan) is not left waiting on a pass that is

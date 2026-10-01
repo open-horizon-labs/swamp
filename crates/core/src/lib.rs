@@ -59,6 +59,7 @@ pub mod git;
 pub mod github;
 pub mod growth;
 pub mod headline;
+pub mod hub_api;
 pub mod ignore;
 pub mod last_used;
 pub mod ledger;

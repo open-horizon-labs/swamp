@@ -300,6 +300,13 @@ pub struct ContainerTable(KeyedTable);
 /// never answered by an old one's rows.
 pub struct BuildStoreTable(KeyedTable);
 
+/// `content key -> (field, value)`: the model-card enrichment cache
+/// (`build_adapters::model_cards::CardCache`). Keyed by content
+/// identity (a revision hash, a manifest's size and mtime, a blob
+/// digest), so most entries never expire; `observed_at` is when the
+/// entry was produced (a network answer's fetch time).
+pub struct ModelCardTable(KeyedTable);
+
 /// `external unit key -> (consumer label, note)`: the declared-consumer
 /// sidecar. Human intent rather than derived data, so it is *not*
 /// fingerprint-invalidated -- the fingerprint column is a constant --
@@ -413,6 +420,23 @@ impl BuildStoreTable {
     pub fn open(swamp_dir: &Path) -> Self {
         Self(KeyedTable {
             path: dir(swamp_dir).join("build_stores.parquet"),
+            value_columns: Self::COLUMNS,
+        })
+    }
+    pub fn load(&self) -> HashMap<String, CachedRows> {
+        load(&self.0)
+    }
+    pub fn save(&self, cache: &HashMap<String, CachedRows>, observed_at: u64) -> Result<()> {
+        store(&self.0, cache, observed_at)
+    }
+}
+
+impl ModelCardTable {
+    pub const COLUMNS: &'static [&'static str] = &["field", "value"];
+
+    pub fn open(swamp_dir: &Path) -> Self {
+        Self(KeyedTable {
+            path: dir(swamp_dir).join("model_cards.parquet"),
             value_columns: Self::COLUMNS,
         })
     }
