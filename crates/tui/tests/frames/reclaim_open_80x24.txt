@@ -16,7 +16,7 @@
 "cache · /Users/dev/.cache/uv                                 3.9GB          —   "
 "▸ installation · /Users/dev/.local/share/mise/installs       1.2GB          —   "
 "reinstall is a download (`rustup toolchain install <toolchain>`) · last used no…"
-"Last used: no record                                                            "
+"removal: Trash (Space, then Backspace)                                          "
 "declared consumers: none found among 2 projects in 1 declared root              "
 "cost from: detector recovery hint                                               "
 "                                                                                "

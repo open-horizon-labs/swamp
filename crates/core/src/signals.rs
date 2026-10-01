@@ -348,6 +348,109 @@ pub fn tip_sha(dir: &Path) -> Option<String> {
     Repo::open(dir)?.head_id_hex()
 }
 
+/// Whether a worktree's HEAD commit is contained in another branch, found
+/// locally from the repository's own refs (no network, no `gh`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TipReach {
+    /// HEAD is an ancestor of (or equal to) this branch's tip.
+    Reachable(TipBranch),
+    /// HEAD is in no remote-tracking branch and not in the default
+    /// branch, every one of which was checked.
+    NotReachable,
+    /// Not established: unborn HEAD, a lookup failed, or the time/ref
+    /// budget ran out before every branch was checked.
+    Unknown,
+}
+
+/// The branch a worktree's HEAD was found in, and how old that evidence
+/// is. Equality is the branch's identity (name and kind); the fetch date
+/// is evidence about it, not part of it.
+#[derive(Debug, Clone, Eq)]
+pub struct TipBranch {
+    /// `origin/feat`, or `main` for a local branch.
+    pub name: String,
+    /// A local branch (in the common `.git`, not pushed by this fact).
+    pub local: bool,
+    /// Unix seconds of the last fetch that could have updated a remote
+    /// tracking ref; `None` when it cannot be told.
+    pub fetched_at: Option<u64>,
+}
+
+impl PartialEq for TipBranch {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.local == other.local
+    }
+}
+
+impl From<&str> for TipBranch {
+    fn from(name: &str) -> Self {
+        TipBranch::remote(name.to_string(), None)
+    }
+}
+
+impl TipBranch {
+    pub fn remote(name: String, fetched_at: Option<u64>) -> Self {
+        TipBranch {
+            name,
+            local: false,
+            fetched_at,
+        }
+    }
+
+    pub fn local(name: String) -> Self {
+        TipBranch {
+            name,
+            local: true,
+            fetched_at: None,
+        }
+    }
+
+    /// The words inside the parentheses of `tip_reachable=yes (...)`.
+    pub fn describe(&self, now: u64) -> String {
+        if self.local {
+            return format!("local {}, not pushed", self.name);
+        }
+        match self.fetched_at {
+            Some(t) => format!(
+                "{}, as of last fetch {}",
+                self.name,
+                crate::last_used::format_day(t, now)
+            ),
+            None => format!("{}, fetch time unknown", self.name),
+        }
+    }
+}
+
+/// Time one worktree's local ancestry check may take before it reports
+/// "not established".
+const TIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// For each worktree path, whether its HEAD is contained in a
+/// remote-tracking branch or the default branch (local, offline; see
+/// [`crate::fs_gate::git::Repo::tip_reachable`]). Order is preserved; a
+/// repository that cannot be opened is `Unknown`, not `NotReachable`.
+pub fn tip_reach_parallel(paths: &[std::path::PathBuf]) -> Vec<TipReach> {
+    let one = |p: &std::path::PathBuf| match Repo::open(p) {
+        Some(r) => r.tip_reachable(TIP_BUDGET),
+        None => TipReach::Unknown,
+    };
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(8));
+    if paths.len() < 2 || workers < 2 {
+        return paths.iter().map(one).collect();
+    }
+    let chunk = paths.len().div_ceil(workers);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = paths
+            .chunks(chunk)
+            .map(|c| s.spawn(move || c.iter().map(one).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
+}
+
 /// Parallel equivalent of [`compute_signals_raw`], preserving input
 /// order. Used by `report.rs` so the merge_complete composite and
 /// `idle_secs` field get the raw values without a second per-worktree

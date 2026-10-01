@@ -2661,13 +2661,10 @@ impl App {
         if self.operation.is_some() {
             return;
         }
-        // A row whose installs its own manager removes (#177) never goes
-        // to Trash: Backspace with nothing marked opens its sheet, Space
-        // says why it cannot be marked.
-        // Backspace on its row opens the manager's own list; Space marks
-        // the folder for Trash like any other (the confirm says the
-        // manager will not know it is gone). Backspace while this very row
-        // is marked is the Trash confirm.
+        // A row whose installs its own manager removes (#177): Backspace
+        // with nothing marked opens the manager's own list (no Trash);
+        // Space marks the folder for Trash like any other row, and
+        // Backspace while this very row is marked is the Trash confirm.
         if !all && let Some(manager) = self.selected_row().and_then(|r| r.tool) {
             let own_mark = self
                 .selected_row()

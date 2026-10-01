@@ -2435,9 +2435,11 @@ pub fn reclaim_rows(
         row.signals = vec![
             r.regeneration.words.clone(),
             format!("last used {}", r.last_used_text),
-            r.removal.text.clone(),
         ];
-        row.last_used = Some(format!("Last used: {}", r.last_used_text));
+        // The signals line is cut at the edge; the removal paths that
+        // exist are a decision fact, so they get their own detail line
+        // (the last-used fact is already in the signals above).
+        row.last_used = None;
         row.mtime_max = r
             .children
             .iter()
@@ -2452,7 +2454,11 @@ pub fn reclaim_rows(
         if standing.is_empty() {
             standing.push(format!("cost from: {}", r.regeneration.source));
         }
-        row.detail_lines = vec![r.consumers.summary.clone(), standing.join(" · ")];
+        row.detail_lines = vec![
+            format!("removal: {}", r.removal.tui_text),
+            r.consumers.summary.clone(),
+            standing.join(" · "),
+        ];
         let key = format!("reclaim-open:{}", r.path);
         if r.children.is_empty() {
             rows.push(row);

@@ -21,6 +21,8 @@ use gix::bstr::ByteSlice;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::signals::{TipBranch, TipReach};
+
 /// Entries the pre-open sweep of one git dir may lstat before the repo
 /// is declined as not measured (#190). Loose objects and packs are not
 /// counted: they are skipped, never opened by the queries swamp asks.
@@ -186,7 +188,135 @@ pub enum Unpushed {
     Unknown,
 }
 
+/// Remote-tracking branches checked per worktree before the answer is
+/// "not established" instead of "no".
+const TIP_REF_CAP: usize = 400;
+
 impl Repo {
+    /// Is HEAD contained in a remote-tracking branch (`refs/remotes/*`,
+    /// `*/HEAD` excluded) or in the local default branch? The default
+    /// branch (`origin/HEAD`'s target) is checked first, then the other
+    /// remote branches, then local `main`/`master`. The worktree's own current local branch is never a
+    /// candidate: HEAD is trivially in it. Detached HEAD is fine.
+    pub fn tip_reachable(&self, budget: Duration) -> TipReach {
+        let repo = &self.0;
+        let start = Instant::now();
+        let Ok(head_id) = repo.head_id() else {
+            return TipReach::Unknown;
+        };
+        let head = head_id.detach();
+        let own = repo
+            .head()
+            .ok()
+            .and_then(|h| h.referent_name().map(|n| n.as_bstr().to_string()));
+        let mut candidates: Vec<(TipBranch, gix::ObjectId)> = Vec::new();
+        let mut first: Vec<String> = Vec::new();
+        if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD")
+            && let gix::refs::TargetRef::Symbolic(t) = r.target()
+        {
+            first.push(t.as_bstr().to_string());
+        }
+        // A local branch lives in the common .git: it is evidence only
+        // when this is a linked worktree, whose directory can go while
+        // that .git stays. In a primary checkout it goes with the folder.
+        let linked = repo.worktree().is_some_and(|w| !w.is_main());
+        let fetched = fetch_time(repo);
+        let mut locals: Vec<(TipBranch, gix::ObjectId)> = Vec::new();
+        for local in ["refs/heads/main", "refs/heads/master"] {
+            if linked
+                && own.as_deref() != Some(local)
+                && let Ok(mut r) = repo.find_reference(local)
+                && let Ok(id) = r.peel_to_id()
+            {
+                locals.push((TipBranch::local(short_ref(local)), id.detach()));
+            }
+        }
+        for full in &first {
+            if let Ok(mut r) = repo.find_reference(full.as_str())
+                && let Ok(id) = r.peel_to_id()
+            {
+                candidates.push((remote_branch(repo, full, fetched), id.detach()));
+            }
+        }
+        let Ok(platform) = repo.references() else {
+            return TipReach::Unknown;
+        };
+        let Ok(iter) = platform.prefixed("refs/remotes/") else {
+            return TipReach::Unknown;
+        };
+        let mut complete = true;
+        let mut seen = 0usize;
+        let mut rest: Vec<(TipBranch, gix::ObjectId)> = Vec::new();
+        for r in iter {
+            let Ok(mut r) = r else {
+                complete = false;
+                continue;
+            };
+            let full = r.name().as_bstr().to_string();
+            if full.ends_with("/HEAD") || first.contains(&full) {
+                continue;
+            }
+            seen += 1;
+            if seen > TIP_REF_CAP {
+                complete = false;
+                break;
+            }
+            match r.peel_to_id() {
+                Ok(id) => rest.push((remote_branch(repo, &full, fetched), id.detach())),
+                Err(_) => complete = false,
+            }
+        }
+        rest.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        candidates.extend(rest);
+        // The local default branch last: a remote branch that has the
+        // commit is the better name for it.
+        candidates.extend(locals);
+        for (name, tip) in candidates {
+            if start.elapsed() >= budget {
+                return TipReach::Unknown;
+            }
+            if tip == head {
+                return TipReach::Reachable(name);
+            }
+            // Is `head` an ancestor of `tip`? A walk from `tip` that checks
+            // the budget at every commit, so one huge history cannot
+            // overrun it.
+            let Ok(walk) = repo.rev_walk([tip]).all() else {
+                complete = false;
+                continue;
+            };
+            let mut found = false;
+            for item in walk {
+                if start.elapsed() >= budget {
+                    return TipReach::Unknown;
+                }
+                match item {
+                    Ok(info) if info.id == head => {
+                        found = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if found {
+                return TipReach::Reachable(name);
+            }
+            // A shallow boundary hides parents: absence proves nothing.
+            if repo.is_shallow() {
+                complete = false;
+            }
+        }
+        if complete {
+            TipReach::NotReachable
+        } else {
+            TipReach::Unknown
+        }
+    }
+
     /// Opens the repository at (or containing) `dir`.
     pub fn open(dir: &Path) -> Option<Repo> {
         if !safe_to_open(dir) {
@@ -279,6 +409,38 @@ impl Repo {
     pub fn worktree_locked(&self) -> bool {
         self.0.worktree().is_some_and(|wt| wt.is_locked())
     }
+}
+
+/// When the remote-tracking refs were last brought up to date: the mtime
+/// of `FETCH_HEAD` in the common git dir.
+fn fetch_time(repo: &gix::Repository) -> Option<u64> {
+    let m = std::fs::metadata(repo.common_dir().join("FETCH_HEAD")).ok()?;
+    m.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// A remote-tracking branch with its evidence age: the last fetch, else
+/// the newest reflog entry of the tracking ref, else unknown.
+fn remote_branch(repo: &gix::Repository, full: &str, fetched: Option<u64>) -> TipBranch {
+    let at = fetched.or_else(|| {
+        let r = repo.find_reference(full).ok()?;
+        let mut platform = r.log_iter();
+        let mut it = platform.rev().ok()??;
+        let line = it.next()?.ok()?;
+        u64::try_from(line.signature.time.seconds).ok()
+    });
+    TipBranch::remote(short_ref(full), at)
+}
+
+/// `refs/remotes/origin/x` as `origin/x`, `refs/heads/main` as `main`.
+fn short_ref(full: &str) -> String {
+    full.strip_prefix("refs/remotes/")
+        .or_else(|| full.strip_prefix("refs/heads/"))
+        .unwrap_or(full)
+        .to_string()
 }
 
 /// An exclude stack plus index for one checkout, reused across many

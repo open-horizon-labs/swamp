@@ -691,8 +691,9 @@ path. Each row says, as facts with their sources:
 - **The removal path that exists.** Every unit and every listed folder: Trash
   after review (Space, then Backspace in the TUI; see "Cleanup and recovery").
   A unit whose manager swamp runs removal for (mise installs, simulator
-  runtimes) also names that manager's own command (Backspace on an unmarked
-  row). JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
+  runtimes, including `/Library/Developer/CoreSimulator/Volumes`) also names
+  that manager's own command, which is permanent with no Trash (Backspace with
+  nothing marked); the text never says the command is "not available yet". JSON: `removal.kind` is `trash_reviewed` or `trash_or_tool_command`.
 
 | Storage category | Class | Words when nothing more specific exists | Source |
 |---|---|---|---|
@@ -1010,8 +1011,12 @@ disk view "accounted" = developer storage + remainder units
 
 `swamp report --view reclaim` prints the first line after its headline, and its
 JSON carries `headline_relation` (`holds`); `headline.disk.accounted_check`
-carries the second. They differ when the ledger's accounted rows came from a
-different observation than the units read here, or when a unit's row was lost.
+carries the second. They differ when units on another volume are counted here but listed
+apart by the ledger, when worktrees outside the declared roots count under projects
+but not in the ledger's declared rows, when the ledger's accounted rows were measured
+at another time than the units read here, or when a unit's row was lost. The line
+names the other-volume bytes and the unexplained rest as numbers, and mentions the
+measurement time only when the two times differ.
 Whenever they differ the report prints a plain line (`disk view check: the
 ledger's accounted bytes (X) differ from developer storage plus the remainder units
 (Y) by Z`) and the Disk view repeats it on its Accounted row. (A same-path
@@ -1398,6 +1403,8 @@ Install and authenticate `gh` to collect GitHub facts:
 swamp observe ~/src
 swamp report ~/src --view worktrees
 ```
+
+Each worktree also carries `tip_reachable`, a fact `observe` computes from the repository's own refs, offline and without `gh`: whether the worktree's HEAD commit is contained in a remote-tracking branch (`refs/remotes/*`, `*/HEAD` excluded). A remote-tracking ref is the state at the last fetch, so the term says so: `tip_reachable=yes (origin/audit/x, as of last fetch Sep 30)`, using the time of `FETCH_HEAD` (else the ref's reflog, else `fetch time unknown`); a branch deleted on the remote since then still reads yes until the next fetch. The local `main`/`master` counts only from a linked worktree, whose own folder can be removed while the shared `.git` keeps that branch, and is named `local main, not pushed`; in a primary checkout a local branch lives in the folder's own `.git` and never counts. It is separate from `merged`, which stays the pull-request fact: a branch with no PR reads `merged=unknown` and can still read `tip_reachable=yes`. The worktree's own checked-out branch is never its own proof; a detached HEAD is judged by its commit. A repository that cannot be opened, a shallow clone where nothing was found, more than 400 remote branches, or a 2-second budget (checked at every commit of the walk) read `tip_reachable=unknown`, never `no`. A squash-merged branch reads `tip_reachable=no` because its commits are in no branch; the `merge-complete` verdict still counts a merged PR as landed.
 
 Reports use the GitHub facts the last `observe` cached. `observe` queries GitHub unless given `--no-enrich`, and reuses a cache entry that is still valid. GitHub cache validity uses the tip SHA: a worktree whose branch is already merged is terminal and is never re-enriched automatically, and every other row is refreshed after a 24-hour TTL. `observe --enrich` is the on-demand override: it refetches everything, ignoring the TTL and the merged rule.
 

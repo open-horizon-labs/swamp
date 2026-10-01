@@ -244,6 +244,14 @@ pub struct AccountedCheck {
     pub developer_plus_remainder: u64,
     /// `disk_view_accounted - developer_plus_remainder`.
     pub difference: i64,
+    /// Bytes of units on another volume: the headline counts them, the
+    /// ledger lists them apart and never adds them. A named part of the
+    /// difference.
+    pub other_volume_bytes: u64,
+    /// When the ledger's accounted rows were measured, and the
+    /// observation they are compared with (equal: the same observation).
+    pub ledger_measured_at: u64,
+    pub observed_at: u64,
     /// The two agree. They can differ when the ledger's accounted rows
     /// came from a different observation than the units read here.
     pub agrees: bool,
@@ -601,6 +609,12 @@ fn measured(
             disk_view_accounted: a.accounted.bytes,
             developer_plus_remainder: sum,
             difference: diff,
+            other_volume_bytes: a
+                .external_volumes
+                .iter()
+                .fold(0u64, |t, r| t.saturating_add(r.bytes.unwrap_or(0))),
+            ledger_measured_at: a.measured_at,
+            observed_at,
             agrees: diff == 0,
         },
     }
@@ -765,18 +779,44 @@ impl Headline {
     }
 
     /// A plain line whenever the ledger's accounted part does not equal
-    /// developer storage plus the remainder units: the two are computed from
-    /// the same observation unless the ledger's rows came from another.
+    /// developer storage plus the remainder units. It names the parts it
+    /// can compute (units on another volume, which the ledger lists apart
+    /// and never adds), the unexplained rest, and the observation age only
+    /// when the ledger really was measured at another time.
     pub fn accounted_sentence(&self) -> Option<String> {
         match &self.disk {
             Disk::Measured(m) if !m.accounted_check.agrees => {
                 let c = &m.accounted_check;
+                let signed = |d: i64| {
+                    format!(
+                        "{}{}",
+                        if d < 0 { "-" } else { "+" },
+                        human(d.unsigned_abs())
+                    )
+                };
+                let mut why: Vec<String> = Vec::new();
+                let mut rest = c.difference;
+                if c.other_volume_bytes > 0 {
+                    why.push(format!(
+                        "{} is on another volume (the ledger lists it apart and never adds it)",
+                        human(c.other_volume_bytes)
+                    ));
+                    rest = rest
+                        .saturating_add(i64::try_from(c.other_volume_bytes).unwrap_or(i64::MAX));
+                }
+                why.push(format!(
+                    "{} is not explained by a named part (for example worktrees outside the declared roots count under projects but not in the ledger's declared rows)",
+                    signed(rest)
+                ));
+                if c.ledger_measured_at != c.observed_at {
+                    why.push("the ledger's accounted rows were measured at a different time than this observation".to_string());
+                }
                 Some(format!(
-                    "disk view check: the ledger's accounted bytes ({}) differ from developer storage plus the remainder units ({}) by {}{}; the ledger's accounted rows may come from a different observation than these units",
+                    "disk view check: the ledger's accounted bytes ({}) differ from developer storage plus the remainder units ({}) by {}: {}",
                     human(c.disk_view_accounted),
                     human(c.developer_plus_remainder),
-                    if c.difference < 0 { "-" } else { "+" },
-                    human(c.difference.unsigned_abs()),
+                    signed(c.difference),
+                    why.join("; "),
                 ))
             }
             _ => None,
