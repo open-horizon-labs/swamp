@@ -4,6 +4,7 @@ error[E0423]: cannot initialize a tuple struct which contains private fields
   |     let _ = BoundedCap(usize::MAX);
   |             ^^^^^^^^^^
   |
+  = note: a struct named `BoundedCap` exists in another namespace
 note: constructor is not visible here due to private fields
  --> $WORKSPACE/crates/core/src/fs_gate/read.rs
   |
