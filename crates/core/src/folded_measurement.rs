@@ -563,6 +563,7 @@ fn folded_rows(
     let mut incomplete_buckets: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut root_incomplete = false;
+    let mut unreplayable: std::collections::HashSet<String> = std::collections::HashSet::new();
     for stamp in stamps {
         // A stamp from outside the unit cannot be validated against the
         // unit root later, so the whole measurement is not stored.
@@ -577,6 +578,12 @@ fn folded_rows(
             return None;
         };
         let rel = rel.display().to_string();
+        if stamp.pending && !rel.is_empty() {
+            // A file whose allocation was still pending: its subfolder's
+            // total may rise at writeback with no event (#197), so it is
+            // walked again rather than replayed.
+            unreplayable.insert(rel.split('/').next().unwrap_or("").to_string());
+        }
         if stamp.incomplete {
             // Something here could not be read: its subfolder is never
             // replayed. The root is re-walked on every pass anyway (an
@@ -682,6 +689,7 @@ fn folded_rows(
             row.exclusions = digest.clone();
         } else if i < first_carried
             && !incomplete_buckets.contains(&row.rel_dir)
+            && !unreplayable.contains(&row.rel_dir)
             && let Some((bytes, mtime_max, linked)) = children.get(&row.rel_dir)
         {
             row.bytes = *bytes;
@@ -1145,6 +1153,7 @@ pub fn folded_bytes_bounded_stamped(
             shared_inode: false,
             linked: Vec::new(),
             incomplete: false,
+            pending: false,
         });
         let mut here = 0u64;
         for entry in rd.flatten() {
@@ -1900,6 +1909,54 @@ mod tests {
         let vouched = sealed_only_unchanged(Some(store.path()), &unit);
         crate::fs_gate::fs_space::testing::clear();
         assert!(!vouched, "a changed plain folder was vouched for");
+    }
+
+    /// CI run 36882714289 follow-up (#197). Tempting wrong patch: record
+    /// a subfolder total taken while one of its files was still waiting
+    /// for its blocks (ZFS before a commit). Writeback raises the bytes
+    /// with no event under the folder, so a replay would keep the lower
+    /// figure as exact. Such a subfolder gets no total; its siblings do.
+    #[test]
+    fn a_subfolder_with_pending_allocation_is_never_given_a_total() {
+        let unit = PathBuf::from("/u");
+        let stamp = |rel: &str, own: u64, pending: bool| crate::walk::DirStamp {
+            path: if rel.is_empty() {
+                unit.clone()
+            } else {
+                unit.join(rel)
+            },
+            mtime_ns: 1,
+            ctime_ns: 1,
+            own_bytes: own,
+            files_mtime_max: 5,
+            shared_inode: false,
+            linked: Vec::new(),
+            incomplete: false,
+            pending,
+        };
+        let stamps = vec![
+            stamp("", 0, false),
+            stamp("a", 4096, true),
+            stamp("b", 8192, false),
+        ];
+        let folded = FoldedUnit {
+            reused: false,
+            bytes: 12_288,
+            hardlinked: false,
+            mtime_max: 5,
+            complete: true,
+            sealed_walked_at: None,
+        };
+        let rows = folded_rows(&unit, &[], 1_000, &folded, &stamps, &[]).unwrap();
+        let marked = |name: &str| {
+            rows.iter()
+                .any(|r| r.rel_dir == name && r.exclusions.ends_with(CHILD_TOTAL_MARK))
+        };
+        assert!(
+            !marked("a"),
+            "a pending subfolder was given a replayable total"
+        );
+        assert!(marked("b"));
     }
 
     /// A different exclusion set describes different bytes, so it must

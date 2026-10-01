@@ -954,6 +954,9 @@ pub struct DirStamp {
     /// This directory, or an entry directly in it, could not be read: the
     /// fold under it is a lower bound.
     pub incomplete: bool,
+    /// A file directly here had its allocation pending (#197): its bytes
+    /// may still rise with no event, so its subfolder is not replayed.
+    pub pending: bool,
 }
 
 /// `attribute_parallel` that takes `carry`ed artifact rows as read (see
@@ -1584,6 +1587,7 @@ fn process_size(
                 shared_inode: false,
                 linked: Vec::new(),
                 incomplete: true,
+                pending: false,
             });
         }
         if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
@@ -1619,6 +1623,7 @@ fn process_size(
     let mut files_mtime_max: u64 = 0;
     let mut shared_inode = false;
     let mut dir_incomplete = false;
+    let mut dir_pending = false;
     // Only exclusions inside this directory can match one of its entries
     // (an exclusion above it was pruned before this job was queued):
     // checked once here instead of per entry, which cost a path
@@ -1679,6 +1684,9 @@ fn process_size(
                 continue;
             }
             file_count += 1;
+            if shared.stamp_dirs {
+                dir_pending |= crate::attribution::allocation_pending(&meta);
+            }
             own_allocated += allocated_bytes(&meta);
             dir_mtime_max = dir_mtime_max.max(meta.mtime());
             let key = (meta.dev(), meta.ino());
@@ -1728,6 +1736,7 @@ fn process_size(
             shared_inode,
             linked,
             incomplete: dir_incomplete,
+            pending: dir_pending,
         });
     }
     if let (Some(worktree_id), Some(root)) = (&group.worktree, &group.worktree_root) {
