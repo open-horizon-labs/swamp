@@ -946,9 +946,11 @@ pub struct DirStamp {
     pub own_bytes: u64,
     pub files_mtime_max: u64,
     pub shared_inode: bool,
-    /// `(device, inode, allocated bytes)` of each file here with another
-    /// hard link, so per-child totals can count each inode once.
-    pub linked: Vec<(u64, u64, u64)>,
+    /// `(device, inode, allocated bytes, link count)` of each file here
+    /// with another hard link, so per-child totals can count each inode
+    /// once and a partial walk can tell whether all of an inode's links
+    /// are inside what it walked.
+    pub linked: Vec<(u64, u64, u64, u64)>,
     /// This directory, or an entry directly in it, could not be read: the
     /// fold under it is a lower bound.
     pub incomplete: bool,
@@ -1626,7 +1628,7 @@ fn process_size(
         .iter()
         .filter(|e| e.starts_with(&path) && **e != path)
         .collect();
-    let mut linked: Vec<(u64, u64, u64)> = Vec::new();
+    let mut linked: Vec<(u64, u64, u64, u64)> = Vec::new();
     let mut dir_mtime_max: i64 = own_meta.as_ref().map(|m| m.mtime()).unwrap_or(0);
     for (i, entry) in entries.enumerate() {
         if i % 1024 == 1023 {
@@ -1692,7 +1694,7 @@ fn process_size(
             if meta.nlink() > 1 {
                 shared_inode = true;
                 if shared.stamp_dirs {
-                    linked.push((meta.dev(), meta.ino(), allocated_bytes(&meta)));
+                    linked.push((meta.dev(), meta.ino(), allocated_bytes(&meta), meta.nlink()));
                 }
             }
             if meta.nlink() <= 1 || group.local_seen.lock().unwrap().insert(key) {

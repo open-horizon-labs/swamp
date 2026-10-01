@@ -141,3 +141,35 @@ fn every_cli_test_spawn_of_swamp_sets_test_mode() {
         "spawns without SWAMP_TEST_MODE: {offenders:?}"
     );
 }
+
+/// Tempting wrong patch: `append_log(..)?` in `observe`, so a log
+/// directory that cannot be written (here a file stands where it should
+/// be) fails every scheduled pass after the work is done and before the
+/// run is recorded. The observation succeeds and says so once.
+#[test]
+fn an_unwritable_log_dir_does_not_fail_the_observation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let root = tmp.path().join("src");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let not_a_dir = tmp.path().join("logs");
+    std::fs::write(&not_a_dir, "a file, not a directory").unwrap();
+    let out = Command::new(bin())
+        .arg("observe")
+        .arg(&root)
+        .env("SWAMP_DIR", tmp.path().join("store"))
+        .env("SWAMP_LOG_DIR", &not_a_dir)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", tmp.path().join("agents"))
+        .env("HOME", &home)
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("observe log not written").count(),
+        1,
+        "{stderr}"
+    );
+}

@@ -1297,18 +1297,18 @@ mod tests {
 
     /// Tempting wrong patch: truncate the log at the cap (losing the
     /// recent history `schedule status` falls back to) or rotate into
-    /// numbered files without a limit. The log rotates into exactly one
-    /// `observe.log.1`, the newest line is always in `observe.log`, and
-    /// the two together never exceed twice the cap.
+    /// numbered files without a limit. The log rotates into exactly three
+    /// files (`observe.log.1` to `.3`), the newest line is always in
+    /// `observe.log`, and each stays near the cap.
     #[test]
-    fn the_observe_log_rotates_into_one_file_and_stays_bounded() {
+    fn the_observe_log_rotates_into_three_files_and_stays_bounded() {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("observe.log");
         // Long lines so three caps' worth of history takes a few hundred
         // appends (each one syncs).
         let filler = "x".repeat(8 * 1024);
         let cap = store::LOG_CAP_BYTES;
-        let appends = 3 * cap / (8 * 1024) + 10;
+        let appends = 6 * cap / (8 * 1024) + 10;
         for i in 0..appends {
             let outcome = RunOutcome {
                 observed_at: 1_000 + i,
@@ -1326,7 +1326,8 @@ mod tests {
         assert!(size(&log) <= cap + 9 * 1024, "{}", size(&log));
         assert!(size(&rotated) <= cap + 9 * 1024, "{}", size(&rotated));
         let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
-        assert_eq!(names.len(), 2, "more than one rotated file");
+        assert_eq!(names.len(), 4, "not exactly three rotated files");
+        assert!(tmp.path().join("observe.log.3").exists());
         assert_eq!(
             last_log_outcome(&log).unwrap().observed_at,
             1_000 + appends - 1
@@ -1358,6 +1359,27 @@ mod tests {
         let r = append_log(&log, &outcome);
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(last_log_outcome(&log).map(|o| o.observed_at), Some(7));
+    }
+
+    /// Docs match code: the log cap and rotated-file count in the usage
+    /// guide are the constants, and the architecture page no longer
+    /// states the subfolder-replay rules this release replaced.
+    #[test]
+    fn docs_state_the_log_cap_and_the_current_replay_rules() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let usage = fs::read_to_string(root.join("usage.md")).unwrap();
+        assert_eq!(store::LOG_CAP_BYTES, 1024 * 1024);
+        assert!(usage.contains("reaches 1 MiB"));
+        assert_eq!(store::LOG_ROTATED_KEPT, 3);
+        assert!(usage.contains("`.2` and `.3`"));
+        let arch = fs::read_to_string(root.join("architecture.md")).unwrap();
+        for stale in [
+            "only when nothing in the unit has a second hard link",
+            "an incomplete fold is never stored",
+        ] {
+            assert!(!arch.contains(stale), "stale: {stale}");
+        }
+        assert!(arch.contains("marked as a lower bound"));
     }
 
     #[test]

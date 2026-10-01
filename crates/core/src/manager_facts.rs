@@ -922,8 +922,17 @@ fn collect_inner(
                     continue;
                 };
                 for name in d.reads {
-                    let (bytes, mtime) = totals.get(*name).copied().unwrap_or((u64::MAX, 0));
-                    owned.push((u.path.join(name), bytes, mtime, false));
+                    let sub = u.path.join(name);
+                    match totals.get(*name) {
+                        Some((bytes, mtime)) => owned.push((sub, *bytes, *mtime, false)),
+                        // Present but with no total (something in it could
+                        // not be read, or it holds a linked file): no key,
+                        // so the manager is asked.
+                        None if crate::fs_gate::symlink_metadata(&sub).is_ok() => {
+                            keyable = false;
+                        }
+                        None => owned.push((sub, u64::MAX, 0, false)),
+                    }
                 }
             }
         }
