@@ -1102,6 +1102,56 @@ mod tests {
         );
     }
 
+    /// Issue #210. Tempting wrong patch: count `chars()` (or stop at one
+    /// hint) and let the terminal clip the line, which ends `q ` with no
+    /// word. Every shown hint must carry its full label at every width,
+    /// for every view.
+    #[test]
+    fn legend_never_shows_a_hint_without_its_label_at_any_width() {
+        let known = [
+            "Tab section",
+            "v view",
+            "/ filter",
+            "R refresh",
+            "⌫ delete",
+            "⌫ trash",
+            "Space mark",
+            "A mark all",
+            "↑↓ move",
+            "→/← in/out",
+            "g/s/n/t/a sort",
+            "r reverse",
+            "? help",
+            "q quit",
+            "b blocked",
+        ];
+        for v in app::ViewKind::ALL {
+            for w in 1u16..=200 {
+                let mut app = App::new(empty_report(), "/root".into());
+                app.set_view(v);
+                let mut t = Terminal::new(TestBackend::new(w, 24)).unwrap();
+                t.draw(|f| ui::draw(f, &app)).unwrap();
+                let buf = t.backend().buffer().clone();
+                let last: String = (0..w)
+                    .map(|x| buf[(x, 23)].symbol().to_string())
+                    .collect::<String>();
+                let line = last.trim_end();
+                if line.is_empty() {
+                    continue;
+                }
+                for part in line.split("  ").map(str::trim).filter(|p| !p.is_empty()) {
+                    assert!(
+                        known.contains(&part),
+                        "view {v:?} width {w}: cut hint {part:?} in {line:?}"
+                    );
+                }
+                if w >= 40 {
+                    assert!(line.ends_with("q quit"), "view {v:?} width {w}: {line:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn footer_legend_names_the_refresh_key() {
         let app = App::new(empty_report(), "/root".into());

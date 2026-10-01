@@ -388,11 +388,30 @@ fn footer_legend(width: usize, blocked: bool, markable: bool, trash: bool) -> St
         }
         parts.push(TAIL);
         let line = parts.join("  ");
-        if line.chars().count() <= width || n == 0 {
+        if legend_cells(&line) <= width {
             return line;
+        }
+        if n == 0 {
+            // Even the two fixed hints do not fit: show whole hints only,
+            // never a hint cut mid-word.
+            let help_quit = format!("{}  {TAIL}", all_items[all_items.len() - 1]);
+            for cand in [help_quit.as_str(), TAIL] {
+                if legend_cells(cand) <= width {
+                    return cand.to_string();
+                }
+            }
+            return String::new();
         }
         n -= 1;
     }
+}
+
+/// Cells a legend line may take on a terminal. Glyphs outside ASCII (the
+/// `⌫` and the arrows) are East Asian ambiguous or font-dependent, so each
+/// is counted as two cells: a line that fits by this count fits however the
+/// terminal draws them, and a hint is dropped whole rather than cut.
+fn legend_cells(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
 /// Rows the status region always takes: what is happening, or what just
