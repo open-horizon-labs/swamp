@@ -671,3 +671,417 @@ fn usage_doc_states_the_bounds_the_code_uses() {
             .contains("hf_enrich = false")
     );
 }
+
+// ---------------------------------------------------------------------
+// Adversarial audit (audit/v080-g7). Each test names the failure it
+// demonstrates; a FAILING test here is a must-fix finding.
+// ---------------------------------------------------------------------
+
+fn one_repo(root: &Path, folder: &str, files: &[(&str, Vec<u8>)]) -> PathBuf {
+    let r = root.join(folder);
+    fs::create_dir_all(r.join("blobs")).unwrap();
+    fs::create_dir_all(r.join("refs")).unwrap();
+    let snap = r.join("snapshots").join(REV1);
+    fs::create_dir_all(&snap).unwrap();
+    fs::write(r.join("refs/main"), REV1).unwrap();
+    for (i, (name, body)) in files.iter().enumerate() {
+        let blob = format!("b{i}");
+        fs::write(r.join("blobs").join(&blob), body).unwrap();
+        if let Some(parent) = Path::new(name).parent() {
+            fs::create_dir_all(snap.join(parent)).unwrap();
+        }
+        let depth = name.matches('/').count();
+        let up = "../".repeat(2 + depth);
+        symlink(format!("{up}blobs/{blob}"), snap.join(name)).unwrap();
+    }
+    r
+}
+
+fn field<'a>(u: &'a NestedArtifact, key: &str) -> Option<&'a str> {
+    ev(u, FIELD_EVIDENCE)
+        .into_iter()
+        .find_map(|f| f.strip_prefix(&format!("{key}: ")))
+}
+
+/// ADV-1 (must-fix). A model sharded into 17 safetensors files: the
+/// adapter reads 16 headers (MAX_WEIGHT_HEADERS) and still states the
+/// sum of those 16 as `params` "exact". 17 shards of one parameter each
+/// must give 17 or no exact count; it gives 16.
+#[test]
+fn adv_params_over_more_shards_than_the_header_cap_is_not_exact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let files: Vec<(String, Vec<u8>)> = (1..=17)
+        .map(|i| {
+            (
+                format!("model-{i:05}-of-00017.safetensors"),
+                st_header(&[("w", "BF16", &[1])]),
+            )
+        })
+        .collect();
+    let files: Vec<(&str, Vec<u8>)> = files.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+    one_repo(&root, "models--org--big", &files);
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let u = unit(&units, "models--org--big");
+    let p = field(u, "params");
+    assert!(
+        p.is_none() || p == Some("17"),
+        "params {p:?} stated exact from 16 of 17 shards: {:?}",
+        ev(u, FIELD_EVIDENCE)
+    );
+}
+
+/// ADV-2 (must-fix). Mistral-style repos ship the same weights twice:
+/// `consolidated.safetensors` and `model-0000N-of-0000M.safetensors`.
+/// Summing every safetensors header in the snapshot doubles the count
+/// and labels it "exact".
+#[test]
+fn adv_params_are_not_summed_across_duplicate_weight_formats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    one_repo(
+        &root,
+        "models--mistralai--m",
+        &[
+            (
+                "consolidated.safetensors",
+                st_header(&[("w", "BF16", &[100, 10])]),
+            ),
+            (
+                "model-00001-of-00002.safetensors",
+                st_header(&[("a", "BF16", &[50, 10])]),
+            ),
+            (
+                "model-00002-of-00002.safetensors",
+                st_header(&[("b", "BF16", &[50, 10])]),
+            ),
+        ],
+    );
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let u = unit(&units, "models--mistralai--m");
+    assert_ne!(
+        field(u, "params"),
+        Some("2000"),
+        "the same 1000 parameters counted twice and called exact: {:?}",
+        ev(u, FIELD_EVIDENCE)
+    );
+}
+
+/// ADV-3 (must-fix). A repo's `blobs/` that is itself a symlink out of
+/// the cache. `list_links` (read_dir) and `lstat` follow a symlinked
+/// *parent*, and `fs_gate::read::open_regular` follows symlinks (no
+/// O_NOFOLLOW), so a snapshot link `README.md -> ../../blobs/secret`
+/// reads a file outside the hub and shows its text as the model card.
+#[test]
+fn adv_a_symlinked_repo_blobs_dir_is_never_read_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret"), "TOPSECRET private text\n").unwrap();
+    let r = root.join("models--org--evil");
+    fs::create_dir_all(r.join("refs")).unwrap();
+    fs::create_dir_all(r.join("snapshots").join(REV1)).unwrap();
+    fs::write(r.join("refs/main"), REV1).unwrap();
+    symlink(&outside, r.join("blobs")).unwrap();
+    symlink(
+        "../../blobs/secret",
+        r.join("snapshots").join(REV1).join("README.md"),
+    )
+    .unwrap();
+    let (units, w) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let t = text_of(unit(&units, "models--org--evil"));
+    assert!(!t.contains("TOPSECRET"), "read outside the cache: {t}");
+    assert_eq!(
+        w.header_bytes_read, 40,
+        "opened a file outside the cache (40 = the ref)"
+    );
+}
+
+/// ADV-4 (must-fix). A sub-folder of the hub's shared `blobs/` that is a
+/// symlink out of the cache: the lexical check passes
+/// (`hub/blobs/ab/x` starts with `hub/blobs`), `lstat` follows the
+/// symlinked parent, and the outside file's bytes are charged to the
+/// repo, so the units no longer sum to the store.
+#[test]
+fn adv_a_symlinked_shared_blob_subdir_is_not_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("big"), vec![9u8; 200_000]).unwrap();
+    fs::create_dir_all(root.join("blobs")).unwrap();
+    symlink(&outside, root.join("blobs/ab")).unwrap();
+    let r = root.join("models--org--x");
+    fs::create_dir_all(r.join("blobs")).unwrap();
+    symlink("../../blobs/ab/big", r.join("blobs/hb")).unwrap();
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let store_total = folded(&root).get(&root).unwrap().allocated_total;
+    let sum: u64 = units
+        .iter()
+        .filter(|u| u.path != root)
+        .map(|u| u.bytes)
+        .sum();
+    assert_eq!(
+        sum, store_total,
+        "bytes outside the cache counted: {units:#?}"
+    );
+}
+
+/// ADV-5. A link inside a repo's own `blobs/` to a sibling blob is put in
+/// `shared` and charged again on top of the folder's walked total.
+#[test]
+fn adv_a_link_between_a_repos_own_blobs_is_counted_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let r = one_repo(
+        &root,
+        "models--org--y",
+        &[("model.safetensors", st_header(&[("w", "F32", &[4])]))],
+    );
+    symlink("b0", r.join("blobs/alias")).unwrap();
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let store_total = folded(&root).get(&root).unwrap().allocated_total;
+    let sum: u64 = units
+        .iter()
+        .filter(|u| u.path != root)
+        .map(|u| u.bytes)
+        .sum();
+    assert_eq!(sum, store_total, "{units:#?}");
+}
+
+/// ADV-6. Ollama `blobs/` as a symlink out of the store: listed and
+/// statted through, charged to the models, while the walk counted
+/// nothing there.
+#[test]
+fn adv_a_symlinked_ollama_blobs_dir_is_not_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("models");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join(digest('a').replacen(':', "-", 1)),
+        vec![7u8; 100_000],
+    )
+    .unwrap();
+    let lib = root.join("manifests/registry.ollama.ai/library/m");
+    fs::create_dir_all(&lib).unwrap();
+    symlink(&outside, root.join("blobs")).unwrap();
+    fs::write(
+        lib.join("latest"),
+        format!(
+            r#"{{"config":{{"mediaType":"c","digest":"{}","size":1}},"layers":[{{"mediaType":"application/vnd.ollama.image.model","digest":"{}","size":100000}}]}}"#,
+            digest('c'),
+            digest('a')
+        ),
+    )
+    .unwrap();
+    let (units, _) = identify(BuildStoreKind::OllamaModels, &root, &CardCache::default());
+    let m = unit(&units, "latest");
+    assert_eq!(
+        m.bytes, 0,
+        "bytes outside the store charged to a model: {m:?}"
+    );
+}
+
+/// ADV-7. A repo folder name with a right-to-left override reaches the
+/// unit's package name and consequence unstripped (folder names come
+/// from the disk, not from swamp).
+#[test]
+fn adv_bidi_in_a_repo_folder_name_is_stripped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    one_repo(
+        &root,
+        "models--org--a\u{202E}gpj.exe",
+        &[("config.json", br#"{"model_type":"x"}"#.to_vec())],
+    );
+    let (units, _) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    let rows = model_rows(&root, &units, 2_000_000_000);
+    let json = serde_json::to_string(&rows).unwrap();
+    assert!(!json.contains('\u{202E}'), "{json}");
+}
+
+/// ADV-8. A malformed Ollama manifest is not cached, so every pass
+/// re-reads it and spends one unit of the 64-parse budget on it: 64
+/// broken manifests starve every new model of its read, forever.
+#[test]
+fn adv_malformed_manifests_do_not_starve_the_parse_budget() {
+    let o = ollama_fixture();
+    let lib = o.root.join("manifests/registry.ollama.ai/library");
+    for i in 0..model_cards::NEW_PARSES_PER_PASS {
+        fs::create_dir_all(lib.join(format!("aa{i:03}"))).unwrap();
+        fs::write(lib.join(format!("aa{i:03}/latest")), "{ nope").unwrap();
+    }
+    let cards = CardCache::default();
+    let _ = identify(BuildStoreKind::OllamaModels, &o.root, &cards);
+    let mut prev = cards.retained(&|_| false);
+    for _ in 0..3 {
+        let c = CardCache::from_entries(prev, model_cards::NEW_PARSES_PER_PASS);
+        let (units, _) = identify(BuildStoreKind::OllamaModels, &o.root, &c);
+        prev = c.retained(&|_| false);
+        let q = unit(&units, "0.6b");
+        if !ev(q, CARD_EVIDENCE).is_empty() {
+            return;
+        }
+    }
+    panic!("after 4 passes qwen3:0.6b is still 'not yet read'");
+}
+
+/// ADV-9 (documents, passes). The manifest fingerprint is size + mtime
+/// (seconds and nanoseconds). A content swap that keeps both (only
+/// `touch -r` or a deliberate restore does) is answered from the cache.
+/// Ollama writes manifests by rename with a fresh mtime, so this does
+/// not arise in practice.
+#[test]
+fn adv_same_size_same_mtime_manifest_swap_is_answered_from_the_cache() {
+    let o = ollama_fixture();
+    let cards = CardCache::default();
+    let _ = identify(BuildStoreKind::OllamaModels, &o.root, &cards);
+    let p = o
+        .root
+        .join("manifests/registry.ollama.ai/library/qwen3/0.6b");
+    let before = fs::metadata(&p).unwrap().modified().unwrap();
+    let text = fs::read_to_string(&p)
+        .unwrap()
+        .replace(&digest('c'), &digest('d'));
+    fs::write(&p, text).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+    let warm = CardCache::from_entries(cards.retained(&|_| false), 64);
+    let (units, _) = identify(BuildStoreKind::OllamaModels, &o.root, &warm);
+    assert_eq!(
+        ev(unit(&units, "0.6b"), CARD_EVIDENCE),
+        vec!["qwen3 · 751.63M params · Q4_K_M"]
+    );
+}
+
+/// ADV-10 (holds?). A snapshot dir that is a symlink, and a snapshot
+/// link to a FIFO in blobs: neither opened (a FIFO read would hang).
+#[test]
+fn adv_fifo_blob_and_symlinked_snapshot_are_not_opened() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("hub");
+    let r = one_repo(&root, "models--org--f", &[]);
+    let fifo = r.join("blobs/fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    symlink(
+        "../../blobs/fifo",
+        r.join("snapshots").join(REV1).join("README.md"),
+    )
+    .unwrap();
+    symlink("/etc", r.join("snapshots").join(REV2)).unwrap();
+    let t0 = std::time::Instant::now();
+    let (units, w) = identify(BuildStoreKind::HuggingFaceHub, &root, &CardCache::default());
+    assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+    // The 40-byte ref only; the FIFO is never opened.
+    assert_eq!(w.header_bytes_read, 40);
+    assert!(!text_of(unit(&units, "models--org--f")).contains("22222222"));
+}
+
+/// ADV-11 (holds?). Hostile GGUF and YAML bounded in time.
+#[test]
+fn adv_hostile_gguf_and_front_matter_are_bounded() {
+    // GGUF: 2^20 kvs claimed, each an array of 2^60 nested arrays.
+    let mut b = b"GGUF".to_vec();
+    b.extend(3u32.to_le_bytes());
+    b.extend(u64::MAX.to_le_bytes());
+    b.extend(u64::MAX.to_le_bytes());
+    for _ in 0..40_000 {
+        b.extend(1u64.to_le_bytes());
+        b.extend(b"k");
+        b.extend(9u32.to_le_bytes());
+        b.extend(9u32.to_le_bytes());
+        b.extend((1u64 << 60).to_le_bytes());
+    }
+    b.truncate(model_cards::MAX_CARD_READ);
+    let t0 = std::time::Instant::now();
+    let _ = model_cards::gguf_header(&b);
+    // Billion laughs and a 1 MiB single line.
+    let mut y = String::from("---\nlicense: &a [x,x,x,x,x,x,x,x,x]\n");
+    for i in 0..20_000 {
+        y.push_str(&format!("tags: &l{i} [*a,*a,*a,*a,*a,*a,*a]\n"));
+    }
+    y.push_str(&"z".repeat(1 << 20));
+    y.push_str("\n---\n");
+    y.push_str(&"p".repeat(1 << 20));
+    let f = model_cards::front_matter(&y);
+    let p = model_cards::first_paragraph(&y);
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert!(f.values().all(|v| v.chars().count() <= 120));
+    assert!(p.is_none_or(|p| p.chars().count() <= model_cards::MAX_CARD_TEXT_CHARS));
+}
+
+/// ADV-12 (must-fix; seen on the real binary). `model_rows` matches
+/// `i.path.starts_with(unit_path)`, so the parent unit `~/.cache/huggingface`
+/// (770 KB, local-state) lists the hub's 968.9 MB models as its own in
+/// `report --view reclaim`. Rows belong to the store they were identified
+/// in (the container), not every ancestor. `attach_last_read` has the same
+/// prefix match.
+#[test]
+fn adv_model_rows_belong_to_their_store_not_its_ancestors() {
+    let h = hub_fixture(README);
+    let (units, _) = identify(
+        BuildStoreKind::HuggingFaceHub,
+        &h.root,
+        &CardCache::default(),
+    );
+    let parent = h.root.parent().unwrap();
+    let rows = model_rows(parent, &units, 2_000_000_000);
+    assert!(
+        rows.is_empty(),
+        "the HF_HOME unit lists the hub's models: {}",
+        rows.len()
+    );
+}
+
+/// ADV-13 (real APFS behaviour). The own-read correction lives only in
+/// the card cache. When that cache is gone (a store-format reset deletes
+/// `model_cards.parquet`, or any re-parse), the next pass records
+/// swamp's *previous* header read as `read_atime_before`, and reports
+/// swamp's own read as the weight file's last read.
+#[test]
+fn adv_after_a_cache_reset_swamps_earlier_read_is_not_shown_as_use() {
+    let h = hub_fixture(README);
+    let w = h.root.join("models--org--a/blobs/h-weights");
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&w)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_accessed(old))
+        .unwrap();
+    let _ = identify(
+        BuildStoreKind::HuggingFaceHub,
+        &h.root,
+        &CardCache::default(),
+    );
+    let moved = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&w).unwrap().atime()
+    };
+    assert!(
+        moved > 1_500_000_000,
+        "APFS did not move atime on swamp's read; test is moot"
+    );
+    // Cache gone (store-format reset): a fresh pass.
+    let (units, _) = identify(
+        BuildStoreKind::HuggingFaceHub,
+        &h.root,
+        &CardCache::default(),
+    );
+    let lr = ev(unit(&units, "models--org--a"), LAST_READ_EVIDENCE)[0];
+    assert!(
+        !lr.starts_with(&format!("{moved}|")),
+        "swamp's own earlier read shown as the last read: {lr}"
+    );
+}
