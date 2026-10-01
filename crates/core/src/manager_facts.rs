@@ -190,6 +190,19 @@ impl ManagerProbe {
         }
     }
 
+    /// Whether this probe's answer is a function of the units the manager
+    /// owns and nothing else, so an unchanged set of units can be answered
+    /// from the stored rows. Homebrew's dry-run autoremove and its
+    /// installed-on-request list read the install receipts inside the
+    /// Cellar and Caskroom; mise's prune and global list also read
+    /// configuration files outside its units, so they are always asked.
+    fn answer_follows_units(self) -> bool {
+        matches!(
+            self,
+            ManagerProbe::BrewAutoremoveDryRun | ManagerProbe::BrewInstalledOnRequest
+        )
+    }
+
     /// The command this probe runs, when it runs one.
     fn invocation(self) -> Option<ManagerCommand> {
         match self {
@@ -764,8 +777,77 @@ fn settings_probe(
 /// One scheduled pass: every manager that owns a measured unit is asked
 /// its own read-only questions, each bounded by [`PROBE_TIMEOUT`] and the
 /// pass by [`PASS_BUDGET`]. The result replaces the stored table whole.
-pub fn collect(units: &[ExternalUnit], runner: &dyn ProbeRunner, now: u64) -> Vec<ManagerFact> {
-    collect_within(units, runner, now, PASS_BUDGET, PROBE_TIMEOUT)
+///
+/// A probe whose answer follows the manager's measured units alone
+/// ([`ManagerProbe::answer_follows_units`]) is answered from the stored
+/// rows when those units measure exactly as they did when it last ran
+/// (same paths, bytes and newest modification) and that answer is less
+/// than [`REUSE_LIMIT_SECS`] old: the stored rows keep the time the
+/// manager actually said it. Anything else asks the manager again.
+pub fn collect(
+    units: &[ExternalUnit],
+    runner: &dyn ProbeRunner,
+    now: u64,
+    store_dir: &std::path::Path,
+) -> Vec<ManagerFact> {
+    let previous = crate::growth::read_manager_fact_table(store_dir);
+    collect_inner(
+        units,
+        runner,
+        now,
+        PASS_BUDGET,
+        PROBE_TIMEOUT,
+        &previous.facts,
+        Some(store_dir),
+    )
+}
+
+/// The longest a stored manager answer is reused while its units are
+/// unchanged, in seconds: a backstop for anything the manager reads that
+/// is not one of the units (its own code, after a self-update).
+pub const REUSE_LIMIT_SECS: u64 = 24 * 3600;
+
+/// The pass row's record of the units each manager's stored answers were
+/// taken over: `inputs <manager>=<hex>` per manager, space separated.
+fn inputs_text(fingerprints: &[(String, u64)]) -> String {
+    let parts: Vec<String> = fingerprints
+        .iter()
+        .map(|(m, h)| format!("{m}={h:016x}"))
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("inputs {}", parts.join(" "))
+    }
+}
+
+fn stored_fingerprint(previous: &[ManagerFact], manager: &str) -> Option<String> {
+    let pass = previous.iter().find(|f| f.kind == FactKind::Pass)?;
+    let rest = pass.text.strip_prefix("inputs ")?;
+    rest.split(' ')
+        .find_map(|p| p.strip_prefix(&format!("{manager}=")).map(str::to_string))
+}
+
+/// FNV-1a over the manager's units, sorted: stable across runs and
+/// builds, so an unchanged machine yields the same value every pass.
+fn units_fingerprint(units: &[(std::path::PathBuf, u64, u64, bool)]) -> u64 {
+    let mut sorted: Vec<_> = units.to_vec();
+    sorted.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    for (path, bytes, mtime_max, hardlinked) in sorted {
+        eat(path.as_os_str().as_encoded_bytes());
+        eat(&[0]);
+        eat(&bytes.to_le_bytes());
+        eat(&mtime_max.to_le_bytes());
+        eat(&[u8::from(hardlinked)]);
+    }
+    h
 }
 
 /// [`collect`] with the pass budget and the per-command limit named, so
@@ -776,6 +858,18 @@ pub fn collect_within(
     now: u64,
     budget: Duration,
     probe_timeout: Duration,
+) -> Vec<ManagerFact> {
+    collect_inner(units, runner, now, budget, probe_timeout, &[], None)
+}
+
+fn collect_inner(
+    units: &[ExternalUnit],
+    runner: &dyn ProbeRunner,
+    now: u64,
+    budget: Duration,
+    probe_timeout: Duration,
+    previous: &[ManagerFact],
+    store_dir: Option<&std::path::Path>,
 ) -> Vec<ManagerFact> {
     let registry = Registry::with_builtins();
     let started = Instant::now();
@@ -806,8 +900,54 @@ pub fn collect_within(
             None => managers.push((decl, decl.probes.to_vec())),
         }
     }
+    let mut fingerprints: Vec<(String, u64)> = Vec::new();
     for (decl, probes) in &managers {
+        // What the manager's answers are read from, as this pass
+        // measured it: each unit whole, or the subfolders its decl names.
+        let mut owned: Vec<(std::path::PathBuf, u64, u64, bool)> = Vec::new();
+        let mut keyable = store_dir.is_some();
+        for detector in registry.detectors() {
+            let Some(d) = detector.manager().filter(|m| m.manager == decl.manager) else {
+                continue;
+            };
+            for u in units.iter().filter(|u| u.detector_id == detector.id()) {
+                if d.reads.is_empty() {
+                    owned.push((u.path.clone(), u.bytes, u.mtime_max, u.hardlinked));
+                    continue;
+                }
+                let totals =
+                    store_dir.and_then(|dir| crate::folded_measurement::child_totals(dir, &u.path));
+                let Some(totals) = totals else {
+                    keyable = false;
+                    continue;
+                };
+                for name in d.reads {
+                    let (bytes, mtime) = totals.get(*name).copied().unwrap_or((u64::MAX, 0));
+                    owned.push((u.path.join(name), bytes, mtime, false));
+                }
+            }
+        }
+        let fingerprint = units_fingerprint(&owned);
+        let unchanged = keyable
+            && stored_fingerprint(previous, decl.manager)
+                .is_some_and(|h| h == format!("{fingerprint:016x}"));
+        fingerprints.push((decl.manager.to_string(), fingerprint));
         for probe in probes {
+            if unchanged && probe.answer_follows_units() {
+                let stored: Vec<&ManagerFact> = previous
+                    .iter()
+                    .filter(|f| f.manager == decl.manager && f.probe == probe.label())
+                    .collect();
+                let fresh_checked = stored.iter().any(|f| {
+                    f.kind == FactKind::Checked
+                        && now.saturating_sub(f.observed_at) < REUSE_LIMIT_SECS
+                });
+                let failed = stored.iter().any(|f| f.kind == FactKind::NotObserved);
+                if fresh_checked && !failed {
+                    rows.extend(stored.into_iter().cloned());
+                    continue;
+                }
+            }
             let remaining = budget.saturating_sub(started.elapsed());
             let Some(command) = probe.invocation() else {
                 rows.extend(settings_probe(runner, &registry, decl, units, now));
@@ -834,12 +974,148 @@ pub fn collect_within(
             ));
         }
     }
+    if let Some(pass) = rows.iter_mut().find(|r| r.kind == FactKind::Pass) {
+        pass.text = inputs_text(&fingerprints);
+    }
     rows
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CountingRunner {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ProbeRunner for CountingRunner {
+        fn run(&self, command: ManagerCommand, _timeout: Duration) -> std::io::Result<RunOutput> {
+            self.calls.lock().unwrap().push(command.args().join(" "));
+            let stdout: &[u8] = match command {
+                ManagerCommand::BrewListInstalledOnRequest => b"foo\n",
+                _ => b"",
+            };
+            Ok(RunOutput {
+                code: Some(0),
+                stdout: stdout.to_vec(),
+                stderr: Vec::new(),
+                timed_out: false,
+                truncated: false,
+            })
+        }
+        fn read_settings(&self, _path: &std::path::Path) -> Result<String, String> {
+            Err("none".into())
+        }
+    }
+
+    fn brew_unit(path: &std::path::Path) -> ExternalUnit {
+        ExternalUnit {
+            detector_id: crate::locations::homebrew::HOMEBREW_OTHER_DETECTOR_ID.to_string(),
+            detector_name: "Homebrew (other)".to_string(),
+            category: crate::locations::StorageCategory::Installation,
+            provenance: crate::locations::Provenance::BuiltinConvention,
+            path: path.to_path_buf(),
+            bytes: 1,
+            mtime_max: 0,
+            hardlinked: false,
+            growth_bytes: None,
+            regrowth_count: 0,
+            observed_at: 1,
+            consumers: Vec::new(),
+            note: None,
+            evidence: Vec::new(),
+            bytes_counted_elsewhere: 0,
+            overlap_count: 0,
+            last_used: crate::last_used::LastUsed::default(),
+            children: Vec::new(),
+        }
+    }
+
+    /// Pass-through manager answers (#181). Tempting wrong patches: (1)
+    /// key Homebrew's stored answer on its whole unit, so a service log
+    /// under `var` re-asks brew every pass; (2) key it on the unit's path
+    /// alone (or never expire it), so a formula installed or a receipt
+    /// rewritten keeps the old answer. Unchanged receipts: no brew call
+    /// and identical rows; a changed receipt or an answer past the reuse
+    /// limit: brew is asked again.
+    #[test]
+    fn brew_answers_are_reused_only_while_its_receipts_measure_the_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let prefix = std::fs::canonicalize(tmp.path()).unwrap().join("prefix");
+        let noise = crate::fs_gate::settle::noise;
+        for (rel, len) in [
+            ("Cellar/foo/1.0/INSTALL_RECEIPT.json", 4096),
+            ("Caskroom/bar/1/x", 4096),
+            ("var/log/a.log", 4096),
+        ] {
+            let p = prefix.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, noise(len)).unwrap();
+        }
+        crate::fs_gate::settle::settle();
+        let none = crate::fs_events::EventCoverage::untrusted();
+        // The unit as an observation reports it: the prefix's own total.
+        let measure_prefix = |at: u64| {
+            let f = crate::folded_measurement::measure(Some(store.path()), &prefix, &[], at, &none);
+            let mut u = brew_unit(&prefix);
+            u.bytes = f.bytes;
+            u.mtime_max = f.mtime_max;
+            vec![u]
+        };
+        let runner = CountingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let calls = || runner.calls.lock().unwrap().len();
+        let pass = |units: &[ExternalUnit], now: u64, previous: &[ManagerFact]| {
+            collect_inner(
+                units,
+                &runner,
+                now,
+                PASS_BUDGET,
+                PROBE_TIMEOUT,
+                previous,
+                Some(store.path()),
+            )
+        };
+        let brew_rows = |rows: &[ManagerFact]| -> Vec<ManagerFact> {
+            rows.iter()
+                .filter(|r| r.manager == "brew")
+                .cloned()
+                .collect()
+        };
+
+        let units = measure_prefix(1_000);
+        let first = pass(&units, 1_000, &[]);
+        assert_eq!(calls(), 2, "both brew probes run on a first pass");
+
+        let second = pass(&units, 2_000, &first);
+        assert_eq!(calls(), 2, "an unchanged Cellar asks brew nothing");
+        assert_eq!(brew_rows(&second), brew_rows(&first));
+
+        // A log under `var` is not a receipt, though the unit grew.
+        std::fs::write(prefix.join("var/log/b.log"), noise(8192)).unwrap();
+        crate::fs_gate::settle::settle();
+        let units = measure_prefix(2_500);
+        assert!(units[0].bytes > 12_288);
+        let third = pass(&units, 3_000, &second);
+        assert_eq!(calls(), 2, "a service log re-asked brew");
+
+        // A receipt rewritten in place: asked again.
+        std::fs::write(
+            prefix.join("Cellar/foo/1.0/INSTALL_RECEIPT.json"),
+            noise(8192),
+        )
+        .unwrap();
+        crate::fs_gate::settle::settle();
+        let units = measure_prefix(3_500);
+        let fourth = pass(&units, 4_000, &third);
+        assert_eq!(calls(), 4, "a changed receipt kept the old answer");
+
+        // Past the reuse limit: asked again even though nothing changed.
+        let _ = pass(&units, 4_000 + REUSE_LIMIT_SECS + 1, &fourth);
+        assert_eq!(calls(), 6);
+    }
 
     #[test]
     fn brew_autoremove_lists_names_under_the_managers_own_header() {

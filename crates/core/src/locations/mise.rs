@@ -89,6 +89,7 @@ impl Detector for MiseDetector {
             subject: SubjectShape::NameBeforeAt,
             catch_all: true,
             probes: &[ManagerProbe::MisePruneDryRun, ManagerProbe::MiseGlobalTools],
+            reads: &[],
         })
     }
 

@@ -299,6 +299,7 @@ fn record_manager_reports(
         units,
         &swamp_core::manager_facts::SystemProbeRunner,
         now,
+        store_dir,
     );
     let not_observed = facts
         .iter()

@@ -1248,6 +1248,14 @@ pub struct ManagerDecl {
     /// for everything of the manager's not measured on its own.
     pub catch_all: bool,
     pub probes: &'static [ManagerProbe],
+    /// The subfolders of this detector's unit the manager's answers are
+    /// read from, when that is not the whole unit (empty: the whole
+    /// unit). An observation reuses a stored answer only while these
+    /// measure exactly as they did when the manager gave it
+    /// (`manager_facts::collect`): Homebrew's remainder unit is the whole
+    /// prefix, whose `var` changes all the time, while its answers come
+    /// from the receipts under `Cellar` and `Caskroom`.
+    pub reads: &'static [&'static str],
 }
 
 /// One fact source under the registry. Copy `builtin.rs` or

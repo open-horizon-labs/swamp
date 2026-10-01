@@ -73,6 +73,7 @@ impl Detector for RustupDetector {
             subject: SubjectShape::ChannelWithHostTriple,
             catch_all: true,
             probes: &[ManagerProbe::SettingsDefault],
+            reads: &[],
         })
     }
 
