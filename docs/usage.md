@@ -1011,8 +1011,12 @@ disk view "accounted" = developer storage + remainder units
 
 `swamp report --view reclaim` prints the first line after its headline, and its
 JSON carries `headline_relation` (`holds`); `headline.disk.accounted_check`
-carries the second. They differ when the ledger's accounted rows came from a
-different observation than the units read here, or when a unit's row was lost.
+carries the second. They differ when units on another volume are counted here but listed
+apart by the ledger, when worktrees outside the declared roots count under projects
+but not in the ledger's declared rows, when the ledger's accounted rows were measured
+at another time than the units read here, or when a unit's row was lost. The line
+names the other-volume bytes and the unexplained rest as numbers, and mentions the
+measurement time only when the two times differ.
 Whenever they differ the report prints a plain line (`disk view check: the
 ledger's accounted bytes (X) differ from developer storage plus the remainder units
 (Y) by Z`) and the Disk view repeats it on its Accounted row. (A same-path
