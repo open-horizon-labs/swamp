@@ -295,12 +295,16 @@ fn record_manager_reports(
     units: &[swamp_core::external::ExternalUnit],
     now: u64,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     let facts = swamp_core::manager_facts::collect(
         units,
         &swamp_core::manager_facts::SystemProbeRunner,
         now,
         store_dir,
     );
+    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        eprintln!("[trace] manager reports: {:?}", started.elapsed());
+    }
     let not_observed = facts
         .iter()
         .filter(|f| f.kind == swamp_core::manager_facts::FactKind::NotObserved)
