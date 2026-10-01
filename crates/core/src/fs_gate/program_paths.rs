@@ -1,32 +1,39 @@
-//! Where an allow-listed program is found, and what environment its
-//! child gets. One facility for every spawn that has been migrated to it
-//! (the package managers today; the rest under #199, and the tool-managed
-//! removal of #177 reuses it as is).
+//! Where every allow-listed program is found, and what environment its
+//! child gets (#199). The one facility for every spawn: the package
+//! managers, git, gh, docker, the system tools, and tool-managed removal
+//! (#177).
 //!
-//! The rules, for a program with a candidate list:
+//! The rules:
 //!
-//! * **Absolute path from a fixed list.** The executable is the first
-//!   candidate that is a regular file. The inherited `PATH` is never
-//!   consulted, so a `brew` or `mise` placed earlier on it (a shim, a
-//!   wrapper, a hostile checkout's `bin`) is never what swamp runs. None
-//!   present is `NotFound`, the same "not installed" a missing binary was.
-//! * **Environment from scratch.** The child starts with an empty
-//!   environment and gets only: a `PATH` of the program's own directory
-//!   plus `/usr/bin:/bin`, `HOME`, `NO_COLOR=1`, `LC_ALL=C`, pagers off and
-//!   Homebrew's auto-update, analytics, cleanup and hints off. The one
-//!   variables passed through are mise's own directory settings
-//!   (`MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`,
-//!   `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
-//!   `XDG_CACHE_HOME`): the same ones the mise detector honors, so the
-//!   probe describes the store the unit measures. Nothing else of
-//!   `HOMEBREW_*`, `MISE_*` or `RUSTUP_*` in swamp's own environment
-//!   reaches the child.
-//! * **A fixed working directory** (`/`): a manager that resolves local
-//!   configuration up the tree (mise) answers the same wherever swamp was
-//!   started.
-//!
-//! A program with no candidate list keeps its old behavior (its
-//! `Program::executable`, the inherited environment) until it is migrated.
+//! * **Absolute path from a fixed list** ([`candidates`], per program and
+//!   platform). The first candidate that exists is used or refused, never
+//!   skipped for a later one. The inherited `PATH` is never consulted, so
+//!   a program placed earlier on it (a shim, a wrapper, a hostile
+//!   checkout's `bin`) is never what swamp runs. None present is
+//!   `NotFound`: "not available", the same as not installed.
+//! * **Checked file and directories.** The real file is an executable
+//!   owned by the user or root, not group- or world-writable; the
+//!   candidate's directory, every directory a symlink chain passes
+//!   through, and the real file's directory are owned by the user or root,
+//!   not world-writable, and group-writable only for the macOS `admin`
+//!   group.
+//! * **Home-relative candidates** (`~/.local/bin`, `~/.cargo/bin`,
+//!   `~/.docker/bin`, `~/.orbstack/bin`) come after every system location:
+//!   any process the user runs can plant a file there, so they are used
+//!   only when no system location has the program, which is about the
+//!   trust the user's own `PATH` gives them.
+//! * **Environment.** `brew` and `mise` start from an empty environment
+//!   and get only: a `PATH` of the program's own directory plus
+//!   `/usr/bin:/bin`, `HOME`, `NO_COLOR=1`, `LC_ALL=C`, pagers off and
+//!   Homebrew's auto-update, analytics, cleanup and hints off, plus mise's
+//!   own directory settings (the ones the mise detector honors). Every
+//!   other program ([`Plan::Fixed`]) keeps the inherited environment for
+//!   its credentials and contexts, minus loader injection and exec hooks
+//!   ([`removed_for_fixed`]: `DYLD_*`, `LD_*`, `GIT_CONFIG*`, `GIT_SSH*`,
+//!   `GIT_EXEC_PATH`, ...) and with a fixed `PATH` ([`fixed_path`]).
+//! * **A fixed working directory** (`/`) for the managers: a manager that
+//!   resolves local configuration up the tree (mise) answers the same
+//!   wherever swamp was started.
 //!
 //! **Tests.** With swamp-core's `testing` feature (never in a shipped
 //! build graph) `SWAMP_TEST_PROGRAM_DIR` names a directory holding fakes:
