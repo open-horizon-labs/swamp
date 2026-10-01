@@ -132,6 +132,7 @@ These choices make repeated observation practical without promising a fixed late
 
 ## Documentation
 
+- [Why swamp exists](docs/WHY.md): the problem, the design rules and what 0.8.0 adds, each with its evidence.
 - [Usage](docs/usage.md): commands, keys, configuration, build details, and recovery.
 - [Architecture](docs/architecture.md): observation, folded measurement, history, and extension contracts.
 - [Platforms](docs/platform.md): macOS and Linux support and limitations.
