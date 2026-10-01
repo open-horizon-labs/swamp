@@ -499,13 +499,13 @@ pub(crate) struct UnitLastUse {
     pub(crate) children: BTreeMap<String, LastUsed>,
 }
 
+/// Time spent in [`probe`] this process, in microseconds (SWAMP_TRACE).
+pub(crate) static PROBE_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Evaluates every source a detector declared for the unit at `path`.
 /// Sources that live outside the folded walk (Xcode's plist) contribute
 /// nothing here; `consumer_wiring` folds them in where its plist reads
 /// already happen.
-/// Time spent in [`probe`] this process, in microseconds (SWAMP_TRACE).
-pub(crate) static PROBE_MICROS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub(crate) fn probe(path: &Path, sources: &[LastUseSource], now: u64) -> UnitLastUse {
     let started = std::time::Instant::now();
     let out = probe_inner(path, sources, now);

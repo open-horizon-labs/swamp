@@ -2618,3 +2618,26 @@ fn rev2_resumed_facts_an_hour_old_are_asked_again() {
     );
     assert_eq!(s.probe.calls.load(Ordering::SeqCst), before + 3);
 }
+
+/// #181 review round 2 (a). Tempting wrong patch: reuse the cycle's
+/// Data-volume size on resume and present the estimate as of this run.
+/// When the estimate rests on a reused figure, the account says when
+/// diskutil gave it.
+#[test]
+fn an_estimate_from_reused_facts_says_when_they_were_taken() {
+    let s = rev2_open_cycle(good_probe());
+    let _ = s.run_at(NOW + 120, true, Duration::from_millis(2_000), Some(0));
+    let a = read_account(s.store.path()).unwrap().unwrap();
+    if a.not_measured.estimate_bytes.is_some() && !a.complete {
+        let notes = a.notes.join(" | ");
+        assert!(
+            notes.contains("the estimate uses the Data volume size diskutil gave"),
+            "{notes}"
+        );
+    } else {
+        panic!(
+            "precondition: an open cycle with an estimate ({:?})",
+            a.not_measured.estimate_bytes
+        );
+    }
+}

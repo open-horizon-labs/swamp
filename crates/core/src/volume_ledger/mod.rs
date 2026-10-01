@@ -752,6 +752,21 @@ pub fn account(rows: &[Row], meta: &VolumeMetaRow) -> Account {
             "the Data volume's own size is not known (diskutil), so what could not be read is not estimated; any gap is in the unattributed line".to_string(),
         );
     }
+    // A resumed cycle reuses the facts its first run took (up to an hour,
+    // `system::FACTS_REUSE_SECS`): the estimate says whose size it used.
+    if estimate.is_some()
+        && let Some(info_at) = live
+            .iter()
+            .filter(|r| r.method.starts_with("diskutil info"))
+            .map(|r| r.measured_at)
+            .max()
+        && info_at < meta.measured_at
+    {
+        notes.push(format!(
+            "the estimate uses the Data volume size diskutil gave {}",
+            age_text(info_at, meta.measured_at)
+        ));
+    }
     if !meta.complete {
         notes.push(
             "the pass has not finished: rows keep the time they were measured, and the next observe continues".to_string(),

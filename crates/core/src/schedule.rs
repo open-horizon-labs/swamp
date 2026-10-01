@@ -1347,7 +1347,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("observe.log");
         fs::write(&log, vec![b'x'; store::LOG_CAP_BYTES as usize]).unwrap();
-        fs::create_dir_all(tmp.path().join("observe.log.1/keep")).unwrap();
+        // With three rotated files the shift `.2 -> .3` is the step that
+        // fails: `.3` is a non-empty directory, which no rename replaces.
+        fs::write(tmp.path().join("observe.log.1"), b"one\n").unwrap();
+        fs::write(tmp.path().join("observe.log.2"), b"two\n").unwrap();
+        fs::create_dir_all(tmp.path().join("observe.log.3/keep")).unwrap();
         let outcome = RunOutcome {
             observed_at: 7,
             wall_ms: 1,
@@ -1359,6 +1363,10 @@ mod tests {
         let r = append_log(&log, &outcome);
         assert!(r.is_ok(), "{r:?}");
         assert_eq!(last_log_outcome(&log).map(|o| o.observed_at), Some(7));
+        assert!(
+            fs::metadata(&log).unwrap().len() > store::LOG_CAP_BYTES,
+            "the rotation was meant to fail and the append go to the full log"
+        );
     }
 
     /// Audit round 2. The test above no longer reaches a failed rotation:
