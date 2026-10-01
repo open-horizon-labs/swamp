@@ -41,6 +41,9 @@ pub fn cmd_observe(
     enrich: bool,
     volume: bool,
 ) -> Result<()> {
+    // Resolved before any work: a misconfigured test (the hermeticity
+    // guard) fails here, not after a whole observation.
+    let log = log_file();
     let config = load_config(&store_dir);
     let timeout = Duration::from_secs(config.observe_timeout_sec.max(1));
     let retention_days = config.retention_days;
@@ -172,7 +175,7 @@ pub fn cmd_observe(
                 mode,
                 outcome: "ok".to_string(),
             };
-            append_log(&log_file(), &outcome)?;
+            append_log(&log, &outcome)?;
             write_last_run(&store_dir, &outcome)?;
             // The observation is over: its lock is released before the volume
             // pass starts, and the pass takes its own (`volume-pass.lock`), so
@@ -193,7 +196,7 @@ pub fn cmd_observe(
                 mode: "full".to_string(),
                 outcome: format!("error({e})"),
             };
-            append_log(&log_file(), &outcome)?;
+            append_log(&log, &outcome)?;
             let _ = write_last_run(&store_dir, &outcome);
             drop(lock);
             eprintln!("observe failed: {e}");
@@ -213,7 +216,7 @@ pub fn cmd_observe(
             if let Some((_, path, _)) = &stuck {
                 let _ = schedule::record_stalled(&store_dir, path, now);
             }
-            append_log(&log_file(), &outcome)?;
+            append_log(&log, &outcome)?;
             let _ = write_last_run(&store_dir, &outcome);
             // Released before exiting so the next observation (and the
             // TUI's first-run scan) is not left waiting on a pass that is

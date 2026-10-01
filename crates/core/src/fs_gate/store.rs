@@ -79,7 +79,9 @@ impl StoreDir {
             return StoreDir(PathBuf::from(dir));
         }
         let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-        StoreDir(PathBuf::from(home).join(".local/share/swamp"))
+        let dir = PathBuf::from(home).join(".local/share/swamp");
+        refuse_real_user_default("store", &dir, Resolve::Write);
+        StoreDir(dir)
     }
 
     /// A store at `dir`. Refused unless `dir` is absolute and, when
@@ -987,14 +989,67 @@ impl TextFile<'_> {
     }
 }
 
+/// Test-only hermeticity guard. A test process (`cfg(test)`, or a swamp
+/// child spawned with `SWAMP_TEST_MODE=1`) that falls through to a per-user
+/// default location (store, observe log, LaunchAgents directory) outside the
+/// system temp directory panics instead of touching it: test fixtures once
+/// appended thousands of lines to the maintainer's real
+/// `~/Library/Logs/swamp/observe.log`. A test points `HOME` at a temp dir or
+/// sets the override (`SWAMP_DIR`, `SWAMP_LOG_DIR`,
+/// `SWAMP_LAUNCH_AGENTS_DIR`). A normal run never sets `SWAMP_TEST_MODE`, so
+/// the guard costs it one environment read. `Resolve::Display` (a path
+/// only printed, as in `schedule status`) is checked in a test child but
+/// not in an in-process unit test, which may render the default; every
+/// write site uses `Resolve::Write`.
+pub(crate) fn refuse_real_user_default(what: &str, path: &Path, resolve: Resolve) {
+    let child = std::env::var_os("SWAMP_TEST_MODE").is_some_and(|v| v == "1");
+    let test_mode = child || (cfg!(test) && resolve == Resolve::Write);
+    if test_mode && !is_under_temp(path) {
+        panic!(
+            "test hermeticity: the {what} resolved to the real user location {}; \
+             set HOME to a temp dir or the override variable",
+            path.display()
+        );
+    }
+}
+
+/// Why a default location is being resolved; see
+/// [`refuse_real_user_default`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resolve {
+    Display,
+    Write,
+}
+
+fn is_under_temp(path: &Path) -> bool {
+    let tmp = std::env::temp_dir();
+    let mut roots = vec![tmp.clone()];
+    if let Ok(c) = std::fs::canonicalize(&tmp) {
+        roots.push(c);
+    }
+    for fixed in [
+        "/tmp",
+        "/private/tmp",
+        "/var/folders",
+        "/private/var/folders",
+    ] {
+        roots.push(PathBuf::from(fixed));
+    }
+    path.is_absolute() && roots.iter().any(|r| path.starts_with(r))
+}
+
 /// `<LaunchAgents>/<label>.plist`: `$SWAMP_LAUNCH_AGENTS_DIR` (tests), else
 /// `~/Library/LaunchAgents`. The only plist swamp writes, removes or hands
 /// to `launchctl`.
 pub fn launch_agent_plist() -> io::Result<PathBuf> {
     let dir = match std::env::var_os("SWAMP_LAUNCH_AGENTS_DIR") {
         Some(v) => PathBuf::from(v),
-        None => PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
-            .join("Library/LaunchAgents"),
+        None => {
+            let dir = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| ".".into()))
+                .join("Library/LaunchAgents");
+            refuse_real_user_default("LaunchAgents directory", &dir, Resolve::Write);
+            dir
+        }
     };
     Ok(dir.join(format!("{}.plist", crate::schedule::LABEL)))
 }
@@ -1082,6 +1137,7 @@ impl LogFile<'_> {
 /// Appends one line and syncs it.
 pub fn append_line(file: LogFile<'_>, line: &str) -> io::Result<()> {
     let path = file.path()?;
+    refuse_real_user_default("observe log", &path, Resolve::Write);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

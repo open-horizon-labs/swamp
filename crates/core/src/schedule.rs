@@ -20,10 +20,6 @@ pub const LABEL: &str = "com.open-horizon-labs.swamp.observe";
 /// Default watchdog budget for one `observe` invocation, in seconds.
 pub const DEFAULT_OBSERVE_TIMEOUT_SECS: u64 = 1800;
 
-fn env_dir(var: &str, default: PathBuf) -> PathBuf {
-    std::env::var(var).map(PathBuf::from).unwrap_or(default)
-}
-
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
 }
@@ -44,7 +40,14 @@ pub fn plist_path() -> PathBuf {
 /// store lives) or cache. A relative `$XDG_STATE_HOME` is ignored, as
 /// the spec requires. `SWAMP_LOG_DIR` still overrides both.
 pub fn log_dir() -> PathBuf {
-    env_dir("SWAMP_LOG_DIR", default_log_dir())
+    match std::env::var_os("SWAMP_LOG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => {
+            let dir = default_log_dir();
+            store::refuse_real_user_default("observe log directory", &dir, store::Resolve::Display);
+            dir
+        }
+    }
 }
 
 fn default_log_dir() -> PathBuf {
@@ -1213,10 +1216,21 @@ mod tests {
     #[test]
     fn the_log_directory_follows_this_platforms_convention_and_the_override_wins() {
         let _guard = ENV_LOCK.lock().unwrap();
+        // HOME points at a temp dir: the hermeticity guard refuses a test
+        // that derives the real user's log directory.
+        let fake_home = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME");
         unsafe {
             std::env::remove_var("SWAMP_LOG_DIR");
+            std::env::set_var("HOME", fake_home.path());
         }
         let derived = log_dir();
+        unsafe {
+            match &real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
         let text = derived.display().to_string();
         match crate::platform::Os::current() {
             crate::platform::Os::MacOs => {
@@ -1256,13 +1270,20 @@ mod tests {
     #[test]
     fn a_relative_xdg_state_home_is_ignored() {
         let _guard = ENV_LOCK.lock().unwrap();
+        let fake_home = tempfile::tempdir().unwrap();
+        let real_home = std::env::var_os("HOME");
         unsafe {
             std::env::remove_var("SWAMP_LOG_DIR");
             std::env::set_var("XDG_STATE_HOME", "relative/state");
+            std::env::set_var("HOME", fake_home.path());
         }
         let derived = log_dir();
         unsafe {
             std::env::remove_var("XDG_STATE_HOME");
+            match &real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
         }
         assert!(
             derived.is_absolute(),

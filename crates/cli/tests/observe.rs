@@ -43,6 +43,8 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
         .arg("observe")
         .arg(root.path())
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run observe");
@@ -98,6 +100,8 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         .arg("observe")
         .args(&root_paths)
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("initial two-root observe");
@@ -114,6 +118,8 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         .args(["protect", "add"])
         .arg(root_paths[0].join("keep.txt"))
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("add retained protection");
@@ -145,6 +151,8 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         .arg("report")
         .args(&root_paths)
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("read compatible prior scope history");
@@ -206,6 +214,8 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         .arg("observe")
         .arg(&root_paths[0])
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("narrow upgrade observe");
@@ -284,6 +294,8 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         .arg("--json")
         .arg(&root_paths[0])
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("report after automatic generation reset");
@@ -297,6 +309,8 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
         .arg("observe")
         .arg(&root_paths[0])
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .env("SWAMP_FSEVENTS_MIN_INTERVAL_SECS", "0")
         .output()
@@ -330,6 +344,8 @@ fn missing_root_does_not_run_store_housekeeping() {
         .arg("observe")
         .arg(missing_parent.path().join("not-created"))
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("observe missing root");
@@ -359,6 +375,8 @@ fn current_generation_narrow_observe_keeps_other_explicit_root_history() {
         .arg("observe")
         .args(&paths)
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .unwrap();
@@ -378,6 +396,8 @@ fn current_generation_narrow_observe_keeps_other_explicit_root_history() {
         .arg("observe")
         .arg(&paths[0])
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .unwrap();
@@ -396,6 +416,8 @@ fn current_generation_narrow_observe_keeps_other_explicit_root_history() {
         .arg("--json")
         .args(&paths)
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .unwrap();
@@ -445,6 +467,8 @@ fn observe_handles_a_closed_stdout_pipe_after_persisting() {
         .arg("observe")
         .arg(root.path())
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::piped())
@@ -493,6 +517,8 @@ fn observe_summary_line_reports_the_real_reason_not_the_no_store_fallback() {
             .arg("observe")
             .arg(root.path())
             .env("SWAMP_DIR", store.path())
+            .env("SWAMP_LOG_DIR", store.path())
+            .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
             .env("SWAMP_TEST_MODE", "1")
             // The second pass must land inside the FSEvents too-soon floor
             // to report `too_soon`. At the default 3 s floor it did not
@@ -581,6 +607,9 @@ fn observe_with_no_roots_uses_the_configured_default_scope() {
     let output = Command::new(bin())
         .arg("observe")
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
         .env("HOME", home.path())
         // The Linux built-in defaults include `$XDG_CACHE_HOME`, which
         // an inherited environment would point at the *real* user's
@@ -654,6 +683,8 @@ fn observe_with_empty_scope_fails_visibly_never_falls_back_to_cwd() {
     let output = Command::new(bin())
         .arg("observe")
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("HOME", home.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
@@ -683,6 +714,9 @@ fn observe_with_invalid_scan_config_fails_visibly() {
     let output = Command::new(bin())
         .arg("observe")
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
         .env("HOME", home.path())
         .output()
         .expect("run observe with invalid config");
@@ -731,7 +765,10 @@ fn observe_with_gh_shim(extra: &[&str]) -> String {
         .args(extra)
         .arg(root.path())
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
+        .env("SWAMP_TEST_ALLOW_GH", "1")
         .env("PATH", path)
         .output()
         .expect("run observe");
@@ -795,6 +832,8 @@ fn observe_aborts_before_touching_the_store_when_free_space_is_below_the_minimum
         .arg("observe")
         .arg(root.path())
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run observe");
@@ -827,6 +866,8 @@ fn min_free_bytes_zero_disables_the_check() {
         .arg("observe")
         .arg(root.path())
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run observe");
@@ -848,6 +889,8 @@ fn observe_enrich_conflicts_with_no_enrich() {
     let output = Command::new(bin())
         .args(["observe", "--enrich", "--no-enrich"])
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run observe");

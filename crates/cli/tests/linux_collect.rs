@@ -28,6 +28,9 @@ fn start_collector(root: &Path, store: &Path, home: &Path) -> Collector {
         .arg("collect")
         .arg(root)
         .env("SWAMP_DIR", store)
+        .env("SWAMP_LOG_DIR", store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store)
+        .env("SWAMP_TEST_MODE", "1")
         .env("HOME", home)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -65,6 +68,8 @@ fn observe(root: &Path, store: &Path, home: &Path, full: bool) -> String {
     }
     let out = cmd
         .env("SWAMP_DIR", store)
+        .env("SWAMP_LOG_DIR", store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store)
         .env("HOME", home)
         .env("SWAMP_TEST_MODE", "1")
         .output()
@@ -204,6 +209,9 @@ fn a_collector_makes_observations_incremental_only_while_it_runs() {
         .args(["collect", "--status", "--json"])
         .arg(&root)
         .env("SWAMP_DIR", &store)
+        .env("SWAMP_LOG_DIR", &store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", &store)
+        .env("SWAMP_TEST_MODE", "1")
         .env("HOME", &home)
         .output()
         .unwrap();
@@ -226,6 +234,9 @@ fn a_second_collector_for_the_same_root_refuses() {
         .arg("collect")
         .arg(&root)
         .env("SWAMP_DIR", &store)
+        .env("SWAMP_LOG_DIR", &store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", &store)
+        .env("SWAMP_TEST_MODE", "1")
         .env("HOME", &home)
         .output()
         .unwrap();

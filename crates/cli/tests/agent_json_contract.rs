@@ -26,6 +26,8 @@ fn run(store: &Path, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .env("SWAMP_DIR", store)
+        .env("SWAMP_LOG_DIR", store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store)
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run swamp")

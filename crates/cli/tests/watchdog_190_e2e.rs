@@ -29,6 +29,7 @@ fn observe(
         .env("SWAMP_DIR", store)
         .env("HOME", home)
         .env("SWAMP_LOG_DIR", logs)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", logs)
         .env("SWAMP_TEST_MODE", "1")
         .env("SWAMP_TEST_PARK_DIR", park)
         .output()
@@ -113,9 +114,11 @@ fn stored(
     swamp_core::work_counters::record_spawn();
     let out = Command::new(env!("CARGO_BIN_EXE_swamp"))
         .args(["report", "--json"])
+        .env("SWAMP_TEST_MODE", "1")
         .env("SWAMP_DIR", store)
         .env("HOME", home)
         .env("SWAMP_LOG_DIR", logs)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", logs)
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

@@ -368,6 +368,13 @@ fn parse_repo_batch(json_text: &str, branches: &[String]) -> Result<RepoBatchRes
 
 impl GithubResponder for GhCliResponder {
     fn is_ready(&self) -> Result<(), String> {
+        // A test run reaches `gh` only when it put a shim on PATH and said
+        // so (`SWAMP_TEST_ALLOW_GH=1`): the real `gh` would use the
+        // developer's GitHub login and write its own state under HOME.
+        let env_is = |k: &str| std::env::var_os(k).is_some_and(|v| v == "1");
+        if env_is("SWAMP_TEST_MODE") && !env_is("SWAMP_TEST_ALLOW_GH") {
+            return Err("gh is not run under SWAMP_TEST_MODE".to_string());
+        }
         bounded_gh(&["auth".to_string(), "status".to_string()]).map(|_| ())
     }
 

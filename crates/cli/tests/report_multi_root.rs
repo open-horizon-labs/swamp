@@ -15,6 +15,8 @@ fn observe(store: &std::path::Path, home: Option<&std::path::Path>, extra_env: &
     let mut cmd = Command::new(bin());
     cmd.arg("observe")
         .env("SWAMP_DIR", store)
+        .env("SWAMP_LOG_DIR", store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store)
         .env("SWAMP_TEST_MODE", "1");
     if let Some(home) = home {
         cmd.env("HOME", home);
@@ -77,6 +79,8 @@ fn report_with_no_explicit_root_observes_every_configured_root() {
         .arg("report")
         .arg("--json")
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("HOME", home.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
@@ -124,6 +128,8 @@ fn report_surfaces_a_missing_configured_root_as_coverage_not_silence() {
         .arg("report")
         .arg("--json")
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("HOME", home.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
@@ -176,6 +182,8 @@ fn report_view_external_lists_detector_resolved_units() {
         .arg("external")
         .arg("--json")
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("HOME", home.path())
         .env("CARGO_HOME", &cargo_home)
         .env("SWAMP_TEST_MODE", "1")
@@ -211,6 +219,8 @@ fn report_with_an_explicit_root_stays_single_root_and_has_no_scope_coverage_key(
         .arg("observe")
         .arg(root.path())
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .status()
         .expect("run observe with an explicit root");
@@ -220,6 +230,8 @@ fn report_with_an_explicit_root_stays_single_root_and_has_no_scope_coverage_key(
         .arg(root.path())
         .arg("--json")
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
         .env("SWAMP_TEST_MODE", "1")
         .output()
         .expect("run report with an explicit root");

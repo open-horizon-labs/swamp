@@ -18,6 +18,9 @@ fn run(store: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .env("SWAMP_DIR", store)
+        .env("SWAMP_LOG_DIR", store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store)
+        .env("SWAMP_TEST_MODE", "1")
         .env("HOME", home)
         .output()
         .expect("run swamp")
@@ -27,7 +30,12 @@ fn run(store: &Path, home: &Path, args: &[&str]) -> Output {
 /// it before a `report`/`report --json` call can read anything back.
 fn observe(store: &Path, home: &Path, extra_env: &[(&str, &str)]) {
     let mut cmd = Command::new(bin());
-    cmd.arg("observe").env("SWAMP_DIR", store).env("HOME", home);
+    cmd.arg("observe")
+        .env("SWAMP_DIR", store)
+        .env("SWAMP_LOG_DIR", store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store)
+        .env("SWAMP_TEST_MODE", "1")
+        .env("HOME", home);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -162,6 +170,9 @@ fn external_only_scope_reports_zero_projects_consistently() {
     let text_out = Command::new(bin())
         .args(["report"])
         .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
         .env("HOME", home.path())
         .env("CARGO_HOME", &cargo_home)
         .output()
@@ -181,6 +192,9 @@ fn external_only_scope_reports_zero_projects_consistently() {
         &Command::new(bin())
             .args(["report", "--view", "worktrees", "--json"])
             .env("SWAMP_DIR", store.path())
+            .env("SWAMP_LOG_DIR", store.path())
+            .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
+            .env("SWAMP_TEST_MODE", "1")
             .env("HOME", home.path())
             .env("CARGO_HOME", &cargo_home)
             .output()
@@ -198,6 +212,9 @@ fn external_only_scope_reports_zero_projects_consistently() {
         &Command::new(bin())
             .args(["report", "--view", "external", "--json"])
             .env("SWAMP_DIR", store.path())
+            .env("SWAMP_LOG_DIR", store.path())
+            .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
+            .env("SWAMP_TEST_MODE", "1")
             .env("HOME", home.path())
             .env("CARGO_HOME", &cargo_home)
             .output()

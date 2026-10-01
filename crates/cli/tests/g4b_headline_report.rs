@@ -20,6 +20,8 @@ fn swamp(store: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .env("SWAMP_DIR", store)
+        .env("SWAMP_LOG_DIR", store)
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store)
         .env("HOME", home)
         .env("SWAMP_TEST_MODE", "1")
         .output()
