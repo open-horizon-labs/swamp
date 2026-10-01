@@ -2,7 +2,7 @@
 //! `swamp report`, in the TUI and above the Reclaim view.
 //!
 //! ```text
-//! Developer storage: 224.1GB across 61 locations (57.4% of used)
+//! Developer storage: 224.1GB across 40 projects and 77 tool locations (50.4% of used)
 //! ```
 //!
 //! **What it counts** (documented in `docs/usage.md` and `DESIGN.md`):
@@ -621,7 +621,7 @@ fn measured(
 }
 
 impl Headline {
-    /// `Developer storage: 224.1GB across 61 locations (57.4% of used)`.
+    /// `Developer storage: 224.1GB across 40 projects and 77 tool locations (50.4% of used)`.
     fn first_line(&self) -> String {
         let projects = self
             .categories

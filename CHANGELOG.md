@@ -79,12 +79,14 @@ observations, not general performance guarantees. See the README for current use
   iOS 26.2 here, or "not measured"), what reinstalling costs, and "No Trash recovery: this
   cannot be undone". `Y` on the confirm (never Enter, and only after it has been on screen
   for a second) checks everything again and runs exactly that command:
-  `mise -C / uninstall <tool>@<version>` or `xcrun simctl runtime delete <UUID>`. swamp refuses, with the reason and the next step,
-  a version a config requests (mise's own dry run does not check this for the global
-  config), a version mise's prune does not list, a simulator that is not shut down (simctl would
-  shut it down and delete anyway), files held open or an open-file check that could not finish,
-  a dry run it cannot read, and anything that changed since the confirm. Devices on a
-  runtime are named on the confirm. Each removal is one `tool-remove` ledger row with the
+  `mise -C / uninstall <tool>@<version>` or `xcrun simctl runtime delete <UUID>`. The manager's
+  advisory facts are warnings on the confirm, not refusals: a version a config requests
+  (mise's own dry run does not check this for the global config), a version mise's prune
+  does not list, a simulator that is not shut down (simctl would shut it down and delete
+  anyway), files held open, and an open-file check that could not finish. swamp refuses
+  only for correctness, with the reason and the next step: a dry run it cannot read, and
+  anything that changed since the confirm (`Y` re-reviews first and refuses if any fact or
+  warning differs). Devices on a runtime are named on the confirm. Each removal is one `tool-remove` ledger row with the
   command, the manager's version and what the re-read showed; there is no CLI for it.
   `brew uninstall` and `rustup toolchain uninstall` have no dry run and stay facts only.
 - **`swamp report --view reclaim`, and a Reclaim view in the TUI (`v`).** One row per
@@ -135,9 +137,9 @@ observations, not general performance guarantees. See the README for current use
   once, under the project.
 - **The overlap note is data now.** The bytes a unit holds that are counted under
   project worktrees are two fields (`bytes_counted_elsewhere`, `overlap_count`) in
-  `--json` and the store; the sentence is rendered from them. This is a store-format
-  change: the first `swamp observe` after upgrading rebuilds the derived tables
-  (configuration, protection, notes and the ledger are kept).
+  `--json` and the store; the sentence is rendered from them. The two fields live in a
+  new sibling table, so the store format is unchanged (see the next bullet); the first
+  `swamp observe` after upgrading fills them.
 - **Upgrading does not reset your store, and two installs can share it.** The store
   format stays as v0.7.5 has it. Everything v0.8.0 adds lives in new tables that v0.7.5
   ignores, and `external_units` keeps its v0.7.5 columns. Checked with the real v0.7.5
