@@ -723,10 +723,28 @@ mod tests {
 
     #[test]
     fn a_relative_home_yields_no_home_candidates() {
-        for home in ["", "relative/home"] {
-            let c = candidates(Program::Mise, Path::new(home));
-            assert!(c.iter().all(|p| p.is_absolute()), "{c:?}");
-            assert_eq!(c.len(), 2);
+        // The expectation comes from the lists themselves (they differ per
+        // platform): a relative HOME yields exactly the candidates an
+        // absolute HOME yields minus the ones under that HOME.
+        let abs = Path::new("/home-for-test");
+        for p in Program::ALL {
+            let system: Vec<PathBuf> = candidates(*p, abs)
+                .into_iter()
+                .filter(|c| !c.starts_with(abs))
+                .collect();
+            for home in ["", "relative/home"] {
+                let c = candidates(*p, Path::new(home));
+                assert!(c.iter().all(|c| c.is_absolute()), "{p:?}: {c:?}");
+                assert_eq!(c, system, "{p:?} with HOME={home:?}");
+            }
+        }
+        // And the property is not vacuous: mise and docker do have
+        // home-based candidates when HOME is absolute.
+        for p in [Program::Mise, Program::Docker] {
+            assert!(
+                candidates(p, abs).iter().any(|c| c.starts_with(abs)),
+                "{p:?}"
+            );
         }
     }
 
