@@ -11,8 +11,10 @@ pub fn sweep_second_external_pass(
     swamp_core::external::observe_external(
         &pass,
         scope,
+        &[],
         Some(store),
         true,
+        false,
         0,
         30,
         3600,
