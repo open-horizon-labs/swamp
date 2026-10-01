@@ -72,68 +72,74 @@ pub struct Scrubbed {
 /// places; a location that does not exist on a platform simply never
 /// matches.
 pub(super) fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
-    let p = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let name = program.binary();
+    let at =
+        |dirs: &[&str]| -> Vec<PathBuf> { dirs.iter().map(|d| Path::new(d).join(name)).collect() };
+    // Linux: the system directories in search order, then Linuxbrew.
+    const LINUX_SYSTEM: &[&str] = &["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"];
+    const LINUXBREW: &str = "/home/linuxbrew/.linuxbrew/bin";
+    let linux_with_brew = || {
+        let mut c = at(LINUX_SYSTEM);
+        c.push(Path::new(LINUXBREW).join(name));
+        c
+    };
     let mac = cfg!(target_os = "macos");
+    // A relative HOME would name these against the working directory,
+    // which is whatever checkout swamp was started in.
+    let in_home = |c: &mut Vec<PathBuf>, rels: &[&str]| {
+        if home.is_absolute() {
+            c.extend(rels.iter().map(|r| home.join(r)));
+        }
+    };
     match program {
-        Program::Brew => p(&[
-            "/opt/homebrew/bin/brew",
-            "/usr/local/bin/brew",
-            "/home/linuxbrew/.linuxbrew/bin/brew",
-        ]),
-        Program::Mise => {
-            let mut c = p(&["/opt/homebrew/bin/mise", "/usr/local/bin/mise"]);
-            // A relative HOME would name these against the working
-            // directory, which is whatever checkout swamp was started in.
-            if home.is_absolute() {
-                c.push(home.join(".local/bin/mise"));
-                c.push(home.join(".cargo/bin/mise"));
-            }
+        Program::Brew if mac => at(&["/opt/homebrew/bin", "/usr/local/bin"]),
+        Program::Brew => {
+            let mut c = vec![Path::new(LINUXBREW).join(name)];
+            c.extend(at(&["/usr/local/bin", "/usr/bin"]));
             c
         }
-        Program::Xcrun => p(&["/usr/bin/xcrun"]),
-        Program::Plutil => p(&["/usr/bin/plutil"]),
-        Program::Defaults => p(&["/usr/bin/defaults"]),
-        Program::Diskutil => p(&["/usr/sbin/diskutil"]),
-        Program::Tmutil => p(&["/usr/bin/tmutil"]),
-        Program::Launchctl => p(&["/bin/launchctl"]),
-        Program::Lsof if mac => p(&["/usr/sbin/lsof"]),
-        Program::Lsof => p(&["/usr/bin/lsof", "/usr/sbin/lsof", "/bin/lsof"]),
-        Program::Du if mac => p(&["/usr/bin/du"]),
-        Program::Du => p(&["/usr/bin/du", "/bin/du"]),
-        Program::Df if mac => p(&["/bin/df"]),
-        Program::Df => p(&["/usr/bin/df", "/bin/df"]),
-        Program::Id => p(&["/usr/bin/id", "/bin/id"]),
-        Program::Kill if mac => p(&["/bin/kill"]),
-        Program::Kill => p(&["/usr/bin/kill", "/bin/kill"]),
-        Program::Systemctl => p(&["/usr/bin/systemctl", "/bin/systemctl"]),
-        Program::Loginctl => p(&["/usr/bin/loginctl", "/bin/loginctl"]),
+        Program::Mise => {
+            let mut c = if mac {
+                at(&["/opt/homebrew/bin", "/usr/local/bin"])
+            } else {
+                let mut c = at(&["/usr/local/bin", "/usr/bin"]);
+                c.push(Path::new(LINUXBREW).join(name));
+                c
+            };
+            in_home(&mut c, &[".local/bin/mise", ".cargo/bin/mise"]);
+            c
+        }
+        // macOS-only programs: Apple's own locations.
+        Program::Xcrun | Program::Plutil | Program::Defaults | Program::Tmutil => at(&["/usr/bin"]),
+        Program::Diskutil => at(&["/usr/sbin"]),
+        Program::Launchctl => at(&["/bin"]),
+        Program::Lsof if mac => at(&["/usr/sbin"]),
+        Program::Du | Program::Id if mac => at(&["/usr/bin"]),
+        Program::Df | Program::Kill if mac => at(&["/bin"]),
+        // Linux-only programs, and the system tools on Linux.
+        Program::Systemctl
+        | Program::Loginctl
+        | Program::Lsof
+        | Program::Du
+        | Program::Df
+        | Program::Id
+        | Program::Kill => at(LINUX_SYSTEM),
         // Homebrew's first on macOS: it is the git/gh the user installed
-        // and runs; `/usr/bin/git` is Apple's (or the distribution's).
-        Program::Git => p(&[
-            "/opt/homebrew/bin/git",
-            "/usr/local/bin/git",
-            "/usr/bin/git",
-            "/home/linuxbrew/.linuxbrew/bin/git",
-        ]),
-        Program::Gh => p(&[
-            "/opt/homebrew/bin/gh",
-            "/usr/local/bin/gh",
-            "/usr/bin/gh",
-            "/home/linuxbrew/.linuxbrew/bin/gh",
-        ]),
+        // and runs; `/usr/bin/git` is Apple's.
+        Program::Git | Program::Gh if mac => {
+            at(&["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"])
+        }
+        Program::Git | Program::Gh => linux_with_brew(),
         // Docker Desktop and OrbStack both link `/usr/local/bin/docker`;
         // OrbStack also installs `~/.orbstack/bin`, Docker Desktop
         // `~/.docker/bin`. Linux packages install `/usr/bin/docker`.
         Program::Docker => {
-            let mut c = p(&[
-                "/usr/local/bin/docker",
-                "/opt/homebrew/bin/docker",
-                "/usr/bin/docker",
-            ]);
-            if home.is_absolute() {
-                c.push(home.join(".docker/bin/docker"));
-                c.push(home.join(".orbstack/bin/docker"));
-            }
+            let mut c = if mac {
+                at(&["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin"])
+            } else {
+                linux_with_brew()
+            };
+            in_home(&mut c, &[".docker/bin/docker", ".orbstack/bin/docker"]);
             c
         }
     }
@@ -679,6 +685,48 @@ mod tests {
             let c = candidates(*p, Path::new("/Users/x"));
             assert!(!c.is_empty(), "{p:?} has no fixed location");
             assert!(c.iter().all(|c| c.is_absolute()), "{p:?}: {c:?}");
+        }
+    }
+
+    /// Linux: the system tools are looked for in every system directory,
+    /// and git, gh and docker in Linuxbrew too, so a fleet runner's
+    /// `/usr/bin/gh` or `/home/linuxbrew/.linuxbrew/bin/git` is found.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_lists_cover_the_system_dirs_and_linuxbrew() {
+        let home = Path::new("/home/x");
+        for p in [
+            Program::Lsof,
+            Program::Du,
+            Program::Df,
+            Program::Id,
+            Program::Kill,
+            Program::Systemctl,
+            Program::Loginctl,
+            Program::Git,
+            Program::Gh,
+            Program::Docker,
+        ] {
+            let c = candidates(p, home);
+            for d in ["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"] {
+                assert!(
+                    c.contains(&Path::new(d).join(p.binary())),
+                    "{p:?} misses {d}"
+                );
+            }
+        }
+        for p in [
+            Program::Git,
+            Program::Gh,
+            Program::Docker,
+            Program::Brew,
+            Program::Mise,
+        ] {
+            let c = candidates(p, home);
+            assert!(
+                c.contains(&Path::new("/home/linuxbrew/.linuxbrew/bin").join(p.binary())),
+                "{p:?} misses Linuxbrew"
+            );
         }
     }
 
