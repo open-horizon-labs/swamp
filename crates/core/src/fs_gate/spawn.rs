@@ -109,7 +109,8 @@ impl Program {
         Program::Tmutil,
     ];
 
-    /// The executable name looked up on `PATH`.
+    /// The program's file name (its fixed locations are
+    /// `fs_gate::program_paths::candidates`; `PATH` is never searched).
     pub fn binary(self) -> &'static str {
         match self {
             Program::Lsof => "lsof",
@@ -130,18 +131,6 @@ impl Program {
             Program::Loginctl => "loginctl",
             Program::Diskutil => "diskutil",
             Program::Tmutil => "tmutil",
-        }
-    }
-
-    /// What is executed. `diskutil` and `tmutil` are fixed absolute paths:
-    /// an earlier directory on `PATH` (a shim, a hostile directory) is
-    /// never the program a volume pass runs. Everything else resolves
-    /// through `PATH` as before.
-    pub fn executable(self) -> &'static str {
-        match self {
-            Program::Diskutil => "/usr/sbin/diskutil",
-            Program::Tmutil => "/usr/bin/tmutil",
-            other => other.binary(),
         }
     }
 
@@ -654,7 +643,13 @@ impl Running {
         install_cleanup_once();
         crate::work_counters::record_spawn();
         let mut command = match plan {
+            #[cfg(test)]
             super::program_paths::Plan::Inherit(exe) => Command::new(exe),
+            super::program_paths::Plan::Fixed { exe, arg0 } => {
+                let mut c = Command::new(exe);
+                c.arg0(arg0);
+                c
+            }
             super::program_paths::Plan::Scrubbed(s) => {
                 let mut c = Command::new(&s.exe);
                 c.env_clear()

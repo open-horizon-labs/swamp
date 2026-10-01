@@ -40,10 +40,19 @@ use std::path::{Path, PathBuf};
 /// How a program is started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Plan {
-    /// The program is not migrated to the scrubbed environment: it runs
-    /// as `Program::executable` says (an absolute path where one is
-    /// fixed, else a `PATH` lookup) with the inherited environment.
+    /// Unit tests of the spawn layer only: a bare name (`sh`) looked up
+    /// on `PATH`. No production spawn is planned this way (#199).
+    #[cfg(test)]
     Inherit(&'static str),
+    /// A program found at one of its fixed locations and checked like any
+    /// other (owner, mode, directory), run with the inherited environment:
+    /// `git`, `gh` and `docker` need the user's own credentials and
+    /// contexts, which a from-scratch environment would drop. Never a
+    /// `PATH` lookup (#199). `exe` is the checked, symlink-resolved file;
+    /// `arg0` is the program's own name, so a multi-call binary reached
+    /// through a link (OrbStack's `docker` -> `docker-tools`) still sees
+    /// the name it dispatches on.
+    Fixed { exe: PathBuf, arg0: &'static str },
     /// Absolute executable, a from-scratch environment and a fixed
     /// working directory.
     Scrubbed(Scrubbed),
@@ -56,20 +65,23 @@ pub struct Scrubbed {
     pub cwd: PathBuf,
 }
 
-/// The fixed locations of `program`, in order. Empty for a program that
-/// has no fixed list.
+/// The fixed locations of `program`, in order: the first that exists is
+/// the one used (and checked); none present is "not available". Never the
+/// inherited `PATH` (#199): a shim earlier on it is never what swamp runs.
+/// macOS and Linux lists differ where the programs live in different
+/// places; a location that does not exist on a platform simply never
+/// matches.
 pub(super) fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
+    let p = |v: &[&str]| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let mac = cfg!(target_os = "macos");
     match program {
-        Program::Brew => vec![
-            PathBuf::from("/opt/homebrew/bin/brew"),
-            PathBuf::from("/usr/local/bin/brew"),
-            PathBuf::from("/home/linuxbrew/.linuxbrew/bin/brew"),
-        ],
+        Program::Brew => p(&[
+            "/opt/homebrew/bin/brew",
+            "/usr/local/bin/brew",
+            "/home/linuxbrew/.linuxbrew/bin/brew",
+        ]),
         Program::Mise => {
-            let mut c = vec![
-                PathBuf::from("/opt/homebrew/bin/mise"),
-                PathBuf::from("/usr/local/bin/mise"),
-            ];
+            let mut c = p(&["/opt/homebrew/bin/mise", "/usr/local/bin/mise"]);
             // A relative HOME would name these against the working
             // directory, which is whatever checkout swamp was started in.
             if home.is_absolute() {
@@ -78,10 +90,52 @@ pub(super) fn candidates(program: Program, home: &Path) -> Vec<PathBuf> {
             }
             c
         }
-        // Tool-managed removal's simulator runtimes (#177). Not migrated for
-        // the detector's own `simctl list devices -j` yet (#199).
-        Program::Xcrun => vec![PathBuf::from("/usr/bin/xcrun")],
-        _ => Vec::new(),
+        Program::Xcrun => p(&["/usr/bin/xcrun"]),
+        Program::Plutil => p(&["/usr/bin/plutil"]),
+        Program::Defaults => p(&["/usr/bin/defaults"]),
+        Program::Diskutil => p(&["/usr/sbin/diskutil"]),
+        Program::Tmutil => p(&["/usr/bin/tmutil"]),
+        Program::Launchctl => p(&["/bin/launchctl"]),
+        Program::Lsof if mac => p(&["/usr/sbin/lsof"]),
+        Program::Lsof => p(&["/usr/bin/lsof", "/usr/sbin/lsof", "/bin/lsof"]),
+        Program::Du if mac => p(&["/usr/bin/du"]),
+        Program::Du => p(&["/usr/bin/du", "/bin/du"]),
+        Program::Df if mac => p(&["/bin/df"]),
+        Program::Df => p(&["/usr/bin/df", "/bin/df"]),
+        Program::Id => p(&["/usr/bin/id", "/bin/id"]),
+        Program::Kill if mac => p(&["/bin/kill"]),
+        Program::Kill => p(&["/usr/bin/kill", "/bin/kill"]),
+        Program::Systemctl => p(&["/usr/bin/systemctl", "/bin/systemctl"]),
+        Program::Loginctl => p(&["/usr/bin/loginctl", "/bin/loginctl"]),
+        // Homebrew's first on macOS: it is the git/gh the user installed
+        // and runs; `/usr/bin/git` is Apple's (or the distribution's).
+        Program::Git => p(&[
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+            "/usr/bin/git",
+            "/home/linuxbrew/.linuxbrew/bin/git",
+        ]),
+        Program::Gh => p(&[
+            "/opt/homebrew/bin/gh",
+            "/usr/local/bin/gh",
+            "/usr/bin/gh",
+            "/home/linuxbrew/.linuxbrew/bin/gh",
+        ]),
+        // Docker Desktop and OrbStack both link `/usr/local/bin/docker`;
+        // OrbStack also installs `~/.orbstack/bin`, Docker Desktop
+        // `~/.docker/bin`. Linux packages install `/usr/bin/docker`.
+        Program::Docker => {
+            let mut c = p(&[
+                "/usr/local/bin/docker",
+                "/opt/homebrew/bin/docker",
+                "/usr/bin/docker",
+            ]);
+            if home.is_absolute() {
+                c.push(home.join(".docker/bin/docker"));
+                c.push(home.join(".orbstack/bin/docker"));
+            }
+            c
+        }
     }
 }
 
@@ -377,12 +431,23 @@ fn developer_dir_ok(d: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// How to start `program`. `NotFound` when it is migrated and no
-/// candidate exists.
-pub fn plan(program: Program) -> io::Result<Plan> {
-    if !migrated(program) {
-        return Ok(Plan::Inherit(program.executable()));
+/// Whether `program` is present at one of its fixed locations (or, in a
+/// test build with `SWAMP_TEST_PROGRAM_DIR`, as a fake): present, not
+/// necessarily trusted or runnable.
+pub fn present(program: Program) -> bool {
+    if let Some(found) = test_override(program) {
+        return found.is_some();
     }
+    let home = std::env::var("HOME").unwrap_or_default();
+    candidates(program, Path::new(&home))
+        .iter()
+        .any(|c| std::fs::symlink_metadata(c).is_ok())
+}
+
+/// How to start `program`: its first fixed location, checked. `NotFound`
+/// ("not available") when none exists; `PermissionDenied`, naming what
+/// failed, when the first that exists is not trusted.
+pub fn plan(program: Program) -> io::Result<Plan> {
     let home = std::env::var("HOME").unwrap_or_default();
     let exe = match test_override(program) {
         Some(found) => found,
@@ -395,9 +460,18 @@ pub fn plan(program: Program) -> io::Result<Plan> {
     let Some(exe) = exe else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("{} was not found in its known locations", program.binary()),
+            format!(
+                "{} is not available: not found in its known locations (swamp does not search PATH)",
+                program.binary()
+            ),
         ));
     };
+    if !migrated(program) {
+        return Ok(Plan::Fixed {
+            exe,
+            arg0: program.binary(),
+        });
+    }
     Ok(Plan::Scrubbed(Scrubbed {
         env: scrubbed_env(program, &exe, &home),
         exe,
