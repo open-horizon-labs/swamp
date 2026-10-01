@@ -1333,6 +1333,33 @@ mod tests {
         );
     }
 
+    /// Adversarial audit (audit/v080-perf). Tempting wrong patch: make
+    /// rotation a precondition of the append (`rotate_if_full(..)?`). A
+    /// rotation that cannot happen (here `observe.log.1` is a directory;
+    /// in the field a read-only or immutable `.1`) then fails every
+    /// append, and `cmd_observe` returns the error after the observation,
+    /// before `write_last_run`: every scheduled pass reports failure
+    /// forever over a log housekeeping step. Before the cap, this append
+    /// succeeded.
+    #[test]
+    fn a_rotation_that_cannot_happen_does_not_fail_the_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("observe.log");
+        fs::write(&log, vec![b'x'; store::LOG_CAP_BYTES as usize]).unwrap();
+        fs::create_dir_all(tmp.path().join("observe.log.1/keep")).unwrap();
+        let outcome = RunOutcome {
+            observed_at: 7,
+            wall_ms: 1,
+            walked_total: 1,
+            projects: 1,
+            mode: "full".to_string(),
+            outcome: "ok".to_string(),
+        };
+        let r = append_log(&log, &outcome);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(last_log_outcome(&log).map(|o| o.observed_at), Some(7));
+    }
+
     #[test]
     fn timeout_outcome_writes_a_log_line() {
         let tmp = tempfile::tempdir().unwrap();

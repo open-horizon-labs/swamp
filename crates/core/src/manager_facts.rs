@@ -1117,6 +1117,78 @@ mod tests {
         assert_eq!(calls(), 6);
     }
 
+    /// Adversarial audit (audit/v080-perf). Tempting wrong patch: when a
+    /// named subfolder has no stored total, key on a constant
+    /// (`(u64::MAX, 0)`). A Cellar holding one folder this process cannot
+    /// list stores no total for `Cellar` (its readable siblings still get
+    /// theirs), so the fingerprint is the same constant every pass and a
+    /// receipt rewritten (a formula upgraded) keeps the old answer for
+    /// up to 24 h.
+    #[test]
+    fn a_cellar_with_an_unreadable_folder_is_never_answered_from_stored_rows() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let prefix = std::fs::canonicalize(tmp.path()).unwrap().join("prefix");
+        let noise = crate::fs_gate::settle::noise;
+        for (rel, len) in [
+            ("Cellar/foo/1.0/INSTALL_RECEIPT.json", 4096),
+            ("Caskroom/bar/1/x", 4096),
+            ("var/log/a.log", 4096),
+        ] {
+            let p = prefix.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, noise(len)).unwrap();
+        }
+        std::fs::create_dir_all(prefix.join("Cellar/locked/1.0")).unwrap();
+        std::fs::set_permissions(
+            prefix.join("Cellar/locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        crate::fs_gate::settle::settle();
+        let none = crate::fs_events::EventCoverage::untrusted();
+        let measure_prefix = |at: u64| {
+            let f = crate::folded_measurement::measure(Some(store.path()), &prefix, &[], at, &none);
+            let mut u = brew_unit(&prefix);
+            u.bytes = f.bytes;
+            u.mtime_max = f.mtime_max;
+            vec![u]
+        };
+        let runner = CountingRunner {
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let calls = || runner.calls.lock().unwrap().len();
+        let pass = |units: &[ExternalUnit], now: u64, previous: &[ManagerFact]| {
+            collect_inner(
+                units,
+                &runner,
+                now,
+                PASS_BUDGET,
+                PROBE_TIMEOUT,
+                previous,
+                Some(store.path()),
+            )
+        };
+        let units = measure_prefix(1_000);
+        let first = pass(&units, 1_000, &[]);
+        assert_eq!(calls(), 2);
+        std::fs::write(
+            prefix.join("Cellar/foo/1.0/INSTALL_RECEIPT.json"),
+            noise(8192),
+        )
+        .unwrap();
+        crate::fs_gate::settle::settle();
+        let units = measure_prefix(2_000);
+        let _ = pass(&units, 2_000, &first);
+        std::fs::set_permissions(
+            prefix.join("Cellar/locked"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(calls(), 4, "a changed receipt kept the old answer");
+    }
+
     #[test]
     fn brew_autoremove_lists_names_under_the_managers_own_header() {
         let out = b"Would autoremove 4 unneeded formulae:\nlibevent\nlibnghttp2\nunbound\nusage\n";
