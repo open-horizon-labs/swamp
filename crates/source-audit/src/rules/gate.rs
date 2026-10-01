@@ -235,6 +235,7 @@ const GROUPS: &[Group] = &[
             (Krate::Core, &["attribution"]),
             (Krate::Core, &["docker"]),
             (Krate::Core, &["github"]),
+            (Krate::Core, &["hub_api"]),
             (Krate::Core, &["actions"]),
             (Krate::Core, &["schedule"]),
             (Krate::Core, &["volume_ledger"]),

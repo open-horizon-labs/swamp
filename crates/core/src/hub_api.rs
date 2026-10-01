@@ -144,10 +144,18 @@ fn fresh(e: &CardEntry, now: u64) -> bool {
 }
 
 /// Adds the Hub's facts to every hub repo unit, from the cache when it
-/// can, fetching only on a miss and only when `enabled`. Never called
-/// by `report` or the TUI.
-pub fn enrich(units: &mut [NestedArtifact], cards: &CardCache, now: u64, enabled: bool) {
-    enrich_with(units, cards, now, enabled, &fetch)
+/// can, fetching only on a miss, only when `enabled`, and only when
+/// `may_fetch` (a CLI or scheduled observe; the TUI's refresh passes
+/// `false` and gets cached answers only). Never called by `report`.
+pub fn enrich(
+    units: &mut [NestedArtifact],
+    cards: &CardCache,
+    now: u64,
+    enabled: bool,
+    may_fetch: bool,
+) {
+    let budget = if may_fetch { MAX_FETCHES_PER_PASS } else { 0 };
+    enrich_with(units, cards, now, enabled, budget, &fetch)
 }
 
 pub(crate) fn enrich_with(
@@ -155,9 +163,9 @@ pub(crate) fn enrich_with(
     cards: &CardCache,
     now: u64,
     enabled: bool,
+    mut budget: usize,
     get: &dyn Fn(&str, &str) -> Result<String, String>,
 ) {
-    let mut budget = MAX_FETCHES_PER_PASS;
     for u in units.iter_mut() {
         if u.adapter.as_deref() != Some("model-stores") {
             continue;
@@ -225,7 +233,7 @@ pub(crate) fn enrich_with(
             b = b.evidence(
                 HUB_API_EVIDENCE,
                 format!(
-                    "not yet fetched from huggingface.co (this pass's {MAX_FETCHES_PER_PASS} requests were used; the next observe asks)"
+                    "not yet fetched from huggingface.co (a pass asks at most {MAX_FETCHES_PER_PASS} times, and only a scheduled or CLI observe asks; the next one does)"
                 ),
                 Confidence::High,
             );
@@ -347,10 +355,17 @@ mod tests {
         let calls = Cell::new(0);
         let cards = CardCache::default();
         let mut units = vec![unit()];
-        enrich_with(&mut units, &cards, 1_000, false, &|_, _| {
-            calls.set(calls.get() + 1);
-            Ok(BODY.into())
-        });
+        enrich_with(
+            &mut units,
+            &cards,
+            1_000,
+            false,
+            MAX_FETCHES_PER_PASS,
+            &|_, _| {
+                calls.set(calls.get() + 1);
+                Ok(BODY.into())
+            },
+        );
         assert_eq!(calls.get(), 0);
         assert_eq!(api(&units[0]), "off");
     }
@@ -367,7 +382,7 @@ mod tests {
         };
         let cards = CardCache::default();
         let mut units = vec![unit()];
-        enrich_with(&mut units, &cards, 1_000, true, &get);
+        enrich_with(&mut units, &cards, 1_000, true, MAX_FETCHES_PER_PASS, &get);
         assert_eq!(calls.get(), 1);
         let text = api(&units[0]);
         assert!(text.starts_with("from huggingface.co, fetched "), "{text}");
@@ -384,10 +399,24 @@ mod tests {
         let stored = cards.retained(&|_| false);
         let cards = CardCache::from_entries(stored, 0);
         let mut units = vec![unit()];
-        enrich_with(&mut units, &cards, 1_000 + MUTABLE_TTL_SECS - 1, true, &get);
+        enrich_with(
+            &mut units,
+            &cards,
+            1_000 + MUTABLE_TTL_SECS - 1,
+            true,
+            MAX_FETCHES_PER_PASS,
+            &get,
+        );
         assert_eq!(calls.get(), 1, "inside the TTL: no fetch");
         let mut units = vec![unit()];
-        enrich_with(&mut units, &cards, 1_000 + MUTABLE_TTL_SECS, true, &get);
+        enrich_with(
+            &mut units,
+            &cards,
+            1_000 + MUTABLE_TTL_SECS,
+            true,
+            MAX_FETCHES_PER_PASS,
+            &get,
+        );
         assert_eq!(calls.get(), 2, "past the TTL: one fetch");
         assert!(
             cards
@@ -407,7 +436,7 @@ mod tests {
         };
         let cards = CardCache::default();
         let mut units = vec![unit()];
-        enrich_with(&mut units, &cards, 1_000, true, &get);
+        enrich_with(&mut units, &cards, 1_000, true, MAX_FETCHES_PER_PASS, &get);
         assert!(api(&units[0]).contains("HTTP 404"));
         let mut units = vec![unit()];
         enrich_with(
@@ -415,11 +444,19 @@ mod tests {
             &cards,
             1_000 + NEGATIVE_TTL_SECS - 1,
             true,
+            MAX_FETCHES_PER_PASS,
             &get,
         );
         assert_eq!(calls.get(), 1);
         let mut units = vec![unit()];
-        enrich_with(&mut units, &cards, 1_000 + NEGATIVE_TTL_SECS, true, &get);
+        enrich_with(
+            &mut units,
+            &cards,
+            1_000 + NEGATIVE_TTL_SECS,
+            true,
+            MAX_FETCHES_PER_PASS,
+            &get,
+        );
         assert_eq!(calls.get(), 2);
     }
 
@@ -441,9 +478,30 @@ mod tests {
                 u
             })
             .collect();
-        enrich_with(&mut units, &cards, 1_000, true, &get);
+        enrich_with(&mut units, &cards, 1_000, true, MAX_FETCHES_PER_PASS, &get);
         assert_eq!(calls.get(), MAX_FETCHES_PER_PASS);
         assert!(api(&units[MAX_FETCHES_PER_PASS]).starts_with("not yet fetched"));
+    }
+
+    /// Tempting wrong patch: letting the TUI's refresh (an observe too)
+    /// fetch. With no fetch budget it answers from the cache only.
+    #[test]
+    fn a_pass_that_may_not_fetch_answers_from_the_cache_only() {
+        let calls = Cell::new(0);
+        let get = |_: &str, _: &str| {
+            calls.set(calls.get() + 1);
+            Ok(BODY.to_string())
+        };
+        let cards = CardCache::default();
+        let mut units = vec![unit()];
+        enrich_with(&mut units, &cards, 1_000, true, 0, &get);
+        assert_eq!(calls.get(), 0);
+        assert!(api(&units[0]).starts_with("not yet fetched"));
+        enrich_with(&mut units, &cards, 1_000, true, 1, &get);
+        let mut units = vec![unit()];
+        enrich_with(&mut units, &cards, 2_000, true, 0, &get);
+        assert_eq!(calls.get(), 1);
+        assert!(api(&units[0]).starts_with("from huggingface.co"));
     }
 
     /// Tempting wrong patch: building the URL from the repo id without

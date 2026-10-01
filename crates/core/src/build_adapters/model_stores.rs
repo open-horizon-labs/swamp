@@ -119,7 +119,7 @@ struct FileFact {
 }
 
 fn file_fact(ctx: &BuildCtx, path: &Path) -> Option<FileFact> {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     let m = ctx.stat(path)?;
     if !m.is_file() || m.file_type().is_symlink() {
         return None;
@@ -223,7 +223,7 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
             continue;
         }
         if e.is_symlink {
-            let Some(target) = ctx.read_link(&path) else {
+            let Some(target) = ctx.link_text(&path) else {
                 s.dangling.push(format!("blobs/{}", e.name));
                 continue;
             };
@@ -278,7 +278,7 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
                 if !e.is_symlink {
                     continue;
                 }
-                let Some(target) = ctx.read_link(&path) else {
+                let Some(target) = ctx.link_text(&path) else {
                     s.dangling.push(rel);
                     continue;
                 };
@@ -310,7 +310,7 @@ fn scan_repo(ctx: &BuildCtx, hub_root: &Path, repo: &Path) -> RepoScan {
 /// the file's size and modification time: a ref moves by being
 /// rewritten, which changes its mtime.
 fn ref_cached(ctx: &BuildCtx, hub_root: &Path, path: &Path) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     let m = ctx.stat(path)?;
     let key = format!("hf|{}|ref:{}", hub_root.display(), path.display());
     let fingerprint = format!("{CARD_FORMAT}|{}:{}:{}", m.len(), m.mtime(), m.mtime_nsec());
@@ -801,7 +801,7 @@ fn ollama_manifest_cached(
     store: &Path,
     path: &Path,
 ) -> Result<Vec<(String, String, u64)>, &'static str> {
-    use std::os::unix::fs::MetadataExt;
+    use crate::fs_gate::MetadataExt;
     let cards = ctx.cards();
     let Some(m) = ctx.stat(path) else {
         return Err("the manifest could not be read");
@@ -1018,7 +1018,7 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
                 t.name
             ));
         if let Some(m) = ctx.stat(&t.path) {
-            use std::os::unix::fs::MetadataExt;
+            use crate::fs_gate::MetadataExt;
             b = b.modified(m.mtime().max(0) as u64, TimeSource::FileModification);
         }
         if shared > 0 {
@@ -1096,6 +1096,98 @@ fn ollama(container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         units.push(b.build());
     }
     units
+}
+
+/// One model, as the Reclaim and External views and the JSON show it:
+/// what it is, which revision or tag, its size, when its weights were
+/// last read, and what getting it back costs. Built from the stored
+/// units only (a pure read).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelRow {
+    pub path: String,
+    /// The repo id (`org/name`) or `model:tag`.
+    pub name: String,
+    /// `model`, `dataset`, `space` or `ollama model`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub bytes: u64,
+    /// The one-line "what it is"; absent when the files state nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// The model card's first paragraph, sanitized and bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
+    /// Every field the files (or the Hub) stated, `key: value`.
+    pub fields: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_read_at: Option<u64>,
+    /// `Sep 29 (file access time of model.safetensors)`, or `no record`.
+    pub last_read: String,
+    pub regeneration: String,
+    /// Revisions and refs (`main -> e613edc6; 1 revision(s)`) or the tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revisions: Option<String>,
+    /// The Hub's answer, with its fetch date, or `off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub: Option<String>,
+    /// Facts about the bytes: shared blobs, incomplete downloads,
+    /// dangling links, what moving the folder leaves behind.
+    pub facts: Vec<String>,
+}
+
+/// The model rows of the store at `unit_path`, largest first.
+pub fn model_rows(unit_path: &Path, interiors: &[NestedArtifact], now: u64) -> Vec<ModelRow> {
+    let mut rows: Vec<ModelRow> = interiors
+        .iter()
+        .filter(|i| {
+            i.present
+                && i.adapter.as_deref() == Some("model-stores")
+                && i.role == ArtifactRole::SharedStoreEntry
+                && i.path.starts_with(unit_path)
+        })
+        .map(|i| {
+            let one = |src: &str| {
+                i.producer_evidence
+                    .iter()
+                    .find(|e| e.source == src)
+                    .map(|e| e.detail.clone())
+            };
+            let (last_read_at, last_read) = match last_read_of(i) {
+                Some((at, label)) => (
+                    Some(at),
+                    format!("{} ({label})", crate::last_used::format_day(at, now)),
+                ),
+                None => (None, "no record".to_string()),
+            };
+            ModelRow {
+                path: i.path.display().to_string(),
+                name: i.variant.package.clone().unwrap_or_default(),
+                kind: i.variant.configuration.clone().unwrap_or_default(),
+                revision: i.variant.version.clone(),
+                bytes: i.bytes,
+                about: one(CARD_EVIDENCE),
+                card: one(CARD_TEXT_EVIDENCE),
+                fields: i
+                    .producer_evidence
+                    .iter()
+                    .filter(|e| e.source == FIELD_EVIDENCE)
+                    .map(|e| e.detail.clone())
+                    .collect(),
+                last_read_at,
+                last_read,
+                regeneration: i
+                    .consequence
+                    .clone()
+                    .unwrap_or_else(|| "regeneration cost not established".into()),
+                revisions: one(REVISION_EVIDENCE),
+                hub: one(HUB_API_EVIDENCE),
+                facts: i.coverage.limits.clone(),
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.path.cmp(&b.path)));
+    rows
 }
 
 /// The last-read fact a unit carries, as `(epoch, label)`.

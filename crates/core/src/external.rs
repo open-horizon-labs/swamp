@@ -408,6 +408,7 @@ pub fn discover_and_measure_with_worktrees(
         worktrees,
         swamp_dir,
         observe,
+        false,
         observed_at,
         retention_days,
         since_secs,
@@ -433,6 +434,7 @@ pub fn discover_and_measure(
         &[],
         swamp_dir,
         observe,
+        false,
         observed_at,
         retention_days,
         since_secs,
@@ -470,6 +472,9 @@ pub fn observe_external(
     worktrees: &[NestedWorktree],
     swamp_dir: Option<&Path>,
     observe: bool,
+    // Whether this pass may ask the network (`crate::hub_api`): a
+    // scheduled or CLI `observe` that enriches, never the TUI's refresh.
+    fetch: bool,
     observed_at: u64,
     retention_days: u64,
     since_secs: u64,
@@ -1003,7 +1008,7 @@ pub fn observe_external(
         crate::build_adapters::identify_all(&adapters, &[], &containers, &build_ctx);
     if observe {
         let hf_enrich = swamp_dir.is_some_and(|d| crate::growth::load_config(d).hf_enrich);
-        crate::hub_api::enrich(&mut interiors, &cards, observed_at, hf_enrich);
+        crate::hub_api::enrich(&mut interiors, &cards, observed_at, hf_enrich, fetch);
     }
     if let Some(dir) = swamp_dir
         && observe

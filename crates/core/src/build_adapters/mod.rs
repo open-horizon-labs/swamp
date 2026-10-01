@@ -484,7 +484,7 @@ impl<'a> BuildCtx<'a> {
     }
 
     /// The text of one named symlink, never followed.
-    pub fn read_link(&self, path: &Path) -> Option<PathBuf> {
+    pub fn link_text(&self, path: &Path) -> Option<PathBuf> {
         crate::work_counters::record_files_statted(1);
         crate::fs_gate::read_link(path).ok()
     }

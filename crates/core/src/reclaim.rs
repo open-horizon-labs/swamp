@@ -330,6 +330,10 @@ pub struct ReclaimChild {
     pub last_used_text: Option<String>,
     /// The line a listing shows after the size.
     pub text: String,
+    /// What the folder is, when a model store's adapter read it: the
+    /// one-line card summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
     pub manager: Vec<ManagerQuote>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold: Option<Hold>,
@@ -363,6 +367,10 @@ pub struct ReclaimRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     pub children: Vec<ReclaimChild>,
+    /// A model store's models, one per repo or model:tag
+    /// (`build_adapters::model_stores::model_rows`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<crate::build_adapters::model_stores::ModelRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -986,6 +994,7 @@ fn child_of(
         last_used: c.last_used.clone(),
         last_used_text: is_entry.then(|| c.last_used.fact(now)),
         text,
+        about: None,
         manager: quotes,
         hold,
     }
@@ -1083,6 +1092,22 @@ fn unit_row(
             child_of(c, now, quotes, hold)
         })
         .collect();
+    let models = crate::build_adapters::model_stores::model_rows(&u.path, input.interiors, now);
+    let children: Vec<ReclaimChild> = children
+        .into_iter()
+        .map(|mut c| {
+            let path = u.path.join(&c.name).display().to_string();
+            if c.kind == ChildKind::Entry
+                && let Some(m) = models.iter().find(|m| m.path == path)
+            {
+                c.about = m.about.clone();
+                if let Some(a) = &m.about {
+                    c.text = format!("{} · {a}", c.text);
+                }
+            }
+            c
+        })
+        .collect();
     let regenerable = matches!(
         regeneration.class,
         RegenClass::Download | RegenClass::Rebuild
@@ -1112,6 +1137,7 @@ fn unit_row(
         held_bytes,
         note: u.display_note(),
         children,
+        models,
     }
 }
 
@@ -1142,6 +1168,7 @@ fn standalone_row(
         held_bytes: 0,
         note: None,
         children: Vec::new(),
+        models: Vec::new(),
     }
 }
 
@@ -1470,6 +1497,9 @@ pub fn render_text(view: &ReclaimView) -> String {
                     let _ = writeln!(out, "{line}");
                 }
             }
+        }
+        for line in crate::render::model_lines(&r.models) {
+            let _ = writeln!(out, "    {line}");
         }
     }
     let t = &view.totals;
