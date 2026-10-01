@@ -593,6 +593,8 @@ time stays in the JSON. A unit that declares no source shows no record.
 | Xcode DerivedData | tool-native: each project folder's `info.plist` `LastAccessedDate` | the existing bounded `plutil` read; a project shows its own, the unit the newest | yes |
 | CoreSimulator devices | not implemented | `device.plist` has no last-booted key on this machine (keys seen: `deviceType`, `isDeleted`, `isEphemeral`, `name`, `runtime`, `runtimePolicy`, `state`, `UDID`; no device was booted) | unverified |
 | Docker and OrbStack | build-cache entries keep the daemon's own `last_used` (an existing fact); images and volumes report none | the daemon | existing |
+| Hugging Face hub repos | file access time | the largest weight blob of the revision shown (the `model-stores` adapter; neither huggingface_hub nor transformers records use), with swamp's own header read set aside | yes: Sep 29 for the one model on this machine |
+| Ollama models | file access time | the model layer blob (`application/vnd.ollama.image.model`); Ollama records no use | yes: Aug 30 for `qwen3:0.6b` |
 | npm `_cacache`, Gradle | not implemented | | unverified |
 | everything else | no record | | |
 
@@ -659,6 +661,71 @@ folders, largest first, with size, modification time and last-used:
   view's row opens (`Enter`) onto them; the selected row's detail line
   carries the last-used fact.
 
+### Model caches
+
+The Hugging Face hub cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`, else
+`~/.cache/huggingface/hub`) and the Ollama store (`OLLAMA_MODELS`, else
+`~/.ollama/models`) are listed one model at a time, in Reclaim (`models` under
+the store's row, and each repo folder's row) and in External (each repo folder's
+row; the Ollama tags under "identified interior"). Each says:
+
+```text
+   968.9MB  mkrausio/EmoWhisper-AnS-Small-v0.1@e613edc6  (model)  whisper · 241.7M params · float32
+      last read: Sep 29 (file access time of model.safetensors)
+      regeneration: downloaded again from huggingface.co (mkrausio/EmoWhisper-AnS-Small-v0.1@e613edc6) when needed; size 968.9MB
+      main -> e613edc6; 1 revision(s): e613edc6; 10 file(s) in the shown revision; 10 blob(s)
+      967.0MB of this repo's size is in the hub's shared blobs/ folder: moving this repo folder leaves those bytes there
+   522.7MB  qwen3:0.6b  (ollama model)  qwen3 · 751.63M params · Q4_K_M
+      regeneration: downloaded again with `ollama pull qwen3:0.6b` when needed, if the registry has it (a model made with `ollama create` exists only here); size 522.7MB
+      moving this manifest frees none of its 522.7MB of layers in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses
+```
+
+- **What it is** comes only from files already on disk: the model card's YAML
+  front matter (`pipeline_tag`, `library_name`, `license`, `base_model`, `tags`,
+  `language`), `config.json` (`model_type`, `architectures`, `torch_dtype`), the
+  `*.safetensors` header (an 8-byte length and a JSON table of dtypes and shapes:
+  the parameter count is exact, and no tensor is read), a `.gguf` header
+  (`general.architecture`, `general.name`, quantization; the count when every
+  tensor entry fits in the read), and Ollama's config blob (family, Ollama's own
+  parameter-size label, quantization). A field none of them states is absent. The
+  card's first paragraph is in the detail pane, with control, bidirectional and
+  zero-width characters removed and at most 400 characters.
+- **Size.** Snapshots are links into `blobs/`; each blob is counted once, and a
+  blob two revisions share once. A blob two repos (or two Ollama tags) share is
+  counted under the first by path, and the other says so. The models plus the
+  store's own `blobs/` row add up to the store. Incomplete downloads
+  (`*.incomplete`, Ollama `-partial`), links that point at nothing, links that
+  leave the cache (never followed, not counted), a ref with no snapshot, and blobs
+  "not referenced by any manifest" are facts on the row.
+- **Regeneration.** A repo with a ref or a revision hash says it is downloaded
+  again from huggingface.co at that revision; one with neither (made locally)
+  keeps "cannot be regenerated (no source recorded)". An Ollama tag names its
+  `ollama pull`.
+- **Trash.** A repo folder or a manifest can be marked like any row. The confirm
+  says what stays: a repo's bytes in the hub's shared `blobs/`, and every layer of
+  an Ollama manifest (`ollama rm` is the tool's own removal).
+- **Cost.** Every content read goes through a cache in the store
+  (`associations/model_cards.parquet`), keyed by what cannot change under the key:
+  a revision's files (name, blob and size), a manifest's size and modification
+  time, a config blob's digest. A revision is parsed once; a later observe over
+  unchanged files reads no file content (only listings and `lstat`). At most 64
+  new parses happen per observe; the rest say "not yet read" until the next one. A
+  weight file costs 64 KiB of header (1 MiB at most when its header is larger).
+  On this machine the cold pass read 67,043 bytes and took 4.6 ms for the hub
+  cache and 1,348 bytes in 0.7 ms for Ollama; the warm pass read 0 bytes (0.9 ms
+  and 0.3 ms, debug build). The TUI reads only what observe stored.
+- **Hub facts (off by default).** With `hf_enrich = true` in `config.toml`
+  (`swamp config path`), a scheduled or CLI `swamp observe` asks
+  `https://huggingface.co/api/models/<id>` (or `datasets/`, `spaces/`) once per
+  repo with `/usr/bin/curl` (allow-listed, 10 s timeout, 1 MiB at most, no header
+  and no token sent), and the row says `from huggingface.co, fetched <date>`:
+  downloads, likes, last modified, whether the revision here is the Hub's current
+  one, and, for that revision only, the pipeline tag, library, license and base
+  model where the local files did not say. Facts tied to a revision are never
+  fetched again; the counts are fetched again after 7 days; a failure (404, gated,
+  offline) is kept for a day. At most 16 requests per observe. The TUI's own
+  refresh never asks the network; `report` never does.
+
 ### The Reclaim view
 
 ```bash
@@ -700,7 +767,7 @@ path. Each row says, as facts with their sources:
 | downloads, cache | download | downloaded or derived again by the tool on next use | npm, pip, uv, Cargo and Gradle document their caches as refilled on use |
 | build-output | rebuild | rebuilt by the tool's build command | the tool's own build command |
 | environments | not established | recreating restores what the manifest names, not data added later | an emulator's apps and data are not in a manifest |
-| local-state, models | not regenerable | cannot be regenerated | state a tool wrote for the user; a model's source may be gone |
+| local-state, models | not regenerable | cannot be regenerated | state a tool wrote for the user; a model's source may be gone. A Hugging Face or Ollama store says more per model (see "Model caches") |
 | unclassified | not established | no detector says what is inside | none |
 | standalone-cargo-target | rebuild | rebuild with `cargo build` | Cargo's own consequence, stated on the row |
 
@@ -1690,6 +1757,7 @@ observe_stall_secs = 300
 # min_free_bytes = 1073741824   # unset: the greater of 1 GiB and 1% of the volume; 0 disables
 volume_pass_interval_hours = 24 # a plain `observe` runs the volume pass when the last is older; 0 = only `observe --volume`
 volume_pass_budget_secs = 120   # one run of the volume pass measures for at most this long
+hf_enrich = false               # true: a scheduled or CLI observe asks huggingface.co about each hub repo (see "Model caches")
 
 [scan]
 defaults = true

@@ -234,6 +234,27 @@ falling back to a different view.
 The Rust text view defaults to the largest 30 units per container;
 `--all` shows every unit. JSON pagination uses `--limit`/`--offset`.
 
+### Model caches (Hugging Face hub, Ollama)
+
+`--view reclaim --json` rows for a model store carry `models`: one object per
+hub repo or Ollama `model:tag`, largest first: `{path, name, kind ("model",
+"dataset", "space" or "ollama model"), revision?, bytes, about?, card?, fields:
+["key: value"], last_read_at?, last_read, regeneration, revisions?, hub?,
+facts: [..]}`. `about` is the one-line "what it is" from the model's own files
+(README front matter, `config.json`, safetensors or GGUF header, Ollama's config
+blob) and is absent when they state nothing; it is never guessed. `last_read` is
+the file access time of the largest weight file (Ollama: the model layer), with
+swamp's own header read set aside, or `no record`. `hub` is `off` (the default),
+or the Hub's answer with its fetch date when `hf_enrich = true`. `facts` say
+which bytes are shared, where they live (a repo's bytes in the hub's shared
+`blobs/` stay there when the repo folder moves; an Ollama manifest's layers stay
+in `blobs/`), incomplete downloads, links pointing at nothing or outside the
+cache, and blobs "not referenced by any manifest". A depth-2 child row whose
+folder is a repo adds `about`. In `report --json`, the same facts are the
+`interiors` units' `producer_evidence` with sources `model-card`,
+`model-card-text`, `model-field`, `model-revision`, `model-last-read` and
+`model-hub-api`, written by the `model-stores` adapter.
+
 ### Pagination
 
 Build/dependency `interior.units` arrays are separately bounded to 30 units
