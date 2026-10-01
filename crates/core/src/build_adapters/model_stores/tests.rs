@@ -41,8 +41,11 @@ fn used(p: &Path) {
         .unwrap();
 }
 
+/// Allocated bytes as the filesystem reports them once every earlier
+/// write is reflected (ZFS assigns `st_blocks` at commit; #197).
 fn allocated(p: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
+    crate::fs_gate::settle::settle();
     crate::fs_gate::symlink_metadata(p).map_or(0, |m| m.blocks() * 512)
 }
 
@@ -133,6 +136,7 @@ fn hub_fixture(readme: &str) -> Hub {
 /// allocated bytes (symlinks counted as the walk counts them: not at
 /// all), summed upward.
 fn folded(root: &Path) -> FoldedIndex {
+    crate::fs_gate::settle::settle();
     fn total(p: &Path, out: &mut Vec<FoldedDir>) -> u64 {
         let mut sum = 0;
         let (entries, _) = crate::locations::shallow_list_links(p);
@@ -165,6 +169,8 @@ fn identify(
     root: &Path,
     cards: &CardCache,
 ) -> (Vec<NestedArtifact>, crate::work_counters::WorkCounters) {
+    // The adapter stats blobs; on ZFS their blocks appear at commit.
+    crate::fs_gate::settle::settle();
     let idx = folded(root);
     let none = EventCoverage::untrusted();
     let cache = ContainerCache::disabled();
@@ -453,7 +459,10 @@ fn ollama_fixture() -> Ollama {
     let write_blob = |c: char, body: &[u8]| {
         fs::write(blobs.join(digest(c).replacen(':', "-", 1)), body).unwrap();
     };
-    write_blob('a', &vec![7u8; 40_000]);
+    // The shared layer dominates every other file (incompressible, 1 MiB),
+    // so no filesystem's block size or compression can blur which tag it
+    // is charged to.
+    write_blob('a', &crate::fs_gate::settle::noise(1024 * 1024));
     write_blob(
         'c',
         br#"{"model_format":"gguf","model_family":"qwen3","model_type":"751.63M","file_type":"Q4_K_M"}"#,
@@ -475,6 +484,7 @@ fn ollama_fixture() -> Ollama {
     fs::write(lib.join("qwen3/0.6b"), manifest('c')).unwrap();
     fs::write(lib.join("qwen3/q8"), manifest('d')).unwrap();
     fs::write(lib.join("broken/latest"), "{ nope").unwrap();
+    crate::fs_gate::settle::settle();
     Ollama { _tmp: tmp, root }
 }
 
@@ -485,12 +495,15 @@ fn ollama_fixture() -> Ollama {
 fn ollama_shared_layers_are_counted_once_and_loose_blobs_are_a_fact() {
     let o = ollama_fixture();
     let (units, _) = identify(BuildStoreKind::OllamaModels, &o.root, &CardCache::default());
-    let a = allocated(&o.root.join("blobs").join(digest('a').replacen(':', "-", 1)));
+    let blob = |c: char| allocated(&o.root.join("blobs").join(digest(c).replacen(':', "-", 1)));
     let first = unit(&units, "0.6b");
     let second = unit(&units, "q8");
-    assert!(first.bytes >= a, "{first:?}");
-    assert!(
-        second.bytes < a,
+    // Exact, from the files' own allocation: the first tag carries the
+    // shared layer and its config; the second only its own config.
+    assert_eq!(first.bytes, blob('a') + blob('c'), "{first:?}");
+    assert_eq!(
+        second.bytes,
+        blob('d'),
         "the shared layer is charged once: {second:?}"
     );
     assert!(text_of(second).contains("counted under another model above"));
