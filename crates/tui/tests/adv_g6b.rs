@@ -238,25 +238,23 @@ fn adv_b_mark_all_over_a_thousand_rows_at_80x24_never_offers_an_unread_plan() {
         a.height = h;
         let fr = frame(&a, w, h);
         let last = fr.lines().last().unwrap_or("").to_string();
-        if a.confirm_fits(w, h) {
+        if a.confirm_review_is_complete(w, h) {
             assert!(
-                !fr.contains("more lines"),
+                fr.contains("Enter move to Trash"),
                 "{w}x{h} offers Enter over a cut plan:\n{fr}"
             );
         } else {
-            assert!(!last.contains("Enter confirm"), "{w}x{h}: {last}");
+            assert!(!last.contains("Enter move to Trash"), "{w}x{h}: {last}");
         }
     }
     a.width = 80;
     a.height = 24;
-    if !a.confirm_fits(80, 24) {
-        handle_key(&mut a, KeyCode::Enter);
-        wait(&mut a);
-        assert!(
-            f.root.join("u0000/f").exists(),
-            "Enter moved a plan that did not fit"
-        );
-    }
+    handle_key(&mut a, KeyCode::Enter);
+    wait(&mut a);
+    assert!(
+        f.root.join("u0000/f").exists(),
+        "Enter moved an unread plan"
+    );
     handle_key(&mut a, KeyCode::Esc);
 }
 
@@ -343,6 +341,8 @@ fn adv_b_a_parent_renamed_between_mark_and_enter_moves_nothing() {
     handle_key(&mut a, KeyCode::Backspace);
     wait(&mut a);
     assert!(a.confirm_open, "{:?}", a.refusal_active());
+    let reviewed = frame(&a, 200, 60);
+    assert!(a.confirm_review_is_complete(200, 60), "{reviewed}");
     let renamed = f.root.join("proj-renamed");
     std::fs::rename(&parent, &renamed).unwrap();
     dir(&p);
@@ -440,11 +440,8 @@ fn space_under_sheet(a: &mut App) {
     a.mark_row(&row);
 }
 
-/// Tempting wrong patch: the merged plan names the folders a warning is
-/// about only up to three, then "and N more", while the paths past the
-/// eighth are a count too. Five of thirteen folders cannot be regenerated:
-/// with Enter offered, every one of the five must be named somewhere on the
-/// plan (on the warning line or in the path list).
+/// Shared facts are summarized once; the explicit inventory still keeps
+/// every marked path available without making a large list the primary view.
 #[test]
 fn adv_b_a_warning_shared_by_more_than_three_folders_names_every_one_while_enter_is_offered() {
     let f = fx();
@@ -467,21 +464,15 @@ fn adv_b_a_warning_shared_by_more_than_three_folders_names_every_one_while_enter
     wait(&mut a);
     assert_eq!(a.marked.len(), 13, "{:?}", a.refusal_active());
     let s = a.confirm_summary();
-    let fits = a.confirm_fits(200, 60);
-    // Named on the warning's own line, or listed as a path of the plan.
-    let named = |p: &Path| {
-        let shown = p.display().to_string();
-        s.lines().any(|l| {
-            (l.contains("cannot be regenerated") && l.contains(&shown))
-                || l.starts_with(&format!("{shown} ("))
-        })
-    };
-    let unnamed: Vec<_> = state.iter().filter(|p| !named(p)).collect();
-    assert!(
-        !fits || unnamed.is_empty(),
-        "Enter offered at 200x60 while {} folder(s) that cannot be regenerated are only \
-         'and N more': {unnamed:?}\n{s}",
-        unnamed.len()
-    );
+    assert!(s.contains("affects 5 actions"), "{s}");
+    let details =
+        swamp_tui::actions::confirm_details(&a.marked.values().cloned().collect::<Vec<_>>());
+    for path in &state {
+        assert!(
+            details.contains(&path.display().to_string()),
+            "missing {}:\n{details}",
+            path.display()
+        );
+    }
     handle_key(&mut a, KeyCode::Esc);
 }

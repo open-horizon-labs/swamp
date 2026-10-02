@@ -172,12 +172,12 @@ fn a_reclaim_unit_and_a_depth_two_folder_mark_and_move_to_trash() {
         "{summary}"
     );
     assert!(summary.contains("7B"), "{summary}");
+    assert!(summary.contains("Cost unknown"), "{summary}");
+    assert!(summary.contains("Last used · no record"), "{summary}");
     assert!(
-        summary.contains("regeneration cost not established"),
+        summary.contains("Trash can be restored until emptied"),
         "{summary}"
     );
-    assert!(summary.contains("last used: no record"), "{summary}");
-    assert!(summary.contains("Trash is the way back"), "{summary}");
     let res = run_plan(&a, &f);
     assert!(res[0].outcome.is_ok(), "{:?}", res[0].outcome);
     assert!(!caches.join("hiphi").exists());
@@ -272,7 +272,7 @@ fn no_category_and_not_the_caches_root_is_refused() {
         );
     }
     let s = a.confirm_summary();
-    assert!(s.contains("cannot be regenerated"), "{s}");
+    assert!(s.contains("Cannot be regenerated"), "{s}");
 }
 
 /// Tempting wrong patch: a protected folder is markable without telling
@@ -507,7 +507,7 @@ fn enter_typed_ahead_during_the_review_does_not_confirm() {
 /// off behind "+N more". On a terminal too small to show the whole plan
 /// Enter does nothing and the footer says to enlarge it.
 #[test]
-fn a_plan_that_does_not_fit_the_terminal_offers_no_enter() {
+fn an_unreviewed_plan_offers_no_enter_even_when_the_overlay_fits() {
     let f = fx();
     let p = f.root.join("c");
     dir(&p);
@@ -522,19 +522,21 @@ fn a_plan_that_does_not_fit_the_terminal_offers_no_enter() {
     assert!(a.confirm_open);
     a.width = 40;
     a.height = 12;
-    assert!(!a.confirm_fits(40, 12));
+    assert!(a.confirm_fits(40, 12));
+    assert!(!a.confirm_review_is_complete(40, 12));
     handle_key(&mut a, KeyCode::Enter);
     assert!(a.operation.is_none() && p.exists());
     let small = frame(&a, 40, 12);
-    assert!(small.contains("lan does not fit"), "{small}");
-    // A roomy terminal shows the whole plan: the path and every warning.
+    assert!(small.contains("Esc cancel"), "{small}");
+    assert!(!small.contains("Enter move to Trash"), "{small}");
+    // A roomy terminal draws the entire plan and arms Enter.
     a.width = 120;
     a.height = 50;
     assert!(a.confirm_fits(120, 50));
     let big = frame(&a, 120, 50);
-    assert!(big.contains("regeneration cost not established"), "{big}");
-    assert!(big.contains("last used: no record"), "{big}");
-    assert!(!big.contains("more lines"), "{big}");
+    assert!(big.contains("Cost unknown"), "{big}");
+    assert!(big.contains("Last used · no record"), "{big}");
+    assert!(a.confirm_review_is_complete(120, 50));
 }
 
 /// Tempting wrong patch: the legend names `Space mark` and `Backspace`
@@ -630,7 +632,7 @@ fn external_rows_and_their_folders_mark_too() {
 /// the marked paths. 400 folders under one unit mark and list; the plan
 /// names the ones it shows and counts the rest, never claiming fewer.
 #[test]
-fn a_huge_marked_list_says_how_many_paths_it_does_not_list() {
+fn a_huge_marked_list_groups_summary_and_keeps_every_path_in_inventory() {
     let f = fx();
     let base = f.root.join("Caches");
     std::fs::create_dir_all(&base).unwrap();
@@ -650,8 +652,14 @@ fn a_huge_marked_list_says_how_many_paths_it_does_not_list() {
     wait(&mut a);
     assert_eq!(a.marked.len(), 13);
     let s = a.confirm_summary();
-    assert!(s.contains("+5 more folders"), "{s}");
-    assert!(s.contains("Move 13 items"), "{s}");
+    assert!(s.contains("Review 13 actions"), "{s}");
+    assert!(s.contains("Trash · 13 actions"), "{s}");
+    let details = a.confirm_details();
+    assert!(
+        details.contains("/unit11"),
+        "the last target was omitted: {details}"
+    );
+    assert_eq!(details.matches("TRASH ·").count(), 13, "{details}");
 }
 
 /// Tempting wrong patch: the move is recorded after it happens, so a
@@ -863,10 +871,8 @@ fn a_tool_managed_row_marks_for_trash_and_keeps_its_own_command_on_backspace() {
     assert!(a.tool_sheet.is_some() || a.operation.is_some());
 }
 
-/// Tempting wrong patch: the footer blames a fixed terminal size ("enlarge
-/// to at least 40x9") when the real limit is whether the whole plan fits.
-/// At a size above 40x9 the footer says the plan does not fit, and `k keep
-/// executables` is not offered for a plan of Reclaim folders alone.
+/// Long Reclaim plans scroll, and `k keep executables` is not offered for
+/// Reclaim folders alone.
 #[test]
 fn the_does_not_fit_footer_is_true_and_k_is_not_offered_for_reclaim_plans() {
     let f = fx();
@@ -882,14 +888,11 @@ fn the_does_not_fit_footer_is_true_and_k_is_not_offered_for_reclaim_plans() {
     assert!(a.confirm_open);
     a.width = 60;
     a.height = 14;
-    assert!(!a.confirm_fits(60, 14));
+    assert!(a.confirm_fits(60, 14));
     let small = frame(&a, 60, 14);
     let last = small.lines().last().unwrap();
-    assert!(
-        last.contains("plan does not fit") || last.contains("Plan does not fit"),
-        "{last}"
-    );
-    assert!(!small.contains("40x9"), "{small}");
+    assert!(last.contains("Read every line"), "{last}");
+    assert!(small.contains("Review actions"), "{small}");
     a.width = 200;
     a.height = 80;
     let big = frame(&a, 200, 80);
@@ -909,6 +912,7 @@ fn plan_strings_hold_no_forged_lines_or_bidi_overrides() {
     let plain = |path: &str, warning: &str| MarkedUnit {
         cargo_unit: None,
         agent_unit: None,
+        session_members: None,
         reclaim: None,
         path: PathBuf::from(path),
         docker: None,

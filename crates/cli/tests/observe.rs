@@ -1,6 +1,5 @@
 //! End-to-end `swamp observe` checks against the built binary:
-//! it writes the growth store and prints one machine-readable line per
-//! root.
+//! it writes the growth store and gives a concise completion summary.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -34,7 +33,7 @@ fn write_git_project(dir: &std::path::Path) {
 }
 
 #[test]
-fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
+fn observe_on_a_fixture_root_writes_the_store_and_prints_human_summary() {
     let root = tempfile::tempdir().expect("root");
     std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
     let store = tempfile::tempdir().expect("store");
@@ -56,8 +55,12 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("observed_at=") && stdout.contains("mode=full"),
-        "stdout did not contain a machine-readable observe line: {stdout}"
+        stdout.contains("Observed 0 projects") && stdout.contains("Coverage: 1 complete root."),
+        "stdout did not contain the human observe summary: {stdout}"
+    );
+    assert!(
+        !stdout.contains("observed_at=") && !stdout.contains("walked_total="),
+        "default output should not expose diagnostic counters: {stdout}"
     );
 
     // The volume-keyed growth store must now exist under SWAMP_DIR.
@@ -73,6 +76,64 @@ fn observe_on_a_fixture_root_writes_the_store_and_prints_the_line() {
     let last_run = swamp_core::schedule::read_last_run(store.path())
         .expect("observe must persist scheduled_runs.parquet");
     assert_eq!(last_run.outcome, "ok");
+}
+
+#[test]
+fn observe_verbose_keeps_the_machine_summary_for_diagnostics() {
+    let root = tempfile::tempdir().expect("root");
+    std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
+    let store = tempfile::tempdir().expect("store");
+
+    let output = Command::new(bin())
+        .arg("observe")
+        .arg(root.path())
+        .arg("--verbose")
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("run verbose observe");
+    assert!(
+        output.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("observed_at=") && stdout.contains("mode=full"),
+        "verbose output should retain the diagnostic line: {stdout}"
+    );
+}
+
+#[test]
+fn observe_default_output_names_missing_roots_in_coverage() {
+    let root = tempfile::tempdir().expect("root");
+    let missing_parent = tempfile::tempdir().unwrap();
+    let missing = missing_parent.path().join("not-created");
+    let store = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
+
+    let output = Command::new(bin())
+        .arg("observe")
+        .arg(root.path())
+        .arg(&missing)
+        .env("SWAMP_DIR", store.path())
+        .env("SWAMP_LOG_DIR", store.path())
+        .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
+        .env("SWAMP_TEST_MODE", "1")
+        .output()
+        .expect("run observe with a missing root");
+    assert!(
+        output.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&missing.display().to_string()) && stdout.contains("missing root"),
+        "default output should name missing coverage: {stdout}"
+    );
 }
 
 #[test]
@@ -213,6 +274,7 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
     let upgraded = Command::new(bin())
         .arg("observe")
         .arg(&root_paths[0])
+        .arg("--verbose")
         .env("SWAMP_DIR", store.path())
         .env("SWAMP_LOG_DIR", store.path())
         .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
@@ -308,6 +370,7 @@ fn successful_narrow_observe_cleans_retired_store_state_once_and_keeps_other_roo
     let repeated = Command::new(bin())
         .arg("observe")
         .arg(&root_paths[0])
+        .arg("--verbose")
         .env("SWAMP_DIR", store.path())
         .env("SWAMP_LOG_DIR", store.path())
         .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
@@ -516,6 +579,7 @@ fn observe_summary_line_reports_the_real_reason_not_the_no_store_fallback() {
         let output = Command::new(bin())
             .arg("observe")
             .arg(root.path())
+            .arg("--verbose")
             .env("SWAMP_DIR", store.path())
             .env("SWAMP_LOG_DIR", store.path())
             .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())
@@ -606,6 +670,7 @@ fn observe_with_no_roots_uses_the_configured_default_scope() {
 
     let output = Command::new(bin())
         .arg("observe")
+        .arg("--verbose")
         .env("SWAMP_DIR", store.path())
         .env("SWAMP_LOG_DIR", store.path())
         .env("SWAMP_LAUNCH_AGENTS_DIR", store.path())

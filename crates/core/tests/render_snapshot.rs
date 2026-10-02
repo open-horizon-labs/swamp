@@ -232,6 +232,51 @@ fn overview_matches_snapshot() {
 }
 
 #[test]
+fn overview_marks_permission_denied_totals_not_measured() {
+    let mut report = fixture_report();
+    report.unowned.push(UnownedRow {
+        measurement: None,
+        path_or_object: "restricted/known".to_string(),
+        bytes: 12_345,
+        reason: UnownedReason::OutsideAnyCheckout,
+        shared_bytes: None,
+        note: None,
+        created_at: None,
+        containers: Vec::new(),
+        shared_with: Vec::new(),
+        dangling: false,
+        docker_kind: None,
+        evidence: Vec::new(),
+    });
+    let text = render_overview(&report, false, false, false);
+    assert!(text.contains("restricted"), "{text}");
+    assert!(text.contains("permission-denied"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with("  restricted") && line.trim_end().ends_with("0B")),
+        "the unreadable directory must not display a zero-byte total: {text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.starts_with("  permission-denied") && line.trim_end().ends_with("0B")),
+        "the unreadable reason must not display a zero-byte total: {text}"
+    );
+    assert!(
+        text.lines().any(
+            |line| line.contains("restricted") && line.contains("at least 12KB + not measured")
+        ),
+        "a mixed directory preserves known bytes and marks the unreadable part: {text}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.contains("permission-denied") && line.contains("not measured")),
+        "the unreadable reason is clearly not measured: {text}"
+    );
+}
+
+#[test]
 fn sorted_by_growth_desc_then_bytes_desc() {
     let report = fixture_report();
     let text = render_overview(&report, false, false, false);
@@ -254,8 +299,8 @@ fn zero_artifact_project_renders_zero_never_panics() {
         .find(|l| l.contains("no-artifacts"))
         .expect("no-artifacts row present");
     assert!(
-        line.contains(" 0 "),
-        "expected a literal 0 byte column, got: {line}"
+        line.contains(" 0B "),
+        "expected a labelled zero byte column, got: {line}"
     );
     assert!(
         line.contains('—'),
@@ -263,7 +308,7 @@ fn zero_artifact_project_renders_zero_never_panics() {
     );
 
     let drill = render_project(&report, "no-artifacts").expect("project found");
-    assert!(drill.contains('0'));
+    assert!(drill.contains("no artifact rows were recorded for this worktree"));
 }
 
 #[test]
@@ -516,7 +561,7 @@ fn external_view_renders_units_largest_first_with_a_total() {
 fn an_empty_external_view_says_so_rather_than_rendering_nothing() {
     let out = swamp_core::render::render_view_external(&[]);
     assert!(
-        out.contains("no external storage units detected"),
+        out.contains("No external storage units were recorded"),
         "an empty view must say it is empty, never print a blank screen: {out:?}"
     );
     // "none detected" is a coverage statement, not a verdict about the

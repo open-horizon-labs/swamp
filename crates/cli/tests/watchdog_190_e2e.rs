@@ -26,6 +26,7 @@ fn observe(
     swamp_core::work_counters::record_spawn();
     let out = Command::new(env!("CARGO_BIN_EXE_swamp"))
         .arg("observe")
+        .arg("--verbose")
         .env("SWAMP_DIR", store)
         .env("HOME", home)
         .env("SWAMP_LOG_DIR", logs)

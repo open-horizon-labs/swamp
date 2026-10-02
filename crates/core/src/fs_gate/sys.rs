@@ -180,6 +180,7 @@ impl RegularFile {
     /// blake3 of the whole content. The bytes never leave this function.
     pub fn digest(&mut self) -> io::Result<String> {
         use std::io::Read;
+        let started = std::time::Instant::now();
         let mut hash = blake3::Hasher::new();
         let mut buf = [0u8; 65536];
         loop {
@@ -187,8 +188,12 @@ impl RegularFile {
             if n == 0 {
                 break;
             }
+            crate::work_counters::record_content_bytes_hashed(n as u64);
             hash.update(&buf[..n]);
         }
+        crate::work_counters::record_content_hash_time(
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+        );
         Ok(hash.finalize().to_hex().to_string())
     }
 

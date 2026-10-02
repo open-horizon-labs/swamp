@@ -114,7 +114,7 @@ fn header_line(app: &App, width: usize) -> String {
         .flat_map(|p| &p.worktrees)
         .flat_map(|w| &w.artifacts)
         .any(|a| a.dedup_stale);
-    let projects = app.report.projects.len();
+    let projects = swamp_core::render::human_count(app.report.projects.len() as u64);
     let attributed: u64 = app
         .report
         .projects
@@ -131,19 +131,15 @@ fn header_line(app: &App, width: usize) -> String {
         .map(|u| u.bytes)
         .sum::<u64>()
         .saturating_sub(docker_unowned);
-    // While our own walk runs, the chip carries the state and elapsed
-    // time; the only detail after it is how much has been seen.
+    // Walk counters reset between roots and are not whole-observation progress.
+    // The activity chip keeps the run-wide elapsed clock visible throughout.
     let obs = if app.observing.is_some() {
-        let (bytes, _, _) = swamp_core::walk::progress::snapshot();
-        let roots = if app.roots.len() > 1 {
-            format!(" · {} roots", app.roots.len())
-        } else {
-            String::new()
-        };
-        format!("{} seen{roots}", human_bytes(bytes))
+        format!(
+            "updating {} root{}",
+            app.roots.len(),
+            if app.roots.len() == 1 { "" } else { "s" }
+        )
     } else {
-        // The age comes from the report itself, so it keeps counting
-        // while the UI stays open.
         format!("observed {}", age_label(app))
     };
     let warn = stale_warning(app);
@@ -538,161 +534,202 @@ fn wrapped_rows(text: &str, width: usize) -> usize {
     rows
 }
 
-fn items(n: usize) -> String {
-    if n == 1 {
-        "1 item".to_string()
+fn confirm_lines(app: &App) -> Vec<(String, Color)> {
+    let cargo_conflict = crate::app::selective_cargo_keep_conflict(
+        app.keep_executables,
+        app.marked.values().any(|u| u.cargo_unit.is_some()),
+    );
+    let summary = if cargo_conflict {
+        app.confirm_summary().replace(
+            "Enter applies this plan",
+            "Enter unavailable until k turns off Keep",
+        )
     } else {
-        format!("{n} items")
-    }
-}
-
-/// The plan sheet: what is ready and what is blocked, the plan by project,
-/// what cannot come back, then names and warnings. `summary` is the
-/// confirm text; its first line is the headline shown in the status rows.
-fn plan_sheet(app: &App, summary: &[String]) -> Vec<(String, Color)> {
-    let rest: &[String] = summary.get(1..).unwrap_or(&[]);
-    // A plan of only Reclaim/External folders: the exact paths and sizes,
-    // what swamp knows and does not know about each, and the way back.
-    if !app.marked.is_empty() && app.marked.values().all(|u| u.reclaim.is_some()) {
-        return rest
-            .iter()
-            .map(|l| {
-                let c = if l.starts_with('⚠') {
-                    Color::Yellow
-                } else {
-                    Color::Reset
-                };
-                (l.clone(), c)
-            })
-            .collect();
-    }
-    let irreversible = rest
-        .iter()
-        .take_while(|l| l.starts_with("Remove ") || l.starts_with("Gone for good"))
-        .count();
-    let yellow = |l: &String| (l.clone(), Color::Yellow);
-    let mut out: Vec<(String, Color)> = rest[..irreversible].iter().map(yellow).collect();
-    let ready = app.marked.len();
-    let blocked = app.blocked.len();
-    let trash_bytes: u64 = app
-        .marked
-        .values()
-        .filter(|u| u.docker.is_none())
-        .map(|u| u.bytes)
-        .sum();
-    let trash_items = app.marked.values().filter(|u| u.docker.is_none()).count();
-    let none_blocked = if blocked == 0 { " · none blocked" } else { "" };
-    if trash_items > 0 {
-        out.push((
-            format!(
-                "Ready: {} ({}) → Trash{none_blocked}",
-                items(trash_items),
-                human_bytes(trash_bytes)
-            ),
-            Color::Reset,
-        ));
-    } else {
-        out.push((
-            format!("Ready: {}{none_blocked}", items(ready)),
-            Color::Reset,
-        ));
-    }
-    if let Some(first) = app.blocked.first() {
-        let more = app
-            .blocked
-            .iter()
-            .filter(|b| b.reason != first.reason)
-            .map(|b| &b.reason)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        let more = if more > 0 {
-            format!(" (+{more} more reasons)")
-        } else {
-            String::new()
-        };
-        out.push((
-            format!("Blocked: {blocked} (d to see why): {}{more}", first.reason),
-            Color::Red,
-        ));
-    }
-    let in_use = app
-        .marked
-        .values()
-        .filter(|u| u.warnings.iter().any(|w| w == "currently in use"))
-        .count();
-    if in_use > 0 {
-        out.push((
-            format!(
-                "{} in use: a process has them open. Close them and check again.",
-                items(in_use)
-            ),
+        app.confirm_summary()
+    };
+    let mut lines: Vec<(String, Color)> = summary
+        .lines()
+        .map(|line| {
+            let color = if line.starts_with("PERMANENT") || line.starts_with("!") {
+                Color::Yellow
+            } else {
+                Color::Reset
+            };
+            (line.to_string(), color)
+        })
+        .collect();
+    if crate::app::selective_cargo_keep_conflict(
+        app.keep_executables,
+        app.marked.values().any(|u| u.cargo_unit.is_some()),
+    ) {
+        lines.push((
+            "Saved Keep executables setting conflicts with selective Cargo removal; press k to turn it off.".into(),
             Color::Yellow,
         ));
     }
-    let by_project = project_breakdown(app);
-    if !by_project.is_empty() {
-        // Under a blocked line the rows need their own heading, or they
-        // read as the blocked ones.
-        if blocked > 0 {
-            out.push(("Ready, by project:".to_string(), Color::Reset));
-        }
-        out.extend(by_project);
+    if !app.blocked.is_empty() {
+        let count = app.blocked.len();
+        lines.push((
+            format!(
+                "{count} row{} skipped; press d to review why",
+                if count == 1 { "" } else { "s" }
+            ),
+            Color::Red,
+        ));
     }
-    out.extend(rest[irreversible..].iter().map(yellow));
-    out
+    lines
 }
 
-/// Whether the plan sheet can show every line of a Reclaim/External plan
-/// at this terminal size. The sheet has no scroll and no key is free to
-/// scroll it, so a plan that would hide a line behind a count does not
-/// offer Enter: the terminal has to be larger.
-pub fn reclaim_plan_fits(app: &App, width: u16, height: u16) -> bool {
-    let summary: Vec<String> = app.confirm_summary().lines().map(str::to_string).collect();
-    let inner_w = usize::from(width.saturating_sub(2)).max(1);
-    let need: usize = plan_sheet(app, &summary)
-        .iter()
-        .map(|(l, _)| wrapped_rows(l, inner_w))
-        .sum::<usize>()
-        + 2;
-    let chrome = 1 + usize::from(headline_rows(height)) + 1 + 1 + usize::from(STATUS_ROWS) + 1;
-    need <= usize::from(height).saturating_sub(chrome)
-}
-
-/// The plan by project, largest first, the tail folded into one line.
-fn project_breakdown(app: &App) -> Vec<(String, Color)> {
-    let mut by: std::collections::BTreeMap<String, (u64, usize)> = Default::default();
-    for u in app.marked.values() {
-        let name = if u.docker.is_some() {
-            "docker".to_string()
-        } else {
-            crate::names::project_of(&app.report, &u.path).unwrap_or_else(|| "other".to_string())
-        };
-        let e = by.entry(name).or_default();
-        e.0 += u.bytes;
-        e.1 += 1;
-    }
-    let mut v: Vec<(String, (u64, usize))> = by.into_iter().collect();
-    v.sort_by_key(|(_, (b, _))| std::cmp::Reverse(*b));
-    let mut out: Vec<(String, Color)> = v
-        .iter()
-        .take(3)
-        .map(|(n, (b, c))| {
+fn confirm_detail_lines(app: &App) -> Vec<(String, Color)> {
+    let mut lines: Vec<_> = app
+        .confirm_details()
+        .lines()
+        .map(|line| {
             (
-                format!("  {n}  {}  {}", human_bytes(*b), items(*c)),
-                Color::Reset,
+                line.to_string(),
+                if line.starts_with("  !") {
+                    Color::Yellow
+                } else {
+                    Color::Reset
+                },
             )
         })
         .collect();
-    if v.len() > 3 {
-        let (b, c) = v[3..]
-            .iter()
-            .fold((0u64, 0usize), |a, (_, (b, c))| (a.0 + b, a.1 + c));
-        out.push((
-            format!("  + {} more  {}  {}", v.len() - 3, human_bytes(b), items(c)),
-            Color::Reset,
-        ));
+    lines.push((
+        "Esc returns to the summary; Enter is disabled here.".into(),
+        Color::Yellow,
+    ));
+    lines
+}
+
+pub fn confirm_review_fingerprint(app: &App) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    confirm_lines(app).hash(&mut h);
+    confirm_detail_lines(app).hash(&mut h);
+    h.finish()
+}
+
+fn wrap_confirm_text(text: &str, width: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for chunk in text.split_inclusive(char::is_whitespace) {
+        let candidate = format!("{current}{chunk}");
+        if crate::model::display_width(&candidate) <= width {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+        for grapheme in chunk.graphemes(true) {
+            if !current.is_empty()
+                && crate::model::display_width(&current) + crate::model::display_width(grapheme)
+                    > width
+            {
+                lines.push(std::mem::take(&mut current));
+            }
+            current.push_str(grapheme);
+        }
     }
-    out
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn confirm_visual_lines(app: &App, width: u16) -> Vec<(String, Color)> {
+    let lines = if app.confirm_details_open {
+        confirm_detail_lines(app)
+    } else {
+        confirm_lines(app)
+    };
+    lines
+        .iter()
+        .flat_map(|(line, color)| {
+            wrap_confirm_text(line, usize::from(width.max(1)))
+                .into_iter()
+                .map(|wrapped| (wrapped, *color))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn confirm_total_rows(app: &App, width: u16) -> usize {
+    confirm_visual_lines(app, width).len()
+}
+
+pub fn confirm_review_rows(app: &App, width: u16) -> usize {
+    confirm_visual_lines_for(&confirm_lines(app), width).len()
+}
+
+pub fn confirm_display_rows(app: &App, width: u16) -> usize {
+    confirm_total_rows(app, width)
+}
+
+fn confirm_visual_lines_for(lines: &[(String, Color)], width: u16) -> Vec<(String, Color)> {
+    lines
+        .iter()
+        .flat_map(|(line, color)| {
+            wrap_confirm_text(line, usize::from(width.max(1)))
+                .into_iter()
+                .map(|wrapped| (wrapped, *color))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn draw_confirm_overlay(frame: &mut Frame, app: &App, screen: Rect) {
+    if screen.width < crate::app::CONFIRM_MIN_COLS || screen.height < 7 {
+        return;
+    }
+    let content_width = screen.width.saturating_sub(2).max(1);
+    let fingerprint = confirm_review_fingerprint(app);
+    app.prepare_confirm_review(screen.width, screen.height, fingerprint);
+    let total = confirm_total_rows(app, content_width);
+    let available_height = screen.height.saturating_sub(1);
+    let wanted = total.saturating_add(2).min(usize::from(available_height)) as u16;
+    let area = Rect {
+        x: screen.x,
+        y: screen.y + (available_height.saturating_sub(wanted) / 2),
+        width: screen.width,
+        height: wanted,
+    };
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(if app.confirm_details_open {
+            " All action paths · Esc summary "
+        } else {
+            " Review actions · l inspect paths "
+        });
+    let inner = block.inner(area);
+    let visible = usize::from(inner.height);
+    let total = confirm_total_rows(app, inner.width);
+    let last = total.saturating_sub(visible);
+    let first = app
+        .confirm_scroll
+        .get()
+        .min(last)
+        .min(usize::from(u16::MAX));
+    app.confirm_scroll.set(first);
+    app.page.set(visible.saturating_sub(1).max(1));
+    if !app.confirm_details_open {
+        app.note_confirm_rows_seen(first, visible, total);
+    }
+    let content: Vec<Line> = confirm_visual_lines(app, inner.width)
+        .iter()
+        .map(|(line, color)| Line::styled(line.clone(), tone(*color)))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(content)
+            .block(block)
+            .scroll((first.min(u16::MAX as usize) as u16, 0)),
+        area,
+    );
 }
 
 /// The blocked sheet: each item, why, and what to do next.
@@ -768,14 +805,22 @@ fn operation_rows(app: &App, op: &crate::app::Operation) -> [String; 2] {
         ],
         "Reviewing" => {
             let counts = if op.total > 0 {
-                format!("Checked {} of {}", op.completed, op.total)
+                format!(
+                    "Checked {} of {}",
+                    swamp_core::render::human_count(op.completed as u64),
+                    swamp_core::render::human_count(op.total as u64)
+                )
             } else {
-                format!("Checked {}", op.completed)
+                format!(
+                    "Checked {}",
+                    swamp_core::render::human_count(op.completed as u64)
+                )
             };
             [
                 format!(
                     "{chip}  {counts} · {} ready · {} blocked",
-                    op.succeeded, op.failed
+                    swamp_core::render::human_count(op.succeeded as u64),
+                    swamp_core::render::human_count(op.failed as u64)
                 ),
                 current,
             ]
@@ -788,8 +833,8 @@ fn operation_rows(app: &App, op: &crate::app::Operation) -> [String; 2] {
                 } else {
                     "Moving to Trash"
                 },
-                op.completed,
-                op.total,
+                swamp_core::render::human_count(op.completed as u64),
+                swamp_core::render::human_count(op.total as u64),
                 human_bytes(op.bytes_done),
                 human_bytes(op.bytes_total)
             ),
@@ -863,47 +908,52 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_view_strip(frame, app, chunks[2]);
     draw_filter_line(frame, app, chunks[3]);
     draw_body(frame, app, chunks[4]);
-    if app.operation.is_none() {
+    if app.operation.is_none() && app.blocked_open {
+        // Two rows per item.
+        app.page
+            .set((usize::from(SHEET_ROWS.min(chunks[4].height)).saturating_sub(2) / 2).max(1));
+        draw_sheet(
+            frame,
+            chunks[4],
+            SHEET_ROWS,
+            &if app.blocked_scroll > 0 {
+                format!(
+                    "Blocked: {} · from item {}",
+                    app.blocked.len(),
+                    app.blocked_scroll + 1
+                )
+            } else {
+                format!("Blocked: {}", app.blocked.len())
+            },
+            &blocked_sheet(app),
+            &|_| "more below (↓ to scroll)".to_string(),
+        );
+    }
+    draw_status(frame, app, &summary, chunks[5]);
+    if app.confirm_open {
+        draw_confirm_overlay(frame, app, size);
         if app.blocked_open {
-            // Two rows per item.
             app.page
                 .set((usize::from(SHEET_ROWS.min(chunks[4].height)).saturating_sub(2) / 2).max(1));
-            draw_sheet(
-                frame,
-                chunks[4],
-                SHEET_ROWS,
-                &if app.blocked_scroll > 0 {
-                    format!(
-                        "Blocked: {} · from item {}",
-                        app.blocked.len(),
-                        app.blocked_scroll + 1
-                    )
-                } else {
-                    format!("Blocked: {}", app.blocked.len())
-                },
-                &blocked_sheet(app),
-                &|_| "more below (↓ to scroll)".to_string(),
-            );
-        } else if app.confirm_open {
-            // A Reclaim plan lists exact paths and what swamp knows of each:
-            // it takes the whole body, and Enter is offered only when all
-            // of it fits (`reclaim_plan_fits`).
-            let rows = if app.marked.values().any(|u| u.reclaim.is_some()) {
-                chunks[4].height
+            let title = if app.blocked_scroll > 0 {
+                format!(
+                    "Blocked: {} · from item {} · Esc returns to plan",
+                    app.blocked.len(),
+                    app.blocked_scroll + 1
+                )
             } else {
-                SHEET_ROWS
+                format!("Blocked: {} · Esc returns to plan", app.blocked.len())
             };
             draw_sheet(
                 frame,
                 chunks[4],
-                rows,
-                "Plan · nothing has changed yet",
-                &plan_sheet(app, &summary),
-                &|n| format!("+{n} more lines"),
+                SHEET_ROWS,
+                &title,
+                &blocked_sheet(app),
+                &|_| "more below (↓ to scroll)".to_string(),
             );
         }
     }
-    draw_status(frame, app, &summary, chunks[5]);
 
     // The keys row is the legend for the state you are actually in, and
     // nothing else ever replaces it.
@@ -930,29 +980,54 @@ pub fn draw(frame: &mut Frame, app: &App) {
         } else {
             fit_hints(&["↑↓ scroll", "r check again", "Esc close"], fw)
         }
-    } else if app.confirm_open && !app.confirm_fits(size.width, size.height) {
-        // The limit is whether the whole plan (every path and warning)
-        // fits the sheet, not a fixed size.
-        let long = fit_hints(
-            &[
-                "The whole plan does not fit: enlarge the terminal or mark fewer rows",
-                "Esc back",
-            ],
-            fw,
-        );
-        if long.starts_with("The whole plan") {
-            long
-        } else {
-            fit_hints(&["Plan does not fit", "Esc back"], fw)
-        }
     } else if app.confirm_open {
-        let mut clauses: Vec<&str> = vec!["Enter confirm", "Esc back"];
+        let complete = app.confirm_review_is_complete(size.width, size.height);
+        let trash_n = app.marked.values().filter(|u| u.docker.is_none()).count();
+        let docker_n = app.marked.values().filter(|u| u.docker.is_some()).count();
+        let action = match (trash_n > 0, docker_n > 0) {
+            (true, true) => "Enter apply actions",
+            (true, false) => "Enter move to Trash",
+            (false, true) => "Enter remove permanently",
+            (false, false) => "Esc cancel",
+        };
+        let mut clauses: Vec<&str> = if app.marked.is_empty() {
+            vec!["No actions marked", "Esc cancel"]
+        } else if app.blocked_open {
+            vec!["Esc return to plan", "↑↓ scroll"]
+        } else if app.confirm_details_open {
+            vec!["Esc summary", "↑↓ PgUp PgDn scroll", "Enter disabled"]
+        } else if crate::app::selective_cargo_keep_conflict(
+            app.keep_executables,
+            app.marked.values().any(|u| u.cargo_unit.is_some()),
+        ) {
+            vec![
+                "k turn off saved Keep setting",
+                "Enter unavailable",
+                "Esc cancel",
+            ]
+        } else if !app.confirm_fits(size.width, size.height) {
+            vec!["Terminal too small to review", "Esc cancel"]
+        } else if complete {
+            vec![action, "↑↓ PgUp PgDn Home End review", "Esc cancel"]
+        } else if confirm_review_rows(app, size.width.saturating_sub(2)) > usize::from(u16::MAX) {
+            vec!["Plan exceeds scroll limit; mark fewer items", "Esc cancel"]
+        } else {
+            vec![
+                "Read every line before action",
+                "↑↓ PgUp PgDn Home End",
+                "Esc cancel",
+            ]
+        };
         if !app.blocked.is_empty() {
             clauses.push("d blocked");
         }
-        // `k` copies executables out of a build folder before a move: it
-        // does nothing for a plan of Reclaim/External folders alone.
-        if !app.marked.values().all(|u| u.reclaim.is_some()) {
+        if !app.confirm_details_open && app.confirm_fits(size.width, size.height) {
+            clauses.insert(1, "l inspect paths");
+        }
+        // Selective Cargo groups cannot use the executable-copy mode.
+        if !app.marked.values().all(|u| u.reclaim.is_some())
+            && !app.marked.values().any(|u| u.cargo_unit.is_some())
+        {
             clauses.push(if app.keep_executables {
                 "keep executables → bin/ (k)"
             } else {
@@ -1044,7 +1119,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// under 16 rows (the headline itself), none under 12. Fixed for a given
 /// height: no view and no state changes it, so no row moves.
 pub fn headline_rows(height: u16) -> u16 {
-    if height >= 22 {
+    if height >= 30 {
         4
     } else if height >= 16 {
         2
@@ -1159,7 +1234,6 @@ pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
         third.push(vec![
             format!("covers the previous scope ({n} roots)"),
             format!("previous scope ({n} roots)"),
-            "previous scope".to_string(),
         ]);
     }
     if h.scope == "explicit_root" {
@@ -1234,14 +1308,17 @@ pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
             third.push(vec![
                 format!(
                     "Not measured: {} {}",
-                    m.not_measured.directories,
+                    swamp_core::render::human_count(m.not_measured.directories as u64),
                     if m.not_measured.directories == 1 {
                         "directory"
                     } else {
                         "directories"
                     }
                 ),
-                format!("not measured {}", m.not_measured.directories),
+                format!(
+                    "not measured {}",
+                    swamp_core::render::human_count(m.not_measured.directories as u64)
+                ),
             ]);
         }
         _ => third.push(vec![format!("observed {observed}")]),
@@ -1268,9 +1345,9 @@ fn pointer_line(
     if !app.views_seen {
         return fit_tiered(
             &[vec![
-                "New: Tab opens Tools (Reclaim) and Disk. Hides after you open either.".to_string(),
-                "New: Tab opens Tools and Disk (hides after use)".to_string(),
-                "New: Tab opens Tools and Disk".to_string(),
+                "Tab switches sections · 2 opens Tools / Reclaim · 3 opens Disk".to_string(),
+                "Tab switches sections · 2 Tools / Reclaim · 3 Disk".to_string(),
+                "Tab: Projects / Tools / Disk".to_string(),
             ]],
             width,
         );
@@ -1322,11 +1399,11 @@ fn draw_headline(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let all = headline_lines(app, area.width as usize, swamp_core::entities::now());
-    // Four rows: all. Two rows: the headline and the pointers. One: the
+    // Four rows: all. Two rows: the headline and its coverage/age. One: the
     // headline.
     let lines: Vec<&String> = match area.height {
         1 => vec![&all[0]],
-        2 | 3 => vec![&all[0], &all[3]],
+        2 | 3 => vec![&all[0], if all[2].is_empty() { &all[3] } else { &all[2] }],
         _ => all.iter().collect(),
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -2175,7 +2252,30 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
             out.push((l, false));
         }
     };
-    heading(&mut out, "Keys");
+    heading(&mut out, "Common tasks");
+    entry(&mut out, "1  2  3", "Projects · Tools and Reclaim · Disk");
+    entry(
+        &mut out,
+        "→ / Enter",
+        "inspect the selected project or folder",
+    );
+    entry(&mut out, "s / g", "sort by size / growth");
+    entry(&mut out, "/ / 0", "filter the list / clear the filter");
+    entry(
+        &mut out,
+        "Space",
+        "mark items for review; nothing changes yet",
+    );
+    entry(
+        &mut out,
+        "Backspace",
+        "review paths, costs and warnings before removal",
+    );
+    entry(&mut out, "Esc", "cancel or go back");
+    entry(&mut out, "R", "refresh stored measurements");
+    plain(&mut out, "Protect a path: swamp protect add <path>", 0);
+    blank(&mut out);
+    heading(&mut out, "Full key reference");
     entry(&mut out, "↑ ↓", "move the cursor");
     entry(
         &mut out,
@@ -2423,4 +2523,27 @@ pub fn pick_signals(signals: &[String], n: usize) -> Vec<String> {
     }
     out.truncate(n);
     out
+}
+
+#[cfg(test)]
+mod confirm_wrap_tests {
+    use super::wrap_confirm_text;
+
+    #[test]
+    fn confirmation_wrapping_preserves_path_whitespace_and_unicode_graphemes() {
+        let path = "/my  cache/模型/e\u{301}/file";
+        let wrapped = wrap_confirm_text(path, 5);
+        assert_eq!(wrapped.concat(), path);
+        assert!(
+            wrapped
+                .iter()
+                .all(|line| crate::model::display_width(line) <= 5)
+        );
+        assert!(wrapped.iter().any(|line| line.contains("  ")));
+        assert!(wrapped.iter().any(|line| line.contains("e\u{301}")));
+
+        let prose = wrap_confirm_text("space is freed", 10);
+        assert_eq!(prose, ["space is ", "freed"]);
+        assert_eq!(prose.concat(), "space is freed");
+    }
 }

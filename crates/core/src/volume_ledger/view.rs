@@ -2,7 +2,7 @@
 //! [`Account`]: nothing here lists, stats or spawns.
 
 use super::{Account, Exactness, Row, age_text};
-use crate::render::human_bytes_pub as human;
+use crate::render::{human_bytes_pub as human, human_count};
 use serde_json::json;
 
 fn signed(bytes: i64) -> String {
@@ -60,11 +60,11 @@ pub fn render_text(a: &Account, now: u64) -> String {
     out.push_str(&format!(
         "Accounted (catalog and declared locations, counted once): {} across {} locations\n",
         human(a.accounted.bytes),
-        a.accounted.locations
+        human_count(a.accounted.locations as u64)
     ));
     out.push_str(&format!(
         "Everything else (measured, {} folders): {}\n",
-        a.everything_else.folders,
+        human_count(a.everything_else.folders as u64),
         human(a.everything_else.bytes)
     ));
     for r in &a.everything_else.top {
@@ -97,7 +97,7 @@ pub fn render_text(a: &Account, now: u64) -> String {
             (Some(0), _) => out.push_str("Local snapshots: none listed\n"),
             (_, n) => out.push_str(&format!(
                 "Local snapshots: {} listed, size not measured [{}]\n",
-                n.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+                n.map(human_count).unwrap_or_else(|| "?".into()),
                 r.note.as_deref().unwrap_or("")
             )),
         },
@@ -105,7 +105,7 @@ pub fn render_text(a: &Account, now: u64) -> String {
     }
     out.push_str(&format!(
         "Not measured: {} folders could not be read\n",
-        a.not_measured.count
+        human_count(a.not_measured.count as u64)
     ));
     for name in a.not_measured.names.iter().take(20) {
         out.push_str(&format!("  {name}\n"));
@@ -113,14 +113,14 @@ pub fn render_text(a: &Account, now: u64) -> String {
     if a.not_measured.count > 20 {
         out.push_str(&format!(
             "  ... and {} more (see --json for up to {} names)\n",
-            a.not_measured.count - 20,
-            super::MAX_NAMED_ROWS
+            human_count((a.not_measured.count - 20) as u64),
+            human_count(super::MAX_NAMED_ROWS as u64)
         ));
     }
     if a.not_measured.not_yet_measured > 0 {
         out.push_str(&format!(
             "Not measured yet this pass: {} locations (the pass continues at the next observe)\n",
-            a.not_measured.not_yet_measured
+            human_count(a.not_measured.not_yet_measured as u64)
         ));
         for name in a.not_measured.not_yet_measured_names.iter().take(10) {
             out.push_str(&format!("  {name}\n"));
@@ -129,14 +129,14 @@ pub fn render_text(a: &Account, now: u64) -> String {
     if let Some(est) = a.not_measured.estimate_bytes {
         out.push_str(&format!(
             "Protected folders: not measured ({} folders); the unexplained part of the Data volume, up to {}, may be inside them (an estimate, not part of any check)\n",
-            a.not_measured.count,
+            human_count(a.not_measured.count as u64),
             human(est)
         ));
     }
     match (a.residual.bytes, a.residual.percent_of_used) {
         (Some(b), Some(p)) => {
             out.push_str(&format!(
-                "{} (bookkeeping): {} ({p:+.2}% of used)\n",
+                "{} (bookkeeping): {} ({p:+.1}% of used)\n",
                 capitalize(a.residual.name),
                 signed(b)
             ));
@@ -156,7 +156,7 @@ pub fn render_text(a: &Account, now: u64) -> String {
     } else {
         out.push_str(&format!(
             "Walk spot-audited: {} folders, max difference {:.1}%\n",
-            a.audit.folders.len(),
+            human_count(a.audit.folders.len() as u64),
             a.audit.max_difference_percent
         ));
         for f in &a.audit.folders {
@@ -170,7 +170,7 @@ pub fn render_text(a: &Account, now: u64) -> String {
                 ));
             } else {
                 out.push_str(&format!(
-                    "  audited {}: ledger {} vs audit {} ({:+.2}%)\n",
+                    "  audited {}: ledger {} vs audit {} ({:+.1}%)\n",
                     f.path,
                     human(f.ledger_bytes),
                     human(f.audited_bytes),

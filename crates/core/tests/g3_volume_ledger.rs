@@ -1320,9 +1320,9 @@ fn reading_the_ledger_lists_nothing_stats_nothing_and_spawns_nothing() {
     assert_eq!(work.dirs_listed, 0);
     assert_eq!(work.files_statted, 0);
     assert_eq!(work.subprocess_spawns, 0);
-    assert!(text.contains("measured 3 h ago"), "{text}");
+    assert!(text.contains("measured 3h ago"), "{text}");
     // Per-row ages are shown.
-    assert!(text.contains("measured 3 h ago)"));
+    assert!(text.contains("measured 3h ago)"));
 }
 
 #[test]

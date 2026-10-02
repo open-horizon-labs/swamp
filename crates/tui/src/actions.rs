@@ -24,6 +24,9 @@ pub struct MarkedUnit {
     /// Set when the row is an agent-storage unit (#101): a single-path
     /// cache/log move, or a session's member list.
     pub agent_unit: Option<swamp_core::actions::PlanUnit>,
+    /// Exact session member facts for the expandable review inventory.
+    /// Execution still uses the revalidated plan metadata above.
+    pub session_members: Option<Vec<swamp_core::agents::AgentMember>>,
     /// Set when the row is a Reclaim/External unit or folder: the review
     /// it was marked on, rechecked at the move. Plain path Trash move.
     pub reclaim: Option<ReclaimMark>,
@@ -530,239 +533,289 @@ pub fn trash_root() -> PathBuf {
     swamp_core::actions::trash_root()
 }
 
-/// Human summary for the confirm banner: current facts, shown once,
-/// before Enter -- never re-checked afterward.
-///
-/// One line per fact, in the order a person authorizing a delete needs
-/// them: count, size and destination first, then what cannot come back,
-/// then names, then warnings. The lines are separate so the screen can
-/// wrap or cut at the tail; the numbers are never behind the names.
+/// Compact decision summary. The separate detail inventory retains every
+/// target/member path; this view groups actions and identical warning facts.
 pub fn confirm_summary(units: &[MarkedUnit]) -> String {
-    let plural = |n: usize, one: &str, many: &str| {
-        if n == 1 {
-            format!("1 {one}")
-        } else {
-            format!("{n} {many}")
-        }
-    };
-    let reclaim_units: Vec<&MarkedUnit> = units.iter().filter(|u| u.reclaim.is_some()).collect();
-    let units: Vec<MarkedUnit> = units
-        .iter()
-        .filter(|u| u.reclaim.is_none())
-        .cloned()
-        .collect();
-    let units_all_n = units.len() + reclaim_units.len();
-    let units = &units[..];
-    let permanent_units: Vec<&MarkedUnit> = units.iter().filter(|u| u.docker.is_some()).collect();
-    let trash_units = units_all_n - permanent_units.len();
-    let permanent: u64 = permanent_units.iter().map(|u| u.bytes).sum();
+    let mut lines: Vec<String> = Vec::new();
+    let trash_n = units.iter().filter(|u| u.docker.is_none()).count();
     let trash_bytes: u64 = units
         .iter()
-        .chain(reclaim_units.iter().copied())
+        .filter(|u| u.docker.is_none())
         .map(|u| u.bytes)
-        .sum::<u64>()
-        - permanent;
-    let mut lines: Vec<String> = Vec::new();
-    let frees_nothing = reclaim_units
+        .sum();
+    let docker_n = units.iter().filter(|u| u.docker.is_some()).count();
+    let docker_bytes: u64 = units
         .iter()
-        .any(|u| u.warnings.iter().any(|w| w.contains("frees about nothing")));
-    let inside_extra = if frees_nothing {
-        ", mounted volumes inside hold most of these bytes: moving it frees about nothing"
-    } else if reclaim_units.iter().any(|u| {
-        u.warnings
-            .iter()
-            .any(|w| w.contains("counted under projects"))
-    }) {
-        " plus project worktrees inside, counted under their projects"
-    } else {
-        ""
-    };
-    // Two destinations, and the difference is the whole point: a path
-    // goes to Trash and comes back, a Docker object does not.
-    if trash_units > 0 {
-        lines.push(format!(
-            "Move {} ({}{inside_extra}) → Trash. Space is freed when Trash is emptied.",
-            plural(trash_units, "item", "items"),
+        .filter(|u| u.docker.is_some())
+        .map(|u| u.bytes)
+        .sum();
+    let count = |n: usize| swamp_core::render::human_count(n as u64);
+    let mut totals = Vec::new();
+    if trash_n > 0 {
+        totals.push(format!(
+            "Trash: {} · {}",
+            count(trash_n),
             human_bytes(trash_bytes)
         ));
     }
-    if !permanent_units.is_empty() {
-        lines.push(format!(
-            "Remove {} ({}) for good, no Trash.",
-            plural(permanent_units.len(), "docker item", "docker items"),
-            human_bytes(permanent)
+    if docker_n > 0 {
+        totals.push(format!(
+            "Permanent: {} · {}",
+            count(docker_n),
+            human_bytes(docker_bytes)
         ));
-        // Name every unit that cannot come back, not just its bytes.
-        let names: Vec<String> = permanent_units
-            .iter()
-            .take(6)
-            .map(|u| {
-                let what = match &u.docker {
-                    Some(swamp_core::docker::Removal::Image { .. }) => "image",
-                    Some(swamp_core::docker::Removal::Volume { .. }) => "volume",
-                    _ => "object",
-                };
-                let name = if u.label.trim().is_empty() {
-                    u.path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?")
-                        .to_string()
-                } else {
-                    u.label.trim().to_string()
-                };
-                format!("{name} (docker {what})")
-            })
-            .collect();
-        let extra = permanent_units.len().saturating_sub(6);
-        let extra = if extra > 0 {
-            format!(" +{extra} more")
+    }
+    let unit_count = count(units.len());
+    lines.push(format!(
+        "Review {unit_count} {} · {}",
+        if units.len() == 1 {
+            "action"
         } else {
-            String::new()
-        };
-        lines.push(format!("Gone for good: {}{extra}", names.join(", ")));
-    }
-    // What kinds of things move, each name once with how many: never the
-    // same name repeated. Checkouts are spelled out as such.
-    let mut kinds: Vec<(String, usize)> = Vec::new();
-    for u in units.iter().filter(|u| u.docker.is_none()) {
-        let name = u
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&u.label)
-            .to_string();
-        let name = match &u.worktree {
-            Some(t) if t.whole_checkout => format!("checkout {name}"),
-            Some(_) => format!("worktree {name}"),
-            None => name,
-        };
-        match kinds.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, c)) => *c += 1,
-            None => kinds.push((name, 1)),
-        }
-    }
-    // Most common first; ties keep the order they were found in.
-    kinds.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-    if !kinds.is_empty() {
-        let shown: Vec<String> = kinds
-            .iter()
-            .take(3)
-            .map(|(n, c)| {
-                if *c > 1 {
-                    format!("{n} ({c})")
-                } else {
-                    n.clone()
-                }
-            })
-            .collect();
-        let rest = kinds.len().saturating_sub(3);
-        let rest = if rest > 0 {
-            format!(", +{rest} kinds")
-        } else {
-            String::new()
-        };
-        lines.push(format!("Includes: {}{rest}", shown.join(", ")));
-    }
-    if units
+            "actions"
+        },
+        totals.join(" · ")
+    ));
+
+    let trash_paths: Vec<PathBuf> = units
         .iter()
-        .any(|u| u.worktree.as_ref().is_some_and(|t| t.whole_checkout))
-    {
-        lines.push("A checkout takes its working copy, .git and source (into Trash).".to_string());
-    }
-    // Warnings, one line per distinct warning with how many items carry
-    // it, never inlined into the names.
-    let mut warned: Vec<(String, usize)> = Vec::new();
-    for w in units.iter().flat_map(|u| u.warnings.iter()) {
-        match warned.iter_mut().find(|(t, _)| t == w) {
-            Some((_, n)) => *n += 1,
-            None => warned.push((w.clone(), 1)),
+        .filter(|u| u.docker.is_none())
+        .map(|u| u.path.clone())
+        .collect();
+    let trash_scope = common_parent(&trash_paths);
+    let mut groups =
+        std::collections::BTreeMap::<(String, String), (usize, u64, Vec<String>)>::new();
+    for u in units {
+        if let Some(removal) = &u.docker {
+            let (kind, target) = match removal {
+                swamp_core::docker::Removal::Image { id } => ("Docker image", id.as_str()),
+                swamp_core::docker::Removal::Volume { name } => ("Docker volume", name.as_str()),
+                swamp_core::docker::Removal::Refused(_) => ("Docker object", u.label.as_str()),
+            };
+            lines.push(format!(
+                "PERMANENT · {kind} · {} · {}",
+                human_bytes(u.bytes),
+                swamp_core::reclaim_trash::plain(target)
+            ));
+            continue;
         }
-    }
-    // Every distinct warning is listed: a warning folded into "+N more"
-    // while Enter is offered is a fact the person did not read. A plan
-    // whose lines do not all fit the sheet offers no Enter (`confirm_fits`).
-    for (text, n) in &warned {
-        let text = swamp_core::reclaim_trash::plain(text);
-        if *n > 1 {
-            lines.push(format!("⚠ {text} ({n} items)"));
+        let destination = "Trash";
+        let scope = if let Some(plan) = u.cargo_unit.as_ref().or(u.agent_unit.as_ref()) {
+            let project = plan.project();
+            if project.is_empty() {
+                trash_scope.clone()
+            } else {
+                project.to_string()
+            }
         } else {
-            lines.push(format!("⚠ {text}"));
+            trash_scope.clone()
+        };
+        let entry = groups.entry((destination.to_string(), scope)).or_default();
+        entry.0 += 1;
+        entry.1 = entry.1.saturating_add(u.bytes);
+        entry.2.push(display_target(u));
+    }
+    for ((destination, scope), (n, bytes, targets)) in groups {
+        if n == 1 {
+            let unit = units
+                .iter()
+                .find(|u| u.docker.is_none() && display_target(u) == targets[0]);
+            let dest =
+                if unit.is_some_and(|u| u.worktree.as_ref().is_some_and(|t| t.whole_checkout)) {
+                    "CHECKOUT → Trash"
+                } else {
+                    "TRASH"
+                };
+            lines.push(format!("{dest} · {} · {}", human_bytes(bytes), targets[0]));
+        } else {
+            lines.push(format!(
+                "{destination} · {} actions · {} · {scope}",
+                count(n),
+                human_bytes(bytes)
+            ));
         }
     }
-    lines.extend(reclaim_lines(&reclaim_units));
+
+    let mut warnings = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for u in units {
+        let mut unit_warnings = std::collections::BTreeSet::new();
+        for warning in &u.warnings {
+            // The member inventory is available in the detail view; repeating
+            // one warning per member obscures the decision in the summary.
+            if crate::names::is_member_warning(warning)
+                && (u.session_members.is_some()
+                    || u.cargo_unit
+                        .as_ref()
+                        .is_some_and(|plan| plan.cargo_group().is_some()))
+            {
+                continue;
+            }
+            unit_warnings.insert(crate::names::compact_warning(warning));
+        }
+        if u.worktree.as_ref().is_some_and(|t| t.whole_checkout) {
+            unit_warnings.insert("includes the working copy, .git and source".to_string());
+        }
+        for warning in unit_warnings {
+            warnings.entry(warning).or_default().push(display_target(u));
+        }
+    }
+    for (warning, targets) in warnings {
+        if targets.len() == 1 {
+            if units.len() == 1 {
+                lines.push(format!("! {warning}"));
+            } else {
+                lines.push(format!("! {warning} · {}", targets[0]));
+            }
+        } else {
+            lines.push(format!(
+                "! {warning} · affects {} actions",
+                count(targets.len())
+            ));
+        }
+    }
+
+    if units.len() > 1
+        || units.first().is_some_and(|u| {
+            u.cargo_unit
+                .as_ref()
+                .is_some_and(|p| p.cargo_group().is_some())
+                || u.session_members.is_some()
+        })
+    {
+        lines.push("Enter applies this plan · l inspects every action and member path.".into());
+    } else {
+        lines.push("Enter applies this action.".into());
+    }
+
+    if trash_n > 0 {
+        lines.push(
+            "Trash can be restored until emptied; space is freed when Trash is emptied.".into(),
+        );
+    }
+    if docker_n > 0 {
+        lines.push("Docker items are removed permanently; Docker has no Trash recovery.".into());
+    }
+    if units.iter().any(|u| u.reclaim.is_some()) {
+        lines.push(
+            "Enter rechecks each folder and whether anything holds it open before moving it."
+                .into(),
+        );
+    }
     lines.join("\n")
 }
 
-/// Most marked folders whose own warnings are listed one by one; more
-/// than this and the paths are listed and the warnings are merged.
-const RECLAIM_BLOCKS: usize = 3;
-/// Most paths listed when the warnings are merged.
-const RECLAIM_PATHS: usize = 8;
-
-/// The confirm's part for Reclaim/External folders: every exact path and
-/// size, then what swamp does and does not know about each (its own
-/// review lines), then the way back. Nothing is cut to "N more" until the
-/// list is long, and then the count says how many paths are not shown.
-fn reclaim_lines(units: &[&MarkedUnit]) -> Vec<String> {
-    use swamp_core::reclaim_trash::plain;
-    let mut lines: Vec<String> = Vec::new();
-    if units.is_empty() {
-        return lines;
-    }
-    let shown = |u: &MarkedUnit| plain(&u.path.display().to_string());
-    if units.len() <= RECLAIM_BLOCKS {
-        for u in units {
-            lines.push(format!("{} ({})", shown(u), human_bytes(u.bytes)));
-            for w in &u.warnings {
-                lines.push(format!("⚠ {}", plain(w)));
-            }
-        }
+fn display_target(u: &MarkedUnit) -> String {
+    if let Some(removal) = &u.docker {
+        let target = match removal {
+            swamp_core::docker::Removal::Image { id } => id.as_str(),
+            swamp_core::docker::Removal::Volume { name } => name.as_str(),
+            swamp_core::docker::Removal::Refused(_) => u.label.as_str(),
+        };
+        swamp_core::reclaim_trash::plain(target)
     } else {
-        for u in units.iter().take(RECLAIM_PATHS) {
-            lines.push(format!("{} ({})", shown(u), human_bytes(u.bytes)));
+        swamp_core::reclaim_trash::plain(&u.path.display().to_string())
+    }
+}
+
+fn common_parent(paths: &[PathBuf]) -> String {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    let mut iter = paths.iter();
+    if let Some(first) = iter.next() {
+        parts = first
+            .parent()
+            .unwrap_or(first)
+            .components()
+            .map(|c| c.as_os_str().to_owned())
+            .collect();
+        for path in iter {
+            let next: Vec<_> = path
+                .parent()
+                .unwrap_or(path)
+                .components()
+                .map(|c| c.as_os_str().to_owned())
+                .collect();
+            let shared = parts
+                .iter()
+                .zip(next.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            parts.truncate(shared);
         }
-        if units.len() > RECLAIM_PATHS {
-            let rest: u64 = units.iter().skip(RECLAIM_PATHS).map(|u| u.bytes).sum();
-            lines.push(format!(
-                "+{} more folders ({}); every path is in the ledger row for its move",
-                units.len() - RECLAIM_PATHS,
-                human_bytes(rest)
-            ));
+    }
+    let mut path = PathBuf::new();
+    for part in parts {
+        path.push(part);
+    }
+    if path.as_os_str().is_empty() {
+        "selected paths".into()
+    } else {
+        swamp_core::reclaim_trash::plain(&path.display().to_string())
+    }
+}
+
+/// Full path inventory is deliberately separate from the compact summary.
+pub fn confirm_details(units: &[MarkedUnit]) -> String {
+    let count = |n: usize| swamp_core::render::human_count(n as u64);
+    let mut lines = vec![
+        "All action and member paths; member byte figures are details, not extra totals.".into(),
+    ];
+    for u in units {
+        let action_kind = u.docker.as_ref().map(|removal| match removal {
+            swamp_core::docker::Removal::Image { .. } => "Docker image",
+            swamp_core::docker::Removal::Volume { .. } => "Docker volume",
+            swamp_core::docker::Removal::Refused(_) => "Docker object",
+        });
+        lines.push(format!(
+            "{}{} · {} · {}",
+            if u.docker.is_some() {
+                "PERMANENT"
+            } else {
+                "TRASH"
+            },
+            action_kind
+                .map(|kind| format!(" · {kind}"))
+                .unwrap_or_default(),
+            human_bytes(u.bytes),
+            display_target(u)
+        ));
+        let mut unit_warnings = std::collections::BTreeSet::new();
+        for warning in &u.warnings {
+            if crate::names::is_member_warning(warning)
+                && (u.session_members.is_some()
+                    || u.cargo_unit
+                        .as_ref()
+                        .is_some_and(|plan| plan.cargo_group().is_some()))
+            {
+                continue;
+            }
+            unit_warnings.insert(crate::names::compact_warning(warning));
         }
-        // Each distinct warning once, and the folders it is about whenever
-        // it is not about all of them: a warning is never shown without
-        // the path it belongs to.
-        let mut merged: Vec<(String, Vec<String>)> = Vec::new();
-        for u in units {
-            for w in &u.warnings {
-                match merged.iter_mut().find(|(t, _)| t == w) {
-                    Some((_, who)) => who.push(shown(u)),
-                    None => merged.push((w.clone(), vec![shown(u)])),
-                }
+        for warning in unit_warnings {
+            lines.push(format!("  ! {warning}"));
+        }
+        if let Some(group) = u.cargo_unit.as_ref().and_then(|p| p.cargo_group()) {
+            lines.push(format!("  {} Cargo members", count(group.members.len())));
+            for member in &group.members {
+                lines.push(format!(
+                    "  member · {} · {}",
+                    human_bytes(member.bytes),
+                    swamp_core::reclaim_trash::plain(&member.path.display().to_string())
+                ));
             }
         }
-        for (text, who) in &merged {
-            let text = plain(text);
-            if who.len() == units.len() {
-                lines.push(format!("⚠ {text} (all {} folders)", units.len()));
-            } else {
-                // Every folder the warning is about, by name: a count
-                // would hide which ones. A plan too long for the sheet
-                // offers no Enter (`confirm_fits`).
-                lines.push(format!("⚠ {text}: {}", who.join(", ")));
+        if let Some(members) = &u.session_members {
+            for member in members {
+                lines.push(format!(
+                    "  member · {} · {}",
+                    human_bytes(member.bytes),
+                    swamp_core::reclaim_trash::plain(&member.path.display().to_string())
+                ));
             }
         }
     }
-    lines.push(
-        "Facts above were read when you marked; Enter re-checks that each entry, and what holds it open, is unchanged."
-            .to_string(),
-    );
-    lines.push(
-        "Trash is the way back: move the folder out of the Trash to restore it. Space is freed when Trash is emptied."
-            .to_string(),
-    );
-    lines
+    if lines.len() == 1 {
+        lines.push(format!("{} action paths", count(units.len())));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -773,6 +826,7 @@ mod tests {
         MarkedUnit {
             cargo_unit: None,
             agent_unit: None,
+            session_members: None,
             reclaim: None,
             path: PathBuf::from(path),
             docker,
@@ -793,7 +847,14 @@ mod tests {
             Some(swamp_core::docker::Removal::Image { id: "abc".into() }),
         );
         let summary = confirm_summary(std::slice::from_ref(&u));
-        assert!(summary.contains("/x"));
+        assert!(
+            summary.contains("PERMANENT · Docker image · 10B · abc"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Docker has no Trash recovery"),
+            "{summary}"
+        );
     }
 
     #[test]
@@ -801,6 +862,63 @@ mod tests {
         let u = unit("/x", 10, None);
         let summary = confirm_summary(std::slice::from_ref(&u));
         assert!(!summary.to_lowercase().contains("permanent"));
+        assert!(summary.contains("Review 1 action"));
+        assert!(summary.contains("TRASH · 10B · /x"));
+        assert!(summary.contains("Trash can be restored until emptied"));
+    }
+
+    #[test]
+    fn compact_reclaim_facts_keep_source_unknown_activity_and_shared_data() {
+        let u = MarkedUnit {
+            warnings: vec![
+                "regeneration cost not established: no record of its download source (from the model row)".into(),
+                "last used: no record (file access time unavailable)".into(),
+                "who needs it: not established for this path".into(),
+                "open-file check unresolved: process state unknown".into(),
+                "shared blobs remain in the cache and are not moved with this folder".into(),
+            ],
+            ..unit("/cache/model", 1024, None)
+        };
+        let summary = confirm_summary(&[u]);
+        assert!(
+            summary
+                .contains("Cost unknown · no record of its download source · source the model row"),
+            "{summary}"
+        );
+        assert!(summary.contains("Last used · no record"), "{summary}");
+        assert!(summary.contains("Consumers · not established"), "{summary}");
+        assert!(summary.contains("shared blobs remain"), "{summary}");
+    }
+
+    #[test]
+    fn large_plan_summary_groups_actions_and_repeated_facts_but_details_keep_every_path() {
+        let units: Vec<_> = (0..499)
+            .map(|n| MarkedUnit {
+                warnings: vec!["open-file check unresolved: process state unknown".into()],
+                ..unit(&format!("/work/project/cache/item-{n}"), 1024, None)
+            })
+            .collect();
+        let summary = confirm_summary(&units);
+        assert!(summary.contains("499 actions"), "{summary}");
+        assert!(summary.contains("affects 499 actions"), "{summary}");
+        assert_eq!(
+            summary.matches("process state unknown").count(),
+            1,
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("item-0"),
+            "the inventory belongs in details"
+        );
+        let details = confirm_details(&units);
+        assert!(details.contains("/work/project/cache/item-0"));
+        assert!(details.contains("/work/project/cache/item-498"));
+        assert_eq!(
+            details
+                .matches("TRASH · 1KB · /work/project/cache/item-")
+                .count(),
+            499
+        );
     }
 
     #[test]

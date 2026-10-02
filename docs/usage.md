@@ -148,6 +148,8 @@ swamp collect --status --json ~/src
 
 History starts when swamp observes a root. `observe --since` selects the comparison window that pass's growth/regrowth figures use, defaulting to the `since` config value; `report` has no `--since` of its own -- it reads whatever window the last `observe` used. Use seconds, minutes, hours, or days here: `30m`, `24h`, `7d`. The filter language also accepts weeks, but the CLI/config history-duration parser does not; use `7d` rather than `1w` for `since`.
 
+`observe` shows elapsed time and the current work, then a concise completion and coverage summary. Walk counters reset between roots, so they are not shown as whole-run progress. Use `observe --verbose` for the exact diagnostic counters and per-root details. Human displays round bytes and durations; JSON and stored records retain their original precision.
+
 Use `observe --full` to force a full filesystem walk. A normal observation can also fall back to a full walk when event history is insufficient; the report notes explain why.
 
 Observations are stored separately for each canonical scan root. You can switch between a project and its parent directory using the same `SWAMP_DIR`; each root keeps its own history and incremental checkpoint. Overlapping roots are separate views, not totals to add together.
@@ -675,6 +677,8 @@ The Hugging Face hub cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`, else
 the store's row, and each repo folder's row) and in External (each repo folder's
 row; the Ollama tags under "identified interior"). Each says:
 
+An expanded repo-folder row keeps the physical folder allocation in the Size column and labels it as a folder. Its facts separately show the model total, including shared weights where present. For example, a 1.9 MB folder can reference a 968.9 MB model while 967 MB stays in the separately listed `blobs/` folder. Those model and blob totals overlap; adding them would count the weights twice. Marking the repo-folder row selects that folder, not its shared blobs.
+
 ```text
    968.9MB  mkrausio/EmoWhisper-AnS-Small-v0.1@e613edc6  (model)  whisper · 241.7M params · float32
       last read: Sep 29 (file access time of model.safetensors)
@@ -1013,7 +1017,7 @@ current section (wrapping). Nothing else opens a view.
 
 | Section | Views (first is the default) |
 |---|---|
-| 1 Projects | Projects, Tree, Builds, Deps, Types, Kinds, Unowned |
+| 1 Projects | Projects, Tree, Builds, Dependencies, Ecosystems, Folder types, Unowned |
 | 2 Tools | Reclaim, Docker, External, Agents |
 | 3 Disk | Summary (the stored volume ledger's parts), Not measured (unreadable and not-yet-measured folders, the largest measured folders outside developer storage) |
 
@@ -1131,14 +1135,7 @@ which way the percent mixes them.
 (`developer_bytes`, `locations`, `categories`, `not_counted`, `percent_of_used`,
 `disk` with its `state`, `ages`, `flags`, and `line`, the text's first line).
 
-In the TUI the same block is four rows under the header on every view and in
-every state (headline, breakdown, disk state and ages, then the pointers to
-Reclaim and Disk), two rows on a terminal under 22 rows tall (the headline and
-the pointers), one under 16, none under 12. Nothing changes its height, so no
-row moves when a warning appears. Until you have opened Tools or Disk once, the
-pointer row says `New: Tab opens Tools (Reclaim) and Disk. Hides after you open
-either.`; that is remembered in `ui_state.json` (`views_seen`; an older swamp
-ignores the key).
+In the TUI, terminals at least 30 rows tall show four header rows: the headline, breakdown, disk state and ages, and view shortcuts. Terminals from 16 to 29 rows show the headline and coverage/age, keeping gaps and audit warnings visible; smaller terminals show the headline only, or omit the block below 12 rows. The height depends only on terminal size, so warnings do not shift the table. The expanded header includes a first-use section hint until you open Tools or Disk; that choice is remembered in `ui_state.json`.
 
 ## Where the whole disk went (the volume ledger)
 
@@ -1517,7 +1514,7 @@ Images, volumes, and build-cache records join to projects using Compose metadata
 
 A project action expands to its actionable artifact rows. If it has none, a direct project action can offer the checkout. Bulk marking with `A` skips that fallback. The `ignored` and `untracked` remainder totals cover scattered files, so those summary buckets are not themselves deletion units.
 
-**What you see and own, you may move to Trash.** Every row with a real folder or file behind it can be marked: a Reclaim unit and each folder listed under it, an External unit and its folders, a store-interior folder, a measured folder in the Disk views, a build folder no cleanup rule covers, a config or credentials file an AI tool keeps. The category, the location and what swamp does not know are **lines on the confirm, never a refusal**: local state and models say they cannot be regenerated, an installation says its tool will still list it (and, where swamp runs the tool's own removal, names that command), the whole `~/Library/Caches` says it is the folder every app keeps its cache in, Claude session scratch says a running session breaks, a size with a coverage gap says it is a lower bound, a path outside your home says the system may refuse, "last used: no record" and "regeneration cost not established" say what swamp could not find, and a process holding a file open is named (or "could not be checked"). The confirm lists every exact path and size, then these lines, then "Trash is the way back"; it fits the whole plan on screen or Enter is not offered.
+**What you see and own, you may move to Trash.** Every row with a real folder or file behind it can be marked: a Reclaim unit and each folder listed under it, an External unit and its folders, a store-interior folder, a measured folder in the Disk views, a build folder no cleanup rule covers, a config or credentials file an AI tool keeps. The category, the location and what swamp does not know are **lines on the confirm, never a refusal**: local state and models say they cannot be regenerated, an installation says its tool will still list it (and, where swamp runs the tool's own removal, names that command), the whole `~/Library/Caches` says it is the folder every app keeps its cache in, Claude session scratch says a running session breaks, a size with a coverage gap says it is a lower bound, a path outside your home says the system may refuse, "last used: no record" and "regeneration cost not established" say what swamp could not find, and a process holding a file open is named (or "could not be checked"). The review groups common warnings once and names item-specific exceptions. Press `l` to inspect every exact path and size. The inventory is optional; Enter confirms from the primary summary after its warning content has been displayed.
 
 The only reasons swamp refuses, each stated on screen:
 
@@ -1927,3 +1924,7 @@ See [architecture](architecture.md) for the meaning of incremental updates, hist
 On macOS, an older stored FSEvents cursor without an event-store UUID needs one full measurement before incremental reuse resumes. A missing or invalid event history also requires measurement; a warm observation time does not predict that first pass.
 
 Automatic host-storage observations exclude nested CoreDevice `devicefs` mounts and name them as unmeasured virtual filesystems. Explicitly requested roots retain their requested scope. When this boundary changes, growth spanning the change is unavailable rather than reported as bytes freed; earlier history is retained.
+
+### Reviewing long Trash plans
+
+Trash review groups destination totals and shared warnings, with item-specific exceptions. Press `l` for the complete path-and-size inventory; use arrows or PgUp/PgDn to scroll, Home/End to jump, and Esc to return. You do not have to page through every path to confirm. Enter acts from the reviewed summary; Esc there cancels. Filesystem paths go to Trash; Docker removals are labelled permanent and have no Trash recovery.

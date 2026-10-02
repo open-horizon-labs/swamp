@@ -6,4 +6,4 @@ Users inspect disk growth by project, worktree, and artifact, then select units 
 
 Use [DESIGN.md](../../DESIGN.md) for the current display contract and [usage](../../docs/usage.md#terminal-controls) for keys. Check committed frames at 80×24 and 200×60.
 
-Preserve the common Report model, visible warnings and recovery behavior, execution checks, and coverage notes. Use a table and tree with signed growth and diverging bars. Help and the filter form use overlays; action confirmation stays inline.
+Preserve the common Report model, visible warnings and recovery behavior, execution checks, and coverage notes. Use a table and tree with signed growth and diverging bars. Help and the filter form use overlays; action confirmation uses a compact summary overlay with an optional full-path inventory.

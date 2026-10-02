@@ -80,11 +80,6 @@ pub fn project_key_of(report: &Report, path: &Path) -> Option<String> {
     best.map(|(n, _)| n.to_string())
 }
 
-/// The display name of the project whose checkout holds `path`.
-pub fn project_of(report: &Report, path: &Path) -> Option<String> {
-    locate(report, path).map(|(project, _)| project)
-}
-
 /// The name a person would give `path`, for progress lines and the
 /// blocked list.
 pub fn friendly_unit_name(report: &Report, path: &Path) -> String {
@@ -110,6 +105,50 @@ pub fn friendly_unit_name(report: &Report, path: &Path) -> String {
             parts[n.saturating_sub(2)..].join("/")
         }
     }
+}
+
+/// Compact sourced warning labels for the human action review.
+pub fn compact_warning(warning: &str) -> String {
+    let text = swamp_core::reclaim_trash::plain(warning);
+    let sourced = |prefix: &str, heading: &str| {
+        text.strip_prefix(prefix).map(|rest| {
+            let rest = rest.trim().trim_start_matches(':').trim();
+            if let Some((facts, source)) = rest
+                .strip_suffix(')')
+                .and_then(|s| s.rsplit_once(" (from "))
+            {
+                format!("{heading} · {} · source {}", facts.trim(), source.trim())
+            } else {
+                format!("{heading} · {}", rest.trim())
+            }
+        })
+    };
+    sourced("regeneration cost not established", "Cost unknown")
+        .or_else(|| sourced("getting it back", "Cost to restore"))
+        .or_else(|| sourced("cannot be regenerated", "Cannot be regenerated"))
+        .or_else(|| {
+            text.strip_prefix("last used:")
+                .map(|s| format!("Last used · {}", s.trim()))
+        })
+        .or_else(|| {
+            text.strip_prefix("who needs it:")
+                .map(|s| format!("Consumers · {}", s.trim()))
+        })
+        .or_else(|| {
+            text.strip_prefix("in use right now:")
+                .map(|s| format!("Open files · {}", s.trim()))
+        })
+        .or_else(|| {
+            text.strip_prefix("whether a process has it open")
+                .map(|s| format!("Open files · whether a process has it open{}", s))
+        })
+        .unwrap_or(text)
+}
+
+/// Whether a warning is the per-member path echo also represented in the
+/// full action inventory. Keep prefix parsing in this presentation module.
+pub fn is_member_warning(warning: &str) -> bool {
+    swamp_core::reclaim_trash::plain(warning).starts_with("member: ")
 }
 
 #[cfg(test)]

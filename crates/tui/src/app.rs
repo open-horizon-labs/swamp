@@ -205,11 +205,11 @@ impl ViewKind {
             ViewKind::Projects => "Projects",
             ViewKind::Tree => "Tree",
             ViewKind::Builds => "Builds",
-            ViewKind::Deps => "Deps",
+            ViewKind::Deps => "Dependencies",
             ViewKind::Docker => "Docker",
-            ViewKind::Kinds => "Kinds",
+            ViewKind::Kinds => "Folder types",
             ViewKind::Unowned => "Unowned",
-            ViewKind::Types => "Types",
+            ViewKind::Types => "Ecosystems",
             ViewKind::External => "External",
             ViewKind::Reclaim => "Reclaim",
             ViewKind::Disk => "Summary",
@@ -345,9 +345,24 @@ enum HeldReload {
 
 const REFRESH_WAITS: &str = "A check is running; press R after it finishes";
 
-/// The smallest terminal that shows the permanent-removal line of a plan.
-pub const CONFIRM_MIN_ROWS: u16 = 9;
+/// Minimum width for a readable Trash review overlay.
+pub const CONFIRM_MIN_ROWS: u16 = 7;
 pub const CONFIRM_MIN_COLS: u16 = 40;
+
+fn keep_executables_toggle(current: bool, selective_cargo_confirm: bool) -> Option<bool> {
+    if selective_cargo_confirm && !current {
+        None
+    } else {
+        Some(!current)
+    }
+}
+
+pub(crate) fn selective_cargo_keep_conflict(
+    keep_executables: bool,
+    has_cargo_action: bool,
+) -> bool {
+    keep_executables && has_cargo_action
+}
 
 type PendingObservation = anyhow::Result<RefreshedObservation>;
 
@@ -406,6 +421,12 @@ pub struct App {
     tool_rx: Option<std::sync::mpsc::Receiver<crate::tool_sheet::ToolEvent>>,
     /// A confirm just appeared: queued input is dropped before any key.
     confirm_drain: bool,
+    /// First wrapped line in the Trash review overlay.
+    pub confirm_scroll: std::cell::Cell<usize>,
+    /// Contiguous wrapped lines the human has actually seen.
+    confirm_seen_rows: std::cell::Cell<usize>,
+    /// Dimensions and plan fingerprint last drawn; changes restart review.
+    confirm_view_key: std::cell::Cell<(u16, u16, u64)>,
     /// How tool removal reaches the machine: the real managers, or a
     /// test's sandbox of fakes.
     pub tool_host: swamp_core::tool_removal::Host,
@@ -506,6 +527,9 @@ pub struct App {
     /// Marked units, keyed by path string for stable identity.
     pub marked: BTreeMap<String, MarkedUnit>,
     pub confirm_open: bool,
+    /// Full action/member inventory is optional; Enter is available only
+    /// after returning to the decision summary.
+    pub confirm_details_open: bool,
     /// Unit ids the press that opened the current confirm marked (Backspace
     /// or `A` on an unmarked selection). Esc on that confirm unmarks exactly
     /// these, so cancelling never leaves marks the screen did not show
@@ -804,6 +828,9 @@ impl App {
             tool_sheet: None,
             tool_rx: None,
             confirm_drain: false,
+            confirm_scroll: std::cell::Cell::new(0),
+            confirm_seen_rows: std::cell::Cell::new(0),
+            confirm_view_key: std::cell::Cell::new((0, 0, 0)),
             tool_host: swamp_core::tool_removal::Host::system(),
             operation: None,
             operation_rx: None,
@@ -840,6 +867,7 @@ impl App {
             collapsed: HashSet::new(),
             marked: BTreeMap::new(),
             confirm_open: false,
+            confirm_details_open: false,
             confirm_base: None,
             held_reload: None,
             help_open: false,
@@ -1366,13 +1394,24 @@ impl App {
     /// says which way it went and what that means; a key that changes
     /// something lasting never answers in silence.
     pub fn toggle_keep_executables(&mut self) {
-        self.keep_executables = !self.keep_executables;
+        let cargo_conflict =
+            self.confirm_open && self.marked.values().any(|u| u.cargo_unit.is_some());
+        let Some(next) = keep_executables_toggle(self.keep_executables, cargo_conflict) else {
+            self.set_result(
+                "Keep executables cannot be enabled for a selective Cargo action; the saved setting remains off.".into(),
+            );
+            return;
+        };
+        self.keep_executables = next;
         self.persist_ui_state();
         self.set_result(if self.keep_executables {
             "Keep executables is now on: release and debug programs are copied to bin/ before their folder goes to Trash. Remembered for next time. k turns it off.".to_string()
         } else {
             "Keep executables is now off: build folders go to Trash as they are. Remembered for next time. k turns it on.".to_string()
         });
+        if self.confirm_open {
+            self.reset_confirm_review();
+        }
     }
 
     /// Switches view. The cursor of the view being left is remembered and
@@ -1660,7 +1699,7 @@ impl App {
     /// Enters a project from the projects view into its tree.
     pub fn drill_into_selected(&mut self) {
         if self.confirm_open {
-            if self.height != 0 && !self.confirm_fits(self.width, self.height) {
+            if !self.confirm_review_is_complete(self.width, self.height) {
                 return;
             }
             self.confirm_delete();
@@ -1857,6 +1896,8 @@ impl App {
             self.set_refusal(&msg);
         }
         self.confirm_open = true;
+        self.confirm_details_open = false;
+        self.reset_confirm_review();
     }
 
     pub fn mark_selected(&mut self) {
@@ -2385,11 +2426,20 @@ impl App {
             .or(agent_unit.as_ref())
             .map(|u| u.bytes())
             .unwrap_or(row.bytes);
+        let session_members = self
+            .agent_units
+            .iter()
+            .find(|u| {
+                u.path == unit_path
+                    && u.action == swamp_core::agents::AgentActionCapability::SessionRemoval
+            })
+            .map(|u| u.members.clone());
         self.marked.insert(
             unit_id.0.clone(),
             MarkedUnit {
                 cargo_unit: cargo_unit.filter(|u| u.cargo_group().is_some()),
                 agent_unit,
+                session_members,
                 reclaim: None,
                 path: unit_path,
                 docker,
@@ -2538,6 +2588,7 @@ impl App {
             MarkedUnit {
                 cargo_unit: None,
                 agent_unit: None,
+                session_members: None,
                 reclaim: Some(actions::ReclaimMark {
                     reviewed: review.reviewed,
                     category: target.category.clone(),
@@ -2623,11 +2674,11 @@ impl App {
             let mut lines = vec![
                 format!("{}", profile.display()),
                 format!(
-                    "deps: {} allocated / {} unique within inspected files · {} entries · {}ms",
+                    "deps: {} allocated / {} unique within inspected files · {} entries · {}",
                     model::human_bytes(inspection.allocated_bytes),
                     model::human_bytes(inspection.unique_allocated_bytes),
                     inspection.entries_examined,
-                    inspection.elapsed_ms
+                    swamp_core::schedule::format_duration_ms(inspection.elapsed_ms)
                 ),
                 inspection.accounting_note.clone(),
             ];
@@ -2940,6 +2991,7 @@ impl App {
                         self.blocked = blocked;
                         self.refusal = refusal.map(|msg| (msg, Instant::now()));
                         self.confirm_open = confirm && !self.marked.is_empty();
+                        self.confirm_details_open = false;
                         if !self.confirm_open {
                             self.confirm_base = None;
                             // Space: say where the marks stand, the row
@@ -3028,7 +3080,54 @@ impl App {
             // already queued is dropped, as for the review path.
             self.confirm_drain |= !self.confirm_open;
             self.confirm_open = true;
+            self.confirm_details_open = false;
+            self.reset_confirm_review();
         }
+    }
+
+    fn reset_confirm_review(&self) {
+        self.confirm_scroll.set(0);
+        self.confirm_seen_rows.set(0);
+        self.confirm_view_key.set((0, 0, 0));
+    }
+
+    /// Called by the renderer before drawing the review sheet. Any changed
+    /// plan or viewport requires a fresh pass over the visible facts.
+    pub fn prepare_confirm_review(&self, width: u16, height: u16, fingerprint: u64) {
+        let key = (width, height, fingerprint);
+        if self.confirm_view_key.get() != key {
+            self.confirm_view_key.set(key);
+            self.confirm_scroll.set(0);
+            self.confirm_seen_rows.set(0);
+        }
+    }
+
+    /// Record only a contiguous range: jumping to End cannot count lines
+    /// above the current review position as read.
+    pub fn note_confirm_rows_seen(&self, first: usize, visible: usize, total: usize) {
+        if first <= self.confirm_seen_rows.get() {
+            self.confirm_seen_rows.set(
+                self.confirm_seen_rows
+                    .get()
+                    .max((first + visible).min(total)),
+            );
+        }
+    }
+
+    pub fn confirm_review_complete(
+        &self,
+        total: usize,
+        width: u16,
+        height: u16,
+        fingerprint: u64,
+    ) -> bool {
+        self.confirm_open
+            && width >= CONFIRM_MIN_COLS
+            && height >= CONFIRM_MIN_ROWS
+            && total > 0
+            && total <= usize::from(u16::MAX)
+            && self.confirm_view_key.get() == (width, height, fingerprint)
+            && self.confirm_seen_rows.get() >= total
     }
 
     /// Backspace: delete what is under the cursor. If nothing is marked,
@@ -3061,6 +3160,8 @@ impl App {
             return;
         }
         self.confirm_open = false;
+        self.confirm_details_open = false;
+        self.reset_confirm_review();
         self.refusal = None;
         let base = self.confirm_base.take().unwrap_or_default();
         let undone: Vec<String> = self
@@ -3073,14 +3174,21 @@ impl App {
             self.marked.remove(id);
         }
         let kept = self.marked.len();
+        let count = |n: usize| swamp_core::render::human_count(n as u64);
         let msg = match (undone.len(), kept) {
             (0, 0) => "Cancelled. Nothing was deleted.".to_string(),
             (0, k) => format!(
-                "Cancelled. Nothing was deleted. {k} still marked (Space unmarks, Backspace asks again)."
+                "Cancelled. Nothing was deleted. {} still marked (Space unmarks, Backspace asks again).",
+                count(k)
             ),
-            (n, 0) => format!("Cancelled. Nothing was deleted. Unmarked the {n} it had marked."),
+            (n, 0) => format!(
+                "Cancelled. Nothing was deleted. Unmarked the {} it had marked.",
+                count(n)
+            ),
             (n, k) => format!(
-                "Cancelled. Nothing was deleted. Unmarked the {n} it had marked; {k} marked earlier remain."
+                "Cancelled. Nothing was deleted. Unmarked the {} it had marked; {} marked earlier remain.",
+                count(n),
+                count(k)
             ),
         };
         self.set_result(msg);
@@ -3090,51 +3198,64 @@ impl App {
     fn mark_state_line(&self, added: usize, removed: usize) -> String {
         let total = self.marked.len();
         let bytes: u64 = self.marked.values().map(|u| u.bytes).sum();
+        let count = |n: usize| swamp_core::render::human_count(n as u64);
         let blocked = match self.blocked.len() {
             0 => String::new(),
-            n => format!(" {n} blocked (b to see why)."),
+            n => format!(" {} blocked (b to see why).", count(n)),
         };
         if total == 0 {
             return if removed > 0 {
-                format!("Unmarked {removed}. Nothing is marked.{blocked}")
+                format!("Unmarked {}. Nothing is marked.{blocked}", count(removed))
             } else {
                 format!("Nothing marked.{blocked}")
             };
         }
         let change = if added > 0 {
-            format!("Marked {added} more. ")
+            format!("Marked {} more. ", count(added))
         } else if removed > 0 {
-            format!("Unmarked {removed}. ")
+            format!("Unmarked {}. ", count(removed))
         } else {
             String::new()
         };
         format!(
-            "{change}{total} marked in all ({}). Nothing has been moved. Backspace moves them to Trash after you confirm.{blocked}",
+            "{change}{} marked in all ({}). Nothing has been moved. Backspace moves them to Trash after you confirm.{blocked}",
+            count(total),
             model::human_bytes(bytes)
         )
     }
 
-    /// Whether a terminal of this size shows what Enter would do. A plan
-    /// that removes anything for good (docker) needs the sheet that says
-    /// so; below that size Enter is not offered and does nothing.
+    /// Whether a review overlay can be drawn at this size. Enter also
+    /// requires `confirm_review_is_complete` for the current plan and size.
     pub fn confirm_fits(&self, width: u16, height: u16) -> bool {
-        let permanent = self.marked.values().any(|u| u.docker.is_some());
-        let roomy = height >= CONFIRM_MIN_ROWS && width >= CONFIRM_MIN_COLS;
-        if self.marked.values().any(|u| u.reclaim.is_some()) {
-            return roomy && crate::ui::reclaim_plan_fits(self, width, height);
-        }
-        // Any plan that carries warnings must show every one of them: the
-        // sheet has no scroll, so Enter is offered only when they fit.
-        let warned = self.marked.values().any(|u| !u.warnings.is_empty());
-        if warned && height != 0 && !crate::ui::reclaim_plan_fits(self, width, height) {
-            return false;
-        }
-        !permanent || roomy
+        width >= CONFIRM_MIN_COLS && height >= CONFIRM_MIN_ROWS
     }
 
     pub fn confirm_summary(&self) -> String {
         let units: Vec<MarkedUnit> = self.marked.values().cloned().collect();
         actions::confirm_summary(&units)
+    }
+
+    pub fn confirm_details(&self) -> String {
+        let units: Vec<MarkedUnit> = self.marked.values().cloned().collect();
+        actions::confirm_details(&units)
+    }
+
+    pub fn confirm_review_is_complete(&self, width: u16, height: u16) -> bool {
+        if self.confirm_details_open
+            || selective_cargo_keep_conflict(
+                self.keep_executables,
+                self.marked.values().any(|u| u.cargo_unit.is_some()),
+            )
+        {
+            return false;
+        }
+        let total = crate::ui::confirm_review_rows(self, width.saturating_sub(2).max(1));
+        self.confirm_review_complete(
+            total,
+            width,
+            height,
+            crate::ui::confirm_review_fingerprint(self),
+        )
     }
 
     /// Enter on the confirm banner: this keypress at the keyboard is the
@@ -3154,6 +3275,7 @@ impl App {
         let units: Vec<MarkedUnit> = self.marked.values().cloned().collect();
         if units.is_empty() {
             self.confirm_open = false;
+            self.confirm_details_open = false;
             return;
         }
         let planned: u64 = units.iter().map(|u| u.bytes).sum();
@@ -3182,6 +3304,7 @@ impl App {
         });
         self.operation_rx = Some(rx);
         self.confirm_open = false;
+        self.confirm_details_open = false;
         self.confirm_base = None;
         self.last_result = None;
         self.refusal = None;
@@ -3258,6 +3381,7 @@ impl App {
             }
         }
         self.confirm_open = false;
+        self.confirm_details_open = false;
         let items = |n: usize| {
             if n == 1 {
                 "1 item".to_string()
@@ -3858,6 +3982,16 @@ mod tests {
         ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Source, WorktreeKind, WorktreeRow,
     };
 
+    #[test]
+    fn keep_executables_cannot_be_enabled_from_a_selective_cargo_confirm() {
+        assert_eq!(keep_executables_toggle(false, true), None);
+        assert_eq!(keep_executables_toggle(true, true), Some(false));
+        assert_eq!(keep_executables_toggle(false, false), Some(true));
+        assert!(selective_cargo_keep_conflict(true, true));
+        assert!(!selective_cargo_keep_conflict(false, true));
+        assert!(!selective_cargo_keep_conflict(true, false));
+    }
+
     fn wait_operation(app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while app.operation.is_some() {
@@ -3906,6 +4040,7 @@ mod tests {
                 MarkedUnit {
                     cargo_unit: None,
                     agent_unit: None,
+                    session_members: None,
                     reclaim: None,
                     path,
                     docker: None,
@@ -3981,6 +4116,7 @@ mod tests {
             MarkedUnit {
                 cargo_unit: None,
                 agent_unit: None,
+                session_members: None,
                 reclaim: None,
                 path: path.clone(),
                 docker: None,
@@ -4673,7 +4809,7 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         assert!(app.confirm_open, "one 'are you sure', with the facts on it");
         assert!(app.confirm_summary().contains("node_modules"));
-        assert!(app.confirm_summary().contains("→ Trash"));
+        assert!(app.confirm_summary().contains("TRASH"));
     }
 
     #[test]
@@ -4685,7 +4821,7 @@ mod tests {
         assert_eq!(app.marked.len(), 1);
         app.open_confirm();
         assert!(app.confirm_open);
-        assert!(app.confirm_summary().contains("Move 1 item"));
+        assert!(app.confirm_summary().contains("Review 1 action"));
     }
 
     #[test]
@@ -5260,7 +5396,7 @@ mod tests {
             summary.contains("could not read your protect list"),
             "{summary}"
         );
-        assert!(summary.contains("last used"), "{summary}");
+        assert!(summary.contains("Last used"), "{summary}");
         assert!(folder.exists(), "marking moves nothing");
         app.confirm_open = true;
         app.start_delete(
@@ -5658,7 +5794,7 @@ mod tests {
         }
         let cases: [Case; 7] = [
             ("check finished", check_finished, "marked in all", "Checked"),
-            ("confirm opens", confirm_opens, "Enter confirm", "Checked"),
+            ("confirm opens", confirm_opens, "Review actions", "Checked"),
             ("cancelled", cancelled, "Check stopped", "Stopping after"),
             (
                 "delete finished",
@@ -5676,12 +5812,12 @@ mod tests {
                 "lock poll change",
                 lock_poll_change,
                 "another observation running",
-                "Enter confirm",
+                "Review 1 action",
             ),
             (
                 "blocked list check again",
                 blocked_check_again,
-                "Enter confirm",
+                "Review 1 action",
                 "check again",
             ),
         ];
@@ -5788,5 +5924,118 @@ mod tests {
         );
         app.cancel_operation();
         wait_operation(&mut app);
+    }
+
+    /// Read-only replay for the slow real Cargo-group mark report. It
+    /// loads a copied store plus an existing target tree, runs only the
+    /// mark/review worker, then paints the summary confirmation at two
+    /// terminal sizes without executing a move. Set the two `SWAMP_MARK_READONLY_*` variables to
+    /// run it manually against a stable copy.
+    #[test]
+    #[ignore = "manual read-only full-App mark trace; set SWAMP_MARK_READONLY_STORE and SWAMP_MARK_READONLY_PROFILE"]
+    fn real_compiled_tests_and_examples_mark_review_baseline() {
+        let store = PathBuf::from(
+            std::env::var_os("SWAMP_MARK_READONLY_STORE")
+                .expect("set SWAMP_MARK_READONLY_STORE to a copied store"),
+        );
+        let profile = PathBuf::from(
+            std::env::var_os("SWAMP_MARK_READONLY_PROFILE")
+                .expect("set SWAMP_MARK_READONLY_PROFILE to the actual target profile"),
+        );
+        let scope = swamp_core::scope::load_last_effective_scope(&store)
+            .expect("copied store must contain its last effective scope");
+        let snapshot = swamp_core::report::report_scope_from_store(&scope, &store)
+            .expect("copied store must contain the last observation");
+        let project = snapshot
+            .report
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|wt| profile.starts_with(&wt.path)))
+            .map(|p| p.name.clone())
+            .expect("profile must belong to a project in the copied report");
+        let group_key = format!("cleanup:runnable:{}", profile.display());
+        let mut app = App::new_multi_root(snapshot.report, scope.scan_paths());
+        app.store_dir = Some(store.clone());
+        app.set_external_units(snapshot.external_units);
+        app.set_store_interiors(snapshot.store_interiors);
+        app.set_agent_units(snapshot.agent_units);
+        app.set_manager_facts(snapshot.manager_facts);
+        app.set_ledger(swamp_core::volume_ledger::read_reading(&store));
+        app.scope = Some(scope);
+        app.view = ViewKind::Tree;
+        app.selected_project = Some(project);
+        app.clear_filter();
+        let rows = app.rows();
+        app.selected = rows
+            .iter()
+            .position(|row| row.expansion_key.as_deref() == Some(group_key.as_str()))
+            .expect("compiled tests/examples cleanup row must be present");
+        let expected = model::cleanup_members(&app.report, &group_key).len();
+        assert!(expected > 0, "the selected cleanup row has no candidates");
+
+        swamp_core::work_counters::reset();
+        let started = Instant::now();
+        app.review_in_background(false, false);
+        let deadline = started + Duration::from_secs(15 * 60);
+        while app.operation.is_some() && Instant::now() < deadline {
+            app.poll_operation();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            app.operation.is_none(),
+            "read-only mark review did not finish"
+        );
+        assert_eq!(
+            app.marked.len() + app.blocked_log.len(),
+            expected,
+            "the full-App review must process every selected candidate"
+        );
+        let work = swamp_core::work_counters::snapshot();
+        eprintln!(
+            "mark-app-baseline reviewed={} marked={} elapsed_ms={} content_bytes_hashed={} content_hash_ms={}",
+            app.last_check
+                .as_ref()
+                .map_or(0, |_| app.marked.len() + app.blocked_log.len()),
+            app.marked.len(),
+            started.elapsed().as_millis(),
+            work.content_bytes_hashed,
+            work.content_hash_nanos / 1_000_000,
+        );
+        assert_eq!(
+            app.marked.len(),
+            expected,
+            "every selected candidate must be marked"
+        );
+        assert!(
+            app.blocked_log.is_empty(),
+            "no selected candidate should be blocked"
+        );
+        app.open_confirm();
+        assert!(app.confirm_open, "the read-only review opens its summary");
+        assert!(
+            !app.confirm_details_open,
+            "start on the compact summary, not the inventory"
+        );
+        for (width, height) in [(80, 24), (120, 30)] {
+            let frame = paint(&app, width, height);
+            eprintln!("mark-app-confirm-{width}x{height}:\n{frame}");
+            assert!(
+                app.confirm_review_is_complete(width, height),
+                "summary should fit and be reviewed at {width}x{height}:\n{frame}"
+            );
+        }
+        app.keep_executables = true;
+        let conflict = paint(&app, 80, 24);
+        assert!(
+            conflict.contains("conflicts with selective Cargo removal"),
+            "{conflict}"
+        );
+        assert!(conflict.contains("Enter unavailable"), "{conflict}");
+        assert!(!app.confirm_review_is_complete(80, 24));
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char('k'));
+        assert!(
+            !app.keep_executables,
+            "k turns off the saved conflicting preference"
+        );
     }
 }

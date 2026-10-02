@@ -17,6 +17,8 @@ pub struct Member {
     #[serde(default)]
     pub hardlink_members: u64,
     pub bytes: u64,
+    /// Prefixed `blake3` for producer evidence or `metadata-v1` for selected
+    /// build payloads; recorded in the recovery manifest, not an execution gate.
     pub digest: String,
 }
 
@@ -398,13 +400,26 @@ fn regular(path: &Path) -> Result<RegularFile> {
 }
 
 fn snapshot(path: &Path) -> Result<Member> {
-    snapshot_at(path, 0, &mut 0)
+    snapshot_at(path, 0, &mut 0, true)
 }
 
-/// Authorization identity for a selected path. Link counts and allocation
-/// accounting are observations, not safety facts: aliases outside the
-/// selection may change without changing the selected content or membership.
-fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member> {
+/// Selected build payloads can be large (compiler outputs routinely span
+/// gigabytes). Their cleanup manifest needs a stable identity for the
+/// reviewed directory entries, not a second read of every payload byte.
+/// Producer fingerprints remain content-hashed by `snapshot` above.
+fn snapshot_payload(path: &Path) -> Result<Member> {
+    snapshot_at(path, 0, &mut 0, false)
+}
+
+/// Content identity for producer-fingerprint evidence. Payload snapshots use
+/// a metadata manifest identity below; neither identity is an execution-time
+/// stale-plan gate. Link counts and allocation remain observations only.
+fn snapshot_at(
+    path: &Path,
+    depth: usize,
+    visited: &mut usize,
+    hash_content: bool,
+) -> Result<Member> {
     *visited += 1;
     if depth > 128 || *visited > 100_000 {
         bail!("cleanup review exceeds depth/member limit; no group is offered");
@@ -423,15 +438,19 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
         let mut bytes = 0;
         let mut hardlink_members = 0;
         for p in paths {
-            let m = snapshot_at(&p, depth + 1, visited)?;
+            let m = snapshot_at(&p, depth + 1, visited, hash_content)?;
             bytes += m.bytes;
             hardlink_members += m.hardlink_members;
-            // The safety identity deliberately excludes allocation/link
-            // accounting. External aliases may appear or disappear without
-            // changing this selected group's membership or content.
+            // Link counts and allocation are observations, not part of the
+            // manifest identity: aliases may change without changing these
+            // selected paths.
             hash.update(&serde_json::to_vec(&(
                 &m.path, m.device, m.inode, &m.digest,
             ))?);
+        }
+        let after = fs::symlink_metadata(path)?;
+        if metadata_identity(&metadata) != metadata_identity(&after) {
+            bail!("member changed during review");
         }
         return Ok(Member {
             path: path.into(),
@@ -442,26 +461,25 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
             nlink: 1,
             hardlink_members,
             bytes,
-            digest: hash.finalize().to_hex().to_string(),
+            digest: format!(
+                "{}:{}",
+                identity_kind(hash_content),
+                hash.finalize().to_hex()
+            ),
         });
     }
     let mut file = regular(path)?;
     let before = file.metadata()?;
-    let digest = file.digest()?;
+    let digest = if hash_content {
+        format!("blake3:{}", file.digest()?)
+    } else {
+        format!("metadata-v1:{}", metadata_identity(&before))
+    };
     let after = file.metadata()?;
-    if (
-        before.len(),
-        before.mtime(),
-        before.mtime_nsec(),
-        before.ctime(),
-        before.ctime_nsec(),
-    ) != (
-        after.len(),
-        after.mtime(),
-        after.mtime_nsec(),
-        after.ctime(),
-        after.ctime_nsec(),
-    ) {
+    let named_after = fs::symlink_metadata(path)?;
+    if metadata_identity(&before) != metadata_identity(&after)
+        || metadata_identity(&before) != metadata_identity(&named_after)
+    {
         bail!("member changed during review");
     }
     Ok(Member {
@@ -473,6 +491,31 @@ fn snapshot_at(path: &Path, depth: usize, visited: &mut usize) -> Result<Member>
         bytes: before.blocks() * 512,
         digest,
     })
+}
+
+fn identity_kind(hash_content: bool) -> &'static str {
+    if hash_content {
+        "blake3-tree"
+    } else {
+        "metadata-v1-tree"
+    }
+}
+
+/// Stable metadata available from the open no-follow descriptor. Including
+/// ctime and inode catches same-size edits that restore mtime without reading
+/// every byte of large compiler outputs.
+fn metadata_identity(metadata: &fs::Metadata) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
 }
 
 fn local_filesystem(path: &Path) -> Result<()> {
@@ -550,6 +593,27 @@ fn explicit_unlock_releases_even_with_a_duplicated_description() {
     let reacquired = acquire(&[path]).expect("duplicate must not extend the critical section");
     drop(reacquired);
     drop(duplicate);
+}
+
+#[test]
+fn selected_payload_snapshot_does_not_read_contents_but_fingerprints_still_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let payload = root.join("compiled-test");
+    let fingerprint = root.join("fingerprint");
+    std::fs::write(&payload, vec![0x5a; 4 * 1024 * 1024]).unwrap();
+    std::fs::write(&fingerprint, b"producer-role-evidence").unwrap();
+
+    let (selected, work) = crate::work_counters::measured(|| snapshot_payload(&payload).unwrap());
+    assert!(selected.digest.starts_with("metadata-v1:"));
+    assert_eq!(work.content_bytes_hashed, 0);
+
+    let (evidence, work) = crate::work_counters::measured(|| snapshot(&fingerprint).unwrap());
+    assert!(evidence.digest.starts_with("blake3:"));
+    assert_eq!(
+        work.content_bytes_hashed,
+        b"producer-role-evidence".len() as u64
+    );
 }
 
 /// Select an evidenced test/example executable with its companions, or one
@@ -633,7 +697,10 @@ pub fn propose(units: &[NestedArtifact], selected: &Path, container: &Path) -> R
     if !directory_group && fs::exists(&dsym) {
         paths.push(dsym);
     }
-    let members: Vec<_> = paths.iter().map(|p| snapshot(p)).collect::<Result<_>>()?;
+    let members: Vec<_> = paths
+        .iter()
+        .map(|p| snapshot_payload(p))
+        .collect::<Result<_>>()?;
     let allocated_bytes = members.iter().map(|m| m.bytes).sum();
     let hardlink_members = members.iter().map(|m| m.hardlink_members).sum();
     Ok(CargoGroup {
@@ -688,4 +755,85 @@ pub(crate) fn move_group(group: &CargoGroup, trash: &Path) -> Result<PathBuf> {
     }
     let dest = envelope.path().to_path_buf();
     Ok(dest)
+}
+
+#[cfg(test)]
+mod readonly_mark_trace {
+    use super::*;
+
+    /// Manual baseline for the TUI's Cargo-group mark path. Reads an
+    /// already-copied store and the real target tree, proposing each
+    /// member exactly as the mark flow does. It never confirms or moves
+    /// anything; Cargo locks are only probed with nonblocking flock.
+    #[test]
+    #[ignore = "manual read-only mark-path trace; set SWAMP_MARK_READONLY_STORE and SWAMP_MARK_READONLY_PROFILE"]
+    fn real_compiled_tests_and_examples_mark_baseline() {
+        let store = PathBuf::from(
+            std::env::var_os("SWAMP_MARK_READONLY_STORE")
+                .expect("set SWAMP_MARK_READONLY_STORE to a copied store"),
+        );
+        let profile = PathBuf::from(
+            std::env::var_os("SWAMP_MARK_READONLY_PROFILE")
+                .expect("set SWAMP_MARK_READONLY_PROFILE to the actual target profile"),
+        );
+        let scope = crate::scope::load_last_effective_scope(&store)
+            .expect("copied store must contain its last effective scope");
+        let snapshot = crate::report::report_scope_from_store(&scope, &store)
+            .expect("copied store must contain the last observation");
+        let units = &snapshot.report.nested_artifacts;
+        let containers: std::collections::HashMap<_, _> = units
+            .iter()
+            .map(|unit| (unit.id.as_str(), unit.path.as_path()))
+            .collect();
+        let mut selected: Vec<_> = units
+            .iter()
+            .filter(|unit| {
+                unit.present
+                    && unit.bytes > 0
+                    && unit.path.starts_with(&profile)
+                    && candidate(unit)
+                    && matches!(
+                        unit.role,
+                        ArtifactRole::TestExecutable | ArtifactRole::Example
+                    )
+                    && !unit.is_dir
+            })
+            .collect();
+        selected.sort_by(|a, b| cleanup_order(a, b, snapshot.report.observed_at));
+        selected.dedup_by(|a, b| a.path == b.path);
+        assert!(
+            !selected.is_empty(),
+            "the profile has no compiled test/example candidates"
+        );
+
+        let started = std::time::Instant::now();
+        let (results, work) = crate::work_counters::measured(|| {
+            selected
+                .iter()
+                .filter_map(|unit| {
+                    let container = unit
+                        .container_id
+                        .as_deref()
+                        .and_then(|id| containers.get(id).copied())?;
+                    let result = propose(units, &unit.path, container);
+                    std::hint::black_box(&result);
+                    Some(result)
+                })
+                .collect::<Vec<_>>()
+        });
+        let elapsed_ms = started.elapsed().as_millis();
+        let proposed = results.iter().filter(|r| r.is_ok()).count();
+        eprintln!(
+            "mark-baseline candidates={} proposed={} elapsed_ms={} content_bytes_hashed={} content_hash_ms={}",
+            selected.len(),
+            proposed,
+            elapsed_ms,
+            work.content_bytes_hashed,
+            work.content_hash_nanos / 1_000_000
+        );
+        assert!(
+            proposed > 0,
+            "no candidate could be re-proposed from the copied report"
+        );
+    }
 }

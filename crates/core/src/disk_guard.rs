@@ -76,7 +76,7 @@ pub fn human(bytes: u64) -> String {
 /// The stderr message for an aborted `observe`.
 pub fn abort_message(store_dir: &Path, free: u64, threshold: u64) -> String {
     format!(
-        "swamp observe: aborted, disk nearly full: {} free ({free} bytes) on the volume holding {}, below the {} ({threshold} bytes) minimum (`min_free_bytes` in config.toml). Nothing was walked and swamp did not write to the store.",
+        "swamp observe: aborted, disk nearly full: {} free on the volume holding {}, below the {} minimum (`min_free_bytes` in config.toml). Nothing was walked and swamp did not write to the store.",
         human(free),
         store_dir.display(),
         human(threshold),

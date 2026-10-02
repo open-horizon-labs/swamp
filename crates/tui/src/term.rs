@@ -16,6 +16,14 @@ use ratatui::widgets::Paragraph;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Current terminal width for a single-line CLI status, with a conservative
+/// fallback when the output terminal cannot report its dimensions.
+pub fn columns() -> usize {
+    crossterm::terminal::size()
+        .map(|(columns, _)| usize::from(columns))
+        .unwrap_or(80)
+}
+
 /// Whether a guard is live, and which thread draws.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// `worker::current_thread_token` of the drawing thread; 0 while none.

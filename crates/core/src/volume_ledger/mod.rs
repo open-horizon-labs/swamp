@@ -918,14 +918,12 @@ pub fn read_account(swamp_dir: &std::path::Path) -> anyhow::Result<Option<Accoun
 /// "measured 3 h ago" from a stored time and now.
 pub fn age_text(then: u64, now: u64) -> String {
     let secs = now.saturating_sub(then);
-    if secs < 90 {
-        "just now".to_string()
-    } else if secs < 90 * 60 {
-        format!("{} min ago", secs / 60)
-    } else if secs < 48 * 3600 {
-        format!("{} h ago", secs / 3600)
+    if then == 0 {
+        "time unknown".to_string()
+    } else if then > now {
+        "clock ahead".to_string()
     } else {
-        format!("{} d ago", secs / 86400)
+        format!("{} ago", crate::schedule::coarse_age(secs))
     }
 }
 
@@ -989,4 +987,19 @@ pub fn accounted_locations(
         });
     }
     out
+}
+
+#[cfg(test)]
+mod age_text_tests {
+    use super::age_text;
+
+    #[test]
+    fn ages_are_coarse_and_preserve_unknown_or_future_times() {
+        let now = 400 * 86_400;
+        assert_eq!(age_text(0, now), "time unknown");
+        assert_eq!(age_text(now + 1, now), "clock ahead");
+        assert_eq!(age_text(now - 1, now), "<1m ago");
+        assert_eq!(age_text(now - 3_600, now), "1h ago");
+        assert_eq!(age_text(now - 365 * 86_400, now), "1y ago");
+    }
 }

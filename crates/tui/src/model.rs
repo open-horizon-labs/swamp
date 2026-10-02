@@ -1609,10 +1609,7 @@ fn append_cleanup_group(
 
 pub(crate) fn age_label(age: Option<u64>) -> String {
     match age {
-        Some(s) if s >= 86400 => format!("{}d", s / 86400),
-        Some(s) if s >= 3600 => format!("{}h", s / 3600),
-        Some(s) if s >= 60 => format!("{}m", s / 60),
-        Some(_) => "<1m".into(),
+        Some(s) => swamp_core::schedule::coarse_age(s),
         None => "?".into(),
     }
 }
@@ -2437,6 +2434,50 @@ fn model_detail_lines(m: &swamp_core::build_adapters::model_stores::ModelRow) ->
     out
 }
 
+fn model_storage_context(
+    m: &swamp_core::build_adapters::model_stores::ModelRow,
+    folder_bytes: Option<u64>,
+    partial: bool,
+) -> (String, String) {
+    let folder = match folder_bytes {
+        Some(bytes) if partial => format!("at least {}", human_bytes(bytes)),
+        Some(bytes) => human_bytes(bytes),
+        None => "unmeasured".to_string(),
+    };
+    let has_shared_blobs = m.facts.iter().any(|fact| fact.contains("shared blobs/"));
+    let model_measure = format!("model {}", human_bytes(m.bytes));
+    let attribution = if has_shared_blobs {
+        "incl. shared blobs"
+    } else {
+        "attributed total"
+    };
+    let signal = format!("{model_measure} {attribution} · folder {folder}");
+    let detail = if has_shared_blobs {
+        format!(
+            "Model attribution: {}; repo folder path (the Size column): {folder}. The model figure includes shared-blob bytes, which are also shown in blobs/ and are not additive.",
+            human_bytes(m.bytes)
+        )
+    } else {
+        format!(
+            "Model attribution: {}; repo folder path (the Size column): {folder}.",
+            human_bytes(m.bytes)
+        )
+    };
+    (signal, detail)
+}
+
+fn add_model_storage_context(
+    row: &mut Row,
+    m: &swamp_core::build_adapters::model_stores::ModelRow,
+    folder_bytes: Option<u64>,
+    partial: bool,
+) {
+    let (signal, detail) = model_storage_context(m, folder_bytes, partial);
+    row.signals.insert(0, signal.clone());
+    row.detail_lines.push(detail);
+    row.cleanup_summary = Some(format!("{signal} · {}", m.regeneration));
+}
+
 fn unit_child_rows(
     u: &swamp_core::external::ExternalUnit,
     now: u64,
@@ -2489,12 +2530,18 @@ fn unit_child_rows(
                     swamp_core::build_adapters::model_stores::shown_path(&u.path.join(&c.name));
                 if let Some(m) = models.iter().find(|m| m.path == path) {
                     // The repo id reads better than `models--org--name`;
-                    // the folder's own name stays in the detail pane.
+                    // keep the folder scope explicit because the Size
+                    // column is the folder allocation, not the model total.
                     row.label = match &m.about {
-                        Some(a) => format!("{} · {a}", m.name),
-                        None => m.name.clone(),
+                        Some(a) => format!("folder: {} · {a}", m.name),
+                        None => format!("folder: {}", m.name),
                     };
-                    row.cleanup_summary = Some(m.regeneration.clone());
+                    add_model_storage_context(
+                        &mut row,
+                        m,
+                        c.bytes.map(|bytes| bytes.max(0) as u64),
+                        c.measure == ChildMeasure::Partial,
+                    );
                     row.detail_lines.extend(model_detail_lines(m));
                     row.detail_lines.push(format!("folder: {}", c.name));
                 }
@@ -2584,7 +2631,7 @@ pub fn reclaim_rows(
             .children
             .iter()
             .enumerate()
-            .map(|(i, c)| reclaim_child_row(&r.path, c, i + 1 == count))
+            .map(|(i, c)| reclaim_child_row(&r.path, c, &r.models, i + 1 == count))
             .collect();
         let first = children.len();
         children.extend(
@@ -2604,7 +2651,12 @@ pub fn reclaim_rows(
     rows
 }
 
-fn reclaim_child_row(unit: &str, c: &swamp_core::reclaim::ReclaimChild, last: bool) -> Row {
+fn reclaim_child_row(
+    unit: &str,
+    c: &swamp_core::reclaim::ReclaimChild,
+    models: &[swamp_core::build_adapters::model_stores::ModelRow],
+    last: bool,
+) -> Row {
     use swamp_core::drilldown::ChildKind;
     let flag = c
         .hold
@@ -2644,6 +2696,23 @@ fn reclaim_child_row(unit: &str, c: &swamp_core::reclaim::ReclaimChild, last: bo
         .map(swamp_core::reclaim::hold_line)
         .chain(c.manager.iter().map(|q| q.line()))
         .collect();
+    if c.kind == ChildKind::Entry
+        && let Some(m) = models.iter().find(|m| {
+            m.path
+                == swamp_core::build_adapters::model_stores::shown_path(
+                    &std::path::Path::new(unit).join(&c.name),
+                )
+        })
+    {
+        row.label = format!("folder: {}", row.label);
+        add_model_storage_context(
+            &mut row,
+            m,
+            c.bytes.map(|bytes| bytes.max(0) as u64),
+            c.measure == swamp_core::drilldown::ChildMeasure::Partial,
+        );
+        row.detail_lines.extend(model_detail_lines(m));
+    }
     // One folder of the unit can be marked like the unit; a row that is
     // not a folder says so here, where the keys that would act are not
     // offered.
@@ -3130,6 +3199,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn age_labels_share_coarse_month_and_year_buckets() {
+        assert_eq!(age_label(Some(59)), "<1m");
+        assert_eq!(age_label(Some(60)), "1m");
+        assert_eq!(age_label(Some(30 * 86_400)), "1mo");
+        assert_eq!(age_label(Some(365 * 86_400)), "1y");
+        assert_eq!(age_label(None), "?");
+    }
+
+    #[test]
     fn worktree_badges_separate_glyphs_from_multi_digit_counts() {
         assert_eq!(badges(&[], false, false, 0), "");
         assert_eq!(badges(&[], false, true, 0), "🔨");
@@ -3146,7 +3224,7 @@ mod tests {
         // Decimal, matching the SI labels the product prints (a GB is
         // 1_000_000_000 bytes, not a GiB under a GB label).
         assert_eq!(human_bytes(500), "500B");
-        assert_eq!(human_bytes(1536), "1.5KB");
+        assert_eq!(human_bytes(1536), "2KB");
         assert_eq!(human_bytes(1_288_490_188), "1.3GB");
         assert_eq!(human_bytes(1_000_000_000), "1.0GB");
         // The exact figure behind the reported arithmetic bug.
@@ -3157,7 +3235,7 @@ mod tests {
     fn signed_bytes_show_sign_and_dash() {
         assert_eq!(human_signed_bytes(0), "0B");
         assert_eq!(human_signed_bytes(184_320_000), "+184.3MB");
-        assert_eq!(human_signed_bytes(-1024), "-1.0KB");
+        assert_eq!(human_signed_bytes(-1024), "-1KB");
     }
 
     #[test]

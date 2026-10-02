@@ -373,7 +373,12 @@ fn adv_property_rows_sum_text_json_agree() {
         let j = h.to_json();
         assert_eq!(j["developer_bytes"].as_u64(), Some(h.developer_bytes));
         let text = h.render_text(NOW);
-        assert!(text.contains(&group_digits(h.developer_bytes)), "{text}");
+        assert!(
+            text.contains(
+                "totals use exact stored bytes; displayed rows are rounded independently"
+            ),
+            "{text}"
+        );
         let jrows: u64 = j["categories"]
             .as_array()
             .unwrap()

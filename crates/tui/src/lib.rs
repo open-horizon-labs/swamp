@@ -184,6 +184,28 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         return;
     }
+    if app.confirm_open && app.confirm_details_open && code == KeyCode::Esc {
+        app.confirm_details_open = false;
+        app.confirm_scroll.set(0);
+        return;
+    }
+    if app.confirm_open && code == KeyCode::Char('l') {
+        app.confirm_details_open = !app.confirm_details_open;
+        app.confirm_scroll.set(0);
+        return;
+    }
+    if app.confirm_open
+        && let Some(at) = scrolled(
+            app.confirm_scroll.get(),
+            code,
+            app.page.get(),
+            crate::ui::confirm_display_rows(app, app.width.saturating_sub(2).max(1))
+                .saturating_sub(app.page.get().saturating_add(1)),
+        )
+    {
+        app.confirm_scroll.set(at);
+        return;
+    }
     // An open confirm is its own small mode: the plan on screen is what
     // Enter would run, so nothing may change what is under it. Keys that
     // move the cursor, switch views or sections, open the filter, or mark
@@ -194,12 +216,6 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
             code,
             KeyCode::Tab
                 | KeyCode::BackTab
-                | KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::PageUp
-                | KeyCode::PageDown
-                | KeyCode::Home
-                | KeyCode::End
                 | KeyCode::Left
                 | KeyCode::Right
                 | KeyCode::Backspace
@@ -226,7 +242,12 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Enter => app.drill_into_selected(),
         KeyCode::Esc => {
             if app.confirm_open {
-                app.cancel_confirm();
+                if app.confirm_details_open {
+                    app.confirm_details_open = false;
+                    app.confirm_scroll.set(0);
+                } else {
+                    app.cancel_confirm();
+                }
             } else if app.view != app::ViewKind::Projects {
                 app.set_view(app::ViewKind::Projects);
             }
@@ -1215,10 +1236,11 @@ mod tests {
                 |a| a.confirm_open = true,
                 23,
                 &[
-                    "Enter confirm",
-                    "Esc back",
-                    "The whole plan does not fit: enlarge the terminal or mark fewer rows",
-                    "Plan does not fit",
+                    "Esc cancel",
+                    "No actions marked",
+                    "Read every line before action",
+                    "Terminal too small to review",
+                    "l inspect paths",
                 ],
             ),
             (
@@ -1459,6 +1481,7 @@ mod tests {
         crate::actions::MarkedUnit {
             cargo_unit: None,
             agent_unit: None,
+            session_members: None,
             reclaim: None,
             path: path.into(),
             docker: docker.then(|| swamp_core::docker::Removal::Volume {
@@ -1475,6 +1498,34 @@ mod tests {
             },
             warnings: vec![],
         }
+    }
+
+    #[test]
+    fn confirmation_inventory_is_optional_and_enter_returns_to_summary_first() {
+        let mut app = App::new(empty_report(), "/root".into());
+        let mut marked = unit("/root/session", 12, false);
+        marked.session_members = Some(vec![swamp_core::agents::AgentMember {
+            path: "/root/session/transcript.jsonl".into(),
+            bytes: 12,
+            kind: swamp_core::agents::AgentMemberKind::Transcript,
+        }]);
+        app.marked.insert("/root/session".into(), marked);
+        app.confirm_open = true;
+        app.width = 80;
+        app.height = 24;
+        let _ = buffer_text(&app, 80, 24);
+        assert!(app.confirm_review_is_complete(80, 24));
+
+        handle_key(&mut app, KeyCode::Char('l'));
+        assert!(app.confirm_details_open);
+        assert!(!app.confirm_review_is_complete(80, 24));
+        assert!(buffer_text(&app, 80, 24).contains("transcript.jsonl"));
+        handle_key(&mut app, KeyCode::Enter);
+        assert!(app.operation.is_none() && app.confirm_open);
+
+        handle_key(&mut app, KeyCode::Esc);
+        assert!(!app.confirm_details_open && app.confirm_open);
+        assert!(app.confirm_review_is_complete(80, 24));
     }
 
     /// A plan with a Trash part and a permanent docker part: whatever the
@@ -1502,7 +1553,8 @@ mod tests {
         ] {
             let s = buffer_text(&app, w, h);
             let keys = s.contains("Enter");
-            let permanent = s.contains("for good") || s.contains("docker");
+            let permanent = s.to_ascii_lowercase().contains("permanently")
+                || s.to_ascii_lowercase().contains("docker");
             if keys && !permanent {
                 bad.push(format!("{w}x{h}:\n{s}"));
             }
@@ -1577,12 +1629,17 @@ mod tests {
         }];
         app.confirm_open = true;
         let s = buffer_text(&app, 100, 30);
-        assert!(s.contains("Ready: 43 items"), "{s}");
-        assert!(!s.contains("none blocked"), "{s}");
-        assert!(s.contains("Blocked: 1 (d to see why)"), "{s}");
-        assert!(s.contains("Ready, by project:"), "{s}");
-        assert!(s.contains("node_modules (40), .build (3)"), "{s}");
-        assert!(!s.contains("node_modules, node_modules"), "{s}");
+        assert!(s.contains("Review 43 actions"), "{s}");
+        assert!(
+            s.contains("/root"),
+            "grouped summary names the shared root: {s}"
+        );
+        let units: Vec<_> = app.marked.values().cloned().collect();
+        let details = crate::actions::confirm_details(&units);
+        assert!(details.contains("/root/p0/node_modules"), "{details}");
+        assert!(details.contains("/root/q2/.build"), "{details}");
+        assert!(s.contains("d blocked"), "{s}");
+        assert!(s.contains("Enter move to Trash"), "{s}");
     }
 
     #[test]
@@ -1593,11 +1650,24 @@ mod tests {
         app.confirm_open = true;
         let s = buffer_text(&app, 40, 10);
         let rows: Vec<&str> = s.lines().collect();
-        let empty_inside = rows
+        let top = rows
             .iter()
-            .filter(|r| r.starts_with('"') && r.trim_matches('"').trim().is_empty())
+            .position(|r| r.starts_with("\"┌ Review actions"))
+            .unwrap();
+        let bottom = rows
+            .iter()
+            .enumerate()
+            .skip(top + 1)
+            .find(|(_, r)| r.starts_with("\"└"))
+            .map(|(i, _)| i)
+            .unwrap();
+        let empty_inside = rows[top + 1..bottom]
+            .iter()
+            .filter(|r| r.trim_matches('"').trim_matches('│').trim().is_empty())
             .count();
-        assert!(s.contains("Ready: 1 item"), "{s}");
+        assert!(s.contains("Review 1 action"), "{s}");
+        assert!(s.contains("/root/p/a"), "{s}");
+        assert!(s.contains("Enter move to Trash"), "{s}");
         assert_eq!(empty_inside, 0, "no blank row inside the box:\n{s}");
     }
 
@@ -1652,7 +1722,11 @@ mod tests {
                 r.starts_with("\"│") && r.trim_matches('"').trim_matches('│').trim().is_empty()
             })
             .count();
-        assert!(s.contains("Blocked: 2"), "{s}");
+        assert!(s.contains("Review 5 actions"), "{s}");
+        let details =
+            crate::actions::confirm_details(&app.marked.values().cloned().collect::<Vec<_>>());
+        assert!(details.contains("/root/p0/node_modules"), "{details}");
+        assert!(s.contains("Enter move to Trash"), "{s}");
         assert_eq!(blank_inside, 0, "{s}");
     }
 }
