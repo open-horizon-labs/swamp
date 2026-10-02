@@ -167,13 +167,22 @@ fn frame(a: &App, w: u16, h: u16) -> String {
 }
 
 fn open_repo_row(a: &mut App) {
-    let at = a.rows().iter().position(|r| r.expandable).unwrap();
+    let hub_key = format!("store-open:{}", a.root.join("hub").display());
+    let at = a
+        .rows()
+        .iter()
+        .position(|r| r.expansion_key.as_deref() == Some(hub_key.as_str()))
+        .expect("the Hugging Face hub row is identified by its path");
     a.selected = at;
     handle_key(a, KeyCode::Right);
     let at = a
         .rows()
         .iter()
-        .position(|r| r.label.starts_with("mkrausio/EmoWhisper"))
+        .position(|r| {
+            r.depth == 1
+                && r.label
+                    .starts_with("folder: mkrausio/EmoWhisper-AnS-Small-v0.1")
+        })
         .unwrap_or_else(|| {
             panic!(
                 "no repo row: {:?}",
@@ -216,7 +225,11 @@ fn external_repo_row_and_detail_say_what_the_model_is_at_80_and_120() {
             s.contains("what it is: automatic-speech-recognition · whisper"),
             "{w}x{h}:\n{s}"
         );
-        assert!(s.contains("card: Whisper fine-tuned"), "{w}x{h}:\n{s}");
+        assert!(
+            s.contains("model 41KB attributed total") && s.contains("folder 41KB"),
+            "{w}x{h}:
+{s}"
+        );
     }
 }
 
@@ -408,6 +421,71 @@ fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
         a.set_store_interiors(ints.clone());
         a.views_seen = true;
         a.set_view(view_kind);
+        let store_path = f.hub.display().to_string();
+        let store_at = a
+            .rows()
+            .iter()
+            .position(|r| r.expandable && r.label.contains(&store_path))
+            .unwrap_or_else(|| panic!("{view_kind:?}: no hub row: {:?}", a.rows()));
+        a.selected = store_at;
+        handle_key(&mut a, KeyCode::Right);
+        let repo_at = a
+            .rows()
+            .iter()
+            .position(|r| {
+                r.label.starts_with("folder:")
+                    && r.label.contains("shared")
+                    && r.signals.iter().any(|s| s.starts_with("model "))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{view_kind:?}: no labeled repo-folder row: {:?}",
+                    a.rows().iter().map(|r| r.label.clone()).collect::<Vec<_>>()
+                )
+            });
+        a.selected = repo_at;
+        let repo_row = &a.rows()[repo_at];
+        let model = model_stores::model_rows(&f.hub, &ints, 1_000)
+            .into_iter()
+            .find(|m| m.name == "org/shared")
+            .unwrap();
+        assert_eq!(
+            repo_row.bytes, 4096,
+            "Size stays the repo folder allocation"
+        );
+        assert_ne!(
+            repo_row.bytes, model.bytes,
+            "model attribution is not the path size"
+        );
+        let storage_signal = repo_row
+            .signals
+            .iter()
+            .find(|s| s.starts_with("model "))
+            .unwrap();
+        assert!(storage_signal.contains(&swamp_tui::model::human_bytes(model.bytes)));
+        assert!(storage_signal.contains("incl. shared blobs"));
+        assert!(storage_signal.contains(&swamp_tui::model::human_bytes(repo_row.bytes)));
+        let detail = repo_row.detail_lines.join("\n");
+        assert!(detail.contains("not additive"), "{detail}");
+        assert!(
+            detail.contains("moving this folder frees about")
+                && detail.contains("stays in the hub's shared blobs/"),
+            "{detail}"
+        );
+        let narrow = frame(&a, 80, 24);
+        let wide = frame(&a, 200, 60);
+        assert!(
+            narrow.contains("folder:"),
+            "{view_kind:?} narrow frame:\n{narrow}"
+        );
+        assert!(
+            narrow.contains(storage_signal.split(" · ").next().unwrap()),
+            "{view_kind:?} narrow frame omitted model attribution:\n{narrow}"
+        );
+        assert!(
+            wide.contains(storage_signal),
+            "{view_kind:?} wide frame:\n{wide}"
+        );
         for _ in 0..4 {
             let Some(at) = a
                 .rows()

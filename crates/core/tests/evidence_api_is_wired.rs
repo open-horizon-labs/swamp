@@ -817,6 +817,16 @@ fn a_current_use_reading_past_its_recheck_window_is_surfaced_at_the_confirmation
         warnings.iter().any(|w| w.contains("recheck window")),
         "a reading older than its own expiry must be visible at the confirmation: {warnings:?}"
     );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("past its 1m recheck window (about 10m old)")),
+        "stale times use coarse human durations: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().all(|w| !w.contains("s ago")),
+        "raw seconds do not appear in confirmation facts: {warnings:?}"
+    );
 
     let fresh = Evidence::known(
         FactKind::CurrentUse,

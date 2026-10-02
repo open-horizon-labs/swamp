@@ -1395,7 +1395,12 @@ fn spot_audit_rows(
                         Exactness::Exact
                     },
                     note: Some(format!(
-                        "ledger {ledger} bytes, audit {audited} bytes, difference {signed}; tolerance {tolerance}"
+                        "ledger {}, spot audit {}, difference {}{}; tolerance {}",
+                        crate::render::human_bytes_pub(ledger),
+                        crate::render::human_bytes_pub(audited),
+                        if signed < 0 { "-" } else { "+" },
+                        crate::render::human_bytes_pub(signed.unsigned_abs() as u64),
+                        crate::render::human_bytes_pub(tolerance)
                     )),
                 });
             }

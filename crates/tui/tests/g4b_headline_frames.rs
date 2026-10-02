@@ -241,8 +241,10 @@ fn no_row_moves_between_states_or_views_at_any_width() {
 /// answer (no size makes the table vanish).
 #[test]
 fn the_headline_block_height_is_a_function_of_the_terminal_height_only() {
-    assert_eq!(ui::headline_rows(24), 4);
-    assert_eq!(ui::headline_rows(22), 4);
+    assert_eq!(ui::headline_rows(30), 4);
+    assert_eq!(ui::headline_rows(29), 2);
+    assert_eq!(ui::headline_rows(24), 2);
+    assert_eq!(ui::headline_rows(22), 2);
     assert_eq!(ui::headline_rows(21), 2);
     assert_eq!(ui::headline_rows(16), 2);
     assert_eq!(ui::headline_rows(15), 1);
@@ -263,7 +265,7 @@ fn the_headline_block_height_is_a_function_of_the_terminal_height_only() {
 #[test]
 fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
     let a = app();
-    let f = frame(&a, 80, 24);
+    let f = frame(&a, 80, 30);
     assert_eq!(
         f[1],
         "Developer storage: 39.0GB across 1 project and 3 tool locations (39.0% of used)"
@@ -271,9 +273,9 @@ fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
     // Breakdown: projects, toolchains, caches, agents.
     assert!(f[2].contains("projects 30.0GB"), "{}", f[2]);
     // Ages and the ledger's parts.
-    assert!(f[3].contains("observed 4 min ago"), "{}", f[3]);
+    assert!(f[3].contains("observed 4m ago"), "{}", f[3]);
     assert!(
-        f[3].contains("ledger 3 h ago") || f[3].contains("disk ledger measured 3 h ago"),
+        f[3].contains("ledger 3h ago") || f[3].contains("disk ledger measured 3h ago"),
         "{}",
         f[3]
     );
@@ -284,7 +286,7 @@ fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
         "{}",
         f[4]
     );
-    assert!(f[4].contains("Disk: ledger 3 h ago (3)"), "{}", f[4]);
+    assert!(f[4].contains("Disk: ledger 3h ago (3)"), "{}", f[4]);
     // Wide enough, they spell the key out.
     let wide = frame(&a, 120, 30);
     assert!(
@@ -293,7 +295,7 @@ fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
         wide[4]
     );
     assert!(
-        wide[4].contains("Disk: ledger measured 3 h ago (3)"),
+        wide[4].contains("Disk: ledger measured 3h ago (3)"),
         "{}",
         wide[4]
     );
@@ -312,16 +314,16 @@ fn a_ledger_that_cannot_be_used_is_named_and_gives_no_percent() {
         set(&mut a);
         let f = frame(&a, 80, 24);
         assert!(!f[1].contains('%'), "{name}: {}", f[1]);
-        assert!(f[3].contains("ledger"), "{name}: {}", f[3]);
-        assert!(f[4].contains("Disk"), "{name}: {}", f[4]);
+        assert!(f[2].contains("ledger"), "{name}: {}", f[2]);
+        assert!(f[3].contains("Disk"), "{name}: {}", f[3]);
     }
     // The previous scope is stated on the block itself.
     let mut a = app();
     a.previous_scope_roots = Some(3);
     let f = frame(&a, 80, 24);
-    assert!(f[3].contains("previous scope (3 roots)"), "{}", f[3]);
+    assert!(f[2].contains("previous scope (3 roots)"), "{}", f[2]);
     let f = frame(&a, 40, 24);
-    assert!(f[3].contains("previous scope"), "{}", f[3]);
+    assert!(f[2].contains("previous scope"), "{}", f[2]);
 }
 
 /// Tempting wrong patch: drawing the block asks the disk or a tool for a
@@ -374,13 +376,13 @@ fn a_spot_audit_that_disagrees_is_the_first_thing_on_the_disk_line_at_every_widt
     a.set_ledger(LedgerReading::Measured(Box::new(account(&rows, &meta))));
     for w in [40u16, 50, 80, 120] {
         let f = frame(&a, w, 24);
-        assert!(f[3].starts_with("FLAG: "), "{w}: {}", f[3]);
-        assert!(f[3].contains("spot audit"), "{w}: {}", f[3]);
+        assert!(f[2].starts_with("FLAG: "), "{w}: {}", f[2]);
+        assert!(f[2].contains("spot audit"), "{w}: {}", f[2]);
         if w >= 80 {
-            assert!(f[3].contains("swamp report --view disk"), "{w}: {}", f[3]);
+            assert!(f[2].contains("swamp report --view disk"), "{w}: {}", f[2]);
         }
         // Same rows as the calm state: strip and table heading unmoved.
-        assert!(f[5].contains("Projects"), "{w}: {}", f[5]);
+        assert!(f[3].contains("Projects"), "{w}: {}", f[3]);
     }
     // The Disk view shows the audit as its own row.
     a.set_view(ViewKind::Disk);
@@ -671,17 +673,17 @@ fn the_first_run_line_hides_after_tools_or_disk_is_opened_and_stays_hidden() {
     let mut a = app();
     a.store_dir = Some(dir.path().to_path_buf());
     a.views_seen = false;
-    let want = "New: Tab opens Tools (Reclaim) and Disk. Hides after you open either.";
-    assert_eq!(frame(&a, 80, 24)[4], want);
+    let want = "Tab switches sections · 2 opens Tools / Reclaim · 3 opens Disk";
+    assert_eq!(frame(&a, 80, 30)[4], want);
     // Moving inside Projects does not end it.
     swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
     swamp_tui::handle_key(&mut a, KeyCode::Char('1'));
-    assert_eq!(frame(&a, 80, 24)[4], want);
+    assert_eq!(frame(&a, 80, 30)[4], want);
     // Opening Disk does.
     swamp_tui::handle_key(&mut a, KeyCode::Char('3'));
     assert!(a.views_seen);
-    let f = frame(&a, 80, 24);
-    assert!(!f[4].starts_with("New:"), "{}", f[4]);
+    let f = frame(&a, 80, 30);
+    assert!(!f[4].starts_with("Tab switches"), "{}", f[4]);
     assert!(f[4].contains("Reclaim:") && f[4].contains("(2"), "{}", f[4]);
     a.flush_ui_state();
     let raw = std::fs::read_to_string(dir.path().join("ui_state.json")).unwrap();
@@ -845,7 +847,7 @@ fn the_reclaim_pointer_names_the_jump_key_not_tab() {
     for w in [40u16, 80, 120] {
         for v in [ViewKind::Projects, ViewKind::Reclaim, ViewKind::Disk] {
             a.set_view(v);
-            let l = frame(&a, w, 24)[4].clone();
+            let l = frame(&a, w, 30)[4].clone();
             assert!(
                 l.contains("Reclaim") && !l.contains("Tab"),
                 "{w} {v:?}: {l}"

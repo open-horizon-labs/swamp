@@ -50,18 +50,46 @@ pub fn human_bytes_signed(delta: i64) -> String {
 }
 
 fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    if bytes < 1_000 {
+        return format!("{bytes}B");
+    }
+
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
+    while value >= 1_000.0 && unit < UNITS.len() - 1 {
+        value /= 1_000.0;
         unit += 1;
     }
-    if unit == 0 {
-        format!("{bytes}B")
-    } else {
-        format!("{value:.1}{}", UNITS[unit])
+    if unit == 1 {
+        // Whole KB avoids false precision in the range where counts move
+        // quickly. Carry a rounded boundary into MB instead of printing
+        // the misleading `1000KB`.
+        let rounded = value.round() as u64;
+        if rounded >= 1_000 {
+            return "1.0MB".to_string();
+        }
+        return format!("{rounded}KB");
     }
+    let rounded_tenths = (value * 10.0).round() / 10.0;
+    if rounded_tenths >= 1_000.0 && unit < UNITS.len() - 1 {
+        return format!("1.0{}", UNITS[unit + 1]);
+    }
+    format!("{rounded_tenths:.1}{}", UNITS[unit])
+}
+
+/// An exact count with thousands separators. Unlike a byte measure, a
+/// count should not be rounded or abbreviated.
+pub fn human_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn human_signed_bytes(delta: i64) -> String {
@@ -173,35 +201,39 @@ fn header(report: &Report, verify_du: bool) -> String {
     if let Some(u) = &report.reconciliation.unique_estimate {
         let _ = writeln!(
             out,
-            "scope filesystem unique={} ({}, reconciled at {}; not reclaimable)",
+            "filesystem unique: {} ({}, last reconciled {}) · not a reclaimable-space estimate",
             human_bytes(u.bytes),
             if u.needs_reconciliation {
                 "needs reconciliation"
             } else {
                 "reconciled"
             },
-            u.reconciled_at
+            timestamp_label(u.reconciled_at)
         );
     }
+    let _ = writeln!(
+        out,
+        "observed {} · {} projects · {} worktrees",
+        timestamp_label(report.observed_at),
+        human_count(report.projects.len() as u64),
+        human_count(worktree_count as u64)
+    );
     let _ = write!(
         out,
-        "observed_at={} projects={} worktrees={} attributed={} unowned={} walked={}",
-        report.observed_at,
-        report.projects.len(),
-        worktree_count,
+        "filesystem: {} attributed · {} unowned · {} walked",
         human_bytes(report.reconciliation.attributed),
         human_bytes(report.reconciliation.unowned),
-        human_bytes(report.reconciliation.walked_total),
+        human_bytes(report.reconciliation.walked_total)
     );
     if verify_du {
         let _ = write!(
             out,
-            " du={}",
+            " · du verification {}",
             report
                 .reconciliation
                 .du_total
                 .map(human_bytes)
-                .unwrap_or_else(|| "n/a".to_string())
+                .unwrap_or_else(|| "not measured (use observe --verify-du)".to_string())
         );
     }
     let _ = writeln!(out);
@@ -209,6 +241,19 @@ fn header(report: &Report, verify_du: bool) -> String {
         let _ = writeln!(out, "{line}");
     }
     out
+}
+
+/// A persisted Unix timestamp shown as a calendar date and time.
+fn timestamp_label(secs: u64) -> String {
+    if secs == 0 {
+        return "time unknown".to_string();
+    }
+    format!(
+        "{} {:02}:{:02} UTC",
+        crate::schedule::utc_date(secs),
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60
+    )
 }
 
 /// The zero-flag, one-screen overview: header, then one line per project
@@ -272,7 +317,10 @@ pub fn render_types(report: &Report) -> String {
     let mut rows: Vec<_> = report.summary.by_type.iter().collect();
     rows.sort_by_key(|a| std::cmp::Reverse(a.1.bytes));
     if rows.is_empty() {
-        let _ = writeln!(out, "0");
+        let _ = writeln!(
+            out,
+            "No ecosystem totals were recorded in this observation."
+        );
         return out;
     }
     for (tag, t) in rows {
@@ -281,8 +329,8 @@ pub fn render_types(report: &Report) -> String {
             "{:<6} {:<14} {:>9} {:>10} {:>12} {:>10}",
             tag,
             t.name,
-            t.projects,
-            t.artifacts,
+            human_count(t.projects as u64),
+            human_count(t.artifacts as u64),
             human_bytes(t.bytes),
             t.growth_bytes
                 .map(human_signed_bytes)
@@ -304,7 +352,11 @@ pub fn render_overview_sorted(
     let _ = writeln!(out);
 
     if report.projects.is_empty() {
-        let _ = writeln!(out, "0 projects discovered under {}", report.root.display());
+        let _ = writeln!(
+            out,
+            "No projects were discovered under {}. Check the effective roots with `swamp scope` or add a source root with `swamp config add-root <path>`.",
+            report.root.display()
+        );
         return out;
     }
 
@@ -364,9 +416,9 @@ pub fn render_overview_sorted(
             .top_kind
             .as_ref()
             .map(|(k, b)| format!("{} ({})", kind_label(k), human_bytes(*b)))
-            .unwrap_or_else(|| "0".to_string());
+            .unwrap_or_else(|| "—".to_string());
         let bytes_str = if totals.bytes == 0 {
-            "0".to_string()
+            "0B".to_string()
         } else {
             human_bytes(totals.bytes)
         };
@@ -382,7 +434,11 @@ pub fn render_overview_sorted(
         );
     }
     if !show_all && total > limit {
-        let _ = writeln!(out, "… and {} more (use --all)", total - limit);
+        let _ = writeln!(
+            out,
+            "… and {} more (use --all)",
+            human_count((total - limit) as u64)
+        );
     }
     let _ = writeln!(out);
     render_unowned_summary(report, &mut out, show_docker);
@@ -408,8 +464,31 @@ fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) 
     // reason; shared caches are listed separately. Docker objects are not
     // filesystem paths at all and are aggregated by kind instead. Never
     // per-file/per-object rows in the default summary.
-    let mut by_dir: BTreeMap<String, u64> = BTreeMap::new();
-    let mut by_reason: BTreeMap<&'static str, u64> = BTreeMap::new();
+    #[derive(Default)]
+    struct UnownedTotal {
+        bytes: u64,
+        not_measured: bool,
+    }
+    impl UnownedTotal {
+        fn add(&mut self, row: &crate::report::UnownedRow) {
+            self.bytes = self.bytes.saturating_add(row.bytes);
+            self.not_measured |= matches!(
+                &row.reason,
+                UnownedReason::PermissionDenied | UnownedReason::NotMeasured
+            );
+        }
+
+        fn label(&self) -> String {
+            match (self.bytes, self.not_measured) {
+                (0, true) => "not measured".to_string(),
+                (bytes, true) => format!("at least {} + not measured", human_bytes(bytes)),
+                (bytes, false) => human_bytes(bytes),
+            }
+        }
+    }
+
+    let mut by_dir: BTreeMap<String, UnownedTotal> = BTreeMap::new();
+    let mut by_reason: BTreeMap<&'static str, UnownedTotal> = BTreeMap::new();
     let mut shared_caches_bytes = 0u64;
     let mut shared_caches_count = 0u64;
     let mut docker_by_kind: BTreeMap<String, (u64, u64)> = BTreeMap::new();
@@ -449,15 +528,18 @@ fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) 
                 .map(|c| c.as_os_str().to_string_lossy().to_string())
                 .unwrap_or_else(|| row.path_or_object.clone())
         };
-        *by_dir.entry(top_dir).or_insert(0) += row.bytes;
-        *by_reason.entry(reason_label(&row.reason)).or_insert(0) += row.bytes;
+        by_dir.entry(top_dir).or_default().add(row);
+        by_reason
+            .entry(reason_label(&row.reason))
+            .or_default()
+            .add(row);
     }
     let _ = writeln!(out, "unowned by top-level dir:");
     if by_dir.is_empty() {
         let _ = writeln!(out, "  (none)");
     } else {
         for (dir, bytes) in &by_dir {
-            let _ = writeln!(out, "  {:<30} {:>10}", dir, human_bytes(*bytes));
+            let _ = writeln!(out, "  {:<30} {:>10}", dir, bytes.label());
         }
     }
     let _ = writeln!(out, "unowned by reason:");
@@ -465,7 +547,7 @@ fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) 
         let _ = writeln!(out, "  (none)");
     } else {
         for (reason, bytes) in &by_reason {
-            let _ = writeln!(out, "  {:<30} {:>10}", reason, human_bytes(*bytes));
+            let _ = writeln!(out, "  {:<30} {:>10}", reason, bytes.label());
         }
     }
     if shared_caches_count > 0 {
@@ -473,7 +555,7 @@ fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) 
             out,
             "shared caches: {} ({} items)",
             human_bytes(shared_caches_bytes),
-            shared_caches_count
+            human_count(shared_caches_count)
         );
     }
     if !docker_by_kind.is_empty() {
@@ -484,7 +566,7 @@ fn render_unowned_summary(report: &Report, out: &mut String, show_docker: bool) 
                 "  {:<30} {:>10} ({} items)",
                 kind,
                 human_bytes(*bytes),
-                count
+                human_count(*count)
             );
         }
         if !show_docker {
@@ -537,9 +619,6 @@ pub fn render_project(report: &Report, name: &str) -> Option<String> {
             .unwrap_or_else(|_| wt.path.display().to_string());
         let short_id = &wt.worktree_id[..wt.worktree_id.len().min(8)];
         let _ = writeln!(out, "worktree: {rel} ({short_id}) [{kind}]");
-        if wt.artifacts.is_empty() {
-            let _ = writeln!(out, "  0");
-        }
         for a in &wt.artifacts {
             let growth_str = a
                 .growth_bytes
@@ -552,8 +631,11 @@ pub fn render_project(report: &Report, name: &str) -> Option<String> {
                 a.path.display(),
                 human_bytes(a.bytes),
                 growth_str,
-                a.regrowth_count,
+                human_count(a.regrowth_count as u64),
             );
+        }
+        if wt.artifacts.is_empty() {
+            let _ = writeln!(out, "  no artifact rows were recorded for this worktree");
         }
         if !wt.signals.is_empty() {
             let signals = wt
@@ -583,13 +665,19 @@ pub fn render_kinds(report: &Report) -> String {
     }
     let _ = writeln!(out, "{:<16} {:>12} {:>8}", "kind", "bytes", "count");
     if agg.is_empty() {
-        let _ = writeln!(out, "0");
+        let _ = writeln!(out, "No artifact kinds were recorded in this observation.");
         return out;
     }
     let mut rows: Vec<(&str, (u64, u64))> = agg.into_iter().collect();
     rows.sort_by_key(|a| std::cmp::Reverse(a.1.0));
     for (kind, (bytes, count)) in rows {
-        let _ = writeln!(out, "{:<16} {:>12} {:>8}", kind, human_bytes(bytes), count);
+        let _ = writeln!(
+            out,
+            "{:<16} {:>12} {:>8}",
+            kind,
+            human_bytes(bytes),
+            human_count(count)
+        );
     }
     out
 }
@@ -665,15 +753,18 @@ pub fn render_worktrees(report: &Report, filter: &crate::filter::Filter) -> Stri
         }
     }
     if shown == 0 {
-        let _ = writeln!(out, "0 worktrees match");
+        let _ = writeln!(
+            out,
+            "No worktrees match this filter. Broaden or remove `--filter`, or check the effective roots with `swamp scope`."
+        );
     }
     out
 }
 
-/// Bare duration ("3d", "4h", "12m", "45s"), no prefix.
+/// A coarse worktree idle duration.
 fn human_duration(secs: u64) -> String {
     if secs < 60 {
-        format!("{secs}s")
+        "under 1m".to_string()
     } else if secs < 3600 {
         format!("{}m", secs / 60)
     } else if secs < 86_400 {
@@ -714,10 +805,14 @@ fn render_pr(pr: &crate::github::PrStatus) -> String {
 pub fn render_text(report: &Report) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "root: {}", report.root.display());
-    let _ = writeln!(out, "observed_at: {}", report.observed_at);
+    let _ = writeln!(out, "observed: {}", timestamp_label(report.observed_at));
     let _ = writeln!(out);
     if report.projects.is_empty() {
-        let _ = writeln!(out, "0 projects discovered under {}", report.root.display());
+        let _ = writeln!(
+            out,
+            "No projects were discovered under {}. Check the effective roots with `swamp scope` or add a source root with `swamp config add-root <path>`.",
+            report.root.display()
+        );
         return out;
     }
     let _ = writeln!(
@@ -737,12 +832,12 @@ pub fn render_text(report: &Report) -> String {
                     kind,
                     kind_label(&artifact.kind),
                     artifact.path.display(),
-                    artifact.bytes,
+                    human_bytes(artifact.bytes),
                     artifact
                         .growth_bytes
-                        .map(|g| g.to_string())
+                        .map(human_signed_bytes)
                         .unwrap_or_else(|| "-".to_string()),
-                    artifact.regrowth_count,
+                    human_count(artifact.regrowth_count as u64),
                 );
             }
             if !worktree.signals.is_empty() {
@@ -765,8 +860,10 @@ pub fn render_text(report: &Report) -> String {
     for row in &report.unowned {
         let _ = writeln!(
             out,
-            "{:<40} {:>12} {:<20?}",
-            row.path_or_object, row.bytes, row.reason
+            "{:<40} {:>12} {:<20}",
+            row.path_or_object,
+            human_bytes(row.bytes),
+            reason_label(&row.reason)
         );
     }
     let _ = writeln!(out);
@@ -871,7 +968,11 @@ pub fn render_project_tree_with_agents(
                 .map(human_signed_bytes)
                 .unwrap_or_else(|| "—".to_string());
             let label = if row.folded_count > 1 {
-                format!("{} (x{})", row.rel_path, row.folded_count)
+                format!(
+                    "{} (x{})",
+                    row.rel_path,
+                    human_count(row.folded_count as u64)
+                )
             } else {
                 row.rel_path.clone()
             };
@@ -908,7 +1009,7 @@ fn write_agent_rows(out: &mut String, rows: &[crate::tree::ProjectAgentToolRow])
         let count = if row.unit_count == 1 {
             "1 unit".to_string()
         } else {
-            format!("{} units", row.unit_count)
+            format!("{} units", human_count(row.unit_count as u64))
         };
         let _ = writeln!(
             out,
@@ -1047,7 +1148,10 @@ fn render_container_section(
         let consequence = match (&f.consequence, f.other_consequences) {
             (Some(c), 0) => c.clone(),
             (Some(c), 1) => format!("{c} (and 1 other consequence inside)"),
-            (Some(c), n) => format!("{c} (and {n} other consequences inside)"),
+            (Some(c), n) => format!(
+                "{c} (and {} other consequences inside)",
+                human_count(n as u64)
+            ),
             (None, _) => "consequence not established".to_string(),
         };
         let size = match f.basis {
@@ -1066,7 +1170,7 @@ fn render_container_section(
             None => "no known modification time".to_string(),
         };
         let unknowns = if f.unknown_age > 0 {
-            format!(", {} of unknown age", f.unknown_age)
+            format!(", {} of unknown age", human_count(f.unknown_age as u64))
         } else {
             String::new()
         };
@@ -1080,7 +1184,7 @@ fn render_container_section(
             section,
             "{indent}  {:<24} {} item(s), {size}, {oldest}{unknowns}{}; no cleanup rule",
             "",
-            f.count,
+            human_count(f.count as u64),
             if f.complete {
                 ""
             } else {
@@ -1094,7 +1198,7 @@ fn render_container_section(
             "{indent}  {:<24} {} -- {} unrecognised entr{}, {}",
             crate::artifact::RoleFamily::Residual.title(),
             crate::build_adapters::family_guidance(crate::artifact::RoleFamily::Residual),
-            summary.unsupported_count,
+            human_count(summary.unsupported_count as u64),
             if summary.unsupported_count == 1 {
                 "y"
             } else {
@@ -1267,7 +1371,17 @@ pub fn render_view_rust_with_limit(
             .then_with(|| a.5.relative_path.cmp(&b.5.relative_path))
     });
     if rows.is_empty() {
-        let _ = writeln!(out, "0 (no Cargo target rows or no supported nested facts)");
+        if let Some(name) = only_project {
+            let _ = writeln!(
+                out,
+                "No Cargo target rows or supported nested facts were recorded for project {name}."
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "No Cargo target rows or supported nested facts were recorded."
+            );
+        }
         return out;
     }
     let count = rows.len();
@@ -1310,8 +1424,9 @@ pub fn render_view_rust_with_limit(
     if limit.is_some_and(|n| count > n) {
         let _ = writeln!(
             out,
-            "Showing {} of {count} rows, largest first. Use --all for all rows, --json for structured cleanup guidance, or `swamp ui` to inspect cleanup groups.",
-            limit.unwrap()
+            "Showing {} of {} rows, largest first. Use --all for all rows, --json for structured cleanup guidance, or `swamp ui` to inspect cleanup groups.",
+            human_count(limit.unwrap() as u64),
+            human_count(count as u64)
         );
     }
     let _ = writeln!(
@@ -1338,6 +1453,15 @@ pub fn nested_artifact_project_name<'a>(
 
 fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[ArtifactKind]) -> String {
     let mut out = String::new();
+    let subject = if kinds == [ArtifactKind::DependencyTree] {
+        "Dependencies"
+    } else {
+        "Build output and caches"
+    };
+    let scope = only_project
+        .map(|name| format!(" for project {name}"))
+        .unwrap_or_else(|| " across all projects".to_string());
+    let _ = writeln!(out, "{subject}{scope}");
     let _ = writeln!(
         out,
         "{:<20} {:<10} {:<40} {:>10} {:>10}",
@@ -1372,7 +1496,22 @@ fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[Artifa
     }
     rows.sort_by_key(|a| std::cmp::Reverse(a.3));
     if rows.is_empty() {
-        let _ = writeln!(out, "0");
+        let empty = if let Some(name) = only_project {
+            if kinds == [ArtifactKind::DependencyTree] {
+                format!(
+                    "No dependency folders were recorded for project {name} in this observation."
+                )
+            } else {
+                format!(
+                    "No build-output or cache folders were recorded for project {name} in this observation."
+                )
+            }
+        } else if kinds == [ArtifactKind::DependencyTree] {
+            "No dependency folders were recorded in this observation.".to_string()
+        } else {
+            "No build-output or cache folders were recorded in this observation.".to_string()
+        };
+        let _ = writeln!(out, "{empty}");
         return out;
     }
     for (project, kind, path, bytes, growth) in rows {
@@ -1400,6 +1539,10 @@ fn render_kind_view(report: &Report, only_project: Option<&str>, kinds: &[Artifa
 /// evidence). Sorted by bytes (unique bytes) desc.
 pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String {
     let mut out = String::new();
+    let scope = only_project
+        .map(|name| format!(" for project {name}"))
+        .unwrap_or_else(|| " across all projects".to_string());
+    let _ = writeln!(out, "Docker objects{scope}");
     let _ = writeln!(
         out,
         "{:<24} {:<20} {:<14} {:>10} {:>10}  detail",
@@ -1519,7 +1662,17 @@ pub fn render_view_docker(report: &Report, only_project: Option<&str>) -> String
     }
     rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     if rows.is_empty() {
-        let _ = writeln!(out, "0");
+        if let Some(name) = only_project {
+            let _ = writeln!(
+                out,
+                "No Docker objects matched project {name} in this observation."
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "No Docker objects were recorded in this observation. Refresh with `swamp observe` to check current daemon facts."
+            );
+        }
         return out;
     }
     for row in rows {
@@ -1553,31 +1706,41 @@ pub fn render_view_reconciliation(report: &Report) -> String {
     let r = &report.reconciliation;
     let _ = writeln!(
         out,
-        "attributed={} unowned={} walked={} du={} docker_attributed={} docker_unowned={}",
+        "Filesystem (allocated bytes): {} attributed · {} unowned · {} walked",
         human_bytes(r.attributed),
         human_bytes(r.unowned),
-        human_bytes(r.walked_total),
-        r.du_total
-            .map(human_bytes)
-            .unwrap_or_else(|| "n/a".to_string()),
+        human_bytes(r.walked_total)
+    );
+    let _ = writeln!(
+        out,
+        "Docker (separate from walked filesystem): {} attributed · {} unowned",
         human_bytes(r.docker_attributed),
         human_bytes(r.docker_unowned),
+    );
+    let _ = writeln!(
+        out,
+        "du verification: {}",
+        r.du_total
+            .map(human_bytes)
+            .unwrap_or_else(|| { "not measured (use `swamp observe --verify-du`)".to_string() })
     );
     match &r.unique_estimate {
         Some(u) => {
             let _ = writeln!(
                 out,
-                "filesystem unique={} · {} · reconciled at {} · not reclaimable bytes",
+                "Filesystem unique: {} · {} · last reconciled {} · not a reclaimable-space estimate",
                 human_bytes(u.bytes),
                 if u.needs_reconciliation {
                     "needs reconciliation; swamp observe --full to reconcile"
                 } else {
                     "reconciled"
                 },
-                u.reconciled_at
+                timestamp_label(u.reconciled_at)
             );
         }
-        None => out.push_str("filesystem unique=unknown; swamp observe --full to reconcile\n"),
+        None => out.push_str(
+            "Filesystem unique: not measured; run `swamp observe --full` to reconcile.\n",
+        ),
     }
     for line in render_sharing_lines(r.unique_estimate.as_ref(), None) {
         let _ = writeln!(out, "{line}");
@@ -1615,7 +1778,7 @@ pub fn render_sharing_lines(
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(format!(
-            "{} shared {}{}{} · observed {}{} · not reclaimable bytes",
+            "{} shared {}{}{} · not reclaimable bytes",
             human_bytes(group.bytes),
             if names.is_empty() {
                 "within selection / unresolved peers"
@@ -1628,7 +1791,10 @@ pub fn render_sharing_lines(
             } else {
                 String::new()
             },
-            estimate.reconciled_at,
+        ));
+        lines.push(format!(
+            "Sharing observed {}{}",
+            timestamp_label(estimate.reconciled_at),
             if estimate.needs_reconciliation {
                 "; needs reconciliation"
             } else {
@@ -1723,7 +1889,10 @@ pub fn render_view_external_with(
 ) -> String {
     let mut out = String::new();
     if units.is_empty() {
-        let _ = writeln!(out, "no external storage units detected");
+        let _ = writeln!(
+            out,
+            "No external storage units were recorded. Check detector coverage with `swamp scope`."
+        );
         return out;
     }
     let mut sorted: Vec<&crate::external::ExternalUnit> = units.iter().collect();
@@ -1845,7 +2014,7 @@ pub fn model_lines(models: &[crate::build_adapters::model_stores::ModelRow]) -> 
     }
     out.push(format!(
         "models ({}), largest first; what each is comes from its own files:",
-        models.len()
+        human_count(models.len() as u64)
     ));
     for m in models {
         let rev = m
@@ -1925,7 +2094,7 @@ pub fn render_standalone_targets(unowned: &[crate::report::UnownedRow]) -> Strin
         out,
         "standalone Cargo targets: {} in {} director{}",
         human_bytes(rows.iter().map(|r| r.bytes).sum()),
-        rows.len(),
+        human_count(rows.len() as u64),
         if rows.len() == 1 { "y" } else { "ies" }
     );
     out
@@ -1941,13 +2110,13 @@ pub fn describe_unit_child(child: &crate::drilldown::UnitChild, now: u64) -> Str
         ChildKind::Remainder => {
             let mut text = format!(
                 "remainder: {} other entr{} (the other folders, and files directly inside)",
-                child.entries,
+                human_count(child.entries as u64),
                 if child.entries == 1 { "y" } else { "ies" }
             );
             if child.not_measured > 0 {
                 text.push_str(&format!(
                     "; {} folder{} not measured",
-                    child.not_measured,
+                    human_count(child.not_measured as u64),
                     if child.not_measured == 1 { "" } else { "s" }
                 ));
             }
@@ -2043,13 +2212,7 @@ fn age_label(mtime_max: u64, now: u64) -> String {
         return "modified in the future (clock skew?)".to_string();
     }
     let secs = now.saturating_sub(mtime_max);
-    if secs < 3600 {
-        format!("{}m ago", (secs / 60).max(1))
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    }
+    format!("{} ago", crate::schedule::coarse_age(secs))
 }
 
 /// One short, source-qualified line per decision-evidence fact (#60):
@@ -2277,10 +2440,10 @@ pub fn evidence_warnings(evidence: &[crate::evidence::Evidence]) -> Vec<String> 
     for e in crate::evidence::stale(evidence, now) {
         let window = e.freshness.expires_after_secs.unwrap_or_default();
         out.push(format!(
-            "this {} reading was taken {}s ago, past its {window}s recheck window; it is re-taken \
-             fresh before any action rather than trusted from here",
+            "this {} reading is past its {} recheck window (about {} old); it is checked fresh before any action",
             evidence_subtype_label(e.subtype),
-            now.saturating_sub(e.observed_at),
+            human_duration(window),
+            human_duration(now.saturating_sub(e.observed_at)),
         ));
     }
     out
@@ -2357,9 +2520,9 @@ pub fn render_view_agents(
     if filtered.is_empty() {
         let _ = writeln!(
             out,
-            "no agent-storage units detected{}",
+            "No agent-storage units were recorded{}.",
             project
-                .map(|p| format!(" linked to project {p:?}"))
+                .map(|p| format!(" for project {p}"))
                 .unwrap_or_default()
         );
         return out;
@@ -2384,7 +2547,7 @@ pub fn render_view_agents(
                 out,
                 "  {cat}  ({} total, {} unit{})",
                 human_bytes(cat_total),
-                cat_units.len(),
+                human_count(cat_units.len() as u64),
                 if cat_units.len() == 1 { "" } else { "s" }
             );
             let mut sorted = cat_units.clone();
@@ -2434,7 +2597,7 @@ pub fn render_view_agents(
                 let _ = writeln!(
                     out,
                     "    … and {} more (--all for the rest)",
-                    sorted.len() - limit
+                    human_count((sorted.len() - limit) as u64)
                 );
             }
         }
@@ -2443,7 +2606,7 @@ pub fn render_view_agents(
         out,
         "\nagent storage total: {} ({} units, independent of walked_total above)",
         human_bytes(grand_total),
-        filtered.len()
+        human_count(filtered.len() as u64)
     );
     out
 }
@@ -2576,5 +2739,43 @@ mod evidence_warnings_tests {
             "unresolved hardlink membership",
         )];
         assert_eq!(evidence_warnings(&bounded).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod human_format_tests {
+    use super::{age_label, human_bytes_pub, human_count};
+
+    #[test]
+    fn modification_ages_share_coarse_buckets_and_preserve_skew_handling() {
+        assert_eq!(age_label(1, 1), "<1m ago");
+        assert_eq!(age_label(0, 1), "age unknown");
+        assert_eq!(
+            age_label(10_000_000, 1),
+            "modified in the future (clock skew?)"
+        );
+        assert_eq!(age_label(100, 100 + 30 * 86_400), "1mo ago");
+        assert_eq!(age_label(100, 100 + 365 * 86_400), "1y ago");
+    }
+
+    #[test]
+    fn byte_values_are_coarse_and_carry_rounded_unit_boundaries() {
+        assert_eq!(human_bytes_pub(999), "999B");
+        assert_eq!(human_bytes_pub(1_000), "1KB");
+        assert_eq!(human_bytes_pub(1_499), "1KB");
+        assert_eq!(human_bytes_pub(1_500), "2KB");
+        assert_eq!(human_bytes_pub(999_499), "999KB");
+        assert_eq!(human_bytes_pub(999_500), "1.0MB");
+        assert_eq!(human_bytes_pub(1_250_000), "1.3MB");
+        assert_eq!(human_bytes_pub(1_000_000_000_000), "1.0TB");
+        assert_eq!(human_bytes_pub(u64::MAX), "18.4EB");
+    }
+
+    #[test]
+    fn counts_remain_exact_and_grouped() {
+        assert_eq!(human_count(0), "0");
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_000), "1,000");
+        assert_eq!(human_count(u64::MAX), "18,446,744,073,709,551,615");
     }
 }

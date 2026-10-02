@@ -183,7 +183,7 @@ fn a_ledger_gives_the_percent_of_the_containers_used_bytes_and_both_ages() {
         first.ends_with(&format!("({}.{}% of used)", tenths / 10, tenths % 10)),
         "{first}"
     );
-    assert!(text.contains("disk ledger measured 3 h ago"), "{text}");
+    assert!(text.contains("disk ledger measured 3h ago"), "{text}");
     assert!(
         text.contains("Everything else (measured, not developer storage)"),
         "{text}"

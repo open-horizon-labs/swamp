@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use swamp_core::external::ExternalUnit;
 use swamp_core::growth::{VolumeMetaRow, write_volume_ledger};
 use swamp_core::headline::{
-    Category, Disk, Headline, Input, ScopeKind, build, category_of_unit, group_digits, relation,
+    Category, Disk, Headline, Input, ScopeKind, build, category_of_unit, relation,
     render_reclaim_header,
 };
 use swamp_core::last_used::LastUsed;
@@ -270,7 +270,7 @@ fn the_known_fixture_produces_the_exact_headline_and_rows() {
     let text = h.render_text(NOW);
     let want = "\
 Developer storage: 60.0GB across 1 project and 7 tool locations (30.0% of used)
-  observed 4 min ago; disk ledger measured 3 h ago
+  observed 4m ago; disk ledger measured 3h ago
   projects                       28.0GB     1 project
   toolchains and SDKs             5.0GB     1 location
   caches                          3.0GB     1 location
@@ -278,7 +278,7 @@ Developer storage: 60.0GB across 1 project and 7 tool locations (30.0% of used)
   containers and VMs             20.0GB     1 location
   standalone Cargo targets        2.0GB     2 locations
   other developer units           1.0GB     1 location
-  the rows add up to 60,000,000,000 bytes, the figure above; each row is rounded on its own
+  totals use exact stored bytes; displayed rows are rounded independently
   not counted: 12.0GB in Homebrew (other) (the rest of a location after its developer tooling)
   not counted: 40.0GB of mounted disk images (views of image files; the disk cost is the image files themselves, listed under Everything else, not in developer storage)
 Everything else (measured, not developer storage): 34.0GB across 2 folders
@@ -334,15 +334,19 @@ fn the_rows_sum_to_the_headline_exactly_whatever_the_rounding() {
     assert_eq!(count, h.locations);
     let text = h.render_text(NOW);
     assert!(
-        text.contains(&format!(
-            "the rows add up to {} bytes, the figure above",
-            group_digits(h.developer_bytes)
-        )),
+        text.contains("totals use exact stored bytes; displayed rows are rounded independently"),
         "{text}"
     );
-    // The exact figure appears once, at the end of the rows, and never
-    // beside a single row.
-    assert_eq!(text.matches(&group_digits(h.developer_bytes)).count(), 1);
+    assert_eq!(h.to_json()["developer_bytes"], h.developer_bytes);
+    assert_eq!(
+        h.to_json()["categories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["bytes"].as_u64().unwrap())
+            .sum::<u64>(),
+        h.developer_bytes
+    );
 }
 
 /// Tempting wrong patch: the percent is rounded to nearest, so 99.96%
@@ -545,7 +549,7 @@ fn a_ledger_much_older_than_the_observation_says_so() {
     let h = headline_of(&units, &r, &ledger, ScopeKind::Current);
     let text = h.render_text(NOW);
     assert!(
-        text.contains("observed 2 h ago; disk ledger measured 4 d ago; the ledger is 3 d older than this observation"),
+        text.contains("observed 2h ago; disk ledger measured 4d ago; the ledger is 3 d older than this observation"),
         "{text}"
     );
     // A ledger a few hours older is not flagged.
@@ -863,6 +867,42 @@ fn the_headline_the_reclaim_totals_and_the_disk_view_agree() {
         text.contains("Developer storage 60.0GB = projects 28.0GB + this view's units"),
         "{text}"
     );
+    assert!(
+        text.lines().count() <= 5,
+        "the reclaim preamble is compact:\n{text}"
+    );
+    assert!(
+        !text.contains("Everything else"),
+        "disk detail belongs in its own view:\n{text}"
+    );
+    assert!(
+        !text.contains("System volumes:"),
+        "disk detail belongs in its own view:\n{text}"
+    );
+
+    let mut warning_headline = h.clone();
+    warning_headline
+        .flags
+        .push("test critical flag remains visible".into());
+    if let Disk::Measured(measured) = &mut warning_headline.disk {
+        measured.audit.flag = true;
+        measured.accounted_check.agrees = false;
+        measured.accounted_check.disk_view_accounted = measured
+            .accounted_check
+            .developer_plus_remainder
+            .saturating_sub(1);
+        measured.accounted_check.difference = -1;
+    }
+    let warning_text = render_reclaim_header(&warning_headline, &view.totals, NOW);
+    assert!(
+        warning_text.contains("FLAG: test critical flag remains visible"),
+        "{warning_text}"
+    );
+    assert!(
+        warning_text.contains("FLAG: walk spot audit disagrees"),
+        "{warning_text}"
+    );
+    assert!(warning_text.contains("disk view check:"), "{warning_text}");
 }
 
 /// Tempting wrong patch: a relation that quietly holds because it is
@@ -1058,7 +1098,7 @@ fn text_and_json_carry_the_same_numbers() {
     }
     // The text says the ages; the JSON keeps the times, so two reads of
     // one store are identical however far apart they run.
-    assert!(text.contains("observed 4 min ago; disk ledger measured 3 h ago"));
+    assert!(text.contains("observed 4m ago; disk ledger measured 3h ago"));
     assert_eq!(j["measured_at"]["observed_at"], r.observed_at);
     assert_eq!(j["measured_at"]["ledger_measured_at"], NOW - 3 * 3600);
     assert!(j.get("ages").is_none());

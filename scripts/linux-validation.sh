@@ -122,7 +122,7 @@ settle() {
     echo "settle: st_blocks did not catch up within 15 s" >&2
     exit 1
 }
-observe() { settle; "$bin" observe "$root" | grep '^observed_at='; }
+observe() { settle; "$bin" observe "$root" --verbose | grep '^observed_at='; }
 timed() { local a b line; a=$(now_ms); line="$(observe)"; b=$(now_ms); echo "$((b - a)) $line"; }
 
 # --- initial full scan -----------------------------------------------
@@ -166,7 +166,7 @@ for r in $(seq "$REPS"); do
 done
 ref_store="$work/ref-store"
 settle
-ref="$(SWAMP_DIR="$ref_store" "$bin" observe "$root" --full | grep '^observed_at=')"
+ref="$(SWAMP_DIR="$ref_store" "$bin" observe "$root" --full --verbose | grep '^observed_at=')"
 [ "$(field "$res" walked_total)" = "$(field "$ref" walked_total)" ] &&
     say "equivalence: incremental walked_total $(field "$res" walked_total) == reference full walk $(field "$ref" walked_total)" ||
     { say "equivalence: MISMATCH incremental=$(field "$res" walked_total) full=$(field "$ref" walked_total)"; exit 1; }

@@ -1,15 +1,16 @@
 root: /src
-observed_at=1000000 projects=3 worktrees=3 attributed=6.2GB unowned=4.4GB walked=10.6GB
+observed 1970-01-12 13:46 UTC · 3 projects · 3 worktrees
+filesystem: 6.2GB attributed · 4.4GB unowned · 10.6GB walked
 
 type       project                           bytes     growth  wts top kind            
            big-grower                        6.0GB     +2.0GB    1 build (5.0GB)       
            small-static                    200.0MB          —    1 cache (200.0MB)     
-           no-artifacts                          0          —    1 0                   
+           no-artifacts                         0B          —    1 —                   
 
 unowned by top-level dir:
   old-project                       400.0MB
-  restricted                             0B
+  restricted                     not measured
 unowned by reason:
   no-containing-repo                400.0MB
-  permission-denied                      0B
+  permission-denied              not measured
 shared caches: 4.0GB (1 items)

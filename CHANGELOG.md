@@ -5,6 +5,13 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- Preparing selected Cargo build outputs no longer reads and hashes the compiled payloads. Payload manifests record metadata identity; small producer fingerprints still use content hashes. On one real 499-action selection, proposal preparation fell from 15.7 seconds to 0.27 seconds, and the full UI marking path took 0.93 seconds. These are local measurements, not timing guarantees.
+
+- Human output uses readable dates, rounded durations, grouped counts, and shared decimal byte units. `observe` reports one elapsed clock and active work instead of per-root byte counters that reset; `observe --verbose` retains detailed diagnostics. JSON and persisted measurement precision are unchanged.
+- Trash review groups destination totals, common warnings, and item-specific exceptions. A separate scrollable inventory lists every action and member path with its size; reviewing every path is optional. Short terminals give more space to data, and help starts with common tasks.
+- Observation lock messages show the start time in UTC and elapsed age. Terminal progress continues after filesystem walks, showing elapsed time and an active work stage and path rather than leaving the last walk counters frozen.
+- Expanded model-folder rows distinguish their physical folder size from the model total including shared weights. The row and details explain that shared blobs are not additive and remain behind when only the repo folder is moved.
+
 ## v0.8.1
 
 - Automatic host-storage observations exclude nested `devicefs` mounts and name their paths as unmeasured virtual filesystems. They no longer traverse the CoreDevice device view as part of the Mac’s Developer storage. Mount appearance and disappearance establish a growth-history boundary, preserving old observations without presenting the scope change as freed bytes. Explicit roots retain their requested scope. Three normal-priority manual warm observations of the release build, using real configured roots and a copied store, took 8.65, 6.48 and 5.94 seconds (6.48-second median); the prior runs included the virtual mount, so this is a scope correction as well as a performance change.

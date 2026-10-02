@@ -48,6 +48,8 @@ pub struct Counters {
     dirs_listed: AtomicU64,
     files_statted: AtomicU64,
     header_bytes: AtomicU64,
+    content_bytes_hashed: AtomicU64,
+    content_hash_nanos: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     containers_reused: AtomicU64,
@@ -65,6 +67,8 @@ impl Counters {
             dirs_listed: self.dirs_listed.load(Ordering::Relaxed),
             files_statted: self.files_statted.load(Ordering::Relaxed),
             header_bytes_read: self.header_bytes.load(Ordering::Relaxed),
+            content_bytes_hashed: self.content_bytes_hashed.load(Ordering::Relaxed),
+            content_hash_nanos: self.content_hash_nanos.load(Ordering::Relaxed),
             identification_cache_hits: self.cache_hits.load(Ordering::Relaxed),
             identification_cache_misses: self.cache_misses.load(Ordering::Relaxed),
             containers_reused: self.containers_reused.load(Ordering::Relaxed),
@@ -82,6 +86,8 @@ static GLOBAL: Counters = Counters {
     dirs_listed: AtomicU64::new(0),
     files_statted: AtomicU64::new(0),
     header_bytes: AtomicU64::new(0),
+    content_bytes_hashed: AtomicU64::new(0),
+    content_hash_nanos: AtomicU64::new(0),
     cache_hits: AtomicU64::new(0),
     cache_misses: AtomicU64::new(0),
     containers_reused: AtomicU64::new(0),
@@ -126,6 +132,12 @@ pub struct WorkCounters {
     pub dirs_listed: u64,
     pub files_statted: u64,
     pub header_bytes_read: u64,
+    /// Bytes read into content digests while preparing Cargo group manifests.
+    #[serde(default)]
+    pub content_bytes_hashed: u64,
+    /// Time spent reading and hashing those bytes, in nanoseconds.
+    #[serde(default)]
+    pub content_hash_nanos: u64,
     pub identification_cache_hits: u64,
     pub identification_cache_misses: u64,
     /// Container directories replayed from the store without a listing
@@ -179,6 +191,15 @@ pub fn record_files_statted(n: u64) {
 
 pub fn record_header_bytes(n: u64) {
     add(|c| &c.header_bytes, n);
+}
+
+/// Bytes consumed by whole-file hashing during Cargo proposal snapshots.
+pub fn record_content_bytes_hashed(n: u64) {
+    add(|c| &c.content_bytes_hashed, n);
+}
+
+pub fn record_content_hash_time(nanos: u64) {
+    add(|c| &c.content_hash_nanos, nanos);
 }
 
 pub fn record_cache_hit() {
@@ -248,6 +269,8 @@ pub fn reset() {
         &GLOBAL.dirs_listed,
         &GLOBAL.files_statted,
         &GLOBAL.header_bytes,
+        &GLOBAL.content_bytes_hashed,
+        &GLOBAL.content_hash_nanos,
         &GLOBAL.cache_hits,
         &GLOBAL.cache_misses,
         &GLOBAL.containers_reused,
@@ -271,6 +294,12 @@ pub fn since(before: WorkCounters) -> WorkCounters {
         header_bytes_read: now
             .header_bytes_read
             .saturating_sub(before.header_bytes_read),
+        content_bytes_hashed: now
+            .content_bytes_hashed
+            .saturating_sub(before.content_bytes_hashed),
+        content_hash_nanos: now
+            .content_hash_nanos
+            .saturating_sub(before.content_hash_nanos),
         identification_cache_hits: now
             .identification_cache_hits
             .saturating_sub(before.identification_cache_hits),
@@ -309,7 +338,11 @@ mod tests {
         let (_, counted) = super::measured(|| {
             std::thread::spawn(super::record_dir_listed).join().unwrap();
             super::record_dir_listed();
+            super::record_content_bytes_hashed(123);
+            super::record_content_hash_time(456);
         });
         assert_eq!(counted.dirs_listed, 1);
+        assert_eq!(counted.content_bytes_hashed, 123);
+        assert_eq!(counted.content_hash_nanos, 456);
     }
 }

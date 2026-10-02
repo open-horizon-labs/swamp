@@ -17,6 +17,125 @@ use swamp_core::schedule::{
     self, LockOutcome, RunOutcome, acquire_lock, append_log, write_last_run,
 };
 
+fn trace_enabled() -> bool {
+    std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
+fn safe_console_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn count_noun(count: usize, singular: &str, plural: &str) -> String {
+    format!(
+        "{} {}",
+        swamp_core::render::human_count(count as u64),
+        if count == 1 { singular } else { plural }
+    )
+}
+
+fn coverage_summary(coverage: &[swamp_core::coverage::RootCoverage]) -> String {
+    use swamp_core::coverage::RegionStatus as Status;
+
+    let mut counts = [0usize; 7];
+    for row in coverage {
+        let index = match &row.status {
+            Status::Complete => 0,
+            Status::Partial { .. } => 1,
+            Status::DetectorOnly => 2,
+            Status::NotMeasured { .. } => 3,
+            Status::Inaccessible { .. } => 4,
+            Status::Excluded => 5,
+            Status::Missing => 6,
+        };
+        counts[index] += 1;
+    }
+    let descriptions = [
+        ("complete root", "complete roots"),
+        ("partial root", "partial roots"),
+        (
+            "tool location not scanned for projects",
+            "tool locations not scanned for projects",
+        ),
+        ("root not measured", "roots not measured"),
+        ("inaccessible root", "inaccessible roots"),
+        ("excluded root", "excluded roots"),
+        ("missing root", "missing roots"),
+    ];
+    let parts = counts
+        .iter()
+        .zip(descriptions)
+        .filter(|(count, _)| **count > 0)
+        .map(|(count, (one, many))| {
+            format!(
+                "{} {}",
+                swamp_core::render::human_count(*count as u64),
+                if *count == 1 { one } else { many }
+            )
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "Coverage: no root coverage was returned.".to_string()
+    } else {
+        format!("Coverage: {}.", parts.join(", "))
+    }
+}
+
+/// Keep ordinary completion output concise when optional detector locations
+/// are absent. Configured/explicit roots and every other measurement failure
+/// remain path-specific; diagnostic output includes all paths.
+fn coverage_details(
+    coverage: &[swamp_core::coverage::RootCoverage],
+    roots: &[swamp_core::scope::ScopeRoot],
+    diagnostics: bool,
+) -> (Vec<String>, Vec<PathBuf>) {
+    use swamp_core::coverage::RegionStatus as Status;
+
+    let mut details = Vec::new();
+    let mut detailed_paths = Vec::new();
+    let mut absent_tool_locations = 0usize;
+    for row in coverage {
+        if matches!(&row.status, Status::Complete | Status::DetectorOnly) {
+            continue;
+        }
+        let optional_missing_tool = matches!(&row.status, Status::Missing)
+            && roots
+                .iter()
+                .find(|root| root.path == row.path)
+                .is_some_and(|root| !root.is_project_root());
+        if optional_missing_tool && !diagnostics {
+            absent_tool_locations += 1;
+            continue;
+        }
+        details.push(format!(
+            "  {}: {}",
+            safe_console_text(&row.path.display().to_string()),
+            safe_console_text(&row.status.label()),
+        ));
+        detailed_paths.push(row.path.clone());
+    }
+    if absent_tool_locations > 0 {
+        details.push(format!(
+            "  {} absent optional tool location{}",
+            swamp_core::render::human_count(absent_tool_locations as u64),
+            if absent_tool_locations == 1 { "" } else { "s" },
+        ));
+    }
+    (details, detailed_paths)
+}
+
+fn quarantine_output_notes(
+    notes: &[(PathBuf, String)],
+    detailed_coverage_paths: &[PathBuf],
+) -> Vec<String> {
+    notes
+        .iter()
+        .filter(|(path, _)| !detailed_coverage_paths.contains(path))
+        .map(|(_, note)| format!("  {}", safe_console_text(note)))
+        .collect()
+}
+
 /// `swamp observe [root...]`. Exits 0 on success, on a graceful
 /// "another observation is running" skip, and even on a timeout/error --
 /// only in-process misuse is a hard error, since a launchd-triggered run
@@ -40,7 +159,10 @@ pub fn cmd_observe(
     since: Option<String>,
     enrich: bool,
     volume: bool,
+    verbose: bool,
+    finish_progress: impl FnOnce(),
 ) -> Result<()> {
+    let command_started = Instant::now();
     // Resolved before any work: a misconfigured test (the hermeticity
     // guard) fails here, not after a whole observation.
     let log = schedule::log_file_for_append();
@@ -55,7 +177,12 @@ pub fn cmd_observe(
     let lock = match acquire_lock(&store_dir)? {
         LockOutcome::Acquired(guard) => guard,
         LockOutcome::HeldBy { pid, since } => {
-            safe_println!("another observation is running (pid {pid}) since {since}");
+            finish_progress();
+            let now = swamp_core::entities::now();
+            safe_println!(
+                "another observation is running (pid {pid}) since {}",
+                schedule::lock_since_label(since, now)
+            );
             return Ok(());
         }
     };
@@ -64,10 +191,16 @@ pub fn cmd_observe(
     // for a day, so one blocking path cannot fail every scheduled pass
     // (#190).
     let mut quarantine_notes = Vec::new();
+    let mut quarantine_seen = std::collections::HashSet::new();
     let mut skipped = Vec::new();
     for (at, path) in schedule::quarantined(&store_dir, swamp_core::entities::now()) {
         let reason = format!("stalled on {}", schedule::utc_date(at));
-        quarantine_notes.push(format!("{}: not measured ({reason})", path.display()));
+        if quarantine_seen.insert(path.clone()) {
+            quarantine_notes.push((
+                path.clone(),
+                format!("{}: not measured ({reason})", path.display()),
+            ));
+        }
         skipped.push((path, reason));
     }
     swamp_core::walk::set_not_measured(skipped);
@@ -131,41 +264,51 @@ pub fn cmd_observe(
             let github = merged.github_enrichment.clone().unwrap_or_default();
             let walked_total = merged.reconciliation.walked_total;
             let projects = merged.projects.len();
+            let diagnostics = verbose || trace_enabled();
 
-            safe_println!(
-                "observed_at={} wall_ms={wall_ms} walked_total={walked_total} projects={projects} external_units={} agent_units={} {fsevents_line}",
-                merged.observed_at,
-                observation.external_units.len(),
-                observation.agent_units.len(),
-            );
-            for c in &observation.coverage {
-                safe_println!(
-                    "  root={} mode={} walked_total={} projects={}",
-                    c.path.display(),
-                    if c.mode.is_empty() { "-" } else { &c.mode },
-                    c.walked_total,
-                    c.projects
-                );
+            let coverage_line = coverage_summary(&observation.coverage);
+            let (coverage_details, detailed_coverage_paths) =
+                coverage_details(&observation.coverage, &pass_scope.roots, diagnostics);
+            let mut diagnostic_lines = Vec::new();
+            if diagnostics {
+                diagnostic_lines.push(format!(
+                    "observed_at={} wall_ms={wall_ms} walked_total={walked_total} projects={projects} external_units={} agent_units={} {fsevents_line}",
+                    merged.observed_at,
+                    observation.external_units.len(),
+                    observation.agent_units.len(),
+                ));
+                for c in &observation.coverage {
+                    diagnostic_lines.push(format!(
+                        "  root={} status={} mode={} walked_total={} projects={}",
+                        safe_console_text(&c.path.display().to_string()),
+                        safe_console_text(&c.status.label()),
+                        if c.mode.is_empty() { "-" } else { &c.mode },
+                        c.walked_total,
+                        c.projects
+                    ));
+                }
+                diagnostic_lines.push(format!(
+                    "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
+                    github.calls_made, github.worktrees_enriched, github.elapsed_secs
+                ));
             }
-            for note in &quarantine_notes {
-                safe_println!("  {note}");
-            }
+            let mut exceptional_notes =
+                quarantine_output_notes(&quarantine_notes, &detailed_coverage_paths);
             for (path, why) in swamp_core::signals::declined_repositories() {
-                safe_println!("  {}: git repository not measured ({why})", path.display());
+                exceptional_notes.push(format!(
+                    "  {}: Git repository not measured ({})",
+                    safe_console_text(&path.display().to_string()),
+                    safe_console_text(why)
+                ));
             }
-            safe_println!(
-                "  github: calls={} worktrees_enriched={} elapsed={:.1}s",
-                github.calls_made,
-                github.worktrees_enriched,
-                github.elapsed_secs
-            );
-            if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
-                eprintln!(
+            let trace_counters = trace_enabled().then(|| {
+                format!(
                     "[debug] work counters: {:?}",
                     swamp_core::work_counters::snapshot()
-                );
-            }
-            record_manager_reports(&store_dir, &observation.external_units, now)?;
+                )
+            });
+            let manager_notes =
+                record_manager_reports(&store_dir, &observation.external_units, now, diagnostics)?;
 
             let outcome = RunOutcome {
                 observed_at: now,
@@ -175,10 +318,11 @@ pub fn cmd_observe(
                 mode,
                 outcome: "ok".to_string(),
             };
+            let mut deferred_warnings = Vec::new();
             if let Err(e) = append_log(&log, &outcome) {
                 // The observation is recorded in the store either way; a
                 // log that cannot be written is said once, not a failure.
-                eprintln!("observe log not written: {e:#}");
+                deferred_warnings.push(format!("observe log not written: {e:#}"));
             }
             write_last_run(&store_dir, &outcome)?;
             // The observation is over: its lock is released before the volume
@@ -186,10 +330,49 @@ pub fn cmd_observe(
             // a slow or stuck pass never makes a scheduled observe say
             // "another observation is running".
             drop(lock);
-            volume_step(&store_dir, &config, &pass_scope, &observation, volume)?;
+            let volume_lines = volume_step(&store_dir, &config, &pass_scope, &observation, volume)?;
+            finish_progress();
+            for warning in deferred_warnings {
+                eprintln!("{warning}");
+            }
+            for line in volume_lines {
+                safe_println!("{line}");
+            }
+            for note in manager_notes {
+                safe_println!("{note}");
+            }
+            for line in diagnostic_lines {
+                safe_println!("{line}");
+            }
+            if let Some(counters) = trace_counters {
+                eprintln!("{counters}");
+            }
+            for line in exceptional_notes {
+                safe_println!("{line}");
+            }
+            for line in coverage_details {
+                safe_println!("{line}");
+            }
+            safe_println!("{coverage_line}");
+            safe_println!(
+                "Observed {}, {} and {} in {}.",
+                count_noun(projects, "project", "projects"),
+                count_noun(
+                    observation.external_units.len(),
+                    "external storage unit",
+                    "external storage units"
+                ),
+                count_noun(
+                    observation.agent_units.len(),
+                    "agent storage unit",
+                    "agent storage units"
+                ),
+                schedule::format_duration_ms(command_started.elapsed().as_millis() as u64),
+            );
             Ok(())
         }
         Ok(Err(e)) => {
+            finish_progress();
             let wall_ms = start.elapsed().as_millis() as u64;
             let now = swamp_core::entities::now();
             let outcome = RunOutcome {
@@ -211,6 +394,7 @@ pub fn cmd_observe(
             std::process::exit(1);
         }
         Err(Waited::TimedOut(stuck)) => {
+            finish_progress();
             let wall_ms = start.elapsed().as_millis() as u64;
             let now = swamp_core::entities::now();
             let outcome = RunOutcome {
@@ -235,8 +419,8 @@ pub fn cmd_observe(
             // parked in one blocking filesystem call (#190).
             drop(lock);
             eprintln!(
-                "observe stopped after {}s: {}",
-                wall_ms / 1000,
+                "observe stopped after {}: {}",
+                schedule::format_duration_ms(wall_ms),
                 outcome.outcome
             );
             std::process::exit(1);
@@ -306,7 +490,8 @@ fn record_manager_reports(
     store_dir: &std::path::Path,
     units: &[swamp_core::external::ExternalUnit],
     now: u64,
-) -> Result<()> {
+    diagnostics: bool,
+) -> Result<Vec<String>> {
     let started = std::time::Instant::now();
     let facts = swamp_core::manager_facts::collect(
         units,
@@ -314,33 +499,38 @@ fn record_manager_reports(
         now,
         store_dir,
     );
-    if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
-        eprintln!("[trace] manager reports: {:?}", started.elapsed());
+    let mut messages = Vec::new();
+    if trace_enabled() {
+        messages.push(format!(
+            "[trace] manager reports: {}",
+            schedule::format_duration_ms(started.elapsed().as_millis() as u64)
+        ));
     }
     let not_observed = facts
         .iter()
         .filter(|f| f.kind == swamp_core::manager_facts::FactKind::NotObserved)
         .count();
     match swamp_core::growth::write_manager_fact_table(store_dir, &facts) {
-        Ok(()) => safe_println!(
-            "  manager reports: {} rows recorded, {not_observed} not observed",
+        Ok(()) if diagnostics => messages.push(format!(
+            "manager reports: {} rows recorded, {not_observed} not observed",
             facts.len()
-        ),
-        Err(e) => eprintln!("manager reports not recorded: {e}"),
+        )),
+        Ok(()) => {}
+        Err(e) => messages.push(format!("manager reports not recorded: {e}")),
     }
-    Ok(())
+    Ok(messages)
 }
 
-/// The volume pass, after a successful observation and still under the
-/// single-flight observe lock. It never fails the observation: its result
-/// is one line, and what it could not do is in the ledger's own rows.
+/// Disk accounting runs after observation, with the observation lock released.
+/// It never fails the observation; any limits or failures are returned as
+/// user-facing messages, and unavailable measurements remain in ledger rows.
 fn volume_step(
     store_dir: &std::path::Path,
     config: &swamp_core::growth::GrowthConfig,
     scope: &swamp_core::scope::EffectiveScope,
     observation: &swamp_core::report::ScopeObservation,
     force: bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     use swamp_core::volume_ledger::pass::{PassOutcome, allowed, run_after_observation};
     let home = swamp_core::locations::Environment::from_process().home;
     let account_home = swamp_core::volume_ledger::pass::account_home();
@@ -351,26 +541,187 @@ fn volume_step(
         &home,
         account_home.as_deref(),
     ) {
-        if force {
-            safe_println!("volume pass skipped: {why}");
-        }
-        return Ok(());
+        return Ok(if force {
+            vec![format!("Disk accounting skipped: {why}")]
+        } else {
+            Vec::new()
+        });
     }
     let mut config = config.clone();
+    let mut messages = Vec::new();
     if config.volume_pass_budget_secs < 5 {
-        safe_println!(
-            "volume_pass_budget_secs = {} is below the 5 s minimum; using 5",
-            config.volume_pass_budget_secs
+        messages.push(
+            "Volume scan budget was below the five-second minimum; using five seconds.".to_string(),
         );
         config.volume_pass_budget_secs = 5;
     }
     match run_after_observation(store_dir, &config, scope, observation, &home, force) {
-        Ok(PassOutcome::Ran(summary)) => safe_println!("{}", summary.line()),
-        Ok(PassOutcome::Skipped(line)) => safe_println!("{line}"),
+        Ok(PassOutcome::Ran(summary)) => messages.push(summary.line()),
+        Ok(PassOutcome::Skipped(line)) => messages.push(line),
         Ok(PassOutcome::NotDue(_)) => {}
-        Err(e) => safe_println!("volume pass failed: {e}"),
+        Err(e) => messages.push(format!("Disk accounting failed: {e}")),
     }
-    Ok(())
+    Ok(messages)
+}
+
+#[cfg(test)]
+mod observe_output_tests {
+    use super::*;
+
+    fn root_coverage(
+        status: swamp_core::coverage::RegionStatus,
+    ) -> swamp_core::coverage::RootCoverage {
+        root_coverage_at("/root", status)
+    }
+
+    fn root_coverage_at(
+        path: &str,
+        status: swamp_core::coverage::RegionStatus,
+    ) -> swamp_core::coverage::RootCoverage {
+        swamp_core::coverage::RootCoverage {
+            path: PathBuf::from(path),
+            status,
+            walked_total: 0,
+            projects: 0,
+            mode: String::new(),
+            reached_by_registry: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn coverage_summary_distinguishes_measurement_outcomes() {
+        use swamp_core::coverage::RegionStatus as Status;
+        let coverage = vec![
+            root_coverage(Status::Complete),
+            root_coverage(Status::Partial {
+                reason: "permission denied".to_string(),
+            }),
+            root_coverage(Status::DetectorOnly),
+            root_coverage(Status::NotMeasured {
+                reason: "stalled".to_string(),
+            }),
+            root_coverage(Status::Inaccessible {
+                reason: "permission denied".to_string(),
+            }),
+            root_coverage(Status::Excluded),
+            root_coverage(Status::Missing),
+        ];
+        assert_eq!(
+            coverage_summary(&coverage),
+            "Coverage: 1 complete root, 1 partial root, 1 tool location not scanned for projects, 1 root not measured, 1 inaccessible root, 1 excluded root, 1 missing root."
+        );
+        assert_eq!(
+            coverage_summary(&[]),
+            "Coverage: no root coverage was returned."
+        );
+    }
+
+    #[test]
+    fn count_noun_uses_singular_and_grouped_plural_forms() {
+        assert_eq!(count_noun(1, "project", "projects"), "1 project");
+        assert_eq!(count_noun(2, "project", "projects"), "2 projects");
+        assert_eq!(count_noun(1_000, "project", "projects"), "1,000 projects");
+    }
+
+    #[test]
+    fn console_paths_cannot_inject_terminal_control_characters() {
+        assert_eq!(safe_console_text("/tmp/a\n\u{1b}[31m"), "/tmp/a??[31m");
+    }
+
+    #[test]
+    fn missing_detector_locations_are_summarized_unless_diagnostics_are_requested() {
+        use swamp_core::coverage::RegionStatus as Status;
+        use swamp_core::locations::{Provenance, StorageCategory};
+        use swamp_core::scope::{RootReason, RootStatus, ScopeRoot};
+
+        let optional_paths = [
+            PathBuf::from("/home/user/.rvm"),
+            PathBuf::from("/home/user/.cache/tool"),
+        ];
+        let roots = vec![
+            ScopeRoot {
+                path: optional_paths[0].clone(),
+                reasons: vec![RootReason::Detector {
+                    detector_id: "test-tool".into(),
+                    category: StorageCategory::Environments,
+                    provenance: Provenance::BuiltinConvention,
+                }],
+                status: RootStatus::Missing,
+            },
+            ScopeRoot {
+                path: optional_paths[1].clone(),
+                reasons: vec![RootReason::Detector {
+                    detector_id: "test-tool".into(),
+                    category: StorageCategory::Cache,
+                    provenance: Provenance::BuiltinConvention,
+                }],
+                status: RootStatus::Missing,
+            },
+            ScopeRoot {
+                path: PathBuf::from("/work/project"),
+                reasons: vec![RootReason::Included],
+                status: RootStatus::Missing,
+            },
+        ];
+        let coverage = vec![
+            root_coverage_at("/home/user/.rvm", Status::Missing),
+            root_coverage_at("/home/user/.cache/tool", Status::Missing),
+            root_coverage_at("/work/project", Status::Missing),
+            root_coverage_at(
+                "/work/blocked",
+                Status::NotMeasured {
+                    reason: "stalled".into(),
+                },
+            ),
+        ];
+
+        let (default_lines, default_detail_paths) = coverage_details(&coverage, &roots, false);
+        assert!(default_lines.contains(&"  2 absent optional tool locations".into()));
+        assert!(!default_lines.iter().any(|line| line.contains(".rvm")));
+        assert!(
+            default_lines
+                .iter()
+                .any(|line| line.contains("/work/project: missing"))
+        );
+        assert!(
+            default_lines
+                .iter()
+                .any(|line| line.contains("/work/blocked: not measured"))
+        );
+        assert!(!default_detail_paths.contains(&optional_paths[0]));
+
+        let (diagnostic_lines, diagnostic_paths) = coverage_details(&coverage, &roots, true);
+        assert!(
+            diagnostic_lines
+                .iter()
+                .any(|line| line.contains("/home/user/.rvm: missing"))
+        );
+        assert!(
+            diagnostic_lines
+                .iter()
+                .any(|line| line.contains("/home/user/.cache/tool: missing"))
+        );
+        assert!(diagnostic_paths.contains(&optional_paths[0]));
+    }
+
+    #[test]
+    fn quarantine_note_is_suppressed_when_coverage_already_names_the_path() {
+        let path = PathBuf::from("/work/Music");
+        let notes = vec![
+            (
+                path.clone(),
+                "/work/Music: not measured (stalled on today)".to_string(),
+            ),
+            (
+                PathBuf::from("/work/Other"),
+                "/work/Other: not measured".to_string(),
+            ),
+        ];
+        assert_eq!(
+            quarantine_output_notes(&notes, std::slice::from_ref(&path)),
+            vec!["  /work/Other: not measured"]
+        );
+    }
 }
 
 /// `swamp schedule [--every <interval>] [--off] <root>...`.

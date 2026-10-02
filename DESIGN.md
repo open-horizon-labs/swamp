@@ -84,22 +84,24 @@ The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take
 
 The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals, but the activity chip (`⠋ observing 12s`, or `⠋ another observation running (pid N, 1m 12s)`) owns the left edge at every width. The UI opens on the stored report at any age and never scans when one exists; with none, the first scan runs in the background and its progress shows in the header. `R` refreshes on demand, and says so, rather than starting a second walk, when another process already holds the observation lock. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
 
-Observation progress shows the elapsed time and the bytes seen; there is no percentage, because the total is not known. The TUI opens no filesystem watch: nothing scans on a file event, so a stored report is exactly as old as the header says. A lock poll only notices when another process observes, shows it, and reloads the stored report when that run ends. The right side of the header is the history sparkline with the net change it covers and the window it is over (`-41.4GB in 1w`); body rows use change bars.
+Observation progress keeps a whole-run elapsed clock. The CLI names the active work; the TUI names the scope being updated. Per-walk byte counters are not displayed as run totals because they reset between roots. There is no percentage, because the total is not known. The TUI opens no filesystem watch: nothing scans on a file event, so a stored report is exactly as old as the header says. A lock poll only notices when another process observes, shows it, and reloads the stored report when that run ends. The right side of the header is the history sparkline with the net change it covers and the window it is over (`-41.4GB in 1w`); body rows use change bars.
+
+Human output shares decimal byte units, grouped counts, whole-second durations, and coarse ages. Ages use minutes, hours, days, months, or years; timestamps show UTC through the minute. Rounded rows need not add up visually: totals are calculated from exact stored bytes. JSON, persisted records, and explicit diagnostic output retain exact numeric values.
 
 ### The developer-storage headline block and the view strip
 
 Under the header, on every view and in every state, sits a headline block of a
-fixed number of rows chosen by the terminal's height alone: four at 22 rows and
+fixed number of rows chosen by the terminal's height alone: four at 30 rows and
 up (the headline with its percent; the breakdown rows, largest first, with
 `+N more` when a narrow screen cannot name them all; the disk state with the
 ages and the ledger's parts; the pointers to Reclaim and Disk with their keys),
-two from 16 rows (headline and pointers), one from 12, none below. Nothing
+two from 16 rows (headline and coverage/age), one from 12, none below. Nothing
 changes that height: a warning, a missing ledger, a running scan, a previous
 scope, the first-run line and every view draw into the same rows, so no row of
 the table moves. Lines that come in shorter forms step together to the form
 that keeps the most leading clauses; the wording of the spot-audit warning is
 never traded away, so the clauses after it give way instead. The first-run line
-("New: Tab opens Tools (Reclaim) and Disk. Hides after you open either.") takes the
+("Tab switches sections · 2 opens Tools / Reclaim · 3 opens Disk") takes the
 pointer row until Tools or Disk is opened once, and is remembered in
 `ui_state.json`.
 
@@ -255,7 +257,7 @@ validation.
 
 ## Actions
 
-Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a single inline row with selected paths, sizes, warnings, and destinations. Enter authorizes the action; Esc cancels it.
+Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a content-sized review overlay with destination totals, selection context, shared warnings shown once, and item-specific exceptions. The primary summary must be displayed before Enter authorizes its action. Press `l` for the complete path, size, and member inventory; this detail view scrolls, and Esc returns to the summary. Inspecting every inventory row is optional. Esc from the summary cancels.
 
 Human keep/protect intent (`swamp protect`) is checked before **any**
 row is marked, in both directions: a row beneath a protected path, and a
@@ -293,9 +295,7 @@ there is no second, presentation-only evidence path to keep in sync.
 ## Layout, review and plan
 
 The chrome is the same rows in every state: header, view and filter line, the
-body, two status rows, and the key legend. Nothing resizes the body. A plan or
-blocked list is a fixed 10-row sheet drawn over the bottom of the list, and a
-result stays in the status rows until the next key. A detail pane of fixed
+body, two status rows, and the key legend. Nothing resizes the body. A blocked list is a fixed 10-row sheet drawn over the bottom of the list. A plan uses a content-sized overlay, up to the terminal height minus its persistent action footer; long warning summaries scroll, while the complete path inventory is a separate optional detail view. A result stays in the status rows until the next key. A detail pane of fixed
 height sits under the list, and the list scrolls only when the selection leaves
 its window, so one Down moves the selection one row.
 
@@ -332,4 +332,8 @@ The terminal is put back however the program ends: on return, on a panic on the
 UI thread (the message prints on the normal screen), and on SIGTERM, SIGHUP or
 SIGINT (`fs_gate::terminal`, chained to the child-kill handlers).
 
-Keep the footer visible. Use overlays for help and the filter form, with inline action confirmation. The help overlay ends with the activity-evidence inventory (which domains this pass can establish a real activity fact for, and which it reports as unknown), the same table `docs/usage.md` carries. Check empty results, narrow layouts, long paths, mixed filesystem/Docker selections, and missing history. The frame tests cover rendered text and layout; they do not establish readability on every font or color theme.
+Keep the footer visible. Use overlays for help, the filter form, and action review. The help overlay ends with the activity-evidence inventory (which domains this pass can establish a real activity fact for, and which it reports as unknown), the same table `docs/usage.md` carries. Check empty results, narrow layouts, long paths, mixed filesystem/Docker selections, and missing history. The frame tests cover rendered text and layout; they do not establish readability on every font or color theme.
+
+## Human-readable values
+
+Human output shares decimal byte units across CLI and TUI, with whole KB and one decimal for larger units, carrying rounded boundaries into the next unit. Counts use digit grouping where needed. Elapsed durations use whole seconds, subsecond work reads `<1s`, and stored timestamps show dates or coarse relative ages with a named timezone where relevant. Machine-readable JSON, logs, and ledger records retain exact values.

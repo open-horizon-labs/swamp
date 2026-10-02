@@ -554,16 +554,35 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+/// A compact, deliberately coarse age used across CLI, reports and the TUI.
+/// Month and year buckets are approximate (30 and 365 days).
+pub fn coarse_age(secs: u64) -> String {
+    const DAY: u64 = 86_400;
+    const MONTH: u64 = 30 * DAY;
+    const YEAR: u64 = 365 * DAY;
+    if secs < 60 {
+        "<1m".to_string()
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < DAY {
+        format!("{}h", secs / 3600)
+    } else if secs < MONTH {
+        format!("{}d", secs / DAY)
+    } else if secs < YEAR {
+        format!("{}mo", secs / MONTH)
+    } else {
+        format!("{}y", secs / YEAR)
+    }
+}
+
 pub fn format_ago(now: u64, then: u64) -> String {
     let secs = now.saturating_sub(then);
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86400 {
-        format!("{}h ago", secs / 3600)
+    if then == 0 {
+        "time unknown".to_string()
+    } else if then > now {
+        "clock ahead".to_string()
     } else {
-        format!("{}d ago", secs / 86400)
+        format!("{} ago", coarse_age(secs))
     }
 }
 
@@ -591,10 +610,10 @@ pub fn header_line(store_dir: &Path, suggested_root: &Path, now: u64) -> String 
     match read_last_run(store_dir) {
         Some(run) if run.outcome == "ok" => {
             format!(
-                "last observation {} ({}, {:.1} s)",
+                "last observation {} ({}, {})",
                 format_ago(now, run.observed_at),
                 run.mode,
-                run.wall_ms as f64 / 1000.0
+                format_duration_ms(run.wall_ms)
             )
         }
         Some(run) => {
@@ -658,11 +677,11 @@ pub fn status(store_dir: &Path) -> Result<String> {
         Some(run) => {
             let now = crate::entities::now();
             out.push_str(&format!(
-                "  Last run: {} ({}, {} projects, {:.1} s)\n",
+                "  Last run: {} ({}, {} projects, {})\n",
                 format_ago(now, run.observed_at),
                 run.outcome,
-                run.projects,
-                run.wall_ms as f64 / 1000.0
+                crate::render::human_count(run.projects as u64),
+                format_duration_ms(run.wall_ms)
             ));
             if let Some(s) = seconds {
                 let next = run.observed_at + s;
@@ -687,12 +706,12 @@ fn status_systemd(store_dir: &Path) -> Result<String> {
     )?;
     match read_last_run(store_dir).or_else(|| last_log_outcome(&log_file())) {
         Some(run) => out.push_str(&format!(
-            "  Last run: {} ({}, mode {}, {} projects, {:.1} s)\n",
+            "  Last run: {} ({}, mode {}, {} projects, {})\n",
             format_ago(crate::entities::now(), run.observed_at),
             run.outcome,
             run.mode,
-            run.projects,
-            run.wall_ms as f64 / 1000.0
+            crate::render::human_count(run.projects as u64),
+            format_duration_ms(run.wall_ms)
         )),
         None => out.push_str("  Last run: none recorded yet\n"),
     }
@@ -798,6 +817,15 @@ pub fn peek_lock(store_dir: &Path) -> Option<LockHolder> {
     let pid: u32 = parts.next()?.parse().ok()?;
     let since: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     pid_alive(pid).then_some(LockHolder { pid, since })
+}
+
+/// Rounded duration for human output; raw milliseconds remain in machine records.
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        "<1s".to_string()
+    } else {
+        format_elapsed(ms.saturating_add(500) / 1_000)
+    }
 }
 
 /// `1m 12s` style duration for live status text.
@@ -1011,7 +1039,7 @@ mod tests {
         assert!(text.contains("30m"));
         assert!(text.contains("/Users/test/src"));
         assert!(text.contains("3 projects"));
-        assert!(text.contains("4.2 s"));
+        assert!(text.contains("4s"));
 
         unsafe {
             std::env::remove_var("SWAMP_LAUNCH_AGENTS_DIR");
@@ -1595,6 +1623,26 @@ pub fn utc_date(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// Human-readable lock creation time plus its age, for the single-flight
+/// message shown to a second observer. Keep the timezone explicit because
+/// lock timestamps are persisted as Unix seconds; this label always uses UTC.
+pub fn lock_since_label(since: u64, now: u64) -> String {
+    if since == 0 {
+        return "unknown time (elapsed time unknown)".to_string();
+    }
+    let clock = format!(
+        "{} {:02}:{:02} UTC",
+        utc_date(since),
+        (since % 86_400) / 3_600,
+        (since % 3_600) / 60
+    );
+    if since > now {
+        return format!("{clock} (clock is {} ahead)", format_elapsed(since - now));
+    }
+    let age = format_ago(now, since);
+    format!("{clock} ({age})")
+}
+
 #[cfg(test)]
 mod stall_quarantine_tests {
     use super::*;
@@ -1614,5 +1662,39 @@ mod stall_quarantine_tests {
         );
         assert!(quarantined(tmp.path(), 2_000 + STALL_QUARANTINE_SECS).is_empty());
         assert_eq!(utc_date(1_790_773_352), "2026-09-30");
+    }
+
+    #[test]
+    fn lock_since_label_shows_utc_time_and_elapsed_age() {
+        assert_eq!(
+            lock_since_label(1_790_000_000, 1_790_000_125),
+            "2026-09-21 14:13 UTC (2m ago)"
+        );
+        assert_eq!(
+            lock_since_label(1_790_000_125, 1_790_000_000),
+            "2026-09-21 14:15 UTC (clock is 2m 5s ahead)"
+        );
+        assert_eq!(
+            lock_since_label(0, 10),
+            "unknown time (elapsed time unknown)"
+        );
+    }
+
+    #[test]
+    fn human_times_are_coarse_without_losing_unknown_or_future_states() {
+        assert_eq!(format_duration_ms(250), "<1s");
+        assert_eq!(format_duration_ms(1_499), "1s");
+        assert_eq!(format_duration_ms(59_600), "1m 0s");
+        assert_eq!(coarse_age(59), "<1m");
+        assert_eq!(coarse_age(60), "1m");
+        assert_eq!(coarse_age(3_599), "59m");
+        assert_eq!(coarse_age(3_600), "1h");
+        assert_eq!(coarse_age(86_400), "1d");
+        assert_eq!(coarse_age(30 * 86_400), "1mo");
+        assert_eq!(coarse_age(365 * 86_400), "1y");
+        assert_eq!(format_ago(10_000, 9_999), "<1m ago");
+        assert_eq!(format_ago(10_000, 9_950), "<1m ago");
+        assert_eq!(format_ago(10_000, 0), "time unknown");
+        assert_eq!(format_ago(10_000, 10_001), "clock ahead");
     }
 }

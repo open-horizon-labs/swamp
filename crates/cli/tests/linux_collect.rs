@@ -62,7 +62,7 @@ fn observe(root: &Path, store: &Path, home: &Path, full: bool) -> String {
     // #197: settle fixture writes before they are measured.
     swamp_core::fs_gate::settle::settle();
     let mut cmd = Command::new(bin());
-    cmd.arg("observe").arg(root);
+    cmd.arg("observe").arg(root).arg("--verbose");
     if full {
         cmd.arg("--full");
     }

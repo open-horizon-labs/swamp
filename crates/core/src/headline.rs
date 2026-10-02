@@ -630,11 +630,21 @@ impl Headline {
             .map_or(0, |c| c.count);
         let tools = self.locations.saturating_sub(projects);
         let across = match (projects, tools) {
-            (0, t) => format!("{t} tool {}", plural(t, "location", "locations")),
-            (p, 0) => format!("{p} {}", plural(p, "project", "projects")),
+            (0, t) => format!(
+                "{} tool {}",
+                crate::render::human_count(t as u64),
+                plural(t, "location", "locations")
+            ),
+            (p, 0) => format!(
+                "{} {}",
+                crate::render::human_count(p as u64),
+                plural(p, "project", "projects")
+            ),
             (p, t) => format!(
-                "{p} {} and {t} tool {}",
+                "{} {} and {} tool {}",
+                crate::render::human_count(p as u64),
                 plural(p, "project", "projects"),
+                crate::render::human_count(t as u64),
                 plural(t, "location", "locations")
             ),
         };
@@ -673,13 +683,13 @@ impl Headline {
             Some(p) => format!(
                 "Developer storage {} in {} {}, {p} of used{suffix}",
                 human(self.developer_bytes),
-                self.locations,
+                crate::render::human_count(self.locations as u64),
                 plural(self.locations, "location", "locations")
             ),
             None => format!(
                 "Developer storage {} in {} {}{suffix}",
                 human(self.developer_bytes),
-                self.locations,
+                crate::render::human_count(self.locations as u64),
                 plural(self.locations, "location", "locations")
             ),
         });
@@ -701,7 +711,8 @@ impl Headline {
     pub fn scope_sentence(&self) -> Option<String> {
         match (self.scope, self.previous_scope_roots) {
             ("previous", Some(n)) => Some(format!(
-                "covers the previous scope ({n} {}), so no percent of used is shown; new roots are not observed yet, run swamp observe",
+                "covers the previous scope ({} {}), so no percent of used is shown; new roots are not observed yet, run swamp observe",
+                crate::render::human_count(n as u64),
                 plural(n, "root", "roots")
             )),
             ("explicit_root", _) => Some(
@@ -758,7 +769,8 @@ impl Headline {
                 first_line_of(reason)
             )),
             Disk::Newer { unknown_rows } => Some(format!(
-                "disk ledger: written by a newer swamp ({unknown_rows} {} this version does not know); not used",
+                "disk ledger: written by a newer swamp ({} {} this version does not know); not used",
+                crate::render::human_count(*unknown_rows as u64),
                 plural(*unknown_rows, "row", "rows")
             )),
             Disk::FutureDated { .. } => Some(
@@ -844,7 +856,7 @@ impl Headline {
         out.push(format!(
             "Everything else (measured, not developer storage): {} across {} {}",
             human(m.everything_else.bytes),
-            m.everything_else.folders,
+            crate::render::human_count(m.everything_else.folders as u64),
             plural(m.everything_else.folders, "folder", "folders")
         ));
         for p in &m.everything_else.top {
@@ -867,7 +879,7 @@ impl Headline {
         let nm = &m.not_measured;
         let mut line = format!(
             "Not measured: {} {}",
-            nm.directories,
+            crate::render::human_count(nm.directories as u64),
             plural(nm.directories, "directory", "directories")
         );
         match nm.estimate_bytes {
@@ -884,14 +896,15 @@ impl Headline {
         if nm.not_yet_measured > 0 {
             out.push(format!(
                 "  {} {} not measured yet in this pass; the next observe continues it",
-                nm.not_yet_measured,
+                crate::render::human_count(nm.not_yet_measured as u64),
                 plural(nm.not_yet_measured, "location", "locations")
             ));
         }
         match (&m.audit.skipped, m.audit.folders) {
             (Some(why), 0) => out.push(format!("Walk spot audit: not run ({why})")),
             (_, n) => out.push(format!(
-                "Walk spot-audited: {n} {}, max difference {:.1}%",
+                "Walk spot-audited: {} {}, max difference {:.1}%",
+                crate::render::human_count(n as u64),
                 plural(n, "folder", "folders"),
                 m.audit.max_difference_percent
             )),
@@ -934,7 +947,7 @@ impl Headline {
                 "  {:<26} {:>10}  {:>4} {unit}",
                 c.label,
                 human(c.bytes),
-                c.count
+                crate::render::human_count(c.count as u64)
             );
         }
         if self.capped {
@@ -945,8 +958,7 @@ impl Headline {
         } else {
             let _ = writeln!(
                 out,
-                "  the rows add up to {} bytes, the figure above; each row is rounded on its own",
-                group_digits(self.developer_bytes)
+                "  totals use exact stored bytes; displayed rows are rounded independently"
             );
         }
         if let Some(m) = self.mixed_owners.iter().max_by_key(|m| m.bytes) {
@@ -1039,15 +1051,7 @@ fn span_text(secs: u64) -> String {
 
 /// `224,105,331,712`: the exact byte count, once, at the end of the rows.
 pub fn group_digits(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    crate::render::human_count(n)
 }
 
 /// How the Reclaim view's totals relate to the headline, on one store.
@@ -1123,12 +1127,30 @@ impl Relation {
     }
 }
 
-/// What `swamp report --view reclaim` prints before the view: the
-/// headline, and how this view's totals add up to it.
+/// Compact context before `swamp report --view reclaim`: the headline,
+/// scope and age, any critical accounting warnings, and how the view's
+/// totals relate to the headline. Detailed ledger rows stay in the disk
+/// view and the default report.
 pub fn render_reclaim_header(h: &Headline, t: &crate::reclaim::Totals, now: u64) -> String {
+    let mut lines = Vec::new();
+    if let Some(scope) = h.scope_sentence() {
+        lines.push(scope);
+    }
+    lines.push(h.ages_sentence(now));
+    if let Some(state) = h.disk_state_sentence() {
+        lines.push(state);
+    }
+    if let Some(audit) = h.audit_sentence() {
+        lines.push(audit);
+    }
+    if let Some(accounted) = h.accounted_sentence() {
+        lines.push(accounted);
+    }
+    lines.extend(h.flags.iter().map(|flag| format!("FLAG: {flag}")));
     format!(
-        "{}  {}\n\n",
-        h.render_text(now),
+        "{}\n  {}\n  {}\n\n",
+        h.line,
+        lines.join("\n  "),
         relation(h, t).text(h.developer_bytes)
     )
 }

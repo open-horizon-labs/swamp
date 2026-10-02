@@ -496,7 +496,7 @@ fn selected_worktree_shows_dated_shared_container_evidence() {
     for (width, height) in [(80, 24), (200, 60)] {
         let frame = capture(&app, width, height);
         assert!(frame.contains("shared with /shared/pnpm"), "{frame}");
-        assert!(frame.contains("12345"), "{frame}");
+        assert!(frame.contains("1970-01-01 03:25 UTC"), "{frame}");
         assert!(frame.contains("needs reconciliation"), "{frame}");
     }
 }
@@ -1233,7 +1233,7 @@ fn checkout_without_a_remote_marks_and_the_confirm_line_warns() {
         f.contains("no remote to restore from"),
         "warning expected:\n{f}"
     );
-    assert!(f.contains("Enter confirm"), "{f}");
+    assert!(f.contains("Enter move to Trash"), "{f}");
 }
 
 #[test]
@@ -1378,6 +1378,7 @@ fn archiving_a_checkout_trashes_it_and_records_the_warnings_shown() {
     let unit = |path: &std::path::Path| MarkedUnit {
         cargo_unit: None,
         agent_unit: None,
+        session_members: None,
         reclaim: None,
         path: path.to_path_buf(),
         docker: None,
@@ -1699,6 +1700,7 @@ fn plain_unit(path: &str, bytes: u64) -> swamp_tui::actions::MarkedUnit {
     swamp_tui::actions::MarkedUnit {
         cargo_unit: None,
         agent_unit: None,
+        session_members: None,
         reclaim: None,
         path: PathBuf::from(path),
         docker: None,
@@ -1720,43 +1722,109 @@ fn wait_idle(app: &mut App) {
     }
 }
 
-/// The confirm must show count, size and destination (and the docker
-/// "for good" line) at every width, however long the warnings are.
+/// The summary groups repeated facts and gates Enter on its decision content;
+/// the optional detail inventory keeps every exact action path available.
 #[test]
-fn confirm_keeps_count_size_and_destination_at_every_width() {
-    for w in [50u16, 80, 120, 320] {
+fn trash_review_scrolls_all_paths_and_mixed_docker_facts_before_enter() {
+    use crossterm::event::KeyCode;
+    for (w, h) in [(80u16, 24u16), (200, 24)] {
         let mut app = App::new(fixture_report(), "/Users/dev/src".into());
-        let long = "reclaimable space is a bound, not exact: APFS clone/snapshot extent sharing outside this selection is not queried".to_string();
+        app.width = w;
+        app.height = h;
+        let phrase = "reclaimable space is a bound, not exact: APFS clone/snapshot extent sharing outside this selection is not queried";
+        let long = std::iter::repeat_n(phrase, 100)
+            .collect::<Vec<_>>()
+            .join(" ");
         for i in 0..5 {
             let mut u = plain_unit(&format!("/Users/dev/src/p/dir{i}"), 3_000_000_000);
             u.warnings = vec![long.clone()];
             app.marked.insert(u.path.display().to_string(), u);
         }
         let mut d = plain_unit("/docker/img", 1_200_000_000);
-        d.docker = Some(swamp_core::docker::Removal::Image { id: "abc".into() });
+        d.docker = Some(swamp_core::docker::Removal::Image {
+            id: "sha256:exact-image-id".into(),
+        });
         d.label = "redis:7".into();
         app.marked.insert("/docker/img".into(), d);
         app.confirm_open = true;
-        let f = capture(&app, w, 24);
-        let rows: Vec<&str> = f.lines().collect();
-        let top: String = rows[rows.len().saturating_sub(12)..].join("\n");
-        assert!(top.contains("Move 5 items (15.0GB) → Trash"), "w={w}\n{f}");
+
+        let first = capture(&app, w, h);
+        let summary = app.confirm_summary();
+        assert!(summary.contains("Review 6 actions"), "{summary}");
+        assert!(summary.contains("Trash · 5 actions · 15.0GB"), "{summary}");
         assert!(
-            top.contains("Remove 1 docker item (1.2GB) for good"),
-            "w={w}\n{f}"
+            summary.contains("PERMANENT · Docker image · 1.2GB · sha256:exact-image-id"),
+            "{summary}"
         );
-        assert!(top.contains("redis:7 (docker image)"), "w={w}\n{f}");
-        assert!(f.contains("Enter confirm · Esc back"), "w={w}\n{f}");
-        // Count, size and destination are on the first confirm row itself.
-        let first = rows
-            .iter()
-            .find(|r| r.contains("Move 5 items"))
-            .unwrap_or_else(|| panic!("no first row w={w}\n{f}"));
+        assert!(summary.contains("affects 5 actions"), "{summary}");
+        assert_eq!(summary.matches(&long).count(), 1, "{summary}");
+        swamp_tui::handle_key(&mut app, KeyCode::Char('l'));
+        let details = capture(&app, w, h);
+        assert!(details.contains("All action and member paths"), "{details}");
+        let inventory =
+            swamp_tui::actions::confirm_details(&app.marked.values().cloned().collect::<Vec<_>>());
+        for i in 0..5 {
+            assert!(
+                inventory.contains(&format!("/Users/dev/src/p/dir{i}")),
+                "{inventory}"
+            );
+        }
+        assert!(inventory.contains("sha256:exact-image-id"), "{inventory}");
+        assert!(first.contains("sha256:exact-image-id"), "{first}");
+        swamp_tui::handle_key(&mut app, KeyCode::Enter);
+        assert!(app.operation.is_none() && app.confirm_open);
+        swamp_tui::handle_key(&mut app, KeyCode::Esc);
         assert!(
-            first.contains("(15.0GB) → Trash"),
-            "clipped at w={w}: {first}"
+            first.contains("Review actions") && !first.contains("Enter apply actions"),
+            "{w}x{h}:
+{first}"
         );
+        assert!(!app.confirm_review_is_complete(w, h));
+
+        // End cannot mark unseen lines reviewed, and Enter remains inert.
+        swamp_tui::handle_key(&mut app, KeyCode::End);
+        let end = capture(&app, w, h);
+        assert!(
+            end.contains("Docker items are removed permanently"),
+            "{w}x{h}:
+{end}"
+        );
+        assert!(!app.confirm_review_is_complete(w, h));
+        swamp_tui::handle_key(&mut app, KeyCode::Enter);
+        assert!(app.operation.is_none() && app.confirm_open);
+
+        swamp_tui::handle_key(&mut app, KeyCode::Home);
+        let _ = capture(&app, w, h);
+        for _ in 0..100 {
+            if app.confirm_review_is_complete(w, h) {
+                break;
+            }
+            swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+            let _ = capture(&app, w, h);
+        }
+        assert!(
+            app.confirm_review_is_complete(w, h),
+            "review did not reach the end at {w}x{h}"
+        );
+        assert!(capture(&app, w, h).contains("Enter apply actions"));
     }
+}
+
+#[test]
+fn one_item_confirm_is_armed_after_its_full_plan_is_drawn() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    let u = plain_unit("/Users/dev/src/p/cache", 440_400_000);
+    app.marked.insert(u.path.display().to_string(), u);
+    app.confirm_open = true;
+    app.width = 80;
+    app.height = 24;
+    let f = capture(&app, 80, 24);
+    assert!(
+        f.contains("TRASH · 440.4MB · /Users/dev/src/p/cache"),
+        "{f}"
+    );
+    assert!(f.contains("Enter move to Trash"), "{f}");
+    assert!(app.confirm_review_is_complete(80, 24));
 }
 
 /// What a check could not include is counted on the plan, listed with a
@@ -1781,11 +1849,18 @@ fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
         },
     ];
     for w in [50u16, 80, 120] {
+        app.width = w;
+        app.height = 24;
         let f = capture(&app, w, 24);
-        assert!(f.contains("Enter confirm · Esc back"), "w={w}\n{f}");
-        assert!(f.contains("Ready: 1 item"), "w={w}\n{f}");
-        assert!(f.contains("Blocked: 2 (d to see why)"), "w={w}\n{f}");
-        assert!(f.contains("Move 1 item"), "w={w}\n{f}");
+        assert!(f.contains("Enter move to Trash"), "w={w}\n{f}");
+        assert!(
+            f.contains("2 rows skipped; press d to review why"),
+            "w={w}\n{f}"
+        );
+        assert!(
+            f.contains("TRASH · 1.0MB · /Users/dev/src/p/dir"),
+            "w={w}\n{f}"
+        );
     }
     swamp_tui::handle_key(&mut app, KeyCode::Char('d'));
     assert!(app.blocked_open);
@@ -1907,7 +1982,10 @@ fn a_checkout_is_named_as_a_checkout() {
         remote: None,
     });
     let s = swamp_tui::actions::confirm_summary(std::slice::from_ref(&u));
-    assert!(s.contains("checkout esp32"), "{s}");
+    assert!(
+        s.contains("CHECKOUT → Trash · 5.0MB · /Users/dev/src/esp32"),
+        "{s}"
+    );
     assert!(s.contains(".git and source"), "{s}");
     let mut app = App::new(fixture_report(), "/Users/dev/src".into());
     app.help_open = true;
@@ -1916,13 +1994,14 @@ fn a_checkout_is_named_as_a_checkout() {
     assert!(f.contains("checkout"), "{f}");
 }
 
-/// On a short screen the confirm drops whole tail lines and says so; it
-/// never cuts a warning mid-sentence, and the numbers stay. A plan that
-/// folds a warning offers no Enter (audit G6 item 12): the footer says the
-/// plan does not fit.
+/// A plan larger than the available screen is scrolled; the footer stays
+/// visible and Enter stays unavailable until the intervening lines are read.
 #[test]
-fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
+fn a_long_plan_scrolls_instead_of_hiding_facts_or_enabling_enter() {
+    use crossterm::event::KeyCode;
     let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.width = 40;
+    app.height = 14;
     for i in 0..4 {
         let mut u = plain_unit(&format!("/Users/dev/src/p/dir{i}"), 1_000_000_000);
         u.warnings = vec![format!(
@@ -1932,11 +2011,13 @@ fn a_short_screen_drops_whole_warning_lines_and_counts_them() {
     }
     app.confirm_open = true;
     let f = capture(&app, 40, 14);
-    assert!(f.contains("Move 4 items (4.0GB) → Trash"), "{f}");
-    assert!(f.contains("more lines"), "{f}");
-    assert!(!app.confirm_fits(40, 14));
-    assert!(!f.contains("Enter confirm · Esc back"), "{f}");
-    assert!(f.contains("Plan does not fit"), "{f}");
+    assert!(f.contains("Review actions"), "{f}");
+    assert!(f.contains("Esc cancel"), "{f}");
+    assert!(!f.contains("Enter move to Trash"), "{f}");
+    assert!(app.confirm_fits(40, 14));
+    assert!(!app.confirm_review_is_complete(40, 14));
+    swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    assert!(app.operation.is_none());
 }
 
 // ---- steady layout: nothing moves, nothing goes quiet ----------------
@@ -1961,9 +2042,8 @@ fn line_of(frame: &str, i: usize) -> String {
     frame.lines().nth(i).unwrap_or("").trim().to_string()
 }
 
-/// The table's own rows sit at the same screen rows in every state:
-/// idle, checking, confirm, blocked list, result, and back. A sheet
-/// covers the bottom of the body; it never resizes it.
+/// The table rows stay at their original positions; the confirmation and
+/// blocked overlays may cover them, then the full table returns on close.
 #[test]
 fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
     for w in [50u16, 80, 120] {
@@ -1975,10 +2055,10 @@ fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
             .lines()
             .position(|l| l.trim_start_matches('"').starts_with("Name"))
             .unwrap();
-        // Header, four headline rows, the view strip, the filter line,
+        // Header, two headline rows, the view strip, the filter line,
         // then the table.
-        assert_eq!(header, 7, "w={w}\n{idle}");
-        let table = |f: &str| (6..=9).map(|i| line_of(f, i)).collect::<Vec<_>>();
+        assert_eq!(header, 5, "w={w}\n{idle}");
+        let table = |f: &str| (6..=7).map(|i| line_of(f, i)).collect::<Vec<_>>();
         let want = table(&idle);
 
         let mut states: Vec<(&str, String)> = Vec::new();
@@ -2009,7 +2089,11 @@ fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
         app.last_result = None;
         states.push(("result gone", capture(&app, w, 24)));
         for (name, f) in &states {
-            assert_eq!(table(f), want, "w={w} state={name}\n{f}");
+            if matches!(*name, "confirm" | "blocked list") {
+                assert_eq!(table(f)[0], want[0], "w={w} state={name}\n{f}");
+            } else {
+                assert_eq!(table(f), want, "w={w} state={name}\n{f}");
+            }
             assert_eq!(f.lines().count(), 24, "w={w} state={name}");
         }
     }
@@ -2294,7 +2378,10 @@ fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
     // 50 columns wraps instead of cutting.
     swamp_tui::handle_key(&mut app, KeyCode::Char('?'));
     let narrow = capture(&app, 50, 24);
-    assert!(narrow.contains("Backspace  move what is under"), "{narrow}");
+    assert!(
+        narrow.contains("Backspace  review paths, costs and warnings"),
+        "{narrow}"
+    );
 }
 
 /// PgUp/PgDn/Home/End page the blocked list by whole items.

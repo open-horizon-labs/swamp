@@ -43,57 +43,35 @@ use swamp_core::{
 /// also the default when `--project` is given with no `--view`.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum View {
+    /// List checkouts and linked worktrees, or expand one project.
     Worktrees,
+    /// Build output and its regeneration cost.
     Builds,
+    /// Installed dependencies and their project owners.
     Deps,
+    /// Docker storage and recorded project links.
     Docker,
+    /// Storage totals by artifact kind.
     Kinds,
+    /// Measured storage with no identified project owner.
     Unowned,
+    /// Compare attributed storage with measured totals.
     Reconciliation,
-    /// Per-ecosystem rollup: projects wearing the tag, artifacts it
-    /// generates, bytes and growth.
+    /// Storage by ecosystem.
     Types,
-    /// Nested Cargo target/build units with physical-accounting and
-    /// evidence/unknown details. Inspection only.
+    /// Inspect Cargo build units and their accounting.
     Rust,
-    /// Ranked list of every discovered project: name, id, total bytes,
-    /// growth, checkout+worktree count, remote. JSON only.
+    /// Ranked project list (requires --json).
     Projects,
-    /// Rows with growth > 0 since the window, sorted desc, plus an
-    /// unowned-bytes summary and coverage (walked/du/unowned totals,
-    /// permission-denied count, history span). JSON only.
+    /// Projects with recorded growth (requires --json).
     Grown,
-    /// External/shared storage units (#43): Cargo registry, rustup
-    /// toolchains, Homebrew, and other detector-resolved locations with
-    /// no containing project. Identity, category, size/growth/regrowth
-    /// history and declared consumers. Read-only: this view never
-    /// removes anything, in this command or any other.
+    /// Shared caches, toolchains, and model storage.
     External,
-    /// The Reclaim view (#175): every unit of developer storage, largest
-    /// first, with what getting it back costs, when it was last used and
-    /// from what record, who is known to need it, what a package manager
-    /// itself reports, and which removal path exists. A read of stored
-    /// facts: it starts no process and lists no directory, and it says
-    /// what its consumer evidence was checked against.
+    /// Developer storage, largest first, with recovery cost and use evidence.
     Reclaim,
-    /// Agent-tool storage (#91-#99/#100): sessions, caches, logs,
-    /// checkpoints and protected config for every named coding-agent
-    /// tool (Claude Code, Codex, Oh My Pi, OpenCode, Gemini CLI, Pi,
-    /// Aider, GitHub Copilot CLI, Cursor, Windsurf, Cline, Roo Code,
-    /// Continue), grouped tool → category → unit with size/growth/age
-    /// and project linkage. `--project` filters to units linked to that
-    /// project. Redaction-aware by construction (this view never has
-    /// session content to print). Read-only from this command; removal
-    /// is TUI-only (Space/Backspace/Enter) -- see `swamp protect` for
-    /// the human-keep-intent surface this view respects.
+    /// Coding-agent sessions, caches, and logs, with project links.
     Agents,
-    /// Where the whole disk went (#169, #170): the APFS container's
-    /// used bytes split into accounted locations, everything else,
-    /// system volumes, purgeable space, snapshots, what could not be
-    /// read, and a named residual, each row with the time it was
-    /// measured. A pure read of the volume ledger `swamp observe`
-    /// stores: it never lists a directory, stats a file or runs a
-    /// program. With no ledger it says so and exits 0.
+    /// Stored disk accounting, system volumes, and measurement gaps.
     Disk,
 }
 
@@ -132,20 +110,25 @@ impl From<SortArg> for OverviewSort {
 }
 
 #[derive(Parser)]
-#[command(name = "swamp", version)]
+#[command(
+    name = "swamp",
+    version,
+    about = "Find which projects and tools own your disk space",
+    after_help = "Start here:\n  swamp observe                 Update measurements\n  swamp                         Browse the stored report\n  swamp report --view reclaim   Read storage and recovery costs\n  swamp scope                   Explain what gets measured\n  swamp schedule --every 1h     Observe hourly\n  swamp protect add <path>      Keep a path out of Trash actions"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum ConfigAction {
+    /// Show effective settings and declared roots.
     Show,
+    /// Print the configuration file's path.
     Path,
+    /// Create a commented configuration file without overwriting an existing one.
     Init,
-    /// Declare a directory that holds your source code (writes `[scan]
-    /// include`; comments and other keys in config.toml are kept). A root
-    /// inside one already declared is refused, one already declared is a
-    /// no-op, and one that contains declared roots keeps them (shown as covered).
+    /// Add a source root. Existing roots are kept; nested duplicates are refused.
     AddRoot {
         path: String,
         /// Record a root that does not exist yet (an unmounted volume);
@@ -153,21 +136,12 @@ enum ConfigAction {
         #[arg(long)]
         allow_missing: bool,
     },
-    /// Stop declaring a source root (matched however it is spelled).
-    RemoveRoot {
-        path: String,
-    },
-    /// Set one top-level key (`swamp config set hf-enrich on`). Unknown
-    /// keys and bad values are refused before anything is written; other
-    /// keys, tables and comments are kept; the write is atomic.
-    Set {
-        key: String,
-        value: String,
-    },
-    /// Print one key's effective value.
-    Get {
-        key: String,
-    },
+    /// Remove a declared source root.
+    RemoveRoot { path: String },
+    /// Change a supported setting, for example: swamp config set hf-enrich on.
+    Set { key: String, value: String },
+    /// Print a setting’s effective value.
+    Get { key: String },
     /// Every key `config set` writes, its effective value and meaning.
     List,
 }
@@ -184,26 +158,19 @@ enum Command {
         #[arg(long, default_value_t = 5000)]
         max_ms: u64,
     },
-    /// Diffstat-ledger terminal UI (ratatui). Default when no
-    /// subcommand is given.
+    /// Browse stored observations interactively. This is the default command.
     Ui {
-        /// Defaults to the configured effective scope's first present
-        /// root when omitted (see `swamp scope`); an explicit root
-        /// still replaces the configured scope for this invocation.
+        /// Omit to browse the configured scope; pass a root to browse only that root.
         root: Option<PathBuf>,
     },
+    /// Measure one root and print raw observation JSON. Use observe for tracked history.
     Scan {
         #[arg(default_value = ".")]
         root: PathBuf,
         #[arg(long)]
         store: Option<PathBuf>,
     },
-    /// Project x worktree x artifact growth report -- a pure read of
-    /// what `swamp observe` last wrote: never walks a directory,
-    /// scans artifact metadata, or spawns a subprocess. Root presence
-    /// is checked to resolve scope. Exits 2 (JSON:
-    /// `{"error":"no_observation", ...}`) when the scope has never been
-    /// observed; run `swamp observe` first.
+    /// Read the last stored observation. Run swamp observe first if none exists.
     Report {
         /// Roots of the stored observation. Pass the same roots as
         /// `observe`; omitted roots use the configured effective scope
@@ -225,12 +192,7 @@ enum Command {
         /// Deprecated alias for `--view kinds` (text or JSON).
         #[arg(long)]
         kinds: bool,
-        /// Named view, at root or narrowed with `--project`: worktrees
-        /// (git-enriched one-line-per-worktree listing at root, the tree
-        /// drill with `--project`), builds, deps, docker, kinds, unowned,
-        /// reconciliation, rust. Every question the issue lists is exactly one
-        /// command through this flag. Supports text and JSON;
-        /// projects and grown views require JSON.
+        /// Choose a report view. Projects and grown require --json.
         #[arg(long, value_enum)]
         view: Option<View>,
         /// Signals for one worktree (matched by exact or root-relative
@@ -239,8 +201,7 @@ enum Command {
         #[arg(long)]
         worktree: Option<PathBuf>,
         /// Filter worktrees/artifacts, e.g. "merge-complete idle > 48h".
-        /// See `swamp_core::filter` for the grammar. Only consulted
-        /// by `--view worktrees` at root.
+        /// Applies to --view worktrees without --project.
         #[arg(long)]
         filter: Option<String>,
         /// Show all text rows: projects, agent units, or Rust units
@@ -253,10 +214,7 @@ enum Command {
         /// default one-line-per-kind summary. Text output only.
         #[arg(long)]
         docker: bool,
-        /// R4c: print each worktree's subdirectory growth table (and any
-        /// large files that grew) instead of the overview. Combine with
-        /// `--project` to narrow to one project; text output only, kept
-        /// separate from `render.rs`'s overview rendering.
+        /// Show subdirectory growth and large files that grew. Text only; use --project to narrow it.
         #[arg(long)]
         dirs: bool,
         /// With `--dirs`, only print directories up to this many path
@@ -295,14 +253,7 @@ enum Command {
         #[arg(long)]
         unowned_only: bool,
     },
-    /// Observe-only: walk `root`s, write the growth store, and refresh
-    /// GitHub enrichment for every GitHub-remote worktree found
-    /// (concurrent, coalesced per repo, cached by tip SHA: a merged branch is
-    /// never re-enriched, everything else is refreshed after 24 hours --
-    /// see `github::observe_all`). No rendering. This is what a scheduled
-    /// LaunchAgent run executes, and the only `swamp` command that calls
-    /// `gh` on your behalf by default; `report` reads whatever this last
-    /// wrote.
+    /// Update stored measurements and tool facts. Reuses unchanged measurements when possible.
     Observe {
         /// Defaults to every present root in the configured effective
         /// scope when omitted (see `swamp scope`); explicit roots still
@@ -343,12 +294,11 @@ enum Command {
         /// valid with explicit roots.
         #[arg(long)]
         volume: bool,
+        /// Print machine-readable timings and incremental-scan diagnostics.
+        #[arg(long)]
+        verbose: bool,
     },
-    /// Linux: watch the scope's roots with inotify until stopped and keep
-    /// a bounded change list, so a later `observe` can reuse measurements
-    /// where event coverage is complete. Reports remain stored reads.
-    /// Opt-in, user-owned, foreground; refuses on
-    /// macOS, where FSEvents already keeps the history.
+    /// Linux: watch for filesystem changes so later observations can reuse measurements.
     Collect {
         /// Defaults to every present root in the configured scope.
         roots: Vec<PathBuf>,
@@ -360,8 +310,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Install, inspect, or remove scheduled observations: a per-user
-    /// LaunchAgent on macOS or systemd user timer on Linux. No cleanup.
+    /// Set up, inspect, or stop scheduled observations.
     Schedule {
         /// Install (or replace) the schedule with this interval, e.g.
         /// "30m", "1h", "12h", "1d".
@@ -377,27 +326,12 @@ enum Command {
         collector: bool,
         roots: Vec<PathBuf>,
     },
-    /// The configuration file: `config show` prints effective values and
-    /// the declared source roots, `config path` where it lives, `config
-    /// init` writes one with every key and its meaning (never overwrites
-    /// an existing file), `config add-root` / `remove-root` declare or
-    /// drop a source directory.
+    /// View or change settings and source roots.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Print the effective scan scope (#41): every root swamp would use
-    /// for this invocation, its status (present/missing/unreadable/
-    /// skipped-as-nested/excluded) and every reason it is in scope --
-    /// built-in default, detector (with id/category/provenance),
-    /// configured include, or explicit command root -- plus the full
-    /// detector catalog (including disabled/not-present/unresolved
-    /// entries) and the detector catalog version. With explicit roots,
-    /// shows what those roots resolve to (configured exclusions still
-    /// apply) instead of the configured scope. This is the one shared
-    /// resolution every scope-aware command (`report`, `observe`, `ui`,
-    /// `schedule`) uses when no explicit root is given -- never a
-    /// separate ad hoc computation.
+    /// Show which roots and tool locations swamp would observe, and why.
     Scope {
         roots: Vec<PathBuf>,
         #[arg(long)]
@@ -409,10 +343,7 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
-    /// Human keep/protect intent for agent-storage paths (#100/#101):
-    /// survives refresh and is never itself inferred from observation --
-    /// only this command changes it. The TUI's mark step refuses to
-    /// queue anything under a protected path for the Trash.
+    /// Keep selected paths out of Trash actions. Applies to their contents and parents.
     Protect {
         #[command(subcommand)]
         cmd: ProtectCmd,
@@ -778,7 +709,7 @@ fn cmd_protect(cmd: ProtectCmd) -> Result<()> {
             if json {
                 safe_println!("{}", serde_json::to_string_pretty(&listing)?);
             } else if listing.is_empty() {
-                safe_println!("no protected agent-storage paths");
+                safe_println!("No protected paths. Add one with: swamp protect add <path>");
             } else {
                 safe_println!("{listing}");
             }
@@ -1142,10 +1073,10 @@ fn main() -> Result<()> {
                 safe_println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 safe_println!(
-                    "Cargo profile: {} ({} bytes allocated; {} unique; coverage {})",
+                    "Cargo profile: {} ({} allocated; {} unique; coverage {})",
                     profile.display(),
-                    result.allocated_bytes,
-                    result.unique_allocated_bytes,
+                    swamp_core::render::human_bytes_pub(result.allocated_bytes),
+                    swamp_core::render::human_bytes_pub(result.unique_allocated_bytes),
                     if result.coverage.complete {
                         "complete"
                     } else {
@@ -1158,12 +1089,12 @@ fn main() -> Result<()> {
                 }
                 for group in result.groups {
                     safe_println!(
-                        "{} [{}; features {}; package {}]: {} bytes allocated{}",
+                        "{} [{}; features {}; package {}]: {} allocated{}",
                         group.target.unwrap_or_else(|| "unknown/residual".into()),
                         group.target_kind.as_deref().unwrap_or("unknown kind"),
                         group.variant.features.as_deref().unwrap_or("unknown"),
                         group.package_id.as_deref().unwrap_or("unknown"),
-                        group.allocated_bytes,
+                        swamp_core::render::human_bytes_pub(group.allocated_bytes),
                         group
                             .residual_reason
                             .map(|r| format!(" ({r})"))
@@ -1671,7 +1602,10 @@ fn main() -> Result<()> {
                 }
                 ConfigAction::Init => {
                     if swamp_core::fs_gate::exists(&path) {
-                        eprintln!("{} already exists; not overwriting", path.display());
+                        eprintln!(
+                            "{} already exists. Use swamp config show to inspect it, or swamp config set <key> <value> to change a setting.",
+                            path.display()
+                        );
                         std::process::exit(1);
                     }
                     swamp_core::fs_gate::store::write_text(
@@ -1711,6 +1645,7 @@ fn main() -> Result<()> {
             no_enrich,
             enrich,
             volume,
+            verbose,
         } => {
             swamp_core::github::set_force_refresh(enrich);
             swamp_core::docker::set_force_refresh(enrich);
@@ -1744,7 +1679,7 @@ fn main() -> Result<()> {
                 );
             }
             note_and_persist_scope(&store_dir, &scope);
-            let progress =
+            let mut progress =
                 spawn_progress_line(std::io::IsTerminal::is_terminal(&std::io::stderr()));
             let result = schedule::cmd_observe(
                 store_dir,
@@ -1755,6 +1690,8 @@ fn main() -> Result<()> {
                 since,
                 !no_enrich,
                 volume,
+                verbose,
+                || progress.stop(),
             );
             progress.stop();
             result?;
@@ -1887,7 +1824,7 @@ fn render_dirs(
                 };
                 let growth = row
                     .growth_bytes
-                    .map(|g| format!(" ({g:+} bytes)"))
+                    .map(|g| format!(" ({})", swamp_core::render::human_bytes_signed(g)))
                     .unwrap_or_default();
                 let track = row
                     .track
@@ -1895,8 +1832,8 @@ fn render_dirs(
                     .unwrap_or_default();
                 let _ = writeln!(
                     out,
-                    "  {label:<40} {:>12} bytes{growth}  changed {}{track}",
-                    row.allocated_total,
+                    "  {label:<40} {:>12}{growth}  changed {}{track}",
+                    swamp_core::render::human_bytes_pub(row.allocated_total),
                     age_from_mod_time_min(row.mod_time_min)
                 );
             }
@@ -1913,10 +1850,10 @@ fn render_dirs(
             for f in file_rows {
                 let _ = writeln!(
                     out,
-                    "    large file {:<38} {:>12} bytes (+{} bytes)  changed {}",
+                    "    large file {:<38} {:>12} ({})  changed {}",
                     f.rel_path,
-                    f.allocated,
-                    f.growth_bytes.unwrap_or(0),
+                    swamp_core::render::human_bytes_pub(f.allocated),
+                    swamp_core::render::human_bytes_signed(f.growth_bytes.unwrap_or(0)),
                     age_from_mod_time_min(f.mod_time_min)
                 );
             }
@@ -1925,37 +1862,34 @@ fn render_dirs(
     Ok(out)
 }
 
-/// A rough human age string ("3d", "5h", "12m", "just now") from minutes
-/// since the Unix epoch, relative to now.
+/// A coarse human age string from minutes since the Unix epoch, relative to now.
 fn age_from_mod_time_min(mod_time_min: i32) -> String {
     let now_min = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
         / 60) as i64;
-    let age_min = (now_min - mod_time_min as i64).max(0);
-    if age_min < 1 {
-        "just now".to_string()
-    } else if age_min < 60 {
-        format!("{age_min}m")
-    } else if age_min < 60 * 24 {
-        format!("{}h", age_min / 60)
-    } else {
-        format!("{}d", age_min / (60 * 24))
+    if mod_time_min <= 0 {
+        return "age unknown".to_string();
     }
+    if mod_time_min as i64 > now_min {
+        return "clock ahead".to_string();
+    }
+    let age_min = (now_min - mod_time_min as i64) as u64;
+    swamp_core::schedule::coarse_age(age_min.saturating_mul(60))
 }
 
-/// A one-line stderr progress readout while a walk runs: bytes and
-/// directories seen so far from `walk::progress`, redrawn in place ten
-/// times a second, erased when done. Off when stderr is not a terminal or
-/// the caller wants machine output.
+/// A one-line stderr readout throughout observation. Elapsed time and the
+/// active operation continue across roots; per-walk counters are omitted
+/// because they restart for each root.
+/// Off when stderr is not a terminal or the caller wants machine output.
 struct ProgressLine {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ProgressLine {
-    fn stop(mut self) {
+    fn stop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -1971,16 +1905,52 @@ fn spawn_progress_line(enabled: bool) -> ProgressLine {
     let flag = stop.clone();
     let handle = std::thread::spawn(move || {
         use std::io::Write;
+        let started = std::time::Instant::now();
         let mut drew = false;
+        let mut last_line = String::new();
+        let mut last_draw = std::time::Instant::now();
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-            let (bytes, dirs, active) = swamp_core::walk::progress::snapshot();
-            if active {
-                let _ = write!(
-                    std::io::stderr(),
-                    "\r\x1b[2Kobserving… {} · {dirs} dirs",
-                    swamp_core::render::human_bytes_pub(bytes)
-                );
-                drew = true;
+            let (_, _, active) = swamp_core::walk::progress::snapshot();
+            let step = swamp_core::beacon::stuck();
+            // A refused writer lock starts no work. Do not draw over its
+            // message, but keep updating once an observation has begun.
+            if !drew && !active && step.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            let first_draw = !drew;
+            drew = true;
+            let mut prefix = format!(
+                "Observing · {}",
+                swamp_core::schedule::format_elapsed(started.elapsed().as_secs())
+            );
+            let mut detail = String::new();
+            if let Some((phase, path, _)) = step {
+                prefix.push_str(&format!(" · {}: ", observe_operation_label(phase)));
+                detail = path
+                    .to_string_lossy()
+                    .chars()
+                    .map(|c| if c.is_control() { '?' } else { c })
+                    .collect();
+            }
+            // Leave the last cell empty so a full-width line cannot wrap.
+            let width = swamp_tui::term::columns().saturating_sub(1);
+            let prefix_width = swamp_tui::model::display_width(&prefix);
+            let line = if width <= prefix_width {
+                swamp_tui::model::truncate_middle(&prefix, width)
+            } else {
+                format!(
+                    "{prefix}{}",
+                    swamp_tui::model::truncate_middle(&detail, width - prefix_width)
+                )
+            };
+            if line != last_line
+                && (first_draw || last_draw.elapsed() >= std::time::Duration::from_secs(1))
+            {
+                let _ = write!(std::io::stderr(), "\r\x1b[2K{line}");
+                let _ = std::io::stderr().flush();
+                last_line = line;
+                last_draw = std::time::Instant::now();
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -1992,5 +1962,42 @@ fn spawn_progress_line(enabled: bool) -> ProgressLine {
     ProgressLine {
         stop,
         handle: Some(handle),
+    }
+}
+
+fn observe_operation_label(phase: &str) -> &str {
+    match phase {
+        "walk" => "walking files",
+        "external unit" => "measuring tool storage",
+        "git signals" => "checking Git repositories",
+        "ignore lens" => "checking Git ignore rules",
+        "agent units" => "reading agent data",
+        "read" => "reading files",
+        _ => "working",
+    }
+}
+
+#[cfg(test)]
+mod observe_progress_tests {
+    use super::observe_operation_label;
+
+    #[test]
+    fn beacon_phases_are_shown_as_plain_operations() {
+        assert_eq!(observe_operation_label("walk"), "walking files");
+        assert_eq!(
+            observe_operation_label("external unit"),
+            "measuring tool storage"
+        );
+        assert_eq!(
+            observe_operation_label("git signals"),
+            "checking Git repositories"
+        );
+        assert_eq!(
+            observe_operation_label("ignore lens"),
+            "checking Git ignore rules"
+        );
+        assert_eq!(observe_operation_label("agent units"), "reading agent data");
+        assert_eq!(observe_operation_label("read"), "reading files");
+        assert_eq!(observe_operation_label("future phase"), "working");
     }
 }

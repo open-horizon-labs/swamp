@@ -318,7 +318,11 @@ fn adv2_cursor_is_clamped_and_restored_across_sections() {
 fn adv2_views_seen_only_by_leaving_projects() {
     let mut a = app();
     a.views_seen = false;
-    let hint = |a: &App| frame(a, 120, 30).join("\n").contains("New: Tab opens");
+    let hint = |a: &App| {
+        frame(a, 120, 30)
+            .join("\n")
+            .contains("Tab switches sections")
+    };
     assert!(hint(&a), "first-run hint missing");
     for _ in 0..ViewKind::ALL.len() {
         handle_key(&mut a, KeyCode::Char('v'));

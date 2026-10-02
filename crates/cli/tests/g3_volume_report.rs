@@ -147,7 +147,7 @@ fn view_disk_reads_the_stored_ledger_with_ages_and_the_named_residual() {
     let text = String::from_utf8_lossy(&out.stdout);
     for needle in [
         "Disk: ",
-        "measured 3 h ago",
+        "measured 3h ago",
         "Accounted (catalog and declared locations, counted once)",
         "Everything else (measured, 1 folders)",
         "/Users/x/Movies",
@@ -200,7 +200,7 @@ fn the_full_report_json_carries_a_disk_object_and_reading_it_runs_nothing() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("volume pass"),
+        !stdout.contains("Disk accounting"),
         "an explicit-root observe must not run (or announce) the pass: {stdout}"
     );
     let out = swamp(
@@ -245,7 +245,7 @@ fn observe_with_explicit_roots_refuses_the_pass_even_when_forced() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("volume pass skipped: explicit roots replace the configured scope"),
+        stdout.contains("Disk accounting skipped: explicit roots replace the configured scope"),
         "{stdout}"
     );
     assert!(!store.path().join("volume_ledger.parquet").exists());
@@ -265,7 +265,7 @@ fn a_plain_observe_under_a_sandboxed_home_does_not_measure_the_real_disk() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("volume pass"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("Disk accounting"));
     assert!(!store.path().join("volume_ledger.parquet").exists());
     assert!(!store.path().join("volume_ledger_meta.parquet").exists());
 }

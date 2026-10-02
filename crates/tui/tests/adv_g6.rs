@@ -163,11 +163,8 @@ fn adv_a_bidi_override_in_a_folder_name_never_reaches_the_plan() {
     );
 }
 
-/// Tempting wrong patch: past three marks the warnings are merged and the
-/// paths past the eighth are a count. A folder that cannot be regenerated
-/// then shows its warning with no path, and its own path is behind "+N
-/// more folders", while Enter is offered: the person cannot tell which of
-/// the marks the warning is about.
+/// A unique consequential warning names its action in the summary even
+/// though the complete path inventory lives in the details view.
 #[test]
 fn adv_a_merged_plan_never_hides_which_folder_a_warning_is_about() {
     let f = fx();
@@ -185,7 +182,7 @@ fn adv_a_merged_plan_never_hides_which_folder_a_warning_is_about() {
     wait(&mut a);
     assert_eq!(a.marked.len(), 13, "{:?}", a.refusal_active());
     let s = a.confirm_summary();
-    assert!(s.contains("cannot be regenerated"), "{s}");
+    assert!(s.contains("Cannot be regenerated"), "{s}");
     let fits = a.confirm_fits(200, 60);
     assert!(
         !fits || s.contains(&state.display().to_string()),

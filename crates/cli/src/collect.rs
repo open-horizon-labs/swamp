@@ -106,14 +106,17 @@ pub fn cmd_collect_status(store_dir: PathBuf, roots: Vec<PathBuf>, json: bool) -
             (false, Some(c)) => safe_println!(
                 "  collector not running (last flush {}, pid {}): its list cannot vouch for \
                  anything since, so observations walk fully",
-                c.flushed_at,
+                swamp_core::schedule::lock_since_label(c.flushed_at, swamp_core::entities::now()),
                 c.pid
             ),
             (true, Some(c)) => {
                 safe_println!(
                     "  collector running (pid {}), epoch opened at {}",
                     c.pid,
-                    c.opened_at
+                    swamp_core::schedule::lock_since_label(
+                        c.opened_at,
+                        swamp_core::entities::now()
+                    )
                 );
                 match &c.lost {
                     None => safe_println!(
