@@ -137,7 +137,7 @@ impl Section {
     pub fn describe(self) -> &'static str {
         match self {
             Section::Projects => "your projects and what they hold",
-            Section::Tools => "storage outside any project: toolchains, caches, AI tools",
+            Section::Tools => "developer tools, Docker, and storage units to review",
             Section::Disk => "where the whole disk went, from the stored volume ledger",
         }
     }
@@ -203,19 +203,54 @@ impl ViewKind {
     pub fn title(self) -> &'static str {
         match self {
             ViewKind::Projects => "Projects",
-            ViewKind::Tree => "Tree",
-            ViewKind::Builds => "Builds",
+            ViewKind::Tree => "Project folders",
+            ViewKind::Builds => "Build outputs",
             ViewKind::Deps => "Dependencies",
             ViewKind::Docker => "Docker",
-            ViewKind::Kinds => "Folder types",
-            ViewKind::Unowned => "Unowned",
+            ViewKind::Kinds => "Storage kinds",
+            ViewKind::Unowned => "Unassigned",
             ViewKind::Types => "Ecosystems",
-            ViewKind::External => "External",
+            ViewKind::External => "Tool storage",
             ViewKind::Reclaim => "Reclaim",
-            ViewKind::Disk => "Summary",
-            ViewKind::DiskGaps => "Not measured",
-            ViewKind::Agents => "Agents",
+            ViewKind::Disk => "Disk usage",
+            ViewKind::DiskGaps => "Coverage gaps",
+            ViewKind::Agents => "Agent storage",
         }
+    }
+
+    /// A short purpose line for navigation UI; intentionally independent
+    /// of `label()`, which is a stable machine-facing view identifier.
+    pub fn purpose(self) -> &'static str {
+        match self {
+            ViewKind::Projects => "Compare project size, growth, and activity",
+            ViewKind::Tree => "Browse a project's worktrees and folders",
+            ViewKind::Builds => "Compare build outputs across projects",
+            ViewKind::Deps => "Compare dependency folders across projects",
+            ViewKind::Docker => "Review Docker images, volumes, and build cache",
+            ViewKind::Kinds => "Compare storage by folder kind",
+            ViewKind::Unowned => "Review storage with unknown project ownership",
+            ViewKind::Types => "Compare storage by ecosystem",
+            ViewKind::External => "Review toolchains, caches, and stores",
+            ViewKind::Reclaim => "Review storage size, known use, and removal cost",
+            ViewKind::Disk => "See how measured disk space is accounted for",
+            ViewKind::DiskGaps => "See gaps and large folders outside developer storage",
+            ViewKind::Agents => "Review AI agent sessions, caches, and logs",
+        }
+    }
+
+    /// Whether this view reads the active filter when building rows.
+    /// The predicate support is view-specific; this only says the view
+    /// participates in filtering at all.
+    pub fn uses_filter(self) -> bool {
+        matches!(
+            self,
+            ViewKind::Projects
+                | ViewKind::Tree
+                | ViewKind::Builds
+                | ViewKind::Deps
+                | ViewKind::Kinds
+                | ViewKind::Types
+        )
     }
 
     /// One line on what the view shows, for `?` help.
@@ -227,18 +262,16 @@ impl ViewKind {
             ViewKind::Deps => "dependency folders across projects",
             ViewKind::Docker => "Docker images, volumes and build cache",
             ViewKind::Kinds => "storage grouped by kind of folder",
-            ViewKind::Unowned => "storage that belongs to no project",
+            ViewKind::Unowned => "storage with unknown or unassigned project ownership",
             ViewKind::Types => "storage grouped by ecosystem",
             ViewKind::External => "toolchains, caches and stores outside any project",
-            ViewKind::Reclaim => {
-                "regenerable developer storage by unit: what getting it back costs, last used"
-            }
+            ViewKind::Reclaim => "developer storage by unit: known use and removal consequences",
             ViewKind::Disk => {
                 "where the whole disk went: accounted, everything else, system volumes, not measured"
             }
             ViewKind::Agents => "AI coding tools' sessions, caches and logs",
             ViewKind::DiskGaps => {
-                "what could not be read or is not measured yet, and the largest measured folders outside developer storage"
+                "what could not be read or measured yet, plus the largest measured folders outside developer storage"
             }
         }
     }
@@ -5297,6 +5330,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn view_titles_purposes_and_filter_membership_are_explicit() {
+        let expected = [
+            (ViewKind::Projects, "Projects", "projects", true),
+            (ViewKind::Tree, "Project folders", "tree", true),
+            (ViewKind::Builds, "Build outputs", "builds", true),
+            (ViewKind::Deps, "Dependencies", "deps", true),
+            (ViewKind::Docker, "Docker", "docker", false),
+            (ViewKind::Kinds, "Storage kinds", "kinds", true),
+            (ViewKind::Unowned, "Unassigned", "unowned", false),
+            (ViewKind::Types, "Ecosystems", "types", true),
+            (ViewKind::External, "Tool storage", "external", false),
+            (ViewKind::Reclaim, "Reclaim", "reclaim", false),
+            (ViewKind::Disk, "Disk usage", "disk", false),
+            (ViewKind::DiskGaps, "Coverage gaps", "not-measured", false),
+            (ViewKind::Agents, "Agent storage", "agents", false),
+        ];
+
+        for (view, title, machine_label, uses_filter) in expected {
+            assert_eq!(view.title(), title, "{view:?}");
+            assert_eq!(view.label(), machine_label, "machine label for {view:?}");
+            assert_eq!(view.uses_filter(), uses_filter, "{view:?}");
+            assert!(
+                view.purpose().chars().count() <= 55,
+                "purpose too long for {view:?}: {} chars",
+                view.purpose().chars().count()
+            );
+        }
+
+        assert!(
+            !ViewKind::Unowned
+                .describe()
+                .contains("belongs to no project")
+        );
+        assert!(!ViewKind::Reclaim.describe().contains("regenerable"));
+    }
+
     // -----------------------------------------------------------------
     // #51: multi-root reports, coverage inspection, and live refresh.
     // -----------------------------------------------------------------
@@ -5783,7 +5853,11 @@ mod tests {
         // not among them.
         // Caches, its two folders, then go-build as its own top-level unit.
         assert_eq!(open.len(), 4, "{labels:?}");
-        assert!(labels[3].contains("go-build"), "{labels:?}");
+        assert_eq!(
+            open[3].unit.as_ref().map(|u| u.0.as_str()),
+            Some("/fixture/Caches/go-build"),
+            "{labels:?}"
+        );
         let shown: u64 = open[1..3].iter().map(|r| r.bytes).sum();
         assert_eq!(
             shown, 1_000,

@@ -1,9 +1,9 @@
-"/Users/dev/src · observed just now · since 1w · 2 projects · 10.7GB attributed  "
+"observed just now · /Users/dev/src · change over 1w                             "
 "Developer storage: 10.9GB across 2 projects                                     "
-"disk ledger: not measured yet; run swamp observe --volume · observed 2y ago     "
-"1 Projects  2 Tools  3 Disk · Tab section                                       "
-"view: Projects › Projects (1 of 7 · v next) · filter: growth > 100MB in 7d      "
-"Name                                                          Size     Change   "
+"disk ledger: not measured yet · 3 Disk for details                              "
+"1 Projects  2 Tools  3 Disk                                                     "
+"Projects · filter: growth > 100MB in 7d                                         "
+"Project                                                       Size     Change   "
 "mole  🔨                                                     2.6GB     +1.3GB   " Hidden by multi-width symbols: [(7, " ")]
 "swamp  🐳 🔨                                                 8.1GB     +2.6GB   " Hidden by multi-width symbols: [(8, " "), (11, " ")]
 "                                                                                "
@@ -21,4 +21,4 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"Tab section  v view  / filter  R refresh  ⌫ delete  Space mark  ? help  q quit  "
+"Space mark  ⌫ review  Tab section  v view  / filter  R refresh  ? help  q quit  "

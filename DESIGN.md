@@ -6,13 +6,9 @@ The UI presents disk growth as a table that opens into a project tree. Size, sig
 
 Each row contains a name, bytes, signed growth, a change bar, and any visible facts. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
 
-Column headings identify name, size, change, and cleanup/facts. Name truncation
-and padding use grapheme-aware terminal-cell widths. Badges have separating
-spaces. Build drilldowns reserve a compact candidates/oldest-modified column even
-at 80 columns, hide the change bar, and hide numeric change below 100 columns.
-Their name column caps at 64 cells. Other views hide bars below 140 columns and
-show facts only in selected-row details below 100 columns. Zero and
-unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+Column headings name the thing being compared: Project, Folder, Build output, Dependencies, Ecosystem, Storage kind, Unassigned storage, Storage item, Docker object, Tool location, Agent storage, Disk allocation, or Location. Name truncation and padding use grapheme-aware terminal-cell widths. Badges have separating spaces. Build drilldowns and Reclaim reserve a removal-consequence column at 80 columns and hide numeric change below 100 columns. Disk views omit change entirely and show measurement facts. These decision-oriented views cap names at 64 cells. Other views hide bars below 140 columns and show facts only in selected-row details below 100 columns. Zero and unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+
+Readable labels lead with the tool or category; exact paths remain in selected details and action review. Current use, unique-copy, sharing, and unknown facts precede secondary metadata in the fixed-height detail pane. Last use keeps its source and is separate from modification age.
 
 Collapsed build categories lead with a recommendation and removal consequence:
 start with compiler caches (slower next build), review tests/examples (rebuild
@@ -82,7 +78,7 @@ The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take
 
 ## Header, progress, and history
 
-The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals, but the activity chip (`⠋ observing 12s`, or `⠋ another observation running (pid N, 1m 12s)`) owns the left edge at every width. The UI opens on the stored report at any age and never scans when one exists; with none, the first scan runs in the background and its progress shows in the header. `R` refreshes on demand, and says so, rather than starting a second walk, when another process already holds the observation lock. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
+The header shows the root, observation status, and available history as space permits. It drops trailing clauses on narrow terminals, but the activity chip (`⠋ observing 12s`, or `⠋ another observation running (pid N, 1m 12s)`) owns the left edge at every width. The UI opens on the stored report at any age and never scans when one exists; with none, the first scan runs in the background and its progress shows in the header. `R` refreshes on demand, and says so, rather than starting a second walk, when another process already holds the observation lock. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
 
 Observation progress keeps a whole-run elapsed clock. The CLI names the active work; the TUI names the scope being updated. Per-walk byte counters are not displayed as run totals because they reset between roots. There is no percentage, because the total is not known. The TUI opens no filesystem watch: nothing scans on a file event, so a stored report is exactly as old as the header says. A lock poll only notices when another process observes, shows it, and reloads the stored report when that run ends. The right side of the header is the history sparkline with the net change it covers and the window it is over (`-41.4GB in 1w`); body rows use change bars.
 
@@ -90,25 +86,10 @@ Human output shares decimal byte units, grouped counts, whole-second durations, 
 
 ### The developer-storage headline block and the view strip
 
-Under the header, on every view and in every state, sits a headline block of a
-fixed number of rows chosen by the terminal's height alone: four at 30 rows and
-up (the headline with its percent; the breakdown rows, largest first, with
-`+N more` when a narrow screen cannot name them all; the disk state with the
-ages and the ledger's parts; the pointers to Reclaim and Disk with their keys),
-two from 16 rows (headline and coverage/age), one from 12, none below. Nothing
-changes that height: a warning, a missing ledger, a running scan, a previous
-scope, the first-run line and every view draw into the same rows, so no row of
-the table moves. Lines that come in shorter forms step together to the form
-that keeps the most leading clauses; the wording of the spot-audit warning is
-never traded away, so the clauses after it give way instead. The first-run line
-("Tab switches sections · 2 opens Tools / Reclaim · 3 opens Disk") takes the
-pointer row until Tools or Disk is opened once, and is remembered in
-`ui_state.json`.
+Under the header, every view has a fixed two-row block: developer-storage total and coverage. It uses one row on terminals from 12 to 15 rows tall and none below that. Detailed allocation belongs in Disk usage. Missing or unreadable ledgers, previous scope, explicit-root scope, unmeasured folders, ledger age, and audit discrepancies remain visible in priority order. The spot-audit warning takes precedence over the total when only one row is available. State changes never move the table.
 
-Under the block is the section strip: one row naming the three sections (`1
-Projects  2 Tools  3 Disk`), the current one in reverse video (an attribute,
-never a color, so `NO_COLOR` and light themes keep it). The line below it names
-the view: `view: Tools › Reclaim (1 of 4 · v next)`, then the filter and sort.
+The section strip names `1 Projects  2 Tools  3 Disk`, with the current section in reverse video so `NO_COLOR` and light themes keep it. Until Tools or Disk is opened once, spare width holds `Tab switches sections`; that choice is remembered in `ui_state.json`. The following line names the current view and shows its applicable filter, sort, and short purpose as width permits. Ignored predicates are identified, and views that ignore filtering show no filter clause. Only Project folders includes the selected project in its title.
+
 The only keys that move between views are `Tab`/`Shift-Tab` (sections), `v` (views
 inside a section, wrapping) and `1` `2` `3` (a section); the legend shows `Tab
 section  v view` and never a key per view. Every modal keeps its own keys first,
@@ -116,7 +97,7 @@ so Tab completes in the filter and none of these switch anything while you type;
 a test reads the keymap and fails when a key is bound twice or a view is
 unreachable by those keys.
 
-The Disk section's Summary view is the stored volume ledger as rows: accounted, everything else
+The Disk section's Disk usage view is the stored volume ledger as rows: accounted, everything else
 with its folders, system volumes, not measured (never a size), the protected
 folders estimate, the bookkeeping line and the walk's spot audit. It is read
 only and built from the stored ledger, so opening it lists nothing.
@@ -127,9 +108,7 @@ only and built from the stored ledger, so opening it lists nothing.
 the TUI three facts recorded here as unimplemented intent by an earlier
 chunk; all three now ship:
 
-- **External rows.** `ViewKind::External` (`'9'`) lists `ExternalUnit`s
-  the same shape as `ViewKind::Unowned` lists unowned rows: path,
-  category, size, growth, consumer count. Every unit and listed folder
+- **Tool storage rows.** `ViewKind::External` (Tools section, third view) lists `ExternalUnit`s with detector/category labels, size and growth. Exact paths, consumer facts and source notes are in selected details. Every unit and listed folder
   is a real path (`Row.unit` set): an external unit is shared,
   detector-resolved storage (a package manager's cache, a toolchain
   install), and Space marks it for the reviewed Trash move like any
@@ -154,9 +133,7 @@ chunk; all three now ship:
   column, so no width rule moves. An unowned row for a standalone Cargo
   target directory is markable like any unowned row and its confirm line
   says what it is and that `cargo build` remakes it.
-- **Agents rows.** `ViewKind::Agents` (Tools section, third view; `v` from
-  Reclaim or External) lists `AgentUnit`s the
-  same way: tool/category/relative-path/project-link facts. Every row
+- **Agent storage rows.** `ViewKind::Agents` (Tools section, fourth view) lists `AgentUnit`s with tool/category/project/item labels. Inferred project associations are labelled; selected details retain the exact path and link evidence. Every row
   carries `Row.unit: Some(...)` (protected/unmarkable ones included):
   `Space`/`Backspace` mark the selected unit through
   `actions::propose_agents` and open the confirm banner with its

@@ -60,6 +60,55 @@ pub fn kind_label(kind: &ArtifactKind) -> &'static str {
     }
 }
 
+/// Human-facing spelling; `kind_label` remains the stable filter key.
+fn kind_name(kind: &ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::BuildOutput => "Build output",
+        ArtifactKind::DependencyTree => "Dependencies",
+        ArtifactKind::Git => "Git history",
+        ArtifactKind::Cache => "Cache",
+        ArtifactKind::Source => "Source files",
+        ArtifactKind::Ignored => "Ignored files",
+        ArtifactKind::Untracked => "Untracked files",
+        ArtifactKind::DockerImage => "Docker image",
+        ArtifactKind::DockerBuildCache => "Docker build cache",
+        ArtifactKind::DockerVolume => "Docker volume",
+        ArtifactKind::Loose => "Unassigned files",
+        ArtifactKind::Unknown => "Unclassified",
+    }
+}
+
+fn kind_name_from_key(key: &str) -> &str {
+    match key {
+        "build" => "Build output",
+        "deps" => "Dependencies",
+        "git" => "Git history",
+        "cache" => "Cache",
+        "source" => "Source files",
+        "ignored" => "Ignored files",
+        "untracked" => "Untracked files",
+        "docker-image" => "Docker image",
+        "docker-cache" => "Docker build cache",
+        "docker-volume" => "Docker volume",
+        "loose" => "Unassigned files",
+        "unknown" => "Unclassified",
+        other => other,
+    }
+}
+
+fn external_category_name(category: swamp_core::locations::StorageCategory) -> &'static str {
+    match category {
+        swamp_core::locations::StorageCategory::Installation => "Installed tool",
+        swamp_core::locations::StorageCategory::Downloads => "Downloads",
+        swamp_core::locations::StorageCategory::Cache => "Cache",
+        swamp_core::locations::StorageCategory::LocalState => "Local data",
+        swamp_core::locations::StorageCategory::Environments => "Environment",
+        swamp_core::locations::StorageCategory::BuildOutput => "Build output",
+        swamp_core::locations::StorageCategory::Models => "Model store",
+        swamp_core::locations::StorageCategory::Unclassified => "Other storage",
+    }
+}
+
 /// `g` / `s`: sort the current view's rows by growth or by size. `None`
 /// keeps report order (the tree view ignores sort -- its rows are a
 /// hierarchy, not a flat ranked list).
@@ -673,8 +722,12 @@ pub fn tree_rows_with_agents(
             depth: 1,
             rail: format!("{wt_connector}{expand_glyph} "),
             label: format!(
-                "{} {}",
-                format!("{:?}", wt.kind).to_lowercase(),
+                "{} · {}",
+                match wt.kind {
+                    swamp_core::report::WorktreeKind::Main => "Main checkout",
+                    swamp_core::report::WorktreeKind::Linked => "Linked checkout",
+                    swamp_core::report::WorktreeKind::Clone => "Additional clone",
+                },
                 source_wt.path.display()
             ),
             bytes: wt.bytes,
@@ -731,11 +784,13 @@ pub fn tree_rows_with_agents(
             let connector = if r_last { "└─ " } else { "├─ " };
             let label = if row.folded_count > 1 {
                 format!(
-                    "{} {} (x{})",
-                    row.kind_label, row.rel_path, row.folded_count
+                    "{} · {} (x{})",
+                    kind_name_from_key(row.kind_label),
+                    row.rel_path,
+                    row.folded_count
                 )
             } else {
-                format!("{} {}", row.kind_label, row.rel_path)
+                format!("{} · {}", kind_name_from_key(row.kind_label), row.rel_path)
             };
             let abs = source_wt.path.join(&row.rel_path);
             let series_key = swamp_core::growth::series_key(
@@ -1681,7 +1736,7 @@ pub fn kinds_rows(report: &Report, filter: &Filter) -> Vec<Row> {
         .map(|(k, (bytes, growth, count))| Row {
             depth: 0,
             rail: String::new(),
-            label: format!("{k} ({count})"),
+            label: format!("{} ({count})", kind_name_from_key(&k)),
             bytes,
             growth: Some(growth),
             signals: Vec::new(),
@@ -1792,7 +1847,7 @@ fn docker_object_rows(report: &Report) -> Vec<Row> {
                 }
                 let mut row = Row::leaf(
                     0,
-                    format!("{} · {} {}", p.name, kind_label(&a.kind), a.path.display()),
+                    format!("{} · {} · {}", p.name, kind_name(&a.kind), a.path.display()),
                     a.bytes,
                     a.growth_bytes,
                 );
@@ -1872,9 +1927,9 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
                 let mut row = Row::leaf(
                     0,
                     format!(
-                        "{} · {} {}",
+                        "{} · {} · {}",
                         project_display_name(p),
-                        kind_label(&a.kind),
+                        kind_name(&a.kind),
                         a.path.display()
                     ),
                     a.bytes,
@@ -2181,7 +2236,7 @@ fn unowned_row(u: &swamp_core::report::UnownedRow) -> Row {
                 u.path_or_object
             )
         } else {
-            format!("{:?} · {}", u.reason, u.path_or_object)
+            format!("{} · {}", unowned_reason_name(&u.reason), u.path_or_object)
         },
         u.bytes,
         None,
@@ -2201,6 +2256,21 @@ fn unowned_row(u: &swamp_core::report::UnownedRow) -> Row {
     }
     row.evidence = u.evidence.clone();
     row
+}
+
+fn unowned_reason_name(reason: &UnownedReason) -> &'static str {
+    match reason {
+        UnownedReason::OutsideAnyCheckout | UnownedReason::NoContainingRepo => {
+            "Outside a Git checkout"
+        }
+        UnownedReason::OwnedByNothing => "No project association",
+        UnownedReason::InconclusiveEvidence => "Ownership is unclear",
+        UnownedReason::SharedCache => "Shared cache",
+        UnownedReason::PermissionDenied => "Could not read",
+        UnownedReason::StandaloneCargoTarget => "Standalone Cargo build folder",
+        UnownedReason::DockerNoJoin => "Unmatched Docker object",
+        UnownedReason::NotMeasured => "Not measured",
+    }
 }
 
 /// External/shared storage view (#43/#51/#60): the same flat shape
@@ -2226,23 +2296,33 @@ pub fn external_rows_with(
     sorted.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     let mut rows = Vec::new();
     for u in sorted {
-        let consumers = if u.consumers.is_empty() {
-            "no declared consumers".to_string()
-        } else {
-            format!("{} consumer(s)", u.consumers.len())
-        };
+        let detector = detector_name(&u.detector_id, &u.detector_name);
         let mut row = Row::leaf(
             0,
-            format!(
-                "{:?} · {} ({}) · {consumers}",
-                u.category,
-                u.path.display(),
-                u.detector_id
-            ),
+            format!("{detector} · {}", external_category_name(u.category)),
             u.bytes,
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        row.detail_lines.push(format!("Source: {detector}"));
+        row.detail_lines.push(if u.consumers.is_empty() {
+            "Consumers: none declared".to_string()
+        } else {
+            format!(
+                "Declared consumers: {}",
+                u.consumers
+                    .iter()
+                    .map(|c| match c.note.as_deref() {
+                        Some(note) => format!("{} ({note})", c.label),
+                        None => c.label.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+        if let Some(note) = u.display_note() {
+            row.detail_lines.push(note);
+        }
         // What the person sees, the person may move to Trash (maintainer
         // decision 2026-09-30): the row is a real path, so it is a unit.
         // The mark's review says what swamp does not know about it.
@@ -2343,6 +2423,34 @@ pub fn external_rows_with(
         }
     }
     rows
+}
+
+fn detector_name(id: &str, name: &str) -> String {
+    let value = if name.trim().is_empty() || name == id {
+        id
+    } else {
+        name
+    };
+    if value.contains('-')
+        && value.split('-').all(|word| {
+            word.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+    {
+        value
+            .split('-')
+            .map(|word| {
+                let mut chars = word.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().to_string() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        value.to_string()
+    }
 }
 
 /// `-50MB adj` (or just `-921.1MB` when the tag would not fit the ten-cell
@@ -2584,7 +2692,7 @@ pub fn reclaim_rows(
             .unwrap_or_default();
         let mut row = Row::leaf(
             0,
-            format!("{} · {}{flag}", r.kind, r.path),
+            format!("{} · {}{flag}", reclaim_kind_name(&r.kind), r.path),
             r.bytes,
             r.growth_bytes,
         );
@@ -2592,14 +2700,8 @@ pub fn reclaim_rows(
         // confirm for the Trash move. The mark's review states what
         // swamp does not know about it.
         row.unit = Some(UnitId::for_artifact(std::path::Path::new(&r.path)));
-        row.signals = vec![
-            r.regeneration.words.clone(),
-            format!("last used {}", r.last_used_text),
-        ];
-        // The signals line is cut at the edge; the removal paths that
-        // exist are a decision fact, so they get their own detail line
-        // (the last-used fact is already in the signals above).
-        row.last_used = None;
+        row.signals = vec![r.regeneration.words.clone()];
+        row.last_used = Some(format!("Last used: {}", r.last_used_text));
         row.mtime_max = r
             .children
             .iter()
@@ -2611,14 +2713,17 @@ pub fn reclaim_rows(
             standing.push(swamp_core::reclaim::hold_line(h));
         }
         standing.extend(r.manager.iter().take(2).map(|q| q.line()));
-        if standing.is_empty() {
-            standing.push(format!("cost from: {}", r.regeneration.source));
-        }
         row.detail_lines = vec![
-            format!("removal: {}", r.removal.tui_text),
-            r.consumers.summary.clone(),
-            standing.join(" · "),
+            format!("Removal: {}", r.removal.tui_text),
+            format!("Regeneration source: {}", r.regeneration.source),
+            format!("Consumers: {}", r.consumers.summary),
         ];
+        if !standing.is_empty() {
+            row.detail_lines.push(standing.join(" · "));
+        }
+        if let Some(note) = &r.note {
+            row.detail_lines.push(note.clone());
+        }
         let key = format!("reclaim-open:{}", r.path);
         let tags = unlisted_models(std::path::Path::new(&r.path), &r.models);
         if r.children.is_empty() && tags.is_empty() {
@@ -2649,6 +2754,18 @@ pub fn reclaim_rows(
         }
     }
     rows
+}
+
+fn reclaim_kind_name(kind: &str) -> &str {
+    match kind {
+        "installation" => "Installed tool",
+        "cache" => "Cache",
+        "local-state" => "Local data",
+        "environment" => "Environment",
+        "unclassified" => "Unclassified",
+        "standalone-cargo-target" => "Cargo build folder",
+        other => other,
+    }
 }
 
 fn reclaim_child_row(
@@ -2748,8 +2865,8 @@ pub fn disk_rows(
     let mut accounted = Row::leaf(
         0,
         format!(
-            "Accounted: declared roots and catalog units ({})",
-            a.accounted.locations
+            "Developer storage · {} locations",
+            swamp_core::render::human_count(a.accounted.locations as u64)
         ),
         a.accounted.bytes,
         None,
@@ -2771,13 +2888,19 @@ pub fn disk_rows(
     let mut else_row = Row::leaf(
         0,
         format!(
-            "Everything else (not developer storage): {} folders",
-            a.everything_else.folders
+            "Everything else · {} folder{}",
+            swamp_core::render::human_count(a.everything_else.folders as u64),
+            if a.everything_else.folders == 1 {
+                ""
+            } else {
+                "s"
+            }
         ),
         a.everything_else.bytes,
         None,
     );
     else_row.allocated = true;
+    else_row.detail_lines = vec!["Measured folders outside developer storage.".into()];
     rows.push(else_row);
     let shown = elsewhere.len().min(DISK_FOLDERS_SHOWN);
     for (i, r) in elsewhere.iter().take(shown).enumerate() {
@@ -2820,11 +2943,12 @@ pub fn disk_rows(
 
     let mut system = Row::leaf(
         0,
-        "System volumes (they share the container's free space)".to_string(),
+        "System volumes".to_string(),
         a.system_volumes.bytes,
         None,
     );
     system.allocated = true;
+    system.detail_lines = vec!["These volumes share the container's free space.".to_string()];
     rows.push(system);
     let n = a.system_volumes.volumes.len();
     for (i, v) in a.system_volumes.volumes.iter().enumerate() {
@@ -2842,8 +2966,8 @@ pub fn disk_rows(
     let mut nm = Row::leaf(
         0,
         format!(
-            "Not measured: {} {} could not be read",
-            a.not_measured.count,
+            "Not read · {} {}",
+            swamp_core::render::human_count(a.not_measured.count as u64),
             if a.not_measured.count == 1 {
                 "directory"
             } else {
@@ -2872,7 +2996,7 @@ pub fn disk_rows(
             1,
             format!(
                 "and {} more (swamp report --view disk)",
-                a.not_measured.count - names
+                swamp_core::render::human_count((a.not_measured.count - names) as u64)
             ),
             0,
             None,
@@ -2882,13 +3006,9 @@ pub fn disk_rows(
         rows.push(c);
     }
     if let Some(est) = a.not_measured.estimate_bytes {
-        let mut e = Row::leaf(
-            0,
-            "Protected folders may hold up to this (an estimate, part of no check)".to_string(),
-            est,
-            None,
-        );
+        let mut e = Row::leaf(0, "Protected folders (estimate)".to_string(), est, None);
         e.detail_lines = vec![
+            "Protected folders may hold up to this amount; an estimate, not part of any check.".to_string(),
             "The unexplained part of the Data volume: its own size minus everything measured above.".to_string(),
         ];
         rows.push(e);
@@ -2896,11 +3016,12 @@ pub fn disk_rows(
     if let Some(r) = a.residual.bytes {
         let mut e = Row::leaf(
             0,
-            format!("{} (bookkeeping)", a.residual.name),
+            "Unexplained (bookkeeping)".to_string(),
             r.unsigned_abs(),
             None,
         );
         e.size_text = Some(swamp_core::render::human_bytes_signed(r));
+        e.detail_lines = vec![format!("Ledger entry: {}", a.residual.name)];
         rows.push(e);
     }
     // The independent spot audit: the one check that can fail from an
@@ -2915,7 +3036,7 @@ pub fn disk_rows(
     } else {
         format!(
             "Walk spot-audited: {} folders, max difference {:.1}%",
-            a.audit.folders.len(),
+            swamp_core::render::human_count(a.audit.folders.len() as u64),
             a.audit.max_difference_percent
         )
     };
@@ -2960,6 +3081,15 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
     let group = |rows: &mut Vec<Row>, label: String, names: &[String], tag: &str, more: usize| {
         let mut head = Row::leaf(0, label, 0, None);
         head.size_text = Some(tag.to_string());
+        match tag {
+            "not read" => head
+                .detail_lines
+                .push("These protected folders could not be read.".into()),
+            "pending" => head
+                .detail_lines
+                .push("The next observe continues this pass.".into()),
+            _ => {}
+        }
         rows.push(head);
         let n = names.len();
         for (i, name) in names.iter().enumerate() {
@@ -2975,7 +3105,10 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
         if more > 0 {
             let mut c = Row::leaf(
                 1,
-                format!("and {more} more (swamp report --view disk --json)"),
+                format!(
+                    "and {} more (swamp report --view disk --json)",
+                    swamp_core::render::human_count(more as u64)
+                ),
                 0,
                 None,
             );
@@ -2987,8 +3120,8 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
     group(
         &mut rows,
         format!(
-            "Could not be read: {} {} (protected folders)",
-            a.not_measured.count,
+            "Not read · {} {}",
+            swamp_core::render::human_count(a.not_measured.count as u64),
             if a.not_measured.count == 1 {
                 "directory"
             } else {
@@ -3002,21 +3135,19 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
             .saturating_sub(a.not_measured.names.len()),
     );
     if let Some(est) = a.not_measured.estimate_bytes {
-        let mut e = Row::leaf(
-            0,
-            "The unexplained part of the Data volume (protected folders may hold up to this; an estimate, part of no check)".to_string(),
-            est,
-            None,
-        );
+        let mut e = Row::leaf(0, "Protected folders (estimate)".to_string(), est, None);
         e.allocated = false;
+        e.detail_lines = vec![
+            "The unexplained part of the Data volume; protected folders may account for up to this. Estimate only, not part of any check.".to_string(),
+        ];
         rows.push(e);
     }
     if a.not_measured.not_yet_measured > 0 {
         group(
             &mut rows,
             format!(
-                "Not measured yet in this pass: {} locations (the next observe continues)",
-                a.not_measured.not_yet_measured
+                "Pending · {} locations",
+                swamp_core::render::human_count(a.not_measured.not_yet_measured as u64)
             ),
             &a.not_measured.not_yet_measured_names,
             "pending",
@@ -3027,11 +3158,12 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
     }
     let mut top = Row::leaf(
         0,
-        "Largest measured folders outside developer storage".to_string(),
+        "Outside developer storage".to_string(),
         a.everything_else.bytes,
         None,
     );
     top.allocated = true;
+    top.detail_lines = vec!["Largest measured folders outside developer storage.".to_string()];
     rows.push(top);
     let n = a.everything_else.top.len();
     for (i, r) in a.everything_else.top.iter().enumerate() {
@@ -3089,7 +3221,24 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
                     None => format!("project: {project_name} (inferred)"),
                 },
                 swamp_core::agents::ProjectLinkState::NotApplicable => "tool-wide".to_string(),
-                other => format!("{other:?}"),
+                swamp_core::agents::ProjectLinkState::Unresolved { .. } => {
+                    "project unresolved".to_string()
+                }
+                swamp_core::agents::ProjectLinkState::Missing { .. } => {
+                    "project path missing".to_string()
+                }
+                swamp_core::agents::ProjectLinkState::NotAProject { .. } => {
+                    "not a project".to_string()
+                }
+                swamp_core::agents::ProjectLinkState::Moved { .. } => {
+                    "project path changed".to_string()
+                }
+                swamp_core::agents::ProjectLinkState::Remote { host, .. } => {
+                    format!("remote: {host}")
+                }
+                swamp_core::agents::ProjectLinkState::Shared { .. } => {
+                    "shared across projects".to_string()
+                }
             };
             // Kept by default, not forbidden: Space marks it, and the confirm says
             // what the tool loses. `A` leaves it out.
@@ -3101,16 +3250,18 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
             let mut row = Row::leaf(
                 0,
                 format!(
-                    "{} · {} · {} · {link}{protect}",
+                    "{} · {} · {} · {}{protect}",
                     u.tool_name,
-                    u.category.label(),
-                    u.relative_path
+                    agent_category_name(u.category),
+                    agent_project_label(&u.project_link),
+                    short_relative_path(&u.relative_path)
                 ),
                 u.bytes,
                 u.growth_bytes,
             );
             row.mtime_max = u.mtime_max;
             row.unit = Some(crate::units::UnitId::for_artifact(&u.path));
+            row.detail_lines.push(format!("Project: {link}"));
             row.individual_only =
                 u.protected || u.action == swamp_core::agents::AgentActionCapability::None;
             row.evidence = u.evidence.clone();
@@ -3119,6 +3270,55 @@ pub fn agent_rows(units: &[swamp_core::agents::AgentUnit]) -> Vec<Row> {
         .collect();
     rows.sort_by_key(|a| std::cmp::Reverse(a.bytes));
     rows
+}
+
+fn agent_category_name(category: swamp_core::agents::AgentCategory) -> &'static str {
+    match category {
+        swamp_core::agents::AgentCategory::Sessions => "Session",
+        swamp_core::agents::AgentCategory::ArchivedSessions => "Archived session",
+        swamp_core::agents::AgentCategory::Attachments => "Attachment",
+        swamp_core::agents::AgentCategory::Checkpoints => "Checkpoint",
+        swamp_core::agents::AgentCategory::Caches => "Cache",
+        swamp_core::agents::AgentCategory::LocalHistory => "Local history",
+        swamp_core::agents::AgentCategory::Logs => "Log",
+        swamp_core::agents::AgentCategory::ManagedWorktrees => "Managed checkout",
+        swamp_core::agents::AgentCategory::Plugins => "Plugin",
+        swamp_core::agents::AgentCategory::ProtectedConfig => "Protected settings",
+        swamp_core::agents::AgentCategory::ProtectedDatabases => "Protected database",
+        swamp_core::agents::AgentCategory::Unclassified => "Unclassified data",
+    }
+}
+
+fn agent_project_label(link: &swamp_core::agents::ProjectLinkState) -> String {
+    use swamp_core::agents::ProjectLinkState as Link;
+    match link {
+        Link::Linked {
+            project_name,
+            source: swamp_core::agents::LinkSource::Declared,
+            ..
+        } => format!("project: {project_name}"),
+        Link::Linked {
+            project_name,
+            source: swamp_core::agents::LinkSource::Inferred,
+            ..
+        } => format!("project: {project_name} (inferred)"),
+        Link::NotApplicable => "tool-wide".to_string(),
+        Link::Unresolved { .. } => "project unresolved".to_string(),
+        Link::Missing { .. } => "project missing".to_string(),
+        Link::NotAProject { .. } => "not a project".to_string(),
+        Link::Moved { .. } => "project changed".to_string(),
+        Link::Remote { host, .. } => format!("{host}"),
+        Link::Shared { .. } => "shared projects".to_string(),
+    }
+}
+
+fn short_relative_path(path: &str) -> String {
+    let mut parts = path.rsplit('/').filter(|part| !part.is_empty());
+    let last = parts.next().unwrap_or(path);
+    match parts.next() {
+        Some(parent) => format!("{parent}/{last}"),
+        None => last.to_string(),
+    }
 }
 
 /// Element-wise sum of several equal-length series; `None` if none.
@@ -3229,6 +3429,35 @@ mod tests {
         assert_eq!(human_bytes(1_000_000_000), "1.0GB");
         // The exact figure behind the reported arithmetic bug.
         assert_eq!(human_bytes(1_951_580_160), "2.0GB");
+    }
+
+    #[test]
+    fn display_names_are_plain_while_kind_filter_keys_stay_stable() {
+        assert_eq!(kind_label(&ArtifactKind::DependencyTree), "deps");
+        assert_eq!(kind_name(&ArtifactKind::DependencyTree), "Dependencies");
+        assert_eq!(kind_name_from_key("docker-cache"), "Docker build cache");
+        assert_eq!(
+            external_category_name(swamp_core::locations::StorageCategory::Cache),
+            "Cache"
+        );
+        assert_eq!(detector_name("cargo-home", "cargo-home"), "Cargo Home");
+        assert_eq!(
+            unowned_reason_name(&UnownedReason::SharedCache),
+            "Shared cache"
+        );
+    }
+
+    #[test]
+    fn agent_rows_can_lead_with_tool_and_item_instead_of_full_session_path() {
+        assert_eq!(
+            short_relative_path("projects/a/sessions/session-123.jsonl"),
+            "sessions/session-123.jsonl"
+        );
+        assert_eq!(short_relative_path("session.jsonl"), "session.jsonl");
+        assert_eq!(
+            agent_category_name(swamp_core::agents::AgentCategory::Sessions),
+            "Session"
+        );
     }
 
     #[test]

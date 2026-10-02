@@ -440,15 +440,12 @@ fn an_older_generation_store_says_it_is_being_rebuilt_not_that_nothing_was_scann
     app.has_index = false;
     app.filter_text = "0".into();
     let plain = capture(&app, 120, 24);
-    assert!(plain.contains("Nothing has been scanned yet"), "{plain}");
+    assert!(plain.contains("No saved observations yet"), "{plain}");
     app.store_rebuild = true;
     let rebuild = capture(&app, 120, 24);
     assert!(rebuild.contains("older"), "{rebuild}");
-    assert!(rebuild.contains("rebuilt in the background"), "{rebuild}");
-    assert!(
-        !rebuild.contains("Nothing has been scanned yet"),
-        "{rebuild}"
-    );
+    assert!(rebuild.contains("in the background"), "{rebuild}");
+    assert!(!rebuild.contains("No saved observations yet"), "{rebuild}");
 }
 
 #[test]
@@ -667,7 +664,12 @@ fn evidence_detail_area_frames() {
         app.set_view(ViewKind::Deps);
         app.selected = 0;
         let frame = capture(&app, w, h);
-        assert!(frame.contains("Last changed 1h ago"), "{frame}");
+        assert!(
+            swamp_tui::detail::lines(&app.rows()[app.selected], &[])
+                .iter()
+                .any(|line| line.contains("Last changed 1h ago")),
+            "modification evidence must remain available"
+        );
         assert!(
             frame.contains("Used by 2 projects: mole, swamp"),
             "multiple consumers must both be visible: {frame}"
@@ -1190,23 +1192,20 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
     assert!(before.contains("1 Projects"), "{before}");
-    assert!(
-        before.contains("view: Projects › Projects (1 of 7 · v next)"),
-        "{before}"
-    );
+    assert!(before.contains("Projects · filter:"), "{before}");
     assert!(before.contains("filter: none"), "{before}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
     let tree = capture(&app, 200, 60);
     assert!(
-        tree.contains("view: Projects › Tree of "),
+        tree.contains("Project folders › "),
         "the view line must name the scope:\n{tree}"
     );
     assert!(tree.contains("Esc: projects"), "{tree}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
-    assert!(back.contains("view: Projects › Projects"), "{back}");
+    assert!(back.contains("Projects · filter:"), "{back}");
 }
 
 #[test]
@@ -2053,7 +2052,7 @@ fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
         let idle = capture(&app, w, 24);
         let header = idle
             .lines()
-            .position(|l| l.trim_start_matches('"').starts_with("Name"))
+            .position(|l| l.trim_start_matches('"').starts_with("Project "))
             .unwrap();
         // Header, two headline rows, the view strip, the filter line,
         // then the table.
@@ -2486,12 +2485,12 @@ fn k_says_what_it_changed_and_the_legend_keeps_the_common_keys() {
     swamp_tui::handle_key(&mut app, KeyCode::Down);
     let f = capture(&app, 80, 24);
     assert!(
-        f.contains("Tab section  v view  / filter  R refresh  ⌫ delete"),
+        f.contains("⌫ review  Tab section  v view"),
         "the four keys people reach for stay at 80 columns:\n{f}"
     );
     assert!(f.contains("? help  q quit"), "{f}");
     let f50 = capture(&app, 50, 24);
-    assert!(f50.contains("Tab section  v view  / filter"), "{f50}");
+    assert!(f50.contains("Space mark  ⌫ review  Tab section"), "{f50}");
     assert!(f50.contains("? help  q quit"), "{f50}");
 }
 
@@ -2507,7 +2506,7 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
     assert_eq!(app.view, ViewKind::Builds);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("view: Projects › Builds of mole (3 of 7"), "{f}");
+    assert!(f.contains("Build outputs · filter:"), "{f}");
     app.set_view(ViewKind::Tree);
     assert_eq!(app.selected, at, "the tree cursor came back");
     // Esc to projects and back to the same project row.
@@ -2516,7 +2515,7 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     // No agent storage in the fixture: the empty view teaches.
     app.set_view(ViewKind::Agents);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("No AI-tool storage found"), "{f}");
+    assert!(f.contains("No agent storage recorded"), "{f}");
     assert!(!f.contains("no rows match"), "{f}");
     assert!(f.contains("Press v for another view"), "{f}");
     // A filter that matches nothing names itself and both ways out.
@@ -2524,8 +2523,8 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     app.filter_text = "growth > 900GB in 7d".into();
     app.commit_filter();
     let f = capture(&app, 80, 24);
-    assert!(f.contains("Nothing matches the filter"), "{f}");
-    assert!(f.contains("Press / to change it, or 0"), "{f}");
+    assert!(f.contains("No matches for the active filters"), "{f}");
+    assert!(f.contains("Press / to edit, or 0"), "{f}");
 }
 
 /// The picker prints its keys once (the footer); the box holds the form.
@@ -2951,10 +2950,7 @@ fn reclaim_view_says_what_its_consumer_evidence_was_checked_against_on_every_scr
     for w in [80u16, 120, 200] {
         let app = reclaim_app(false);
         let f = capture(&app, w, 24);
-        assert!(
-            f.contains("consumer evidence checked against 2 projects in 1 declared root"),
-            "w={w}\n{f}"
-        );
+        assert!(f.contains("2 projects in 1 declared root"), "w={w}\n{f}");
         let app = reclaim_app(true);
         let f = capture(&app, w, 24);
         assert!(f.contains("incomplete"), "w={w}\n{f}");
@@ -2997,32 +2993,34 @@ fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
         assert!(reclaim_footer.contains("v view"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("q quit"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("? help"), "{reclaim_footer}");
-        // Reclaim names `Space mark` and `⌫ trash` while the row under the
+        // Reclaim names `Space mark` and `⌫ review` while the row under the
         // cursor is a real path (a unit, or a listed folder), and never
         // the old "delete" word, which Reclaim did not do.
-        for want in ["⌫ trash", "Space mark"] {
+        for want in ["⌫ review", "Space mark"] {
             assert!(reclaim_footer.contains(want), "{reclaim_footer}");
         }
         assert!(!reclaim_footer.contains("⌫ delete"), "{reclaim_footer}");
-        // Every other view keeps its footer, on the same screen row.
-        let external = {
-            app.set_view(ViewKind::External);
-            footer_of(&app)
-        };
+        // Every view keeps navigation and exit hints on the same row;
+        // action/filter hints reflect whether that view can use them.
         for v in ViewKind::ALL {
-            // Reclaim and the two Disk views mark nothing: no delete keys.
-            if matches!(v, ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps) {
-                continue;
-            }
             app.set_view(v);
-            assert_eq!(footer_of(&app), external, "w={w} view={v:?}");
+            let footer = footer_of(&app);
+            for hint in ["Tab section", "v view", "? help", "q quit"] {
+                assert!(footer.contains(hint), "w={w} view={v:?}: {footer}");
+            }
+            if !v.uses_filter() {
+                assert!(!footer.contains("/ filter"));
+            }
         }
         app.set_view(ViewKind::Reclaim);
         // The heading is on the row every flat view puts it on.
         let heading = |app: &App| {
             capture(app, w, h)
                 .lines()
-                .position(|l| l.trim_start_matches('"').starts_with("Name"))
+                .position(|l| {
+                    l.contains("Size")
+                        && (l.contains("Storage item") || l.contains("Tool location"))
+                })
                 .unwrap()
         };
         let reclaim_heading = heading(&app);

@@ -30,6 +30,29 @@ fn stored_views_render_cost() {
         .find(|p| p.name.contains("swamp"))
         .map(|p| p.name.clone());
     app.clear_filter();
+    app.live_age = true;
+    // Optional artifact capture uses the same copied store as the replay.
+    if let Some(dir) = std::env::var_os("SWAMP_CLARITY_CAPTURE") {
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for view in ViewKind::ALL {
+            app.set_view(view);
+            for (name, width, height) in [("compact", 80, 24), ("wide", 200, 60)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| ui::draw(f, &app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let contents = (0..height)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                std::fs::write(dir.join(format!("{}-{name}.txt", view.label())), contents).unwrap();
+            }
+        }
+    }
     for view in [
         ViewKind::Projects,
         ViewKind::Tree,

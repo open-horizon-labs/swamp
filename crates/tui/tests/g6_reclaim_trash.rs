@@ -114,6 +114,10 @@ fn select(a: &mut App, needle: &str) {
         .iter()
         .position(|r| r.label.trim() == needle)
         .or_else(|| rows.iter().position(|r| r.label.contains(needle)))
+        .or_else(|| {
+            rows.iter()
+                .position(|r| r.unit.as_ref().is_some_and(|u| u.0.contains(needle)))
+        })
         .unwrap_or_else(|| panic!("no row with {needle:?}"));
     a.selected = at;
 }
@@ -569,7 +573,7 @@ fn the_legend_names_the_keys_only_where_they_act() {
     let on_folder = frame(&a, 120, 30);
     let last = on_folder.lines().last().unwrap();
     assert!(
-        last.contains("Space mark") && last.contains("⌫ trash"),
+        last.contains("Space mark") && last.contains("⌫ review"),
         "{last}"
     );
     // The remainder row: not a folder.

@@ -1017,12 +1017,12 @@ current section (wrapping). Nothing else opens a view.
 
 | Section | Views (first is the default) |
 |---|---|
-| 1 Projects | Projects, Tree, Builds, Dependencies, Ecosystems, Folder types, Unowned |
-| 2 Tools | Reclaim, Docker, External, Agents |
-| 3 Disk | Summary (the stored volume ledger's parts), Not measured (unreadable and not-yet-measured folders, the largest measured folders outside developer storage) |
+| 1 Projects | Projects, Project folders, Build outputs, Dependencies, Ecosystems, Storage kinds, Unassigned |
+| 2 Tools | Reclaim, Docker, Tool storage, Agent storage |
+| 3 Disk | Disk usage (the stored volume ledger’s parts), Coverage gaps (unreadable and not-yet-measured folders, and the largest measured folders outside developer storage) |
 
 A row under the headline names the three sections with the current one in reverse
-video; the line below it names the view (`view: Tools › Reclaim (1 of 4 · v next)`).
+video; the line below it names the view, its applicable filter and sort, and its purpose when space permits. Views that ignore filtering show no filter clause; partially applied filters name the ignored predicates. The CLI view identifiers are unchanged.
 `?` help lists every section and view with a line on each. **Changed in 0.8.0:** in
 0.7.x the digits `1`-`9` selected views; now `1`-`3` select sections and the old
 digits are unbound.
@@ -1135,7 +1135,9 @@ which way the percent mixes them.
 (`developer_bytes`, `locations`, `categories`, `not_counted`, `percent_of_used`,
 `disk` with its `state`, `ages`, `flags`, and `line`, the text's first line).
 
-In the TUI, terminals at least 30 rows tall show four header rows: the headline, breakdown, disk state and ages, and view shortcuts. Terminals from 16 to 29 rows show the headline and coverage/age, keeping gaps and audit warnings visible; smaller terminals show the headline only, or omit the block below 12 rows. The height depends only on terminal size, so warnings do not shift the table. The expanded header includes a first-use section hint until you open Tools or Disk; that choice is remembered in `ui_state.json`.
+In the TUI, terminals at least 16 rows tall show two headline rows: the developer-storage total and its coverage/ledger age. Detailed allocation is in Disk usage. Smaller terminals show one row, with an audit warning taking precedence, or omit the block below 12 rows. The height depends only on terminal size, so warnings do not shift the table. The section strip includes a first-use navigation hint until you open Tools or Disk; that choice is remembered in `ui_state.json`.
+
+At 80 columns, Reclaim shows removal cost beside each size; Disk usage and Coverage gaps show measurement facts without an empty change column. Selected details prioritize current use, recovery, shared bytes and unknown facts, then last use with its source and the exact path. Backspace is labelled `review`: it opens the appropriate review before any action.
 
 ## Where the whole disk went (the volume ledger)
 

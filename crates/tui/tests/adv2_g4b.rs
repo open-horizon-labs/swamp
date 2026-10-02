@@ -319,9 +319,8 @@ fn adv2_views_seen_only_by_leaving_projects() {
     let mut a = app();
     a.views_seen = false;
     let hint = |a: &App| {
-        frame(a, 120, 30)
-            .join("\n")
-            .contains("Tab switches sections")
+        let h = 30;
+        frame(a, 120, h)[1 + ui::headline_rows(h) as usize].contains("Tab switches sections")
     };
     assert!(hint(&a), "first-run hint missing");
     for _ in 0..ViewKind::ALL.len() {
@@ -391,6 +390,16 @@ fn adv2_every_view_every_size_keeps_the_legend() {
         a.set_view(v);
         for &(w, h) in &sizes {
             let f = frame(&a, w, h);
+            let hr = ui::headline_rows(h) as usize;
+            // At least one row is needed for each fixed chrome line, plus
+            // a body row; below that, the key legend takes precedence.
+            if w as usize >= v.title().len().max(16) && h as usize >= hr + 7 {
+                assert!(
+                    f[2 + hr].contains(v.title()),
+                    "{v:?} {w}x{h} lost its title: {}",
+                    f[2 + hr]
+                );
+            }
             if h >= 3 && w >= 16 {
                 let last = f.last().unwrap();
                 if !last.contains("q quit") && !last.contains("? help") {

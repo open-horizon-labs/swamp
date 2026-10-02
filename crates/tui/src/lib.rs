@@ -900,7 +900,10 @@ mod tests {
         let mut t = ratatui::Terminal::new(TestBackend::new(200, 10)).unwrap();
         t.draw(|f| ui::draw(f, &app)).unwrap();
         let s = t.backend().to_string();
-        assert!(s.contains("since 4h (asked 1w; history is 4h)"), "{s}");
+        assert!(
+            s.contains("change over 4h (asked 1w; history is 4h)"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -1136,6 +1139,7 @@ mod tests {
             "R refresh",
             "⌫ delete",
             "⌫ trash",
+            "⌫ review",
             "Space mark",
             "A mark all",
             "↑↓ move",

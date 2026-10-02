@@ -336,7 +336,7 @@ fn adv_disk_view_not_measured_row_is_singular_for_one() {
     let nm: Vec<&String> = rows
         .iter()
         .map(|r| &r.label)
-        .filter(|n| n.starts_with("Not measured"))
+        .filter(|n| n.starts_with("Not read"))
         .collect();
     assert_eq!(nm.len(), 1);
     assert!(!nm[0].contains("1 directories"), "{}", nm[0]);
