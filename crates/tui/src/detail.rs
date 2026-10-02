@@ -143,6 +143,12 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
             .filter(|e| e.kind == FactKind::Reclaimability)
             .filter_map(sentence),
     );
+    if !out.iter().any(|line| line.starts_with("Projects:")) {
+        out.extend(row.detail_lines.iter().filter_map(|line| {
+            line.strip_prefix("Declared consumers: ")
+                .map(|names| format!("Projects: {names}"))
+        }));
+    }
     out.extend(sharing.iter().cloned());
     // Enrichment has its own line, rather than competing with the item name.
     out.extend(

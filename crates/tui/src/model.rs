@@ -1205,9 +1205,8 @@ fn family_member_row(
     if u.adapter.as_deref() == Some("model-stores")
         && let Some(m) = swamp_core::build_adapters::model_stores::model_row_of(u, observed_at)
     {
-        if let Some(a) = &m.about {
-            row.label = format!("{} · {a}", row.label);
-        }
+        row.label = m.name.clone();
+        row.table_note = model_summary(&m);
         row.last_used = Some(format!("Last used: {}", m.last_read));
         row.detail_lines.extend(model_detail_lines(&m));
     }
@@ -2302,6 +2301,32 @@ pub fn external_rows_with(
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        let projects: Vec<String> = u
+            .evidence
+            .iter()
+            .filter_map(|e| match (&e.kind, &e.status) {
+                (
+                    swamp_core::evidence::FactKind::Consumer,
+                    swamp_core::evidence::FactStatus::Known(swamp_core::evidence::FactValue::List(
+                        names,
+                    )),
+                ) => Some(names.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if !projects.is_empty() {
+            row.table_note = Some(format!("Projects: {}", projects.join(", ")));
+        } else if !u.consumers.is_empty() {
+            row.table_note = Some(format!(
+                "Projects: {}",
+                u.consumers
+                    .iter()
+                    .map(|c| c.label.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         row.detail_lines.push(format!("Source: {detector}"));
         row.detail_lines.push(if u.consumers.is_empty() {
             "Consumers: none declared".to_string()
