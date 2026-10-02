@@ -5,6 +5,13 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+## v0.8.3 — 2026-10-02
+
+- Model rows separate repository and tag names from file-derived architecture, parameter count and precision. Selected details show last use once and distinguish shared model storage from the selected folder's size.
+- Tool storage shows associated project names in the table and selected details.
+- Expanded toolchain versions stay under their parent when sorting, including reverse sorting.
+
+
 ## v0.8.2 — 2026-10-02
 
 - Project tables name their comparison period (`Change 7d`) and offer `w` to change it. Period and growth-filter changes now recalculate from stored history without scanning projects. Shorter available history is labelled approximately; clearing the filter preserves the period.
