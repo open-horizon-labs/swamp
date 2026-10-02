@@ -23,6 +23,8 @@ the Trash) or a human running a shell command themselves. There is no
 `propose`/`approve`/`execute`/`grant` command any more; do not invent
 one.
 
+For current section names, navigation and review controls, see [the usage guide](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls). The CLI view identifiers remain unchanged.
+
 ## Binary setup
 
 Check `command -v swamp` and `swamp --version` before using it. If it is

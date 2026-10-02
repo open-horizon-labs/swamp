@@ -23,21 +23,18 @@ confirmation token, no authority key.
 The TUI can remove selected data; a human can also use their own shell
 commands. Filesystem selections use the Trash flow:
 
-- **Space** marks a row (an artifact, a Cargo purpose group, an
-  agent-storage unit, a worktree/checkout).
-- **Backspace** shows the confirm banner: current facts for everything
-  marked -- path, size, what it is, what deleting it costs (rebuild,
-  redownload, lose session history, lose emulator data, unpushed
-  commits, no remote…), and whether anything currently has it open.
-- **Enter** moves exactly what was marked into the platform Trash
-  (`~/.Trash` on macOS, the freedesktop home trash on Linux) and appends
-  one ledger line per unit: path, recovery location, bytes, time.
+- **Space** marks a row or the supported members of a group. It removes nothing.
+- **Backspace** opens review: destination totals, common warnings once, and item-specific exceptions, including rebuilding costs, unique history, unpushed commits and current use. Scroll through the primary summary before confirming. `l` opens the optional full path, size and member inventory; Enter is disabled there, and Esc returns to the summary.
+- **Enter** confirms from the reviewed summary. Filesystem selections move into the platform Trash (`~/.Trash` on macOS, the freedesktop home trash on Linux), with each unit’s original path, recovery location, bytes and time recorded in the ledger. Esc from the summary cancels.
 
-Docker image/volume removal uses Docker and has no Trash recovery. A mise tool version or a simulator runtime is removed by mise or simctl itself, permanently, from the TUI only (Backspace on its row, then `Y` on a confirm that shows the manager's own dry run); its confirm warns when a config requests the version, a simulator is not shut down, or files are held open or cannot be checked, and `Y` refuses if any fact changed since the confirm (`.oh/guardrails/tool-removal-refuses-on-manager-facts.md`). No CLI, JSON or agent path runs it.
+`A` reviews eligible rows across the current list, including off-screen rows; it skips checkout fallbacks, rows kept by default and paths without a cleanup rule. Those paths can still be reviewed individually. Pending marks remain visible as the human changes views. `b` opens blocked reasons, or `d` from review; `r` there checks again.
+
+Docker image/volume removal uses Docker and has no Trash recovery. A mise version or simulator runtime also offers its manager’s permanent removal: Backspace on an unmarked manager row with no pending marks opens its list, Enter reviews the command and dry run, and `Y` executes after the full confirmation has been displayed and held for a second. `Y` rechecks the facts and refuses if they changed. Space on that folder offers the Trash flow instead. No CLI, JSON or agent path runs a manager removal. See [the trust guardrail](https://github.com/open-horizon-labs/swamp/blob/main/.oh/guardrails/tool-removal-refuses-on-manager-facts.md) and [terminal controls](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls).
+
 Moving filesystem data to Trash does not itself free disk space.
 
 There is no occupancy veto -- the open-file
-fact is shown, never enforced. Reclaim, External and Disk moves recheck
+fact is shown, never enforced. Reclaim, Tool storage and Disk moves recheck
 that the marked entry is the same entry in the same place (a plan that
 changed refuses) and write a ledger row first; other moves are not re-derived.
 Otherwise Enter refuses only for an ordinary OS-level error: permission
@@ -62,5 +59,5 @@ with no permanent-delete fallback.
   themselves.
 - When you report on what stops accidental cleanup, the honest answer
   is: nothing automated does, because nothing automated deletes. The
-  human sees the facts on the TUI's confirm banner, and their own
+  human sees the facts in the TUI's removal review, and their own
   keypress is the only thing that moves a path to the Trash.

@@ -8,19 +8,7 @@ fact is not proof of no use; it means this pass could not establish it.
 
 ## Where to find it
 
-`report --json` includes an `"evidence"` array on each row/unit in
-every view: the default report view, `--view external`/`--view agents`
-(whole structs), and `--view kinds`/`--view builds`/`--view deps`/
-`--view unowned`/`--view worktrees`/`--view docker` (each row's own
-evidence; a `kinds` row is a bucket aggregating many artifact rows, so
-its `evidence` is the concatenation of all of theirs). The TUI takes
-one fresh current-use reading when a row is marked, shown on its
-confirm banner. The interactive CLI's
-`report --view external` text output prints one line per fact under
-each unit; the TUI's selected-row detail area does the same (ordered
-activity/consumer/current-use/recovery/reclaimability), and its
-delete-confirmation row adds a short warning line for a declared
-consumer, current use, or an uncertain recovery/reclaimability fact.
+`report --json` includes an `"evidence"` array on rows and units, including `external`, `agents`, `kinds`, `builds`, `deps`, `unowned`, `worktrees` and `docker`. A `kinds` bucket combines its members’ evidence. `report --view external` prints the facts beneath each unit. TUI details prioritize current use, recovery costs, sharing and unknowns; last use always keeps its source. Removal review groups shared warnings and names item-specific exceptions. Open-file checks happen during review; rechecks depend on the action, as listed below.
 
 ## Reading one fact
 
@@ -104,7 +92,7 @@ lands on a filesystem row, and vice versa.
 | `activity`/`accessed` | every filesystem artifact row (never a Docker row, whose "path" is a repo tag or volume name) | observation; reports reuse the stored anchor-path fact, not child access times |
 | `activity`/`tool-reported-use` | Docker build-cache rows (the daemon's own `LastUsedAt`) | whenever Docker facts are read |
 | `current-use`/`running-container` | Docker image and volume rows | whenever Docker facts are read |
-| `current-use`/`open-file` | any unit the TUI marks | taken once, when the row is marked (bounded `lsof +D`); shown on the confirm banner, never re-taken at Enter |
+| `current-use`/`open-file` | filesystem selections in TUI review | checked during review and shown with its source or coverage limit. Reclaim, Tool storage and Disk path moves recheck at Enter and refuse changed facts; other Trash moves retain the reviewed facts. Manager removal rechecks at `Y` |
 | `current-use`/`lock`, `current-use`/`booted` | an external unit, when its deep facts are pulled up (`actions::unit_from_external`): a manager lock file in the unit's own directory; each CoreSimulator device directory in a device store | on demand only -- never during identification, so an ordinary report spawns no process per detected unit |
 | `recovery` | artifact rows by kind; external units by storage category and the capabilities their detector declares (an installation store names each installed version as reinstallable; a Maven-layout local repository states Maven's own downloaded-versus-`mvn install` ambiguity) | recorded during observation; reused by report |
 | `reclaimability`/`logical-bytes` | Docker rows (the daemon's own object size); a sparse unit's apparent length | recorded during observation; reused by report |

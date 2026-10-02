@@ -6,7 +6,7 @@ The UI presents disk growth as a table that opens into a project tree. Size, sig
 
 Each row contains a name and measured size. Show signed change only where the view has recorded change values, notes only where rows have facts, and change bars only where at least one change is nonzero. A measured zero stays `0B`; an unknown measurement never becomes zero. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
 
-Column headings name the thing being compared: Project, Folder, Build output, Dependencies, Ecosystem, Storage kind, Unassigned storage, Storage item, Docker object, Tool location, Agent storage, Disk allocation, or Location. Name truncation and padding use grapheme-aware terminal-cell widths. Badges have separating spaces. Build drilldowns reserve Notes at 80 columns; Reclaim reserves If removed. Both hide numeric change below 100 columns. Disk views omit change entirely and label facts Measurement. These views cap names at 64 cells only when notes need the remaining width. Other views hide bars below 140 columns and show facts only in selected-row details below 100 columns. Zero and unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+Column headings name the thing being compared: Project, Folder, Build output, Dependencies, Ecosystem, Storage kind, Unassigned storage, Storage item, Docker object, Tool location, Agent storage, Disk allocation, or Location. Name truncation and padding use grapheme-aware terminal-cell widths. Badges have separating spaces. Build outputs, Dependencies and build drilldowns reserve Notes at 80 columns; Reclaim reserves If removed. These and Reclaim hide numeric change below 100 columns. Disk views omit change entirely and label facts Measurement. These views cap names at 64 cells only when notes need the remaining width. Other views hide bars below 140 columns and show facts only in selected-row details below 100 columns. Zero and unknown changes have no vertical bar. Keep the selected row visible when scrolling.
 
 Build and dependency labels lead with the project and checkout-relative path; additional checkouts carry a discriminator. Unassigned rows lead with their path. Tool labels keep the detector and identifying path suffix. Exact paths remain in selected details and action review. Reclaim table costs come from the typed regeneration class; original wording and source remain in the details. Current use, unique-copy, sharing, and unknown facts precede secondary metadata in the fixed-height detail pane. Last use keeps its source and is separate from modification age.
 
@@ -60,7 +60,7 @@ are navigation, not selective cleanup units. The selected-row detail area shows 
 and rebuilding consequences. Compiler caches are a suggested starting point,
 not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
 
-The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to all changes in the current view, including off-screen rows. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
+The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to all changes in the current view, including off-screen rows. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the rounded change; the bar is not a linear scale of bytes.
 
 Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy; Tree, Reclaim and Disk ignore sort/reverse keys and omit those hints. Sorting or reversing keeps the same item selected. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
 
@@ -92,85 +92,18 @@ Under the header, every view has a fixed two-row block: developer-storage total 
 
 The section strip names `1 Projects  2 Tools  3 Disk`, with the current section in reverse video so `NO_COLOR` and light themes keep it. Until Tools or Disk is opened once, spare width holds `Tab switches sections`; that choice is remembered in `ui_state.json`. The following line names the current view and shows its applicable filter, sort, and short purpose as width permits. Ignored predicates are identified, and views that ignore filtering show no filter clause. Only Project folders includes the selected project in its title.
 
-The only keys that move between views are `Tab`/`Shift-Tab` (sections), `v` (views
-inside a section, wrapping) and `1` `2` `3` (a section); the legend shows `Tab
-section  v view` and never a key per view. Every modal keeps its own keys first,
-so Tab completes in the filter and none of these switch anything while you type;
-a test reads the keymap and fails when a key is bound twice or a view is
-unreachable by those keys.
+`Tab`/`Shift-Tab` change sections, `v` cycles views inside a section, and `1` `2` `3` open each section’s default view. Enter or → on a project opens Project folders; Esc returns to Projects. The legend shows `Tab section  v view`, without a key per view. Modals own their keys: Tab completes a raw filter instead of changing sections. Keymap tests check duplicate bindings and reachability.
 
 The Disk section's Disk usage view is the stored volume ledger as rows: accounted, everything else
 with its folders, system volumes, not measured (never a size), the protected
 folders estimate, the bookkeeping line and the walk's spot audit. It is read
 only and built from the stored ledger, so opening it lists nothing.
 
-### External and Agents rows, and a scope-coverage header clause
+### Tool storage, Agent storage and scope coverage
 
-`report_scope`/`external.rs` (#42/#43) and `agents.rs` (#91/#92) gave
-the TUI three facts recorded here as unimplemented intent by an earlier
-chunk; all three now ship:
-
-- **Tool storage rows.** `ViewKind::External` (Tools section, third view) lists `ExternalUnit`s with detector/category labels, size and growth. Exact paths, consumer facts and source notes are in selected details. Every unit and listed folder
-  is a real path (`Row.unit` set): an external unit is shared,
-  detector-resolved storage (a package manager's cache, a toolchain
-  install), and Space marks it for the reviewed Trash move like any
-  path, the confirm saying what swamp does not know and that the
-  manager will not know it is gone. A unit whose manager swamp runs
-  removal for also opens that manager's own list on Backspace. A unit that is a
-  machine-wide build store (a Maven repository, Go's module cache,
-  DerivedData, the Android SDK, ...) is expandable: `Enter`/`→` opens it
-  onto the **same** family groups a project container shows (closed
-  until opened, guidance first, every row `blocked`, no `UnitId`), from
-  `ScopeObservation::store_interiors` of the same pass. The Docker view
-  gains one row per BuildKit builder that opens the same way; its member
-  rows say "created (daemon)" rather than "modified", because the time
-  is the daemon's record, not a file's. A unit that declares a last-use
-  source, and an unclassified root of 1 GiB or more, also opens onto its
-  depth-2 rows first (its top 15 child folders largest first, then one
-  remainder row that makes the rows sum to the unit's total; a folder that
-  could not be read draws `unmeasured` in the Size cell, a signed correction draws `-50MB adj`, and neither ever draws a size; a unit that also has an identified interior holds it under one closed "identified interior" header so no byte is listed twice). Every such
-  row is `blocked`, no `UnitId`, and the table layout is unchanged: the
-  last-used fact (`Last run or opened: Jul 8 (file access time)`) is the
-  first line under the signals in the selected-row detail pane, not a
-  column, so no width rule moves. An unowned row for a standalone Cargo
-  target directory is markable like any unowned row and its confirm line
-  says what it is and that `cargo build` remakes it.
-- **Agent storage rows.** `ViewKind::Agents` (Tools section, fourth view) lists `AgentUnit`s with tool/category/project/item labels. Inferred project associations are labelled; selected details retain the exact path and link evidence. Every row
-  carries `Row.unit: Some(...)` (protected/unmarkable ones included):
-  `Space`/`Backspace` mark the selected unit through
-  `actions::propose_agents` and open the confirm banner with its
-  current facts (session-removal loss warnings, the linked project);
-  `Enter` moves it to the Trash through the ordinary background-worker
-  path (`actions::execute_plan_progress`) every other markable view
-  already uses -- never a new blocking call on the event/render thread,
-  and with no re-check between marking and moving. A protected row, or
-  one whose category has no Trash move at all, marks with a warning
-  (`propose_agents_for_human`: kept by default, no rule for the category,
-  database-like file); only the person's own `swamp protect` mark
-  refuses, and its reason becomes the status text, never a
-  generic "nothing to delete." Bulk marking (`Shift+A`,
-  `mark_all_in_view`) reaches agent rows too: since `model::agent_rows`
-  sets `Row.unit` but never `Row.kind` (there is no `ArtifactKind` for
-  an agent-storage unit), `mark_all_in_view` has a third branch
-  alongside its `row.kind`/`ArtifactKind` and projects-view
-  `row.project` ones -- when a row has neither but does carry `unit`, it
-  reuses `mark_row`'s own per-row refusal rather than duplicating that
-  logic, and counts a skip instead of a hard stop. The status rows name how
-  many agent rows were skipped and why whenever at least one row *was*
-  marked, never silently proceeding as if the skipped rows were not on
-  screen.
-- **Project tree's collapsed "Agent storage (linked)" row (#100
-  completion).** `ViewKind::Tree`'s own drill (`model::tree_rows_with_agents`,
-  built from the same `crate::tree::build_project_tree` the CLI's
-  `--project` text drill uses) now appends one row per tool
-  contributing linked agent storage to the selected project, after the
-  project's own worktrees. It is informational only (`unit: None`):
-  the row exists so "does this project have any linked agent storage,
-  from which tools, how much" is visible from the project drill itself
-  without also opening the separate Agents view -- acting on a specific
-  unit still happens there, where per-unit protections/occupancy are
-  checked. Absence of any linked unit means no row at all, never a
-  zero-byte placeholder.
+- **Tool storage.** `ViewKind::External`, third in Tools, lists `ExternalUnit`s with detector/category labels, sizes and recorded changes. Selected details retain exact paths, consumers and source notes. Enter or → expands stored folder rows or identified interior groups. Real path rows can be marked for Trash; structural and remainder rows are informational. Depth-2 folder rows name unmeasured allocations and corrections instead of treating them as measured sizes. Last use stays in details with its source. On a manager row, Backspace opens the manager’s list only when the row is unmarked and no marks are pending; Space selects the folder for Trash instead.
+- **Agent storage.** `ViewKind::Agents`, fourth in Tools, lists `AgentUnit`s with tool, category, project and item labels. Inferred associations stay labelled; details retain exact paths and link evidence. `actions::propose_agents_for_human` supplies the warnings for an individual mark, including kept-by-default, unknown-category and database-like rows. The human’s own protect entries block conflicting selections. `A` reviews eligible rows across the complete current list, skipping `individual_only` rows and reporting skips; these rows remain available for individual review with Space. Removal uses the ordinary background worker.
+- **Linked storage in Project folders.** `ViewKind::Tree` includes a collapsed Agent storage (linked) summary per contributing tool, built from the same project tree as the CLI drill. These rows are informational (`unit: None`); individual selection happens in Agent storage. No linked units means no summary row, rather than a zero-byte placeholder.
 - **Scope-coverage header clause, now driven by real observation
   outcome (#51).** `App::set_scope_note` adds one short header clause
   when there is more than one region or the one region is not simply
@@ -236,7 +169,7 @@ validation.
 
 ## Actions
 
-Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a content-sized review overlay with destination totals, selection context, shared warnings shown once, and item-specific exceptions. The primary summary must be displayed before Enter authorizes its action. Press `l` for the complete path, size, and member inventory; this detail view scrolls, and Esc returns to the summary. Inspecting every inventory row is optional. Esc from the summary cancels.
+Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a content-sized review overlay with destination totals, selection context, shared warnings shown once, and item-specific exceptions. The primary summary must be displayed before Enter authorizes its action. Press `l` for the complete path, size, and member inventory; this detail view scrolls, Enter is disabled there, and Esc returns to the summary. Inspecting every inventory row is optional. Esc from the summary cancels.
 
 Human keep/protect intent (`swamp protect`) is checked before **any**
 row is marked, in both directions: a row beneath a protected path, and a
@@ -248,9 +181,9 @@ only for the two row kinds that happened to propose through core, which
 is how a one-directional protection bug survived every test; see
 `.oh/guardrails/protection-fails-closed.md`.
 
-Project rows expand to actionable artifacts. If none exist, a direct project action may offer the checkout. Bulk marking with `A` skips that fallback. Worktree and source-directory selections carry their own warnings; the `ignored` and `untracked` summary buckets are not individual paths to delete.
+Project rows expand to actionable artifacts. If none exist, a direct project action may offer the checkout. Bulk review with `A` skips that fallback and opens the plan before acting. Worktree and source-directory selections carry their own warnings; the `ignored` and `untracked` summary buckets are not individual paths to delete.
 
-Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Tool-managed removal (mise versions, simulator runtimes) has its own sheet over the screen, opened by Backspace on the mise installs or simulator runtimes row: the manager's own list, then a confirm whose rows keep a fixed order (what is removed, "No Trash recovery: this cannot be undone", the command heading, the command, never cut, then program, size, reinstall cost, open files, the manager's quoted reasons, warnings, what the dry run removes, and the dry run verbatim, bounded with a "+k more lines" row), and whose last inner row is always its keys (`Y remove (cannot be undone) · Esc cancel`: Enter only opens the review, and `Y` counts only after the confirm has been drawn and 1 s has passed). A refusal shows "Reason:" and "Next:" and that nothing ran; a result says what the manager's list showed afterwards. `Y` runs nothing on a terminal too small to show the whole command block. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals show in the status rows with their reason; what a check or a delete could not include is listed with `b` (or `d` on the plan), each with its whole reason and a next step, and `r` there checks again.
+Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Tool-managed removal (mise versions, simulator runtimes) has its own sheet over the screen, opened by Backspace on an unmarked mise installs or simulator runtimes row when no marks are pending: the manager's own list, then a confirm whose rows keep a fixed order (what is removed, "No Trash recovery: this cannot be undone", the command heading, the command, never cut, then program, size, reinstall cost, open files, the manager's quoted reasons, warnings, what the dry run removes, and the dry run verbatim, bounded with a "+k more lines" row), and whose last inner row is always its keys (`Y remove (cannot be undone) · Esc cancel`: Enter only opens the review, and `Y` counts only after the confirm has been drawn and 1 s has passed). A refusal shows "Reason:" and "Next:" and that nothing ran; a result says what the manager's list showed afterwards. `Y` runs nothing on a terminal too small to show the whole command block. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals show in the status rows with their reason; what a check or a delete could not include is listed with `b` (or `d` on the plan), each with its whole reason and a next step, and `r` there checks again.
 
 The selected row's own decision evidence (#53/#60) renders below the
 table, in a fixed four-row detail pane (`crates/tui/src/detail.rs`): what

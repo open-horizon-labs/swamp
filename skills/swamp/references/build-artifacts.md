@@ -34,8 +34,7 @@ do not imply a CLI deletion command exists.
   families; a `node_modules` that is mostly pnpm store shows that.
 - `swamp report --view external` -- each machine-wide store's family rows
   under its unit; `--json` carries them as `interiors`, keyed by the
-  unit's path, in the same shape as `interior` above. TUI External view:
-  a store row opens onto the same family groups.
+  unit's path, in the same shape as `interior` above. TUI equivalent: Tool storage (`2`, then `v` twice); a store row opens onto the same family groups.
 - `swamp report <root> --view docker` -- BuildKit records per builder,
   in the daemon's terms; `--json` adds a `buildkit` array.
 

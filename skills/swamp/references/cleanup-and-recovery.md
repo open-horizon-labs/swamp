@@ -1,27 +1,12 @@
 # Finding and restoring what the TUI trashed
 
-There is no `propose`/`approve`/`execute`/`grant`/`cleanup-check`
-command any more, and no CLI command deletes anything. Deletion happens
-only in the TUI (Space marks, Backspace shows current facts, Enter
-moves the marked paths to the Trash) or by a human running a shell
-command directly. This reference is for the read-only half of that
-lifecycle: how to find what went where, and how to get it back.
+There is no `propose`/`approve`/`execute`/`grant`/`cleanup-check` command, and no CLI deletion command. In the TUI, Space marks, Backspace opens review, and Enter moves filesystem selections to Trash after the summary has been displayed. `l` opens the optional exact path/member inventory; Esc returns to the summary or cancels from there. Docker and manager removals are permanent and have no Trash recovery. See [the trust model](trust-model.md) for those controls. This reference explains how to find a Trash move and restore it.
 
 ## Where things went
 
-Every Trash move appends one line to `~/.local/share/swamp/ledger.jsonl`
-(a `LogFile`; override with `$SWAMP_LEDGER_PATH` for tests/CI, never for
-a real move):
+The action ledger is `ledger.parquet` in the swamp store (normally `~/.local/share/swamp`), with the reviewed facts in `ledger_facts.parquet`. A `started` record precedes the move; its final outcome records the original path, recovery location, selected bytes and time. These are Parquet tables, not a JSON-lines log.
 
-```json
-{"id":"...","verb":"Delete","entity_id":"...","evidence":{"label":"...","bytes":123,"observed_at":...,"warnings_shown":[...]},"grant_id":"human-marked","actor":"human:tui","outcome":"completed","recovery_location":"/Users/you/.Trash/target-1700000000","measured_free_space_delta":null,"observed_path_state":"trashed","recorded_at":...}
-```
-
-`recovery_location` is where it went; `None` there means it was removed
-permanently (a Docker image or volume -- Docker has no Trash, so this
-is the one case with nothing to restore). `grant_id` is a historical
-field name kept for ledger compatibility; it carries no authorization
-any more, just the constant `human-marked`.
+`recovery_location` records where a Trash move went. Permanent Docker and manager removals have no Trash recovery; check the action and outcome before looking for a restore path. `grant_id` is a historical field name kept for ledger compatibility; it carries no authorization, just the constant `human-marked`.
 
 For a Cargo group or an agent-storage session, several original paths
 moved together into one **envelope** (a directory under the Trash root

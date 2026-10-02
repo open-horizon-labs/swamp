@@ -81,7 +81,19 @@ swamp report ~/src ~/work --view grown --json
 swamp ui ~/src ~/work
 ```
 
-In the UI, arrow keys, PgUp, PgDn, Home and End navigate, and `?` opens a help you can scroll. Press `0` to clear the initial `growth > 100MB in 7d` filter and see projects that have not grown. Saved filter and sort choices take precedence on later runs.
+Start with the question you want to answer:
+
+| Question | Where to go |
+|---|---|
+| Which project owns the storage, and what grew? | `1` Projects; Enter opens the selected project's folders and build groups. |
+| Which tool storage should I review first? | `2` Tools opens Reclaim, largest first, with removal costs. Press `v` for Docker, Tool storage, then Agent storage. |
+| Where did the rest of the disk go? | `3` Disk opens Disk usage; `v` shows Coverage gaps. |
+
+`Tab` / `Shift-Tab` change sections; `v` changes views within a section. Arrow keys, PgUp/PgDn and Home/End navigate. `?` opens scrollable help, and the bottom row names the keys available where you are. See the [full controls](docs/usage.md#terminal-controls).
+
+Press `0` to clear the initial `growth > 100MB in 7d` filter and see projects that have not grown. `/` opens the filter form; `:` edits its expression. An invalid expression stays open for correction, and Esc restores the previous filter. Saved filter and sort choices take precedence on later runs.
+
+Tables shorten names and paths to make comparison easier; selected details and removal review retain exact paths and supporting facts. Reclaim keeps recovery costs beside sizes on narrow screens. An unread or unmeasured size is labelled, and a lower bound uses `≥`; neither becomes zero. Empty columns disappear, while a measured zero stays visible.
 
 History starts with your first observation. To collect it while the UI is closed:
 
@@ -95,11 +107,15 @@ This uses a per-user LaunchAgent on macOS or a systemd user timer on Linux. It o
 
 Git status, unpushed commits, cached PR information, modification age, and removal consequences sit alongside usage. These are evidence for a decision, not a universal “safe to delete” verdict.
 
-Space marks supported rows in the TUI and changes nothing; a check says `ready` or `blocked` for each item, and `b` lists what is blocked with the reason and the next step. Backspace opens the plan (count, size, destination, and what is removed for good); Enter confirms. The result stays on screen until your next key. A build profile selects its supported cleanup groups, not the entire profile directory. Other views can select whole checkouts or worktrees: read the actual paths and warnings.
+Space marks a path or cleanup group without removing it. The marked count, selected size and Trash/permanent-removal destinations stay visible as you navigate. Backspace opens review; `A` reviews all eligible rows in the current view. A build profile selects its supported cleanup groups, not the entire profile directory. Other rows can select whole checkouts or worktrees.
 
-Filesystem removals move paths to Trash. **Space is not reclaimed until Trash is emptied.** Docker image and volume removals use the daemon and are not recoverable through Trash. Anything you can see as a real folder or file can be marked, including shared stores and paths swamp has no cleanup rule for: the confirm lists what swamp does not know, and only a path that is not a real deletable folder or file, an OS refusal, a plan that changed since you marked it, an unwritable ledger or your own `swamp protect` mark refuses. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery).
+Review shows destination totals, shared warnings once, and item-specific exceptions. Scroll through the summary before Enter can confirm. Press `l` for the complete path, size and member inventory; inspecting every inventory row is optional, and Enter is disabled there. Esc returns to the summary or cancels it. `b` opens blocked reasons (`d` from review), with `r` to check again. The result stays on screen until your next key.
 
-There is no CLI deletion command or MCP server. Cleanup is a human-confirmed TUI action; Reclaim, External and Disk moves re-check that the marked entry is unchanged at Enter, other moves do not re-derive facts between marking and confirmation.
+For mise installs and simulator runtimes, Backspace on an unmarked manager row with no pending marks opens the manager's list. Enter reviews its command; `Y` runs that command permanently, without Trash recovery. Space on the same row selects its folder for the Trash flow instead.
+
+Filesystem removals move paths to Trash. **Space is not reclaimed until Trash is emptied.** Docker image and volume removals use the daemon and are not recoverable through Trash. Anything you can see as a real folder or file can be marked, including shared stores and paths swamp has no cleanup rule for: review lists what swamp does not know, and only a path that is not a real deletable folder or file, an OS refusal, a plan that changed since you marked it, an unwritable ledger or your own `swamp protect` mark refuses. See [cleanup and recovery](docs/usage.md#cleanup-and-recovery).
+
+There is no CLI deletion command or MCP server. Cleanup is a human-confirmed TUI action; Reclaim, Tool storage and Disk moves re-check that the marked entry is unchanged at Enter, other moves do not re-derive facts between marking and confirmation.
 
 ## Use it from an agent
 

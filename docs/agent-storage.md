@@ -278,7 +278,7 @@ retain their per-member outcomes in the Trash envelope's `restore.json`.
 - Anything a human protected with `swamp protect add <path>`.
 
 (2026-09-23: occupancy of an active session is still computed and
-shown on the TUI's confirm banner as a fact, but no longer refuses a
+shown in the TUI's removal review as a fact, but no longer refuses a
 move -- see `.oh/guardrails/occupancy-is-tristate-at-sinks.md`.)
 
 ## Project linkage
@@ -905,12 +905,12 @@ tools this chunk added.
 |---|---|
 | CLI text | `swamp report --view agents [--project NAME] [--all]` |
 | CLI JSON | `swamp report --view agents --json` (`{units, total_bytes}`) |
-| TUI (read) | `2` opens the Tools section, `v` cycles to the Agents view |
-| TUI (act) | `Space`/`Backspace` mark the selected agent unit and open the confirm banner (`App::mark_row`'s agent-storage branch); `Shift+A` (`mark_all_in_view`) marks every row in the Agents view that swamp has a rule for, leaving out what it keeps by default or has no rule for and naming how many in the footer (Space marks those one at a time); `Enter` moves it to the Trash through the ordinary background-worker path (`execute_plan_progress`), never blocking the event/render thread. A row swamp keeps by default (credentials, settings) or has no rule for marks with a warning (`actions::propose_agents_for_human`); only your own `swamp protect` mark refuses. The agent-facing `propose_agents` keeps every refusal. |
+| TUI (read) | `2` opens Tools; press `v` three times for Agent storage. The CLI identifier remains `agents` |
+| TUI (act) | Space marks the unit; Backspace opens review; Enter confirms from the displayed summary. `l` opens an optional path/member inventory; Enter is disabled there. `A` reviews eligible rows across the full current list, including off-screen rows, skipping kept-by-default units and those without a cleanup rule. Space can select those individually with warnings (`actions::propose_agents_for_human`); your own protect entries still block conflicting selections. Removal uses the ordinary background worker. See [terminal controls](usage.md#terminal-controls). |
 | Protect | `swamp protect add\|remove\|list [--json] <path>` |
 | Removal | TUI only (2026-09-23: there is no `propose`/`propose-agents`/`approve`/`execute` command any more). |
 | Skill | `skills/swamp/references/agent-storage.md` |
-| Project tree | `swamp report --project <name>` (text) and `--project <name> --json` (no `--view` needed) both include this project's linked agent storage: a collapsed "Agent storage (linked)" row per contributing tool in the text tree (`crate::tree::agent_rows_for_project`, shared by the CLI drill and the TUI's own Tree view), and an `agent_storage: {units, total_bytes}` object in the JSON envelope. |
+| Project tree | `swamp report --project <name>` (text) and `--project <name> --json` (no `--view` needed) both include this project's linked agent storage: a collapsed "Agent storage (linked)" row per contributing tool in the text tree (`crate::tree::agent_rows_for_project`, shared by the CLI drill and the TUI's Project folders view), and an `agent_storage: {units, total_bytes}` object in the JSON envelope. |
 
 ## Known gaps, recorded rather than hidden
 
@@ -918,13 +918,7 @@ tools this chunk added.
   the matrix above) -- the epic's full-catalog acceptance is met at the
   identification/project-linkage layer; independent validation (#102)
   is still a separate, unchecked box.
-- TUI bulk marking (`Shift+A`, `mark_all_in_view`) now recognizes agent
-  rows too (reusing `App::mark_row`'s own per-row protected/unsupported/
-  active refusal, never a duplicated refusal path): the actionable rows
-  in view are marked, and a footer names how many were skipped and why
-  when at least one was. Marking one agent unit at a time
-  (`Space`/`Backspace` on the selected row) still works exactly as
-  before.
+- Bulk review uses the same per-row checks as individual selection, reporting skips while preserving the selection for review. Kept-by-default units and paths without a cleanup rule require an individual mark; they are not included by `A`.
 - **Resolved this chunk:** `swamp propose --path` (and the deprecated
   `propose-agents` alias) used to skip computing a full `Report` for
   speed, discovering Aider's per-repo units only by walking upward from
@@ -1003,10 +997,10 @@ added the independent #102 validation pass. Landed:
   gained `agent_rows: Vec<ProjectAgentToolRow>` (`crate::tree::
   agent_rows_for_project`), a per-tool collapsed summary of the agent
   storage linked to one project. `render_project_tree_with_agents`
-  (CLI text) and `model::tree_rows_with_agents` (TUI Tree view) both
+  (CLI text) and `model::tree_rows_with_agents` (TUI Project folders view) both
   render one "Agent storage (linked)" line per contributing tool,
   informational only (`unit: None` in the TUI -- acting on a specific
-  unit stays the dedicated Agents view's job, with its own per-unit
+  unit stays the Agent storage view's job, with its own per-unit
   protections/occupancy checks). Previously this information existed
   only in the flat `--view agents` list, with no way to see "does this
   project have any linked agent storage" from the project drill itself.
@@ -1061,12 +1055,12 @@ added the independent #102 validation pass. Landed:
   shared-blob reference-state correctness, an integrated canary sweep
   across render text/JSON/plan/execute-result/ledger for two
   differently-shaped adapters, nested-accounting agreement between the
-  flat Agents view and the project tree, incremental/unchanged-refresh
+  Agent storage view and the project tree, incremental/unchanged-refresh
   growth history, and stable history after relinking a session to a
   different project) and
   `crates/tui/tests/agent_storage_validation.rs` (a real, on-disk
   fixture run through real identification into the TUI's own rendered
-  frames -- both the Agents view and the new project-tree row -- to
+  frames -- both the Agent storage view and the new project-tree row -- to
   prove real session content never reaches what a human actually sees,
   not just the JSON/plan/ledger surfaces the prior chunks' tests
   already covered).

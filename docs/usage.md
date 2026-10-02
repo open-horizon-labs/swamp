@@ -547,9 +547,7 @@ flushed; such files are counted as reported and listed as
 right after a big write is explained rather than surprising. A file that
 cannot be read mid-walk is not measured; the rest of its directory still is.
 
-The TUI has a dedicated External view (Tools section: `2`, then `v`): the same
-one-row-per-unit facts as `--view external`; each unit and each listed
-folder can be marked for the reviewed Trash move.
+The TUI's Tool storage view is in the Tools section: press `2`, then `v` twice (Reclaim → Docker → Tool storage). It shows the same per-unit facts as `--view external`; each unit and listed folder can be marked for a reviewed Trash move. The CLI identifier remains `external`.
 
 ### Last run or opened
 
@@ -665,17 +663,14 @@ folders, largest first, with size, modification time and last-used:
   disk; no file content and no `Info.plist` is read for them.
 - **From the one walk.** The rows come from the per-directory rows the
   folded walk already produces, are stored in `unit_children.parquet`, and
-  are replayed with the unit when it is unchanged. In the TUI the External
-  view's row opens (`Enter`) onto them; the selected row's detail line
-  carries the last-used fact.
+  are replayed with the unit when it is unchanged. In Tool storage, Enter opens the unit onto these rows; the selected details carry the last-used fact.
 
 ### Model caches
 
 The Hugging Face hub cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`, else
 `~/.cache/huggingface/hub`) and the Ollama store (`OLLAMA_MODELS`, else
 `~/.ollama/models`) are listed one model at a time, in Reclaim (`models` under
-the store's row, and each repo folder's row) and in External (each repo folder's
-row; the Ollama tags under "identified interior"). Each says:
+the store's row, and each repo folder's row) and in Tool storage (each repo folder's row; the Ollama tags under "identified interior"). Each says:
 
 An expanded repo-folder row keeps the physical folder allocation in the Size column and labels it as a folder. Its facts separately show the model total, including shared weights where present. For example, a 1.9 MB folder can reference a 968.9 MB model while 967 MB stays in the separately listed `blobs/` folder. Those model and blob totals overlap; adding them would count the weights twice. Marking the repo-folder row selects that folder, not its shared blobs.
 
@@ -732,7 +727,7 @@ An expanded repo-folder row keeps the physical folder allocation in the Size col
   keeps "cannot be regenerated (no source recorded)". An Ollama tag names its
   `ollama pull`.
 - **Trash.** A repo folder or a manifest can be marked like any row (in the TUI,
-  an Ollama tag is its own row under its store in Reclaim and External). The
+  an Ollama tag is its own row under its store in Reclaim and Tool storage). The
   confirm and the detail pane say what stays: "moving this folder frees about X;
   Y stays in the hub's shared blobs/", and for a manifest that its layers stay in
   `blobs/` (`ollama rm` is the tool's own removal). A row belongs to its own
@@ -874,12 +869,7 @@ rows[]       { path, kind, detector, bytes, growth_bytes?,
 not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
 is not measured). `totals` is the object the storage headline reuses (`remainder_bytes` is the part of it that is not developer storage; see "Developer storage: the headline").
 
-In the TUI, Reclaim is the first view of the Tools section (`2`, or `Tab` from Projects). It is built from the
-stored facts, scans nothing on open, and keeps the same layout as every view:
-the scope statement sits under the heading, the cost, last-used fact and removal
-path are the signals (and the detail pane's first lines at any width), `→` or
-`Enter` opens a unit onto its folders, and a default is flagged beside its
-name. `R` refreshes exactly as before.
+In the TUI, Reclaim is the first view of Tools (`2`, or `Tab` from Projects), ordered largest first. Its If removed column uses the stored regeneration class: Download again, Rebuild, Cannot regenerate, or Cost unknown. Selected details retain the original recovery wording, last-used fact and source, exact path and removal route. The scope statement stays under the heading. `→` or Enter expands a unit's recorded folders; `R` refreshes observations. Opening the view reads stored facts and starts no scan.
 
 ### Standalone Cargo target directories
 
@@ -904,7 +894,7 @@ and the consequence "rebuild with `cargo build`".
   **recorded link** (second tier, labelled "recorded in dep-info, not checked
   to exist"); it is never used to select, order or authorize anything.
 - It has its own section in `swamp report --view external` (and
-  `standalone_cargo_targets` in `--json`, and rows in the TUI's External view),
+  `standalone_cargo_targets` in `--json`, and rows in the TUI's Tool storage view),
   counted under unowned and not in the external total.
 - A project's own `target/` is a build artifact of that project and is
   counted once there, never also as a standalone target.
@@ -995,25 +985,15 @@ today vs. named-and-planned). In short:
   contributing tool in the text tree, and an `agent_storage: {units,
   total_bytes}` object in JSON.
 
-The TUI has a dedicated Agents view (Tools section: `2`, then `v` to Agents): the same per-unit facts as `--view agents`. `Space`/
-`Backspace` mark the selected unit and open the confirm banner showing
-its real consequences (session-removal loss warnings, the linked
-project); `Enter` moves it to the Trash through the same
-background-worker path every other TUI deletion uses -- never blocking
-the event/render thread. A protected row, or one whose category has no
-Trash move at all (credentials, settings, an unconfirmed layout), cannot
-be marked; the status rows name the exact reason. Bulk marking (`Shift+A`)
-reaches the Agents view too: it marks every markable row on screen the
-same way, skipping protected/unmarkable ones and naming the skip in the
-status rows. The project tree's own Tree view also shows the collapsed
-"Agent storage (linked)" summary row (informational; marking a specific
-unit still happens in the Agents view).
+The TUI's Agent storage view is fourth in Tools: press `2`, then `v` three times. It shows the per-unit facts from `--view agents`, with tool, category, project association and item identity; inferred associations remain labelled. Selected details retain the exact path and project-link evidence.
+
+Space marks a unit; Backspace opens review of its consequences, including session history lost and the linked project. Enter confirms the reviewed Trash action. Rows kept by default, database-like files and categories without a cleanup rule can be selected individually with their warnings. Your own `swamp protect` entry still blocks a conflicting selection. `A` reviews eligible rows across the current list, including rows off screen, while skipping units kept by default or without a cleanup rule. The project folders view also shows an informational Agent storage (linked) summary; select individual units in Agent storage.
 
 ## The TUI's sections and views
 
 The TUI has three sections, each holding a few views. `Tab` and `Shift-Tab` move
 between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the
-current section (wrapping). Nothing else opens a view.
+current section (wrapping). Enter or → on a project opens Project folders; Esc returns to Projects.
 
 | Section | Views (first is the default) |
 |---|---|
@@ -1300,14 +1280,17 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | Key | Action |
 |---|---|
 | Up / Down | Move selection |
-| PgUp / PgDn | Move one screenful; in help, the blocked list and the picker they scroll or jump the same way |
-| Home / End | First / last row (or first / last displayed help or blocked line, picker field) |
+| PgUp / PgDn | Move one screenful; scroll wrapped help, review, blocked reasons or Cargo details. In the filter form, jump to the first / last field |
+| Home / End | First / last row, displayed explanation line or filter field |
 | Right / Left | Open or expand / collapse an expanded row, select its parent, or return to projects |
-| Enter | Open a project or confirm the pending action |
+| Enter | Open a project or folder; confirm a fully displayed Trash/Docker review summary. In a manager list, review the selected command |
 | Esc | Cancel the current interaction or return to projects |
 | Space | Mark or unmark a row |
-| Backspace | Request removal of the selected row or marked set |
-| `A` | Review all actionable rows in the current view, excluding the checkout fallback; opens the plan before any action |
+| Backspace | Review the selected row or marked set; with no pending marks, an unmarked manager row opens its own removal list |
+| `A` | Review eligible rows across the current list, including off-screen rows. Skips checkout fallbacks, rows kept by default and paths without a cleanup rule |
+| `l` | In removal review, open or close the complete path/size/member inventory; Enter does nothing in that inventory |
+| `Y` | In a manager confirmation, run the displayed command after its review and hold; this is permanent removal |
+| `i` | Inspect the selected Cargo profile on demand; results scroll and Esc or q closes them |
 | `k` | Toggle keeping supported compiled outputs before removal. The result line says whether it is now on or off; the choice is remembered |
 | `b` / `d` | List what the last check or delete could not include, with the reason and next step (`d` on the plan). Inside the list, `r` checks again |
 | `/` | Open the filter form |
@@ -1318,6 +1301,7 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | `1`, `2`, `3` | Jump to a section: 1 Projects, 2 Tools, 3 Disk (help lists them; the legend does not) |
 | `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age; Project folders, Reclaim and Disk keep their fixed order |
 | `r` | Reverse the sort in views that support sorting |
+| `R` | Refresh observations; shows when another observation is already running |
 | `?` | Show help |
 | `q` | Quit; closes help and inspection lists first. Closes the picker except in its project field, where it types q. While a check or move runs, stops it after the current item |
 
@@ -1329,11 +1313,13 @@ Below the list, the status area keeps your marked count and selected size visibl
 
 If Enter rejects a raw filter expression, keep typing to correct it or press Esc to restore the accepted expression. The previous filter, selection and marks stay in place until a valid expression is applied; invalid drafts are not saved.
 
-Rows show size and signed growth. Red bars extend right for increases; green bars extend left for decreases. Bar length is logarithmic, so use the number to compare exact changes.
+Size is measured storage; Change is the signed difference over the recorded comparison window. A `0B` change is measured zero, `—` is unknown, and `not read` or `not measured` is an unknown size. `≥` labels a lower bound where part of a group is unmeasured. A `*` marks allocated bytes that may count shared files again. None of these sizes promises freed disk space.
 
-The filter form’s project field accepts literal text, including q, e, 0 and spaces; arrows choose a match and Enter applies it. Elsewhere in the form, q closes, e opens text editing and 0 clears. Blocked reasons and Cargo inspection scroll through wrapped lines with arrows, PgUp/PgDn and Home/End, including after resize. Unsupported Ctrl/Alt/Super/Hyper/Meta chords are ignored rather than acting like plain commands; Ctrl-C retains its explicit cancel/quit behavior.
+At 80 columns, Build outputs, Dependencies, build drilldowns and Reclaim prioritize notes or recovery costs over Change. Disk views show Measurement rather than Change. Empty Notes/Change columns and all-zero bars are omitted. Where bars appear on wide terminals, red extends right for growth and green left for shrinkage; their logarithmic scale is shared across the full list, including off-screen rows. Human-readable numbers are rounded; use JSON when exact values matter.
 
-Build and dependency tables show project-relative paths; selected details and review retain exact paths. Reclaim uses concise recovery labels with full original wording and source in details. Empty note/change columns and all-zero bars are omitted. A recorded zero stays visible; an unread or unmeasured folder is labelled explicitly.
+The filter form’s project field accepts literal text, including q, e, 0 and spaces; arrows choose a match and Enter applies it. Elsewhere in the form, q closes, e opens text editing and 0 clears. Blocked reasons and Cargo inspection scroll through wrapped lines with arrows, PgUp/PgDn and Home/End, including after resize. Unsupported Ctrl/Alt/Super/Hyper/Meta chords and Shift+Enter/Backspace are ignored rather than acting like plain commands. Shift characters and Shift-Tab remain supported; Ctrl-C retains its explicit cancel/quit behavior.
+
+Build and dependency tables show checkout-relative paths and distinguish multiple checkouts of the same project. Selected details and review retain exact paths; Reclaim details preserve the full recovery wording and its source.
 
 ## Report views
 
@@ -1390,17 +1376,16 @@ does not promise it can be downloaded again. Machine-wide stores (npm
 cache, pnpm store, Gradle user home, `~/.m2/repository`) are reported
 as whole external units for now; their per-entry identification exists
 but is not yet joined into the report (see
-[docs/build-artifacts.md](build-artifacts.md)). The Rust view explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs have no selective cleanup rule: each can be marked on its own row.
+[docs/build-artifacts.md](build-artifacts.md)). The CLI's `--view rust` explains Cargo target/build storage as nested containers, profiles, dependencies, test/example outputs, build-script output, incremental state, final outputs, and companion metadata. Dependencies remain a folded directory aggregate, not a per-crate breakdown. Group sizes are allocated bytes; unknown subgroup hardlink charges are not reclaimable-space estimates. The view prints evidence limits and unknown variants. Final outputs have no selective cleanup rule: each can be marked on its own row.
 
-Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. Opening a project in the TUI shows cleanup groups under each build profile: **Compiler caches**, **Compiled tests & examples**, and **Build-script output**, when supported members exist. Space marks a group's exact members for review; Backspace opens confirmation. Expand with → to choose Tests, Examples, or individual age-ranked members instead. Unrelated dependencies are not part of these groups. **Inspect directories** retains the physical layout as another view of the same bytes. No switch to Builds is required. The selected-row details explain cleanup recommendations and rebuilding consequences. Incremental compiler caches are suggested as a starting point if slower subsequent builds are an acceptable trade-off—not because Swamp has proved them obsolete. Compiled dependencies remain a folded aggregate without selective dependency cleanup.
+Rust inspection does not invoke Cargo or build scripts. It reads layout and existing fingerprints; hashed filenames alone do not establish ownership, last execution, or obsolescence. Opening a project in the TUI shows cleanup groups under each build profile: **Compiler caches**, **Compiled tests & examples**, and **Build-script output**, when supported members exist. Space marks a group's exact members for review; Backspace opens confirmation. Expand with → to choose Tests, Examples, or individual age-ranked members instead. Unrelated dependencies are not part of these groups. **Inspect directories** retains the physical layout as another view of the same bytes. No switch to Build outputs is required. The selected-row details explain cleanup recommendations and rebuilding consequences. Incremental compiler caches are suggested as a starting point if slower subsequent builds are an acceptable trade-off—not because Swamp has proved them obsolete. Compiled dependencies remain a folded aggregate without selective dependency cleanup.
 
-In the project tree or Builds view, mark an identified test/example executable or an individual incremental/build-script directory to review an exact cleanup group. Purpose groups and profiles mark their supported members, not the entire profile directory. Executable groups include existing dep-info and debug-symbol companions. Cleanup is TUI-only; there is no CLI cleanup plan or approval command.
+In Project folders or Build outputs, mark an identified test/example executable or an individual incremental/build-script directory to review an exact cleanup group. Purpose groups and profiles mark their supported members, not the entire profile directory. Executable groups include existing dep-info and debug-symbol companions. Cleanup is TUI-only; there is no CLI cleanup plan or approval command.
 
 ### On-demand Cargo dependency inspection
 
 Select a Cargo profile in the TUI and press `i`. Inspection runs in the
-background; Esc or Ctrl-C cancels while it runs. The results are scrollable
-with ↑/↓ and close with Esc. To request the same details from the CLI:
+background; Esc or Ctrl-C cancels while it runs. Results scroll by displayed lines with ↑/↓, PgUp/PgDn and Home/End, including long wrapped lines after resize. Esc or q closes the inspection. To request the same details from the CLI:
 
 ```sh
 swamp inspect-cargo ./target/debug --json
@@ -1426,33 +1411,28 @@ space. These diagnostics do not enable per-crate deletion.
 
 Open a project with → to see cleanup groups beneath each Cargo build profile. Choose by the cost of rebuilding, then expand a group if you want to remove only older members.
 
-![Swamp's project tree showing debug compiler caches, compiled tests and examples, and build-script output, with sizes, removal consequences and an oldest-candidate preview.](images/cargo-build-cleanup.png)
+The checked terminal examples show the current layout at [80 columns](../crates/tui/tests/frames/cargo_tree_80x24.txt) and [200 columns](../crates/tui/tests/frames/cargo_tree_200x60.txt). Their fixture sizes illustrate the layout, not expected savings.
 
-Its sizes and ages are one observation of Swamp's own build directory, not expected savings for every project. Old `slop_livin` names are build artifacts left from the project's earlier name.
+| Group | What removal changes |
+|---|---|
+| Compiler caches | Discards incremental compiler state. Start here if a slower subsequent build is acceptable. |
+| Compiled tests & examples | Removes identified test executables and examples. Rebuild before rerunning; unrelated compiled dependencies are not selected. |
+| Build-script output | Scripts run again on a later build and may need external tools or network access. |
+| Inspect directories | Shows the same storage by physical path, including dependencies, final outputs and metadata; it is not another cleanup group. |
 
-| Group | In this screenshot | What removal changes |
-|---|---|---|
-| Compiler caches | 11.7 GB allocated, 617 groups | Discards incremental compiler state. Start here if a slower subsequent build is acceptable. |
-| Compiled tests & examples | 8.8 GB allocated, 206 groups | Removes identified test executables and examples. Rebuild before rerunning; unrelated compiled dependencies are not selected. |
-| Build-script output | 123.6 MB allocated under debug | Scripts run again on a later build and may need external tools or network access. |
-| Inspect directories | Another view of the profile's bytes | Shows the physical layout, including dependencies, final outputs and metadata. It is not another cleanup group or additional storage. |
+**Choose a group or individual members.** Space marks a cleanup group's exact supported members. → expands it; Compiled tests & examples splits into Tests and Examples, then individual members ordered by modification age. Backspace opens review for the marked selection, Enter confirms, and Esc cancels confirmation. Marking a fully marked group clears its marks. A failed member check rolls back newly added marks rather than silently selecting only part of the group. Review runs in the background and shows elapsed time. Cargo review checks payload metadata and small producer fingerprints without hashing compiled payloads.
 
-**Choose a group or individual members.** Space marks a cleanup group's exact supported members. → expands it; Compiled tests & examples splits into Tests and Examples, then individual members ordered by modification age. Backspace opens review for the marked selection, Enter confirms, and Esc cancels confirmation. Marking a fully marked group clears its marks. A failed member check rolls back newly added marks rather than silently selecting only part of the group. Stop builds before cleanup; marking can take time because it checks the selected contents.
+**Read age as a suggestion, not proof of disuse.** `Oldest 3d` means the oldest known modification age among the group's candidates, not that every member is three days old or has gone unused for three days. Expand to choose older members; selecting the collapsed group includes recent members too. Unknown age appears as `?`. The lower preview, when space permits, shows only its stated subset, not the full selection.
 
-**Read age as a suggestion, not proof of disuse.** `Oldest 3d` means the oldest known modification age among the group's candidates, not that every member is three days old or has gone unused for three days. Expand to choose older members; selecting the collapsed group includes recent members too. Unknown age appears as `?`. The lower preview shows only the stated subset—31 of 617 in this screenshot—not the full selection.
+**Do not add all the displayed sizes.** A `*` marks allocated bytes, which can count shared hardlinks more than once. A nested profile can therefore show more allocated bytes than a containing target measured on a different accounting basis. Parent rows include their children, and Inspect directories repeats the same storage by path. A dash in a purpose group's Change column means no aggregate growth value is supplied, not zero growth.
 
-**Do not add all the displayed sizes.** A `*` marks allocated bytes, which can count shared hardlinks more than once. That is why debug can show 34.5 GB while the containing build target shows 30.1 GB on a different accounting basis. Parent rows include their children, and Inspect directories repeats the same storage by path. A dash in a purpose group's Change column means no aggregate growth value is supplied, not zero growth.
-
-**Candidates are not guaranteed free space.** The debug profile's 20.7 GB candidate total covers supported cleanup members, not all debug output. Missing groups or “Selective cleanup unsupported” describe Swamp's action support, not a requirement to retain those files. Final outputs and the remaining compiled dependencies have no selective cleanup rule; each is marked on its own row. Space or Backspace on a profile reviews all supported cleanup groups beneath it, not the entire profile directory. Use the candidate total, not the profile's full size, to understand that selection.
+**Candidates are not guaranteed free space.** A profile's candidate total covers supported cleanup members, not all its output. Missing groups or “Selective cleanup unsupported” describe Swamp's action support, not a requirement to retain those files. Final outputs and the remaining compiled dependencies have no selective cleanup rule; each is marked on its own row. Space or Backspace on a profile reviews all supported cleanup groups beneath it, not the entire profile directory. Use the candidate total, not the profile's full size, to understand that selection.
 
 Cleanup moves supported filesystem groups to Trash; those bytes are not immediately freed. Emptying Trash later may reclaim space, but surviving hardlinks and filesystem snapshots can limit the result. Source files and unrelated dependency artifacts are outside these purpose-based selections. Protection is checked when marking, and Cargo's advisory lock is held during removal. There is no post-mark occupancy veto or separate approval grant.
 
 ### Progress and cancellation
 
-Marking runs review checks in the background. After you confirm, a **Deleting**
-bar shows processed/total groups, successful and refused counts, elapsed time,
-and the current path. It measures groups processed, not bytes freed. Review and
-deletion keep the terminal responsive; additional actions wait until they finish.
+Review and removal run in the background. The status rows show elapsed time and the item being processed; review reports checked items and names its open-file check stage. A Trash move shows processed items and selected bytes processed, not measured free space. The table stays in place, and additional actions wait until the operation finishes.
 
 **Esc or Ctrl-C stops after the current group.** Swamp finishes that group's
 check or move and records its outcome before stopping. Completed moves remain in
@@ -1464,7 +1444,7 @@ and does not delete anything. Ctrl-C exits when no operation is running.
 
 The Rust text view shows the largest 30 units per container by default; add `--all` for the full list. Category totals include their children: do not sum them. A category is not an individual cleanup selection. Report JSON includes the same guidance under each nested row's `cleanup` field.
 
-There is no `swamp cleanup-check` command any more. Report and inspection commands do not remove scanned data; `observe` writes report state. To act on a Cargo purpose group, open the TUI's Rust view, mark the group (Space), read its current facts on the confirm banner (Backspace), and press Enter -- the group's exact member list (selected build output plus its `.d`/`.dSYM` companions) moves together into one Trash envelope with a restore manifest. Cargo's advisory lock is held for the duration of the move (so a concurrent `cargo build` does not race it), not as a "did anything change" check.
+There is no `swamp cleanup-check` command any more. Report and inspection commands do not remove scanned data; `observe` writes report state. To act on a Cargo purpose group, open the project's folders in the TUI, mark the group (Space), read its current facts in review (Backspace), and press Enter -- the group's exact member list (selected build output plus its `.d`/`.dSYM` companions) moves together into one Trash envelope with a restore manifest. Cargo's advisory lock is held for the duration of the move (so a concurrent `cargo build` does not race it), not as a "did anything change" check.
 
 The CLI's *text* rendering applies `--filter` only to the root `--view worktrees` output; it does not filter the builds view, project drill-down, or overview text. For a filter that narrows every row, add `--json`: see below and [the agent interface](#agent-interface).
 
@@ -1522,29 +1502,29 @@ Images, volumes, and build-cache records join to projects using Compose metadata
 
 ## Cleanup and recovery
 
-**Swamp reports; the human removes.** `swamp report` and its views read stored facts. `observe` writes observations, history, and enrichment; `protect add/remove` writes a keep-list, while `protect list` reads it. Configuration and scheduling commands can also write state. Removal is a separate TUI flow: Space marks a row, Backspace shows its current facts, Enter moves filesystem selections to the Trash. Docker image/volume removal uses Docker and has no Trash recovery. Checkouts and linked worktrees can be selected as well as artifacts and Cargo groups. Dirty, unpushed, and untracked facts are shown on the confirm banner for judgment; they do not block removal.
+**Swamp reports; the human removes.** `swamp report` and its views read stored facts. `observe` writes observations, history, and enrichment; `protect add/remove` writes a keep-list, while `protect list` reads it. Configuration and scheduling commands can also write state. Removal is a separate TUI flow: Space marks a row, Backspace shows its current facts, Enter moves filesystem selections to the Trash. Docker image/volume removal uses Docker and has no Trash recovery. Checkouts and linked worktrees can be selected as well as artifacts and Cargo groups. Dirty, unpushed, and untracked facts are shown in removal review for judgment; they do not block removal.
 
-A project action expands to its actionable artifact rows. If it has none, a direct project action can offer the checkout. Bulk marking with `A` skips that fallback. The `ignored` and `untracked` remainder totals cover scattered files, so those summary buckets are not themselves deletion units.
+A project action expands to its actionable artifact rows. If it has none, a direct project action can offer the checkout. Bulk review with `A` skips that fallback. The `ignored` and `untracked` remainder totals cover scattered files, so those summary buckets are not themselves deletion units.
 
-**What you see and own, you may move to Trash.** Every row with a real folder or file behind it can be marked: a Reclaim unit and each folder listed under it, an External unit and its folders, a store-interior folder, a measured folder in the Disk views, a build folder no cleanup rule covers, a config or credentials file an AI tool keeps. The category, the location and what swamp does not know are **lines on the confirm, never a refusal**: local state and models say they cannot be regenerated, an installation says its tool will still list it (and, where swamp runs the tool's own removal, names that command), the whole `~/Library/Caches` says it is the folder every app keeps its cache in, Claude session scratch says a running session breaks, a size with a coverage gap says it is a lower bound, a path outside your home says the system may refuse, "last used: no record" and "regeneration cost not established" say what swamp could not find, and a process holding a file open is named (or "could not be checked"). The review groups common warnings once and names item-specific exceptions. Press `l` to inspect every exact path and size. The inventory is optional; Enter confirms from the primary summary after its warning content has been displayed.
+**What you see and own, you may move to Trash.** Every row with a real folder or file behind it can be marked: a Reclaim unit and each folder listed under it, a Tool storage unit and its folders, a store-interior folder, a measured folder in the Disk views, a build folder no cleanup rule covers, a config or credentials file an AI tool keeps. The category, the location and what swamp does not know are **lines on the confirm, never a refusal**: local state and models say they cannot be regenerated, an installation says its tool will still list it (and, where swamp runs the tool's own removal, names that command), the whole `~/Library/Caches` says it is the folder every app keeps its cache in, Claude session scratch says a running session breaks, a size with a coverage gap says it is a lower bound, a path outside your home says the system may refuse, "last used: no record" and "regeneration cost not established" say what swamp could not find, and a process holding a file open is named (or "could not be checked"). The review groups common warnings once and names item-specific exceptions. Press `l` to inspect every exact path and size. The inventory is optional; Enter confirms from the primary summary after its warning content has been displayed.
 
 The only reasons swamp refuses, each stated on screen:
 
 1. **Not a real deletable folder or file**: gone, a socket or device, not an absolute path, a `.` or `..` in it, a daemon's record rather than a path (a Docker build-cache record, an `ignored`/`untracked` aggregate, a category total, a remainder row), or a folder the walk could not read.
 2. **The OS refuses**: permission denied, a protected system path, a different filesystem. The OS error is the reason.
 3. **The plan changed**: the target changed since you marked it (a symlink swapped in for the folder, a different folder renamed into place, a path that now resolves elsewhere). Nothing moves and the mark stays.
-4. **The ledger cannot be written**: a `started` row is written before a Reclaim/External move, so a store swamp cannot write means nothing moves.
+4. **The ledger cannot be written**: a `started` row is written before a Reclaim/Tool storage move, so a store swamp cannot write means nothing moves.
 5. **Overlapping marks**: a folder and one inside it cannot both be marked.
 6. **Your own `swamp protect` mark**: `protected by you (...); swamp protect remove <entry> takes the mark off`, where `<entry>` is the keep entry that covers the row (it may be a folder above or below it, not the row's own path). `swamp protect remove` on a path that matches no entry now says `nothing matched`.
 7. **Swamp's own ledger or the Trash**: a folder that is, or holds, swamp's store (the one `SWAMP_DIR` names included) or the Trash the move goes into cannot be moved by swamp, because the move is recorded in that ledger: `this holds swamp's own ledger, which records this move; move it yourself in Finder if you want it gone`. A protect list that cannot be read is not an empty list and does not block you: the confirm says `could not read your protect list ... your keep marks were not checked`.
 
 Facts read when you mark a row: what it contains (a folder above known units says how many and which, your whole Library, the system temp folder, Homebrew's whole prefix, a mounted volume's root, the folder swamp was started in), mounted volumes inside it (their bytes live on the disk images, so moving it frees about nothing), a git checkout at it or one level below, a file with other hard links, the Trash on another volume (swamp never copies, so that move is refused), and what holds it open. Enter re-reads the entry and what holds it open, and refuses with "changed since review" if either is different. A failed move leaves a `failed:` ledger row with the OS error, never a `started` row. Two folders with the same name can move in one confirm. Control and invisible characters in a folder name are shown escaped.
 
-A symlink itself can be moved (the link, never its target). The Reclaim, External and Disk rows use the same review: Space marks (and says why if not), Backspace opens the confirm (it never acts directly), Enter confirms, Esc cancels; no other key acts while the confirm is open. `A` marks each top-level unit once; a folder listed under a unit, a path no cleanup rule covers, and what swamp keeps by default are marked one at a time with Space. Moving a folder out of a unit takes its bytes off the unit on screen at once; the next observation remeasures. The result line says "Sizes are from the last observation" and that space is freed when the Trash is emptied. Other Trash moves (artifact rows, worktrees, Cargo groups, agent units) are not re-derived between marking and Enter, and Enter refuses only for an ordinary OS error. Tool-managed removal (below) has no Trash and keeps its review-to-`Y` recheck of the facts you were shown.
+A symlink itself can be moved (the link, never its target). The Reclaim, Tool storage and Disk rows use the same review: Space marks (and says why if not), Backspace opens the confirm (it never acts directly), Enter confirms after the summary has been displayed, and Esc cancels. Navigation scrolls the review; `l` opens its optional inventory, where Enter is disabled. `A` reviews each eligible top-level unit once; a folder listed under a unit, a path no cleanup rule covers, and what swamp keeps by default are marked one at a time with Space. Moving a folder out of a unit takes its bytes off the unit on screen at once; the next observation remeasures. The result line says "Sizes are from the last observation" and that space is freed when the Trash is emptied. Other Trash moves (artifact rows, worktrees, Cargo groups, agent units) are not re-derived between marking and Enter, and Enter refuses only for an ordinary OS error. Tool-managed removal (below) has no Trash and keeps its review-to-`Y` recheck of the facts you were shown.
 
 ### Tool-managed removal: mise versions and simulator runtimes
 
-Installs that Trash would break are removed by their own manager, permanently, and only from the TUI. In the external view, Backspace on the mise installs row or a simulator runtimes row (the row says `removed by mise itself · Backspace`) opens that manager's own list: mise's installed versions (marked "mise reports prunable" where mise's own prune says so), or the simulator runtimes `simctl` lists with its size and last-use record. Nothing is read from a manager until that key press. Enter on an item reviews it:
+Mise versions and simulator runtimes offer the manager's own removal command, permanently, from the TUI. In Tool storage or Reclaim, Backspace on an unmarked manager row with no pending marks opens that manager's list: mise's installed versions (marked "mise reports prunable" where mise's own prune says so), or the simulator runtimes `simctl` lists with its size and last-use record. Nothing is read from a manager until that key press. Enter on an item reviews it:
 
 1. The manager's list is read again, and swamp's refusals run (below).
 2. The manager's **own dry run** runs with the exact command plus its dry-run flag: `mise -C / uninstall --dry-run <tool>@<version>` or `xcrun simctl runtime delete <UUID> --dry-run`.
@@ -1572,7 +1552,7 @@ Refusals (a removal that would not be the removal you reviewed, or a manager tha
 | Anything changed between the confirm and `Y`, including any warning that appeared, disappeared or changed (swamp reviews everything again when you press `Y`) | swamp runs only what that re-review still shows; a change in the milliseconds between that re-review and the command starting is not seen |
 | The confirm does not fit the terminal, or was never drawn | `Y` runs nothing it has not shown in full |
 
-A mise install folder or simulator runtime can also be marked with Space and moved to Trash like any other folder; the confirm says the manager will not know it is gone. Backspace on a row that is not marked opens the manager's own list.
+A mise install folder or simulator runtime can also be marked with Space and moved to Trash like any other folder; the confirm says the manager will not know it is gone. Backspace opens the manager's own list only when that row is unmarked and there are no pending marks. With a marked selection, return to a marked row to review it; the footer names the action available on the current row.
 
 The confirm names how many simulator devices use a runtime and which, and they stop working until you create them again. When simctl shows no Xcode Previews device set the confirm says other device sets are not visible to swamp. A manager version other than the one swamp was tested against (mise 2026.9.15, xcrun 72) is a warning on the confirm. The manager is resolved from a fixed list of directories (never `PATH`); a candidate that exists but is not owned by you or root, or is writable by others, refuses rather than falling through to another. A directory swamp runs a program from must be owned by you or root and not writable by everyone; it may be group-writable only for the macOS `admin` group, because admin members can already use sudo, so this grants no power they lack (standard Homebrew on Apple Silicon keeps `/opt/homebrew/bin` that way). Any other group, any other owner, or any group-write on Linux refuses, and the refusal names the group ("/opt/homebrew/bin is writable by group staff"). The program file itself must still be owned by you or root and not group- or world-writable. Its environment is built from nothing (`HOME`, a fixed `PATH`, `NO_COLOR=1`, `LC_ALL=C`, pagers off), from `/`. mise gets only its own directory settings (`MISE_DATA_DIR`, `MISE_CONFIG_DIR`, `MISE_CACHE_DIR`, `MISE_STATE_DIR`, `MISE_GLOBAL_CONFIG_FILE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`), the same ones its detector and swamp's manager probe honor; xcrun gets `DEVELOPER_DIR` only when it is a real directory owned by you or root, not writable by others, holding a trusted `simctl` (otherwise the confirm says "DEVELOPER_DIR ignored"). Two swamp instances are not locked against each other for the removal itself: if both confirm the same removal, the second run finds nothing to remove (the manager does nothing, or errors). The ledger is locked: every write takes an advisory lock beside it (`ledger.lock`, waiting up to 10 s), so neither instance loses the other's row. The `started` row is written before anything moves or runs: a ledger that stays locked means it cannot be written, so nothing moves. The final row comes after the move, so if the ledger is locked then, the item is gone and only the `started` row remains to say what was about to happen (the result line says so plainly). Within one swamp, removals run one at a time. A removal still running is not stopped by Esc or Ctrl-C: a manager killed halfway can leave a half-removed install; after 10 minutes it is killed and reported as not finished, and never retried.
 
@@ -1627,17 +1607,7 @@ structs), and `--view kinds`/`--view builds`/`--view deps`/
 `--view unowned`/`--view worktrees`/`--view docker` (each row's own
 evidence; a `kinds` bucket, which aggregates many rows into one, carries
 the concatenation of all of them; a `worktrees` row carries its own
-`Source` row's evidence). The interactive CLI text output
-(`--view external`) prints one line per fact; so does the TUI's
-selected-row detail area, ordered activity/consumer/current-use/
-recovery/reclaimability so a narrow terminal shows the most
-decision-relevant facts first, and the TUI's inline delete-confirmation
-row adds a short warning for a declared consumer, current use, or an
-uncertain recovery/reclaimability fact next to the existing git-status
-warnings. Marking a row in the TUI snapshots its report-row evidence
-plus a fresh current-use reading at that moment; the confirm banner
-shows that reading as a fact, and Enter does not re-take it -- there is
-no second check between marking and moving.
+`Source` row's evidence). The CLI text output (`--view external`) prints one line per fact. TUI selected details prioritize current use, recovery, sharing and unknowns; removal review groups shared warnings and item-specific exceptions. Marking adds a fresh current-use check to the stored evidence. Reclaim, Tool storage and Disk path moves recheck the entry and current use at Enter, refusing changed facts; other Trash moves retain the reviewed facts. Manager removal rechecks at `Y`.
 
 Tool-version declarations (#56) and dependency-lockfile/shared-store
 associations (#57) are wired live into the report/external-unit

@@ -40,15 +40,7 @@ known worktree, recomputed every pass), and `protected`
 (true for credentials/config/skills/automation by default, or anything
 a human added with `swamp protect`).
 
-Only two categories are markable in the TUI: **caches/logs** (a whole
-category directory, recoverable Trash move -- regenerated automatically
-by the tool) and **sessions** (the exact transcript + its linked
-recovery material, moved together -- this discards unique
-resume/rewind/checkpoint history, never the linked project's own
-files). Everything else -- config swamp keeps by default, plugins
-outside their own `.trash` staging area, attachments, unclassified --
-has no swamp rule; a person can still mark it one row at a time, and the
-confirm says what the tool loses.
+Supported cleanup rules cover caches/logs (a category directory the tool can regenerate) and sessions (the transcript with linked recovery material). Session removal discards unique resume/rewind/checkpoint history, never the linked project’s files. Config kept by default, plugins outside their own `.trash` staging area, attachments and unclassified paths can be selected individually; their review says what the tool loses. `A` skips kept-by-default units and those without a cleanup rule, while reviewing eligible rows across the full current list, including off-screen rows.
 
 A project's linked agent storage is also visible from the project tree
 itself, not only `--view agents`: `swamp report --project <name>` (text
@@ -65,11 +57,8 @@ swamp protect remove <path>
 
 ## Removing agent-storage units: TUI only
 
-There is no CLI command that removes an agent-storage unit -- explain
-what a unit is and what removing it would cost, and point the human at
-the TUI: open `report --view agents`'s TUI equivalent, mark the unit
-(Space), read its current facts on the confirm banner (Backspace,
-naming the linked project and what history is lost), and press Enter.
+There is no CLI command that removes an agent-storage unit. Point the human to Agent storage in the TUI: `2`, then `v` three times. Space marks the unit; Backspace opens review, naming the linked project and history lost. Enter confirms after the primary summary has been displayed. `l` opens the optional path/member inventory; Esc returns to the summary, or cancels from there. See [terminal controls](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls).
+
 A session removal that partially fails (some members moved, then a
 later one could not be) leaves a `restore.json` manifest inside its
 Trash envelope naming exactly which member moved where.
@@ -78,7 +67,7 @@ If a unit cannot be marked, the TUI's footer names the exact reason
 (`protected by you: ...` for the person's own `swamp protect` mark, or a
 path that is gone) -- relay it verbatim, never as "unsafe" or "can't be
 deleted". The other facts (kept by default, no rule for the category, a
-database-like file) are warnings on the confirm, not refusals.
+database-like file) are warnings in review, not refusals.
 
 ## Full reference
 
@@ -89,6 +78,6 @@ verified against, and every documented gap (Oh My Pi's shared-blob GC
 and OpenCode's snapshot/`storage/part` actions are both deliberately out
 of scope; Gemini CLI's project id is one-way). Twelve of the fourteen
 rows are `supported`; **Cursor and Windsurf are `unverified`** -- their
-units are identified and measured, but no action is offered and project
+units are identified and measured, but no supported cleanup rule is offered and project
 linkage is reported `unresolved`, because no primary source confirms the
 layout those adapters model.
