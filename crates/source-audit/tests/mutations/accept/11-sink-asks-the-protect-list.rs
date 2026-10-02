@@ -8,5 +8,5 @@ fn sweep_accept_protected(
     p: &std::path::Path,
 ) -> anyhow::Result<Option<crate::protection::Conflict>> {
     let list = crate::protection::load_protect(store)?;
-    Ok(list.conflict(p).map(|c| c.entry.display().to_string()))
+    Ok(list.conflict(p))
 }
