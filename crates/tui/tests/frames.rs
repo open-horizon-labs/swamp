@@ -739,7 +739,7 @@ fn evidence_detail_area_frames() {
             "modification evidence must remain available"
         );
         assert!(
-            frame.contains("Used by 2 projects: mole, swamp"),
+            frame.contains("Projects: mole, swamp"),
             "multiple consumers must both be visible: {frame}"
         );
         assert!(

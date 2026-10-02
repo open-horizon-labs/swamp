@@ -64,13 +64,11 @@ fn sentence(e: &Evidence) -> Option<String> {
             Some("May be the only copy: nothing else has this.".into())
         }
         (FactKind::Consumer, FactStatus::Known(FactValue::Text(who))) => {
-            Some(format!("Used by {who}."))
+            Some(format!("Used by: {who}"))
         }
-        (FactKind::Consumer, FactStatus::Known(FactValue::List(who))) => Some(format!(
-            "Used by {} projects: {}.",
-            who.len(),
-            who.join(", ")
-        )),
+        (FactKind::Consumer, FactStatus::Known(FactValue::List(who))) => {
+            Some(format!("Projects: {}", who.join(", ")))
+        }
         (FactKind::Activity, FactStatus::Known(FactValue::Timestamp(t))) => {
             let age = age_label(Some(e.observed_at.saturating_sub(*t)));
             Some(if age == "<1m" {
@@ -145,9 +143,28 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
             .filter(|e| e.kind == FactKind::Reclaimability)
             .filter_map(sentence),
     );
+    if !out.iter().any(|line| line.starts_with("Projects:")) {
+        out.extend(row.detail_lines.iter().filter_map(|line| {
+            line.strip_prefix("Declared consumers: ")
+                .map(|names| format!("Projects: {names}"))
+        }));
+    }
     out.extend(sharing.iter().cloned());
+    // Enrichment has its own line, rather than competing with the item name.
+    out.extend(
+        row.detail_lines
+            .iter()
+            .filter(|line| line.starts_with("Model:"))
+            .cloned(),
+    );
     // Recorded use belongs before bookkeeping and generic advice.
     out.extend(row.last_used.iter().cloned());
+    out.extend(
+        row.detail_lines
+            .iter()
+            .filter(|line| line.starts_with("Storage:"))
+            .cloned(),
+    );
     let mut unknown: Vec<&str> = Vec::new();
     for e in &facts {
         if matches!(
@@ -171,14 +188,22 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
             .cloned(),
     );
     if !row.signals.is_empty() {
-        out.extend(row.signals.iter().cloned());
+        out.extend(
+            row.signals
+                .iter()
+                .filter(|line| {
+                    !(row.last_used.is_some()
+                        && (line.starts_with("last used ") || line.starts_with("last read ")))
+                })
+                .cloned(),
+        );
     } else if let Some(text) = row.kind.as_ref().and_then(what_it_is) {
         out.push(text.to_string());
     }
     out.extend(
         row.detail_lines
             .iter()
-            .filter(|line| !line.starts_with("Removal:") && line.starts_with("what it is:"))
+            .filter(|line| line.starts_with("what it is:"))
             .cloned(),
     );
     if let Some(unit) = &row.unit {
@@ -195,7 +220,11 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
     out.extend(
         row.detail_lines
             .iter()
-            .filter(|line| !line.starts_with("Removal:") && !line.starts_with("what it is:"))
+            .filter(|line| {
+                !["Removal:", "what it is:", "Model:", "Storage:"]
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            })
             .cloned(),
     );
     out.extend(
@@ -372,6 +401,24 @@ mod tests {
                 "Path: /Users/me/.cargo"
             ]
         );
+    }
+
+    #[test]
+    fn enrichment_and_sourced_use_do_not_compete_with_duplicate_signals() {
+        let mut row = Row::leaf(1, "org/model".into(), 1_900_000, None);
+        row.unit = Some(crate::units::UnitId("/cache/models--org--model".into()));
+        row.last_used = Some("Last used: Sep 29 (file access time)".into());
+        row.signals = vec!["last used Sep 29 (file access time)".into()];
+        row.detail_lines = vec![
+            "Model: whisper · 241.7M params · float32".into(),
+            "Storage: 968.9MB including shared blobs · Folder: 1.9MB".into(),
+        ];
+        let rendered = lines(&row, &[]);
+        assert_eq!(rendered.len(), 4);
+        assert!(rendered[0].starts_with("Model:"));
+        assert!(rendered[1].starts_with("Last used:"));
+        assert!(rendered[2].starts_with("Storage:"));
+        assert!(rendered[3].starts_with("Path:"));
     }
 
     #[test]

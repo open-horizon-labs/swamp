@@ -1205,9 +1205,8 @@ fn family_member_row(
     if u.adapter.as_deref() == Some("model-stores")
         && let Some(m) = swamp_core::build_adapters::model_stores::model_row_of(u, observed_at)
     {
-        if let Some(a) = &m.about {
-            row.label = format!("{} · {a}", row.label);
-        }
+        row.label = m.name.clone();
+        row.table_note = model_summary(&m);
         row.last_used = Some(format!("Last used: {}", m.last_read));
         row.detail_lines.extend(model_detail_lines(&m));
     }
@@ -2302,6 +2301,32 @@ pub fn external_rows_with(
             u.growth_bytes,
         );
         row.evidence = u.evidence.clone();
+        let projects: Vec<String> = u
+            .evidence
+            .iter()
+            .filter_map(|e| match (&e.kind, &e.status) {
+                (
+                    swamp_core::evidence::FactKind::Consumer,
+                    swamp_core::evidence::FactStatus::Known(swamp_core::evidence::FactValue::List(
+                        names,
+                    )),
+                ) => Some(names.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        if !projects.is_empty() {
+            row.table_note = Some(format!("Projects: {}", projects.join(", ")));
+        } else if !u.consumers.is_empty() {
+            row.table_note = Some(format!(
+                "Projects: {}",
+                u.consumers
+                    .iter()
+                    .map(|c| c.label.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         row.detail_lines.push(format!("Source: {detector}"));
         row.detail_lines.push(if u.consumers.is_empty() {
             "Consumers: none declared".to_string()
@@ -2481,11 +2506,22 @@ fn unlisted_models<'a>(
 /// One model that is not a folder row: its name and what it is, its
 /// size (its layers, also inside `blobs/` above), and the detail pane's
 /// facts. Marks its own path (the manifest).
+fn model_summary(m: &swamp_core::build_adapters::model_stores::ModelRow) -> Option<String> {
+    let about = m.about.as_ref()?;
+    let parts: Vec<_> = about.split(" · ").collect();
+    // Task tags can be long; architecture, parameter count and precision
+    // answer what this download contains. Keep the full task in details.
+    Some(
+        if parts.len() > 3 && parts.iter().any(|part| part.contains(" params")) {
+            parts[1..].join(" · ")
+        } else {
+            about.clone()
+        },
+    )
+}
+
 fn model_tag_row(m: &swamp_core::build_adapters::model_stores::ModelRow, last: bool) -> Row {
-    let label = match &m.about {
-        Some(a) => format!("{} · {a}", m.name),
-        None => m.name.clone(),
-    };
+    let label = m.name.clone();
     let mut row = Row::leaf(1, label, m.bytes, None);
     row.rail = if last {
         "└─ ".into()
@@ -2494,10 +2530,8 @@ fn model_tag_row(m: &swamp_core::build_adapters::model_stores::ModelRow, last: b
     };
     row.allocated = true;
     row.cleanup_summary = Some(m.regeneration.clone());
-    row.signals = vec![
-        format!("last read {}", m.last_read),
-        "its layers are the bytes of blobs/ above, not more".to_string(),
-    ];
+    row.signals = vec!["Layers remain in blobs/ when this tag moves to Trash.".into()];
+    row.table_note = model_summary(m);
     row.last_used = Some(format!("Last used: {}", m.last_read));
     row.detail_lines = model_detail_lines(m);
     row.unit = Some(UnitId::for_artifact(std::path::Path::new(&m.path)));
@@ -2510,8 +2544,10 @@ fn model_tag_row(m: &swamp_core::build_adapters::model_stores::ModelRow, last: b
 /// about its bytes. Stored facts only; nothing is read here.
 fn model_detail_lines(m: &swamp_core::build_adapters::model_stores::ModelRow) -> Vec<String> {
     let mut out = vec![format!(
-        "what it is: {}",
-        m.about.as_deref().unwrap_or("no field stated in its files")
+        "Model: {}",
+        model_summary(m)
+            .as_deref()
+            .unwrap_or("no field stated in its files")
     )];
     if let Some(c) = &m.card {
         out.push(format!("card: {c}"));
@@ -2528,7 +2564,6 @@ fn model_detail_lines(m: &swamp_core::build_adapters::model_stores::ModelRow) ->
     if let Some(r) = &m.revisions {
         out.push(r.clone());
     }
-    out.push(format!("last read: {}", m.last_read));
     out.push(format!("regeneration: {}", m.regeneration));
     match m.hub.as_deref() {
         Some("off") => out.push(swamp_core::hub_api::OFF_LINE.to_string()),
@@ -2551,23 +2586,16 @@ fn model_storage_context(
         None => "unmeasured".to_string(),
     };
     let has_shared_blobs = m.facts.iter().any(|fact| fact.contains("shared blobs/"));
-    let model_measure = format!("model {}", human_bytes(m.bytes));
-    let attribution = if has_shared_blobs {
-        "incl. shared blobs"
-    } else {
-        "attributed total"
-    };
-    let signal = format!("{model_measure} {attribution} · folder {folder}");
+    let model_measure = human_bytes(m.bytes);
     let detail = if has_shared_blobs {
-        format!(
-            "Model attribution: {}; repo folder path (the Size column): {folder}. The model figure includes shared-blob bytes, which are also shown in blobs/ and are not additive.",
-            human_bytes(m.bytes)
-        )
+        format!("Storage: {model_measure} including shared blobs · Folder: {folder}")
     } else {
-        format!(
-            "Model attribution: {}; repo folder path (the Size column): {folder}.",
-            human_bytes(m.bytes)
-        )
+        format!("Storage: {model_measure} · Folder: {folder}")
+    };
+    let signal = if has_shared_blobs {
+        "Weights stay in shared blobs".to_string()
+    } else {
+        "Download again".to_string()
     };
     (signal, detail)
 }
@@ -2579,7 +2607,8 @@ fn add_model_storage_context(
     partial: bool,
 ) {
     let (signal, detail) = model_storage_context(m, folder_bytes, partial);
-    row.signals.insert(0, signal.clone());
+    row.signals.clear();
+    row.table_note = model_summary(m);
     row.detail_lines.push(detail);
     row.cleanup_summary = Some(format!("{signal} · {}", m.regeneration));
 }
@@ -2638,10 +2667,7 @@ fn unit_child_rows(
                     // The repo id reads better than `models--org--name`;
                     // keep the folder scope explicit because the Size
                     // column is the folder allocation, not the model total.
-                    row.label = match &m.about {
-                        Some(a) => format!("folder: {} · {a}", m.name),
-                        None => format!("folder: {}", m.name),
-                    };
+                    row.label = m.name.clone();
                     add_model_storage_context(
                         &mut row,
                         m,
@@ -2747,11 +2773,11 @@ pub fn reclaim_rows(
             .map(|(i, c)| reclaim_child_row(&r.path, c, &r.models, i + 1 == count))
             .collect();
         let first = children.len();
-        children.extend(
-            tags.iter()
-                .enumerate()
-                .map(|(i, m)| model_tag_row(m, first + i + 1 == count)),
-        );
+        children.extend(tags.iter().enumerate().map(|(i, m)| {
+            let mut row = model_tag_row(m, first + i + 1 == count);
+            row.table_note = None;
+            row
+        }));
         row.expandable = true;
         row.expansion_key = Some(key);
         row.rail = if open { "▾ ".into() } else { "▸ ".into() };
@@ -2838,7 +2864,7 @@ fn reclaim_child_row(
                 )
         })
     {
-        row.label = format!("folder: {}", row.label);
+        row.label = m.name.clone();
         add_model_storage_context(
             &mut row,
             m,
@@ -2846,6 +2872,8 @@ fn reclaim_child_row(
             c.measure == swamp_core::drilldown::ChildMeasure::Partial,
         );
         row.detail_lines.extend(model_detail_lines(m));
+        // Reclaim's column answers "If removed"; metadata belongs in the pane.
+        row.table_note = None;
     }
     // One folder of the unit can be marked like the unit; a row that is
     // not a folder says so here, where the keys that would act are not

@@ -178,11 +178,7 @@ fn open_repo_row(a: &mut App) {
     let at = a
         .rows()
         .iter()
-        .position(|r| {
-            r.depth == 1
-                && r.label
-                    .starts_with("folder: mkrausio/EmoWhisper-AnS-Small-v0.1")
-        })
+        .position(|r| r.depth == 1 && r.label.starts_with("mkrausio/EmoWhisper-AnS-Small-v0.1"))
         .unwrap_or_else(|| {
             panic!(
                 "no repo row: {:?}",
@@ -203,8 +199,9 @@ fn external_repo_row_and_detail_say_what_the_model_is_at_80_and_120() {
     open_repo_row(&mut a);
     let row = &a.rows()[a.selected];
     assert!(
-        row.label
-            .contains("automatic-speech-recognition · whisper · 241.0K params · float32"),
+        row.table_note
+            .as_deref()
+            .is_some_and(|note| note.contains("whisper · 241.0K params · float32")),
         "{}",
         row.label
     );
@@ -222,11 +219,12 @@ fn external_repo_row_and_detail_say_what_the_model_is_at_80_and_120() {
         let s = frame(&a, w, h);
         assert!(s.contains("mkr"), "{w}x{h}:\n{s}");
         assert!(
-            s.contains("what it is: automatic-speech-recognition · whisper"),
-            "{w}x{h}:\n{s}"
+            s.contains("241.0K params · float32"),
+            "model metadata must survive at {w}x{h}:\n{s}"
         );
+        assert!(s.contains("Model: whisper"), "{w}x{h}:\n{s}");
         assert!(
-            s.contains("model 41KB attributed total") && s.contains("folder 41KB"),
+            s.contains("Storage: 41KB") && s.contains("Folder: 41KB"),
             "{w}x{h}:
 {s}"
         );
@@ -433,9 +431,7 @@ fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
             .rows()
             .iter()
             .position(|r| {
-                r.label.starts_with("folder:")
-                    && r.label.contains("shared")
-                    && r.signals.iter().any(|s| s.starts_with("model "))
+                r.label == "org/shared" && r.detail_lines.iter().any(|s| s.starts_with("Storage:"))
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -458,15 +454,15 @@ fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
             "model attribution is not the path size"
         );
         let storage_signal = repo_row
-            .signals
+            .detail_lines
             .iter()
-            .find(|s| s.starts_with("model "))
+            .find(|s| s.starts_with("Storage:"))
             .unwrap();
         assert!(storage_signal.contains(&swamp_tui::model::human_bytes(model.bytes)));
-        assert!(storage_signal.contains("incl. shared blobs"));
+        assert!(storage_signal.contains("including shared blobs"));
         assert!(storage_signal.contains(&swamp_tui::model::human_bytes(repo_row.bytes)));
         let detail = repo_row.detail_lines.join("\n");
-        assert!(detail.contains("not additive"), "{detail}");
+        assert!(detail.contains("including shared blobs"), "{detail}");
         assert!(
             detail.contains("moving this folder frees about")
                 && detail.contains("stays in the hub's shared blobs/"),
@@ -475,7 +471,7 @@ fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
         let narrow = frame(&a, 80, 24);
         let wide = frame(&a, 200, 60);
         assert!(
-            narrow.contains("folder:"),
+            narrow.contains("org/shared"),
             "{view_kind:?} narrow frame:\n{narrow}"
         );
         assert!(
@@ -502,7 +498,9 @@ fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
             .into_iter()
             .find(|r| {
                 r.label.contains("qwen3:0.6b")
-                    && r.label.contains("qwen3 · 751.63M params · Q4_K_M")
+                    && r.detail_lines
+                        .iter()
+                        .any(|line| line.contains("qwen3 · 751.63M params · Q4_K_M"))
             })
             .unwrap_or_else(|| {
                 panic!(
