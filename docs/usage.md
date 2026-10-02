@@ -685,6 +685,8 @@ An expanded repo-folder row keeps the physical folder allocation in the Size col
       moving this manifest frees none of its layers: the layers (522.7MB) stay in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses
 ```
 
+In the TUI, model rows show the repo or tag name without appending metadata to it. Select a row to see architecture, parameter count and precision on a dedicated **Model** line, followed by sourced last use and **Storage** (model bytes and the selected folder size). Tool storage also shows the metadata in Notes; Reclaim keeps **If removed** for removal consequences.
+
 - **What it is** comes only from files already on disk: the model card's YAML
   front matter (`pipeline_tag`, `library_name`, `license`, `base_model`, `tags`,
   `language`), `config.json` (`model_type`, `architectures`, `torch_dtype`), the

@@ -2332,8 +2332,12 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
             .into_iter()
             .enumerate()
             .map(|(i, l)| {
-                if i == 0 {
-                    Line::raw(l)
+                if i == 0
+                    || l.starts_with("Model:")
+                    || l.starts_with("Projects:")
+                    || l.starts_with("Used by:")
+                {
+                    Line::styled(l, Style::default().add_modifier(Modifier::BOLD))
                 } else {
                     Line::styled(l, Style::default().add_modifier(Modifier::DIM))
                 }

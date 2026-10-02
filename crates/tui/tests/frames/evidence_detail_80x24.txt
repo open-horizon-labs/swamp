@@ -15,7 +15,7 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"Used by 2 projects: mole, swamp.                                                "
+"Projects: mole, swamp                                                           "
 "Unknown: how to get it back.                                                    "
 "Installed dependencies. Installing again brings them back, usually over the net…"
 "Path: /Users/dev/src/mole/node_modules                                          "
