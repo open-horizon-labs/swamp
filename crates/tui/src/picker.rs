@@ -34,7 +34,7 @@ pub fn windows_for(history_secs: Option<u64>) -> Vec<String> {
         .map(|(label, _)| label.to_string())
         .collect();
     if !WINDOW_LADDER.iter().any(|(_, secs)| *secs == span) {
-        out.push(format!("all history ({})", human_span(span)));
+        out.push(format!("all history ({})", comparison_span(span)));
     }
     out
 }
@@ -54,19 +54,28 @@ pub fn window_secs(label: &str, history_secs: Option<u64>) -> u64 {
 /// A window label as the filter grammar spells it (`4h`, `7d`).
 pub fn window_filter_text(label: &str, history_secs: Option<u64>) -> String {
     if label.starts_with("all history") {
-        human_span(history_secs.unwrap_or(0))
+        format!("{}s", history_secs.unwrap_or(0))
     } else {
         label.to_string()
     }
 }
 
-pub fn human_span(secs: u64) -> String {
-    if secs >= 86_400 {
-        format!("{}d", secs / 86_400)
-    } else if secs >= 3_600 {
-        format!("{}h", secs / 3_600)
+/// Keep comparison labels coarse while marking a rounded period honestly.
+pub fn comparison_span(seconds: u64) -> String {
+    if seconds < 60 {
+        return "<1m".into();
+    }
+    let (unit, suffix) = if seconds >= 86_400 {
+        (86_400, "d")
+    } else if seconds >= 3_600 {
+        (3_600, "h")
     } else {
-        format!("{}m", (secs / 60).max(1))
+        (60, "m")
+    };
+    if seconds.is_multiple_of(unit) {
+        format!("{}{suffix}", seconds / unit)
+    } else {
+        format!("~{}{suffix}", seconds.saturating_add(unit / 2) / unit)
     }
 }
 pub const IDLES: &[&str] = &["off", "24h", "48h", "7d", "30d", "90d"];
@@ -406,7 +415,7 @@ impl Picker {
             Some(span) => format!(
                 "last {}   (history: {})",
                 self.windows[self.window_ix],
-                human_span(span)
+                comparison_span(span)
             ),
             None => "last —   (no observations yet)".to_string(),
         };
@@ -742,14 +751,25 @@ mod window_tests {
     use super::*;
 
     #[test]
+    fn comparison_periods_mark_rounding() {
+        assert_eq!(comparison_span(604_800), "7d");
+        assert_eq!(comparison_span(430_472), "~5d");
+        assert_eq!(comparison_span(15_000), "~4h");
+        assert_eq!(comparison_span(30), "<1m");
+    }
+
+    #[test]
     fn windows_never_exceed_the_history_the_store_holds() {
         // Four hours of observations: a week-long window would report
         // growth the tool never observed.
         let w = windows_for(Some(4 * 3_600 + 600));
-        assert_eq!(w, vec!["1h".to_string(), "all history (4h)".to_string()]);
+        assert_eq!(w, vec!["1h".to_string(), "all history (~4h)".to_string()]);
         assert!(!w.iter().any(|x| x == "7d" || x == "1y"));
-        assert_eq!(window_secs("all history (4h)", Some(15_000)), 15_000);
-        assert_eq!(window_filter_text("all history (4h)", Some(15_000)), "4h");
+        assert_eq!(window_secs("all history (~4h)", Some(15_000)), 15_000);
+        assert_eq!(
+            window_filter_text("all history (~4h)", Some(15_000)),
+            "15000s"
+        );
 
         // Exactly on a rung: no synthetic entry.
         let w = windows_for(Some(7 * 86_400));

@@ -91,6 +91,8 @@ Start with the question you want to answer:
 
 `Tab` / `Shift-Tab` change sections; `v` changes views within a section. Arrow keys, PgUp/PgDn and Home/End navigate. `?` opens scrollable help, and the bottom row names the keys available where you are. See the [full controls](docs/usage.md#terminal-controls).
 
+`Change 7d` names the period behind the numbers. Press `w` to choose a different period with the arrow keys, then Enter to apply or Esc to cancel. Swamp recalculates from stored observations; it does not scan your projects. If history is shorter than requested, the heading shows the available span, such as `Change ~5d`. Clearing the filter keeps the comparison period.
+
 Press `0` to clear the initial `growth > 100MB in 7d` filter and see projects that have not grown. `/` opens the filter form; `:` edits its expression. An invalid expression stays open for correction, and Esc restores the previous filter. Saved filter and sort choices take precedence on later runs.
 
 Tables shorten names and paths to make comparison easier; selected details and removal review retain exact paths and supporting facts. Reclaim keeps recovery costs beside sizes on narrow screens. An unread or unmeasured size is labelled, and a lower bound uses `≥`; neither becomes zero. Empty columns disappear, while a measured zero stays visible.

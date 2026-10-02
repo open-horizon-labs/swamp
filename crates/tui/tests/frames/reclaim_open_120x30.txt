@@ -1,4 +1,4 @@
-"observed just now · /Users/dev/src · change over 1w · 1 declared root                                                   "
+"observed just now · /Users/dev/src · change over 7d · 1 declared root                                                   "
 "Developer storage: 26.7GB across 2 projects and 4 tool locations                                                        "
 "disk ledger: not measured yet · 3 Disk for details                                                                      "
 "1 Projects  2 Tools  3 Disk                                                                                             "

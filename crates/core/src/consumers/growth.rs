@@ -189,7 +189,7 @@ impl Consumer for GrowthConsumer {
     }
 }
 
-fn add_nested_history_rows(
+pub(crate) fn add_nested_history_rows(
     projects: &mut [crate::report::ProjectRow],
     nested: &[crate::artifact::NestedArtifact],
     observed_at: u64,
@@ -240,7 +240,7 @@ fn add_nested_history_rows(
     paths
 }
 
-fn copy_nested_history(
+pub(crate) fn copy_nested_history(
     projects: &mut [crate::report::ProjectRow],
     nested: &mut [crate::artifact::NestedArtifact],
     paths: &[(String, std::path::PathBuf)],

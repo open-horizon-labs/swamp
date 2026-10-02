@@ -2339,6 +2339,7 @@ pub(crate) fn derive_report_views(
     swamp_dir: &Path,
     scope_key: &str,
     snapshot: &mut ReportSnapshot,
+    window_secs: Option<u64>,
 ) {
     let Some(run) = read_run_row(swamp_dir, scope_key) else {
         return;
@@ -2353,6 +2354,7 @@ pub(crate) fn derive_report_views(
             needs_reconciliation: run.unique_needs_reconciliation.unwrap_or(true),
         });
     let observed_at = run.observed_at;
+    let since_secs = window_secs.unwrap_or(run.since_secs);
     let roots: Vec<PathBuf> = snapshot
         .coverage
         .iter()
@@ -2394,14 +2396,28 @@ pub(crate) fn derive_report_views(
             })
             .filter(|p| !p.worktrees.is_empty())
             .collect();
+        let nested_paths = window_secs.map(|_| {
+            crate::consumers::add_nested_history_rows(
+                &mut mine,
+                &snapshot.report.nested_artifacts,
+                observed_at,
+            )
+        });
         let _ = annotate_readonly_before(
             swamp_dir,
             volume_id,
             &mut mine,
             observed_at,
             run.retention_days,
-            run.since_secs,
+            since_secs,
         );
+        if let Some(paths) = nested_paths {
+            crate::consumers::copy_nested_history(
+                &mut mine,
+                &mut snapshot.report.nested_artifacts,
+                &paths,
+            );
+        }
 
         // Directory and large-file rows: the volume's current tables,
         // growth from their history, then the same shaping the observe
@@ -2419,7 +2435,7 @@ pub(crate) fn derive_report_views(
             &mut dirs,
             observed_at,
             run.retention_days,
-            run.since_secs,
+            since_secs,
         );
         crate::report::attach_allocated_from_dirs(&mut mine, &dirs, &artifact_roots);
         dirs.retain(|row| !crate::report::dir_inside_artifact(row, &artifact_roots));
@@ -2440,7 +2456,7 @@ pub(crate) fn derive_report_views(
             &mut files,
             observed_at,
             run.retention_days,
-            run.since_secs,
+            since_secs,
         );
         for d in dirs {
             dirs_by_worktree
@@ -2487,7 +2503,7 @@ pub(crate) fn derive_report_views(
 
         // The sparkline history, exactly as `consumers/history.rs`
         // computed it for this root at observe time.
-        let asked = run.since_secs;
+        let asked = since_secs;
         let hist = history_span_secs(&vol, observed_at).unwrap_or(asked);
         let window = asked.min(hist).max(60);
         let (series, total) = history_series(&vol, window, 24, observed_at);

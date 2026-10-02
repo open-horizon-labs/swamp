@@ -74,21 +74,15 @@ fn draw_spark(frame: &mut Frame, series: &[Option<u64>], area: Rect) {
     );
 }
 
-/// The growth window the header reports. When the asked-for window is
-/// longer than the observations the store holds, the effective window is
-/// the history itself, and the label says so instead of implying a week
-/// of growth from four hours of data.
+/// The comparison window attached to the displayed values, independent
+/// of a cleared filter or a pending request for another period.
 fn since_label(app: &App) -> Option<String> {
-    let asked = crate::filter::growth_window_secs(&app.filter)?;
-    Some(match app.history_secs {
-        Some(hist) if hist < asked => format!(
-            "{} (asked {}; history is {})",
-            human_duration(hist),
-            human_duration(asked),
-            human_duration(hist)
-        ),
-        _ => human_duration(asked),
-    })
+    let seconds = if app.view.uses_filter() {
+        app.report.series_window_secs
+    } else {
+        app.stored_window_secs
+    };
+    (seconds > 0).then(|| crate::picker::comparison_span(seconds))
 }
 
 fn human_duration(secs: u64) -> String {
@@ -1077,6 +1071,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             });
         }
         fit_hints(&clauses, fw)
+    } else if app.change_period.is_some() {
+        fit_hints(&["←/→ period", "Enter apply", "Esc cancel"], fw)
     } else if let Some(picker) = &app.picker {
         if picker.field == 3 {
             fit_hints(
@@ -1155,6 +1151,32 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if let Some(p) = &app.picker {
         draw_picker(frame, app, p, size);
+    }
+    if let Some(p) = &app.change_period {
+        let width = size.width.min(64);
+        let height = size.height.min(6);
+        let popup = Rect::new(
+            size.x + (size.width - width) / 2,
+            size.y + (size.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let text = format!(
+            "Period: {}\nHistory available: {}\nRecalculates from stored observations.",
+            p.choices[p.selected],
+            crate::picker::comparison_span(app.history_secs.unwrap_or(0))
+        );
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Change period "),
+                ),
+            popup,
+        );
     }
     if let Some(sheet) = &app.tool_sheet {
         draw_tool_sheet(frame, sheet, size);
@@ -1624,9 +1646,9 @@ fn filter_clause(app: &App, width: usize) -> String {
             })
             .collect();
         let value = if app.filter_text.trim().is_empty() || app.filter_text == "0" {
-            "none"
+            "none".into()
         } else {
-            &app.filter_text
+            crate::filter::display_text(&app.filter_text)
         };
         if ignored.is_empty() {
             format!("filter: {value}")
@@ -1653,18 +1675,26 @@ fn filter_clause(app: &App, width: usize) -> String {
             format!("sort: {name}{}", if app.reverse { " reversed" } else { "" })
         }
     };
+    if width < 64 && app.view.uses_filter() {
+        return fit_clauses(&[title, filter, "w period".into()], width);
+    }
     // The current view always has a name. Only settings used by this view
     // are shown; purpose fills spare space instead of competing with them.
-    if !filter.is_empty() && crate::model::display_width(&format!("{title} · {filter}")) > width {
-        if width < 40 {
-            return clip_end(&title, width);
-        }
-        let short_title = clip_end(&title, width.saturating_sub(14).max(1));
-        return clip_end(&format!("{short_title} · {filter}"), width);
-    }
     fit_clauses(
         &[
             title,
+            if app.view.uses_filter() {
+                if width < 100 && matches!(app.view, V::Tree | V::Builds | V::Deps) {
+                    format!(
+                        "change: {} · w period",
+                        since_label(app).unwrap_or_else(|| "?".into())
+                    )
+                } else {
+                    "w change period".into()
+                }
+            } else {
+                String::new()
+            },
             filter,
             sort,
             if app.view == V::Tree {
@@ -1889,7 +1919,17 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         .max()
         .unwrap_or(10)
         .clamp(10, 16);
-    let fixed = size_width + 3 + if show_growth { 11 + bar_width } else { 0 };
+    let change_heading = since_label(app)
+        .map(|period| format!("Change {period}"))
+        .unwrap_or_else(|| "Change ?".into());
+    let growth_width = crate::model::display_width(&change_heading).max(10);
+    let fixed = size_width
+        + 3
+        + if show_growth {
+            growth_width + 1 + bar_width
+        } else {
+            0
+        };
     let flexible = width.saturating_sub(fixed);
     let signals_width = if !has_notes {
         0
@@ -1936,7 +1976,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         ),
         "Size",
         if show_growth {
-            format!("{:>10} ", "Change")
+            format!("{change_heading:>growth_width$} ")
         } else {
             String::new()
         },
@@ -2054,7 +2094,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
             }
         );
         let growth = format!(
-            "{:>10}",
+            "{:>growth_width$}",
             row.growth
                 .map(human_signed_bytes)
                 .unwrap_or_else(|| "—".into())
@@ -2386,6 +2426,11 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "inspect the selected project or folder",
     );
     entry(&mut out, "s / g", "sort by size / growth");
+    entry(
+        &mut out,
+        "w",
+        "change the comparison period using stored history",
+    );
     entry(&mut out, "/ / 0", "filter the list / clear the filter");
     entry(
         &mut out,

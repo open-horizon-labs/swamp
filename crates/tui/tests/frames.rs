@@ -415,7 +415,7 @@ fn fixture_report() -> Report {
         notes: vec![],
         series_by_key: Default::default(),
         total_series: Vec::new(),
-        series_window_secs: 0,
+        series_window_secs: 7 * 86_400,
         summary: Default::default(),
     }
 }
@@ -1260,7 +1260,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
     assert!(before.contains("1 Projects"), "{before}");
-    assert!(before.contains("Projects · filter:"), "{before}");
+    assert!(before.contains("Projects · w change period"), "{before}");
     assert!(before.contains("filter: none"), "{before}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
@@ -1273,7 +1273,7 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
-    assert!(back.contains("Projects · filter:"), "{back}");
+    assert!(back.contains("Projects · w change period"), "{back}");
 }
 
 #[test]
@@ -1779,6 +1779,36 @@ fn plain_unit(path: &str, bytes: u64) -> swamp_tui::actions::MarkedUnit {
         worktree: None,
         label: path.to_string(),
         warnings: Vec::new(),
+    }
+}
+
+#[test]
+fn change_column_names_its_actual_period_with_no_filter_and_in_the_picker() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.width = w;
+        app.height = h;
+        app.history_secs = Some(14 * 86_400);
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Change 7d"), "{frame}");
+        assert!(frame.contains("w change period"), "{frame}");
+        assert!(frame.contains("filter: none"), "{frame}");
+        check(&format!("change_period_{w}x{h}"), &frame);
+        app.change_period = Some(swamp_tui::app::ChangePeriod {
+            choices: vec!["24h".into(), "7d".into()],
+            selected: 0,
+        });
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Period: 24h"), "{frame}");
+        assert!(frame.contains("Enter apply"), "{frame}");
+        assert!(!frame.contains("0 clear"), "{frame}");
+        check(&format!("change_period_picker_{w}x{h}"), &frame);
+        app.change_period = None;
+        app.report.series_window_secs = 430_472;
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Change ~5d"), "{frame}");
+        assert!(!frame.contains("Change 7d"), "{frame}");
     }
 }
 
@@ -2968,7 +2998,8 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
     assert_eq!(app.view, ViewKind::Builds);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("Build outputs · filter:"), "{f}");
+    assert!(f.contains("Build outputs · change: 7d · w period"), "{f}");
+    assert!(f.contains("filter: none"), "{f}");
     app.set_view(ViewKind::Tree);
     assert_eq!(app.selected, at, "the tree cursor came back");
     // Esc to projects and back to the same project row.

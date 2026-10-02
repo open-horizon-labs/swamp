@@ -1313,7 +1313,7 @@ Below the list, the status area keeps your marked count and selected size visibl
 
 If Enter rejects a raw filter expression, keep typing to correct it or press Esc to restore the accepted expression. The previous filter, selection and marks stay in place until a valid expression is applied; invalid drafts are not saved.
 
-Size is measured storage; Change is the signed difference over the recorded comparison window. A `0B` change is measured zero, `—` is unknown, and `not read` or `not measured` is an unknown size. `≥` labels a lower bound where part of a group is unmeasured. A `*` marks allocated bytes that may count shared files again. None of these sizes promises freed disk space.
+Size is measured storage; `Change 7d` is the signed difference over seven days. In project views, press `w`, choose a period with the arrow keys, and Enter to apply or Esc to cancel. The choice is saved and recalculated from stored observations in the background. The heading keeps the previous period until its replacement is ready. Shorter available history is shown with a rounded span, such as `Change ~5d`; clearing the filter with `0` keeps the period. A `0B` change is measured zero, `—` is unknown, and `not read` or `not measured` is an unknown size. `≥` labels a lower bound where part of a group is unmeasured. A `*` marks allocated bytes that may count shared files again. None of these sizes promises freed disk space.
 
 At 80 columns, Build outputs, Dependencies, build drilldowns and Reclaim prioritize notes or recovery costs over Change. Disk views show Measurement rather than Change. Empty Notes/Change columns and all-zero bars are omitted. Where bars appear on wide terminals, red extends right for growth and green left for shrinkage; their logarithmic scale is shared across the full list, including off-screen rows. Human-readable numbers are rounded; use JSON when exact values matter.
 
@@ -1466,7 +1466,7 @@ Filesystem reconciliation and Docker accounting are separate. `--verify-du` adds
 
 Supported interfaces share the core parser, but apply predicates to their own row types. Combine predicates with spaces:
 
-Growth predicates filter the report's already-computed growth values. Their `in <duration>` clause does not currently recompute the baseline. For an explicit comparison, run `swamp observe --since <window>` before `report` (window moved to `observe`, R12). The TUI obtains its report window from configuration; changing the filter form's window can change the displayed label without changing those measurements.
+In the TUI, `in <duration>` and the filter form's period recalculate project growth from stored observations, just like `w`. CLI growth predicates filter already-computed values; use `swamp observe --since <window>` before `report` for a different CLI comparison. Periods cannot extend beyond available observations.
 
 | Expression | Meaning |
 |---|---|

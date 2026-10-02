@@ -643,6 +643,11 @@ pub struct App {
     /// Seconds of observation history the store holds; bounds the growth
     /// windows a human may pick (the store cannot answer beyond it).
     pub history_secs: Option<u64>,
+    pub change_period: Option<ChangePeriod>,
+    pub requested_window_secs: Option<u64>,
+    pub stored_window_secs: u64,
+    comparison_rx: Option<std::sync::mpsc::Receiver<Result<Report, String>>>,
+    comparison_observed_at: u64,
     /// git tracking status per absolute path, filled when a project is
     /// opened (one exclude stack per worktree, reused for its rows).
     pub track: std::collections::HashMap<PathBuf, swamp_core::ignore::TrackState>,
@@ -720,6 +725,11 @@ pub struct BlockedItem {
     pub name: String,
     pub reason: String,
     pub next: String,
+}
+
+pub struct ChangePeriod {
+    pub choices: Vec<String>,
+    pub selected: usize,
 }
 
 /// The next step for a reason a check gave. Unknown reasons still get a
@@ -810,6 +820,8 @@ enum OperationEvent {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UiState {
     #[serde(default)]
+    pub comparison_window_secs: Option<u64>,
+    #[serde(default)]
     pub filter: String,
     #[serde(default)]
     pub sort: String,
@@ -877,6 +889,11 @@ impl App {
         let filter = filter::default_filter();
         let root = roots.first().cloned().unwrap_or_default();
         App {
+            change_period: None,
+            requested_window_secs: None,
+            stored_window_secs: report.series_window_secs,
+            comparison_rx: None,
+            comparison_observed_at: 0,
             cargo_inspection: None,
             cargo_inspection_scroll: std::cell::Cell::new(0),
             tool_sheet: None,
@@ -1176,6 +1193,8 @@ impl App {
         // the new report sorts it.
         let anchor = self.selected_row_key();
         self.report = report;
+        self.stored_window_secs = self.report.series_window_secs;
+        self.reload_comparison();
         self.headline_cache.borrow_mut().take();
         self.restore_selection(anchor);
     }
@@ -1607,19 +1626,246 @@ impl App {
     }
 
     pub fn open_picker(&mut self) {
-        self.picker = Some(crate::picker::Picker::from_report(
-            &self.report,
-            &self.filter_text,
-            self.history_secs,
-        ));
+        let mut picker =
+            crate::picker::Picker::from_report(&self.report, &self.filter_text, self.history_secs);
+        if filter::growth_window_secs(&self.filter).is_none() {
+            let current = self
+                .requested_window_secs
+                .unwrap_or(self.report.series_window_secs);
+            if let Some(index) = picker
+                .windows
+                .iter()
+                .position(|choice| crate::picker::window_secs(choice, self.history_secs) == current)
+            {
+                picker.window_ix = index;
+            }
+        }
+        self.picker = Some(picker);
     }
 
     pub fn apply_picker(&mut self) {
         if let Some(p) = self.picker.take() {
+            let window = crate::picker::window_secs(&p.windows[p.window_ix], p.history_secs);
             self.filter_text = p.compose();
             self.editing_filter = false;
             self.commit_filter();
+            if window > 0 && self.requested_window_secs != Some(window) {
+                self.requested_window_secs = Some(window);
+                self.reload_comparison();
+                self.persist_ui_state();
+            }
         }
+    }
+
+    pub fn open_change_period(&mut self) {
+        if !self.view.uses_filter() {
+            return;
+        }
+        if self.history_secs.is_none_or(|seconds| seconds == 0)
+            || self.store_dir.is_none()
+            || self.scope.is_none()
+        {
+            self.status =
+                Some("Change period unavailable: no stored history for this scope.".into());
+            return;
+        }
+        let choices = crate::picker::windows_for(self.history_secs);
+        let current = self
+            .requested_window_secs
+            .unwrap_or(self.report.series_window_secs);
+        let selected = choices
+            .iter()
+            .position(|choice| crate::picker::window_secs(choice, self.history_secs) == current)
+            .unwrap_or(choices.len().saturating_sub(1));
+        self.change_period = Some(ChangePeriod { choices, selected });
+    }
+
+    pub fn apply_change_period(&mut self) {
+        let Some(p) = self.change_period.take() else {
+            return;
+        };
+        let seconds = crate::picker::window_secs(&p.choices[p.selected], self.history_secs);
+        let period_text = if p.choices[p.selected].starts_with("all history") {
+            format!("{seconds}s")
+        } else {
+            p.choices[p.selected].clone()
+        };
+        // Keep existing growth thresholds and other predicates; only their
+        // comparison period changes. No growth filter is added when cleared.
+        let mut words: Vec<String> = self
+            .filter_text
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        for i in 0..words.len().saturating_sub(4) {
+            if words[i] == "growth" && words[i + 3] == "in" {
+                words[i + 4] = period_text.clone();
+            }
+        }
+        self.filter_text = words.join(" ");
+        self.filter = filter::parse(&self.filter_text).unwrap_or_else(|_| self.filter.clone());
+        self.requested_window_secs = Some(seconds);
+        self.reload_comparison();
+        self.persist_ui_state();
+    }
+
+    pub fn restore_comparison_window(&mut self, seconds: Option<u64>) {
+        if let Some(seconds) = seconds.filter(|s| *s > 0) {
+            self.requested_window_secs = Some(seconds);
+            self.reload_comparison();
+        }
+    }
+
+    fn reload_comparison(&mut self) {
+        self.comparison_rx = None;
+        let (Some(seconds), Some(scope), Some(store)) = (
+            self.requested_window_secs,
+            self.scope.clone(),
+            self.store_dir.clone(),
+        ) else {
+            return;
+        };
+        if self.report.series_window_secs
+            == seconds.min(self.history_secs.unwrap_or(seconds)).max(60)
+        {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.comparison_observed_at = self.report.observed_at;
+        self.comparison_rx = Some(rx);
+        self.status = Some(format!(
+            "Loading change over {} from stored history…",
+            crate::picker::comparison_span(seconds)
+        ));
+        crate::worker::spawn(move || {
+            let result = swamp_core::report::report_scope_from_store_with_window(
+                &scope,
+                &store,
+                Some(seconds),
+            )
+            .map(|snapshot| snapshot.report)
+            .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    pub fn poll_comparison(&mut self) -> bool {
+        if self.reload_must_wait() {
+            return false;
+        }
+        let result = match self.comparison_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                Err("history worker stopped; try again".into())
+            }
+            _ => return false,
+        };
+        self.comparison_rx = None;
+        if self.report.observed_at != self.comparison_observed_at {
+            return false;
+        }
+        match result {
+            Ok(compared) if compared.observed_at == self.report.observed_at => {
+                let anchor = self.selected_row_key();
+                // Copy comparisons only. A read of older stored facts must
+                // never restore removed paths or overwrite current sizes.
+                let mut artifacts_by_path = std::collections::HashMap::<_, Vec<_>>::new();
+                for artifact in compared
+                    .projects
+                    .iter()
+                    .flat_map(|p| &p.worktrees)
+                    .flat_map(|w| &w.artifacts)
+                {
+                    artifacts_by_path
+                        .entry(&artifact.path)
+                        .or_default()
+                        .push(artifact);
+                }
+                for project in &mut self.report.projects {
+                    for worktree in &mut project.worktrees {
+                        for artifact in &mut worktree.artifacts {
+                            artifact.growth_bytes = None;
+                            artifact.allocated_growth_bytes = None;
+                            if let Some(source) =
+                                artifacts_by_path.get(&artifact.path).and_then(|sources| {
+                                    sources.iter().find(|source| source.kind == artifact.kind)
+                                })
+                            {
+                                artifact.growth_bytes = (source.bytes == artifact.bytes)
+                                    .then_some(source.growth_bytes)
+                                    .flatten();
+                                artifact.allocated_growth_bytes = (source.allocated_bytes
+                                    == artifact.allocated_bytes)
+                                    .then_some(source.allocated_growth_bytes)
+                                    .flatten();
+                            }
+                        }
+                    }
+                }
+                if let (Some(dest), Some(source)) = (
+                    &mut self.report.dirs_by_worktree,
+                    &compared.dirs_by_worktree,
+                ) {
+                    for (key, rows) in dest {
+                        let values: std::collections::HashMap<_, _> = source
+                            .get(key)
+                            .into_iter()
+                            .flatten()
+                            .map(|row| (&row.rel_path, (row.allocated_total, row.growth_bytes)))
+                            .collect();
+                        for row in rows {
+                            row.growth_bytes = values
+                                .get(&row.rel_path)
+                                .filter(|(bytes, _)| *bytes == row.allocated_total)
+                                .and_then(|(_, growth)| *growth);
+                        }
+                    }
+                }
+                if let (Some(dest), Some(source)) = (
+                    &mut self.report.files_by_worktree,
+                    &compared.files_by_worktree,
+                ) {
+                    for (key, rows) in dest {
+                        let values: std::collections::HashMap<_, _> = source
+                            .get(key)
+                            .into_iter()
+                            .flatten()
+                            .map(|row| (&row.rel_path, (row.allocated, row.growth_bytes)))
+                            .collect();
+                        for row in rows {
+                            row.growth_bytes = values
+                                .get(&row.rel_path)
+                                .filter(|(bytes, _)| *bytes == row.allocated)
+                                .and_then(|(_, growth)| *growth);
+                        }
+                    }
+                }
+                self.report.series_window_secs = compared.series_window_secs;
+                let nested_by_id: std::collections::HashMap<_, _> = compared
+                    .nested_artifacts
+                    .iter()
+                    .map(|unit| (&unit.id, unit))
+                    .collect();
+                for unit in &mut self.report.nested_artifacts {
+                    unit.growth_bytes = nested_by_id
+                        .get(&unit.id)
+                        .filter(|source| source.bytes == unit.bytes)
+                        .and_then(|source| source.growth_bytes);
+                }
+                self.report.series_by_key = compared.series_by_key;
+                self.report.total_series = compared.total_series;
+                self.report.summary = swamp_core::report::summarize(&self.report.projects);
+                self.status = None;
+                self.restore_selection(anchor);
+            }
+            Ok(_) => {
+                self.status = Some(
+                    "New observation available; change the period again after it loads.".into(),
+                )
+            }
+            Err(error) => self.status = Some(format!("Could not load change period: {error}")),
+        }
+        true
     }
 
     /// `e` in the picker: carry its composed text into the raw line.
@@ -1680,6 +1926,12 @@ impl App {
     pub fn commit_filter(&mut self) {
         match filter::parse(&self.filter_text) {
             Ok(f) => {
+                if let Some(seconds) = filter::growth_window_secs(&f)
+                    && self.requested_window_secs != Some(seconds)
+                {
+                    self.requested_window_secs = Some(seconds);
+                    self.reload_comparison();
+                }
                 self.filter = f;
                 self.editing_filter = false;
                 self.completions.clear();
@@ -1718,6 +1970,7 @@ impl App {
             return;
         };
         let state = UiState {
+            comparison_window_secs: self.requested_window_secs,
             filter: self.filter_text.clone(),
             sort: sort_to_str(self.sort).to_string(),
             reverse: self.reverse,
@@ -3655,6 +3908,7 @@ impl App {
         if removed.is_empty() {
             return;
         }
+        self.comparison_rx = None;
         let anchor = self.selected_row_key();
         self.prune_reclaim(&removed);
         self.store_interiors.retain(|u| {
@@ -4139,7 +4393,8 @@ impl App {
     /// Something on screen moves by itself: a check or a move, our own
     /// scan, or another process's. Only then does the UI paint on a timer.
     pub fn is_busy(&self) -> bool {
-        self.tool_rx.is_some()
+        self.comparison_rx.is_some()
+            || self.tool_rx.is_some()
             || self.operation.is_some()
             || self.observing.is_some()
             || self.pending.is_some()
@@ -5047,6 +5302,61 @@ mod tests {
         rows.push(Row::leaf(1, "child two".into(), 1, None));
         assert_eq!(nearest_parent_row(&rows, 3), Some(2));
         assert_eq!(nearest_parent_row(&rows, 1), Some(0));
+    }
+
+    #[test]
+    fn comparison_updates_only_deltas_and_keeps_selection_sizes_and_removed_paths() {
+        let mut report = fixture_report();
+        report.series_window_secs = 7 * 86_400;
+        let original_path = report.projects[0].worktrees[0].artifacts[0].path.clone();
+        let original_bytes = report.projects[0].worktrees[0].artifacts[0].bytes;
+        let mut app = App::new(report.clone(), "/root".into());
+        app.clear_filter();
+        let anchor = app.selected_row_key();
+        let mut compared = report;
+        compared.series_window_secs = 3_600;
+        compared.projects[0].worktrees[0].artifacts[0].growth_bytes = Some(456);
+        compared.projects[0].worktrees[0].artifacts[1].bytes += 99;
+        let mut removed = compared.projects[0].worktrees[0].artifacts[0].clone();
+        removed.path = PathBuf::from("/removed/cache");
+        compared.projects[0].worktrees[0].artifacts.push(removed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.comparison_observed_at = app.report.observed_at;
+        app.comparison_rx = Some(rx);
+        tx.send(Ok(compared)).unwrap();
+        let (_, work) = swamp_core::work_counters::measured(|| assert!(app.poll_comparison()));
+        assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+        assert_eq!(app.selected_row_key(), anchor);
+        assert_eq!(app.report.series_window_secs, 3_600);
+        let artifacts = &app.report.projects[0].worktrees[0].artifacts;
+        let artifact = artifacts.iter().find(|a| a.path == original_path).unwrap();
+        assert_eq!(artifact.growth_bytes, Some(456));
+        assert_eq!(artifact.bytes, original_bytes);
+        assert!(
+            artifacts[1].growth_bytes.is_none(),
+            "a changed size cannot borrow an old observation's delta"
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|a| a.path == std::path::Path::new("/removed/cache"))
+        );
+        assert_eq!(app.filter_text, "0");
+    }
+
+    #[test]
+    fn a_period_reply_for_an_older_observation_is_discarded() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        let before = app.report.series_window_secs;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.comparison_observed_at = app.report.observed_at.saturating_sub(1);
+        app.comparison_rx = Some(rx);
+        let mut old = app.report.clone();
+        old.series_window_secs = 3_600;
+        tx.send(Ok(old)).unwrap();
+        assert!(!app.poll_comparison());
+        assert_eq!(app.report.series_window_secs, before);
+        assert!(!app.is_busy());
     }
 
     #[test]

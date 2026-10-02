@@ -137,6 +137,20 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         return;
     }
+    if let Some(p) = app.change_period.as_mut() {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => app.change_period = None,
+            KeyCode::Enter => app.apply_change_period(),
+            KeyCode::Left | KeyCode::Up => p.selected = p.selected.saturating_sub(1),
+            KeyCode::Right | KeyCode::Down => {
+                p.selected = (p.selected + 1).min(p.choices.len().saturating_sub(1))
+            }
+            KeyCode::Home | KeyCode::PageUp => p.selected = 0,
+            KeyCode::End | KeyCode::PageDown => p.selected = p.choices.len().saturating_sub(1),
+            _ => {}
+        }
+        return;
+    }
     if let Some(p) = app.picker.as_mut() {
         match code {
             KeyCode::Esc => app.picker = None,
@@ -276,6 +290,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('A') => app.review_in_background(true, true),
         KeyCode::Backspace => app.review_in_background(false, true),
         KeyCode::Char('/') => app.open_picker(),
+        KeyCode::Char('w') => app.open_change_period(),
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
         // Three sections, and the views inside them: Tab and Shift-Tab move
@@ -303,20 +318,17 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     }
 }
 
-/// How far back the store can answer for `root`. Growth windows are
-/// bounded by it: a 7d window over 4h of observations would report a
-/// week of growth that was never observed. History is stored under the
-/// root-scoped directory (`growth::history_span_for_root`), the same one
-/// the header's sparkline reads; the bare device directory holds only
-/// side tables, which made the picker say "no observations yet" next to
-/// a header that showed history.
-fn history_span(store: &std::path::Path, root: &std::path::Path) -> Option<u64> {
+#[cfg(test)]
+fn history_span(store: &Path, root: &Path) -> Option<u64> {
     swamp_core::growth::history_span_for_root(store, root, swamp_core::entities::now())
 }
 
-/// The longest history any of `roots` has.
+#[cfg(test)]
 fn history_span_of_roots(store: &Path, roots: &[PathBuf]) -> Option<u64> {
-    roots.iter().filter_map(|r| history_span(store, r)).max()
+    roots
+        .iter()
+        .filter_map(|root| history_span(store, root))
+        .max()
 }
 
 /// Runs the interactive UI against `root`.
@@ -634,10 +646,18 @@ fn finish_startup(
     }
     // The picker may offer a window as long as the longest history of any
     // root this report covers.
-    app.history_secs = history_span_of_roots(store, &app.roots);
+    app.history_secs = app
+        .roots
+        .iter()
+        .filter_map(|root| {
+            swamp_core::growth::history_span_for_root(store, root, app.report.observed_at)
+        })
+        .max();
     let saved = app::load_ui_state(store);
     if !saved.filter.is_empty() {
         app.filter_text = saved.filter;
+        app.commit_filter();
+    } else {
         app.commit_filter();
     }
     if !saved.sort.is_empty() {
@@ -648,6 +668,7 @@ fn finish_startup(
     // A store that has never shown the new views shows the pointer to them
     // once; the flag is written when either is opened.
     app.views_seen = saved.views_seen;
+    app.restore_comparison_window(saved.comparison_window_secs);
 }
 
 fn run_terminal_loop(mut guard: term::TerminalGuard, app: &mut App) -> Result<()> {
@@ -717,6 +738,9 @@ impl RedrawGate {
 /// the terminal size. Each one that changed the screen's inputs touches the
 /// gate, so the very next frame shows it.
 fn advance(app: &mut App, gate: &mut RedrawGate, size: Option<(u16, u16)>) {
+    if app.poll_comparison() {
+        gate.touch();
+    }
     if app.poll_operation() {
         gate.touch();
     }
@@ -1004,17 +1028,52 @@ mod tests {
     }
 
     #[test]
+    fn change_period_is_a_modal_choice_and_does_not_add_a_growth_filter() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.clear_filter();
+        app.report.series_window_secs = 7 * 86_400;
+        app.history_secs = Some(14 * 86_400);
+        app.change_period = Some(app::ChangePeriod {
+            choices: vec!["24h".into(), "7d".into()],
+            selected: 1,
+        });
+        let view = app.view;
+        handle_key(&mut app, KeyCode::Char('2'));
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.view, view);
+        assert!(app.operation.is_none());
+        handle_key(&mut app, KeyCode::Left);
+        handle_key(&mut app, KeyCode::Enter);
+        assert!(app.change_period.is_none());
+        assert_eq!(app.requested_window_secs, Some(86_400));
+        assert_eq!(app.filter_text, "0");
+        assert!(app.filter.predicates.is_empty());
+        assert_eq!(
+            app.report.series_window_secs,
+            7 * 86_400,
+            "old label stays until its values are ready"
+        );
+        app.change_period = Some(app::ChangePeriod {
+            choices: vec!["1h".into()],
+            selected: 0,
+        });
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.requested_window_secs, Some(86_400));
+    }
+
+    #[test]
     fn header_never_claims_a_window_longer_than_the_history() {
         let mut app = App::new(empty_report(), "/root".into());
         app.width = 200;
         app.history_secs = Some(4 * 3_600);
+        app.report.series_window_secs = 4 * 3_600;
         app.filter_text = "growth > 100MB in 7d".into();
         app.commit_filter();
         let mut t = ratatui::Terminal::new(TestBackend::new(200, 10)).unwrap();
         t.draw(|f| ui::draw(f, &app)).unwrap();
         let s = t.backend().to_string();
         assert!(
-            s.contains("change over 4h (asked 1w; history is 4h)"),
+            s.contains("change over 4h") && !s.contains("Change 7d"),
             "{s}"
         );
     }

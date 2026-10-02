@@ -9,6 +9,50 @@ use swamp_tui::{
 };
 
 #[test]
+#[ignore = "manual stored-history comparison; set SWAMP_RENDER_READONLY_STORE"]
+fn stored_periods_recalculate_values_without_measuring_projects() {
+    let store = PathBuf::from(
+        std::env::var_os("SWAMP_RENDER_READONLY_STORE").expect("copied store required"),
+    );
+    let scope = swamp_core::scope::load_last_effective_scope(&store).unwrap();
+    let mut comparisons = Vec::new();
+    for seconds in [3_600, 7 * 86_400] {
+        let (result, work) = swamp_core::work_counters::measured(|| {
+            swamp_core::report::report_scope_from_store_with_window(&scope, &store, Some(seconds))
+        });
+        assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+        let report = result.unwrap().report;
+        let rows = swamp_tui::model::projects_rows(&report, &swamp_tui::filter::Filter::default());
+        eprintln!(
+            "requested_s={seconds} displayed_s={} projects={} dirs={} stats={} spawns={}",
+            report.series_window_secs,
+            rows.len(),
+            work.dirs_listed,
+            work.files_statted,
+            work.subprocess_spawns
+        );
+        comparisons.push(
+            rows.into_iter()
+                .map(|row| (row.label, row.growth))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        );
+    }
+    let changed = comparisons[0]
+        .iter()
+        .filter(|(key, value)| {
+            comparisons[1]
+                .get(*key)
+                .is_some_and(|other| other != *value)
+        })
+        .count();
+    eprintln!("projects with different one-hour and seven-day deltas: {changed}");
+    assert!(
+        changed > 0,
+        "the selected real-store fixture must exercise different growth values"
+    );
+}
+
+#[test]
 #[ignore = "manual real-store render measurement; set SWAMP_RENDER_READONLY_STORE"]
 fn stored_views_render_cost() {
     let store = PathBuf::from(
