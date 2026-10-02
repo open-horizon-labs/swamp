@@ -1507,7 +1507,7 @@ Each worktree also carries `tip_reachable`, a fact `observe` computes from the r
 
 Reports use the GitHub facts the last `observe` cached. `observe` queries GitHub unless given `--no-enrich`, and reuses a cache entry that is still valid. GitHub cache validity uses the tip SHA: a worktree whose branch is already merged is terminal and is never re-enriched automatically, and every other row is refreshed after a 24-hour TTL. `observe --enrich` is the on-demand override: it refetches everything, ignoring the TTL and the merged rule.
 
-Docker facts are cached for five minutes, with fresh reads during enrichment. Docker must be installed and its daemon reachable. Unavailable Docker data is reported in notes.
+Routine observations reuse Docker facts for up to five minutes and show their capture age in row details. Run `swamp observe --enrich` to request fresh daemon facts immediately. Unavailable answers are reused for up to one minute; timestamps in the future are rejected. Docker must be installed and its daemon reachable. Unavailable Docker data is reported in notes.
 
 Images, volumes, and build-cache records join to projects using Compose metadata or source-remote evidence. Unmatched objects remain unowned. Filesystem and Docker sizes should not be added to predict how much physical disk space an action will reclaim.
 
@@ -1921,3 +1921,9 @@ SWAMP_TRACE=1 swamp observe
 ```
 
 See [architecture](architecture.md) for the meaning of incremental updates, history retention, and cached enrichment.
+
+## Observation changes in 0.8.1
+
+On macOS, an older stored FSEvents cursor without an event-store UUID needs one full measurement before incremental reuse resumes. A missing or invalid event history also requires measurement; a warm observation time does not predict that first pass.
+
+Automatic host-storage observations exclude nested CoreDevice `devicefs` mounts and name them as unmeasured virtual filesystems. Explicitly requested roots retain their requested scope. When this boundary changes, growth spanning the change is unavailable rather than reported as bytes freed; earlier history is retained.
