@@ -23,7 +23,7 @@ the Trash) or a human running a shell command themselves. There is no
 `propose`/`approve`/`execute`/`grant` command any more; do not invent
 one.
 
-For current section names, navigation and review controls, see [the usage guide](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls). Trash review emphasizes restore cost, sourced last use and consequential exceptions; `l` opens all paths and original supporting facts, with Enter disabled there. Successful moves disappear immediately from current views; shared model layers remain. The CLI view identifiers remain unchanged.
+For TUI controls, see [the usage guide](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls). Trash review shows restore cost, sourced last use and consequential exceptions; `l` opens full details. Successful moves disappear from current views; shared model layers remain.
 
 ## Binary setup
 

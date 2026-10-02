@@ -532,7 +532,11 @@ fn an_unreviewed_plan_offers_no_enter_even_when_the_overlay_fits() {
     assert!(a.operation.is_none() && p.exists());
     let small = frame(&a, 40, 12);
     assert!(small.contains("Esc cancel"), "{small}");
-    assert!(!small.contains("Enter move to Trash"), "{small}");
+    assert_eq!(
+        small.contains("Enter move to Trash"),
+        a.confirm_review_is_complete(40, 12),
+        "{small}"
+    );
     // A roomy terminal draws the entire plan and arms Enter.
     a.width = 120;
     a.height = 50;
