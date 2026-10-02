@@ -1,7 +1,7 @@
 //! The tool-managed removal sheet (#177): Backspace on a mise installs or
 //! simulator runtimes row opens it. It lists what the manager itself
 //! lists, reviews one item (the manager's own dry run, swamp's refusals),
-//! shows the confirm, and on Enter runs exactly the command shown. Every
+//! shows the confirm, and on Y runs exactly the command shown. Every
 //! step that touches the machine runs on a worker (`worker::spawn`, in
 //! `app.rs`); this module only holds the state and lays out its lines.
 //!
@@ -21,7 +21,7 @@ pub enum Stage {
     Choose,
     /// The review (dry run, refusals, open files) is running for this item.
     Reviewing(String),
-    /// The confirm: Enter runs exactly this preview's command.
+    /// The confirm: Y runs exactly this preview's command.
     Confirm(Box<Preview>),
     /// swamp will not run it: the reason and the next step.
     Refused { what: String, refusal: Refusal },
@@ -213,7 +213,7 @@ pub fn confirm_lines(p: &Preview, width: usize, height: usize) -> Vec<String> {
     let mut out: Vec<String> = vec![
         format!("Remove {} with {name}, permanently.", p.title()),
         "No Trash recovery: this cannot be undone.".to_string(),
-        "Command (Enter runs exactly this):".to_string(),
+        "Command (Y runs exactly this):".to_string(),
     ];
     // The command is never cut: it wraps under itself.
     push_wrapped(

@@ -738,6 +738,34 @@ fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
     }
 }
 
+/// Removing empty columns must not remove measurement state or turn an
+/// unreadable location into a measured zero. Both disk tables retain the
+/// allocated/shared legend while omitting a meaningless growth column.
+#[test]
+fn disk_tables_keep_measurement_and_unknown_size_at_compact_and_wide_widths() {
+    for view in [ViewKind::Disk, ViewKind::DiskGaps] {
+        for (w, h) in [(80, 24), (200, 60)] {
+            let mut a = app();
+            a.set_view(view);
+            let f = frame(&a, w, h);
+            let heading = &f[5];
+            assert!(heading.contains("Size"), "{view:?}: {heading}");
+            assert!(heading.contains("Measurement"), "{view:?}: {heading}");
+            assert!(!heading.contains("Change"), "{view:?}: {heading}");
+            assert!(
+                f.iter()
+                    .any(|line| line.contains("shared files may be counted again"))
+            );
+            let unread = f
+                .iter()
+                .find(|line| line.contains("/Users/x/Pictures"))
+                .expect("unreadable path retained");
+            assert!(unread.contains("not read"), "{unread}");
+            assert!(!unread.contains("0B"), "{unread}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Typing
 // ---------------------------------------------------------------------

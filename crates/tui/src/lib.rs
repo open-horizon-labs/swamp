@@ -37,10 +37,13 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
 }
 
 pub fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
+    if key.kind != crossterm::event::KeyEventKind::Press {
+        return;
+    }
+    let modifiers = key.modifiers;
     if key.code == KeyCode::Char('c')
-        && key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::CONTROL)
+        && modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+        && modifiers.bits() & !crossterm::event::KeyModifiers::CONTROL.bits() == 0
     {
         if app.operation.is_some() {
             app.cancel_operation();
@@ -54,6 +57,17 @@ pub fn handle_terminal_key(app: &mut App, key: crossterm::event::KeyEvent) {
         } else {
             app.quit = true;
         }
+        return;
+    }
+    // Only Shift has documented key meanings (uppercase commands and
+    // BackTab). Never turn a modified Enter/Backspace/letter into an
+    // ordinary destructive or navigational command.
+    if modifiers.bits() & !crossterm::event::KeyModifiers::SHIFT.bits() != 0 {
+        return;
+    }
+    if modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
+        && !matches!(key.code, KeyCode::Char(_) | KeyCode::BackTab)
+    {
         return;
     }
     handle_key_mod(
@@ -79,7 +93,8 @@ fn scrolled(cur: usize, code: KeyCode, page: usize, last: usize) -> Option<usize
     })
 }
 
-/// `shift` distinguishes Shift-→/Shift-← inside the picker's growth field.
+/// Shift is retained for terminal compatibility; key meanings are encoded
+/// by the resulting key code (for example `A` and BackTab).
 pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
     // A result stays until the next key, and only a key removes it: no
     // timer repaints the screen while nobody is looking.
@@ -109,21 +124,27 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         }
         return;
     }
-    if let Some(lines) = &app.cargo_inspection {
+    if app.cargo_inspection.is_some() {
         if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
             app.cargo_inspection = None;
         } else if let Some(at) = scrolled(
-            app.cargo_inspection_scroll as usize,
+            app.cargo_inspection_scroll.get(),
             code,
             app.page.get(),
-            lines.len().saturating_sub(1).min(u16::MAX as usize),
+            usize::MAX / 2,
         ) {
-            app.cargo_inspection_scroll = at as u16;
+            app.cargo_inspection_scroll.set(at);
         }
         return;
     }
     if let Some(p) = app.picker.as_mut() {
         match code {
+            KeyCode::Esc => app.picker = None,
+            KeyCode::Enter => app.apply_picker(),
+            KeyCode::Char('q') if p.field != 3 => app.picker = None,
+            // The project field is literal type-to-narrow input. In
+            // particular, q/e/0/space are project-name characters here.
+            KeyCode::Char(c) if p.field == 3 => p.type_char(c),
             KeyCode::Up => p.up(),
             KeyCode::Down => p.down(),
             KeyCode::Home | KeyCode::PageUp => p.first(),
@@ -132,10 +153,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
             KeyCode::Right => p.cycle(1),
             KeyCode::Left => p.cycle(-1),
             KeyCode::Backspace => p.backspace(),
-            KeyCode::Enter => app.apply_picker(),
-            KeyCode::Esc => app.picker = None,
-            KeyCode::Char('e') if p.field != 3 => app.picker_to_raw_edit(),
-            KeyCode::Char(c) if p.field == 3 => p.type_char(c),
+            KeyCode::Char('e') => app.picker_to_raw_edit(),
             KeyCode::Char('0') => {
                 app.picker = None;
                 app.clear_filter();
@@ -173,12 +191,12 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
             KeyCode::Char('r') => app.recheck_blocked(),
             _ => {
                 if let Some(at) = scrolled(
-                    app.blocked_scroll,
+                    app.blocked_scroll.get(),
                     code,
                     app.page.get(),
-                    app.blocked.len().saturating_sub(1),
+                    usize::MAX / 2,
                 ) {
-                    app.blocked_scroll = at;
+                    app.blocked_scroll.set(at);
                 }
             }
         }
@@ -869,6 +887,101 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_modifiers_and_repeats_cannot_activate_modal_actions() {
+        use crossterm::event::{KeyEvent, KeyEventKind, KeyModifiers};
+        let mut app = App::new(empty_report(), "/root".into());
+        app.open_picker();
+        let original_filter = app.filter_text.clone();
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(app.picker.is_some(), "Ctrl-Enter must not apply the picker");
+        assert_eq!(app.filter_text, original_filter);
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+        assert!(
+            app.picker.is_some(),
+            "Alt-Backspace must not dismiss the modal"
+        );
+        handle_terminal_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert!(
+            app.picker.is_some(),
+            "Shift-Enter must not apply the picker"
+        );
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::SHIFT),
+        );
+        assert!(
+            app.picker.is_some(),
+            "Shift-Backspace must not dismiss the picker"
+        );
+
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new_with_kind(KeyCode::Char('q'), KeyModifiers::NONE, KeyEventKind::Repeat),
+        );
+        assert!(app.picker.is_some(), "repeat events are not actions");
+
+        app.picker = None;
+        app.confirm_open = true;
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        assert!(app.confirm_open, "Ctrl-Enter must not authorize the plan");
+        assert!(app.operation.is_none());
+    }
+
+    #[test]
+    fn shift_backtab_remains_a_section_navigation_key() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let mut app = App::new(empty_report(), "/root".into());
+        let before = app.view.section();
+        handle_terminal_key(
+            &mut app,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.view.section(), before.prev());
+    }
+
+    #[test]
+    fn project_picker_keeps_all_characters_literal_and_q_closes_other_fields() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.open_picker();
+        app.picker.as_mut().unwrap().field = 3;
+        for c in ['q', 'e', '0', ' '] {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.picker.as_ref().unwrap().project_query, "qe0 ");
+
+        app.picker.as_mut().unwrap().field = 2;
+        handle_key(&mut app, KeyCode::Char('q'));
+        assert!(app.picker.is_none(), "q closes non-project picker fields");
+    }
+
+    #[test]
+    fn wrapped_overlay_navigation_uses_a_display_line_sentinel() {
+        let mut app = App::new(empty_report(), "/root".into());
+        app.cargo_inspection = Some(vec!["one long wrapped line".into()]);
+        handle_key(&mut app, KeyCode::End);
+        assert_eq!(app.cargo_inspection_scroll.get(), usize::MAX / 2);
+
+        app.cargo_inspection = None;
+        app.blocked_open = true;
+        app.blocked.push(app::BlockedItem {
+            name: "fixture".into(),
+            reason: "long reason".into(),
+            next: "next step".into(),
+        });
+        handle_key(&mut app, KeyCode::End);
+        assert_eq!(app.blocked_scroll.get(), usize::MAX / 2);
+    }
+
+    #[test]
     fn slash_opens_picker_and_enter_applies_its_filter() {
         let mut app = App::new(empty_report(), "/root".into());
         app.history_secs = Some(30 * 86_400);
@@ -1141,7 +1254,7 @@ mod tests {
             "⌫ trash",
             "⌫ review",
             "Space mark",
-            "A mark all",
+            "A review all",
             "↑↓ move",
             "→/← in/out",
             "g/s/n/t/a sort",

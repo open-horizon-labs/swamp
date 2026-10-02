@@ -242,7 +242,8 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
             rendered.contains("slower"),
             "selected consequence should remain visible: {rendered}"
         );
-        assert!(rendered.contains("Size*"));
+        assert!(rendered.contains("Size"));
+        assert!(rendered.contains("* allocated bytes"));
         assert!(rendered.contains("candidate"));
         if width >= 100 {
             assert!(rendered.contains("Change"));
@@ -1271,6 +1272,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         expandable: false,
         expansion_key: None,
         cleanup_summary: None,
+        table_note: None,
         allocated: false,
         project: None,
         evidence: Vec::new(),
@@ -1867,7 +1869,7 @@ fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
     assert!(f.contains("Blocked: 2"), "{f}");
     assert!(f.contains("next: open the project"), "{f}");
     assert!(f.contains("Esc back to the plan"), "{f}");
-    // The list scrolls by item and never runs off the sheet.
+    // The list scrolls by displayed line and never runs off the sheet.
     app.blocked = (0..12)
         .map(|i| swamp_tui::app::BlockedItem {
             name: format!("project-{i}"),
@@ -1876,12 +1878,18 @@ fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
         })
         .collect();
     let f = capture(&app, 80, 24);
-    assert!(f.contains("project-0") && f.contains("more below"), "{f}");
+    assert!(
+        f.contains("project-0") && f.contains("lines 1-8 of 24"),
+        "{f}"
+    );
     for _ in 0..7 {
         swamp_tui::handle_key(&mut app, KeyCode::Down);
     }
     let f = capture(&app, 80, 24);
-    assert!(f.contains("from item 8") && f.contains("project-7"), "{f}");
+    assert!(
+        f.contains("lines 8-15 of 24") && f.contains("project-7"),
+        "{f}"
+    );
     assert!(!f.contains("project-0"), "{f}");
     // Enter cannot move anything while the list is open.
     swamp_tui::handle_key(&mut app, KeyCode::Enter);
@@ -2309,6 +2317,81 @@ fn many_rows_app(n: usize) -> App {
     app
 }
 
+#[test]
+fn summary_tables_reuse_empty_columns_without_hiding_measured_zero_change() {
+    let mut report = fixture_report();
+    for project in &mut report.projects {
+        for wt in &mut project.worktrees {
+            for artifact in &mut wt.artifacts {
+                artifact.growth_bytes = Some(0);
+            }
+        }
+    }
+    let mut app = App::new(report, "/Users/dev/src".into());
+    app.clear_filter();
+    app.set_view(ViewKind::Kinds);
+    for (w, h) in [(80, 24), (200, 60)] {
+        let f = capture(&app, w, h);
+        let heading = line_of(&f, 5);
+        assert!(
+            heading.contains("Change"),
+            "zero is measured change: {heading}"
+        );
+        assert!(!heading.contains("Notes"), "{heading}");
+        assert!(
+            !heading.contains("Change bar"),
+            "all-zero bars convey nothing: {heading}"
+        );
+        assert!(f.contains("0B"));
+        check(&format!("summary_columns_{w}x{h}"), &f);
+    }
+    app.set_view(ViewKind::Unowned);
+    let f = capture(&app, 80, 24);
+    assert!(
+        !line_of(&f, 5).contains("Change"),
+        "no recorded changes in this view:\n{f}"
+    );
+}
+
+#[test]
+fn build_tables_pair_relative_identity_with_recovery_and_keep_exact_action_paths() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.clear_filter();
+    for view in [ViewKind::Builds, ViewKind::Deps] {
+        app.set_view(view);
+        let rows = app.rows();
+        let first = &rows[0];
+        assert!(!first.label.contains("/Users/dev/src"), "{}", first.label);
+        assert!(
+            first
+                .unit
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("/Users/dev/src/")
+        );
+        for (w, h) in [(80, 24), (200, 60)] {
+            let f = capture(&app, w, h);
+            let details = swamp_tui::detail::lines(first, &[]).join("\n");
+            assert!(details.contains(&first.unit.as_ref().unwrap().0));
+            assert!(
+                details.contains(if view == ViewKind::Builds {
+                    "build tool makes it again"
+                } else {
+                    "Installing again"
+                }),
+                "{details}"
+            );
+            // Mixed structural/activity facts must not be labelled as a
+            // removal consequence just because some rows are cleanup groups.
+            assert!(!line_of(&f, 5).contains("If removed"), "{f}");
+            assert!(line_of(&f, 5).contains("Notes"), "{f}");
+            assert!(f.contains(first.table_note.as_deref().unwrap()), "{f}");
+            check(&format!("relative_{}_{w}x{h}", view.label()), &f);
+        }
+    }
+}
+
 /// Marks stay visible after the marking result clears, even when the selected
 /// items are outside the current page, filter or view. Position counts the
 /// whole current list, not just the viewport.
@@ -2548,9 +2631,24 @@ fn scrolled_growth_bars_keep_the_offscreen_maximum() {
             )
         })
         .collect();
+    let template = report.projects[0].clone();
+    report.projects = template.worktrees[0]
+        .artifacts
+        .iter()
+        .enumerate()
+        .map(|(i, artifact)| {
+            let mut project = template.clone();
+            project.project_id = format!("project-{i}");
+            project.name = format!("pkg{i:03}");
+            project.remote = None;
+            project.worktrees[0].artifacts = vec![artifact.clone()];
+            project.worktrees[0].worktree_id = format!("worktree-{i}");
+            project
+        })
+        .collect();
     let mut app = App::new(report, "/Users/dev/src".into());
     app.clear_filter();
-    app.set_view(ViewKind::Deps);
+    app.set_view(ViewKind::Projects);
     app.sort = swamp_tui::model::Sort::Size;
     app.selected = app.rows().len() - 1;
     let frame = capture(&app, 200, 24);
@@ -2585,8 +2683,8 @@ fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('?'));
     let first = capture(&app, 80, 24);
     let row_with = |f: &str, needle: &str| f.lines().position(|l| l.contains(needle));
-    let a = row_with(&first, "mark every row here").expect("A entry");
-    let bs = row_with(&first, "Backspace  move what is under the cursor").expect("Backspace");
+    let a = row_with(&first, "review all rows here").expect("A entry");
+    let bs = row_with(&first, "Backspace  review paths, costs and warnings").expect("Backspace");
     assert_ne!(a, bs, "A and Backspace on separate rows:\n{first}");
     assert!(first.contains("1-2"), "position is shown:\n{first}");
     assert!(!first.contains("mark every row here the tool can act on  Ba"));
@@ -2594,6 +2692,10 @@ fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
     swamp_tui::handle_key(&mut app, KeyCode::PageDown);
     let second = capture(&app, 80, 24);
     assert_ne!(first, second, "PgDn scrolls the help");
+    assert!(
+        second.contains("Backspace  move what is under the cursor"),
+        "{second}"
+    );
     swamp_tui::handle_key(&mut app, KeyCode::End);
     let end = capture(&app, 80, 24);
     assert!(end.contains("Activity evidence"), "{end}");
@@ -2621,7 +2723,7 @@ fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
     );
 }
 
-/// PgUp/PgDn/Home/End page the blocked list by whole items.
+/// PgUp/PgDn/Home/End page the wrapped reasons, keeping the last item reachable.
 #[test]
 fn the_blocked_list_pages_and_jumps() {
     use crossterm::event::KeyCode;
@@ -2636,13 +2738,80 @@ fn the_blocked_list_pages_and_jumps() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('b'));
     let _ = capture(&app, 80, 24);
     swamp_tui::handle_key(&mut app, KeyCode::PageDown);
-    assert!(app.blocked_scroll >= 3, "{}", app.blocked_scroll);
+    assert!(
+        app.blocked_scroll.get() >= 3,
+        "{}",
+        app.blocked_scroll.get()
+    );
     swamp_tui::handle_key(&mut app, KeyCode::End);
-    assert_eq!(app.blocked_scroll, 19);
     let f = capture(&app, 80, 24);
     assert!(f.contains("project-19"), "{f}");
     swamp_tui::handle_key(&mut app, KeyCode::Home);
-    assert_eq!(app.blocked_scroll, 0);
+    assert_eq!(app.blocked_scroll.get(), 0);
+}
+
+#[test]
+fn wrapped_reasons_and_cargo_inspection_remain_reachable_after_paging_and_resize() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.blocked = (0..4)
+        .map(|i| swamp_tui::app::BlockedItem {
+            name: format!("item-{i}"),
+            reason: format!(
+                "{} REASON_END_{i}",
+                "A recorded reason needs context. ".repeat(30)
+            ),
+            next: format!(
+                "{} NEXT_END_{i}",
+                "A recovery instruction also needs context. ".repeat(20)
+            ),
+        })
+        .collect();
+    app.open_blocked();
+    let mut seen = String::new();
+    for _ in 0..200 {
+        seen.push_str(&capture(&app, 50, 24));
+        let old = app.blocked_scroll.get();
+        swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+        seen.push_str(&capture(&app, 50, 24));
+        if app.blocked_scroll.get() == old {
+            break;
+        }
+    }
+    for i in 0..4 {
+        for marker in [format!("REASON_END_{i}"), format!("NEXT_END_{i}")] {
+            assert!(seen.contains(&marker), "paging skipped {marker}");
+        }
+    }
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    let end = capture(&app, 50, 24);
+    assert!(end.contains("NEXT_END_3"));
+    check("blocked_wrapped_end_50x24", &end);
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+
+    app.cargo_inspection = Some(vec![format!(
+        "{} CARGO_TAIL",
+        "dependency evidence ".repeat(80)
+    )]);
+    let _ = capture(&app, 40, 12);
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    let tail = capture(&app, 40, 12);
+    assert!(
+        tail.contains("CARGO_TAIL"),
+        "one source line wraps far beyond one screen:\n{tail}"
+    );
+    assert!(app.cargo_inspection_scroll.get() > 0);
+    let wider = capture(&app, 200, 60);
+    assert!(wider.contains("CARGO_TAIL"));
+    assert_eq!(
+        app.cargo_inspection_scroll.get(),
+        0,
+        "resizing clamps the actual cursor"
+    );
+    swamp_tui::handle_key(&mut app, KeyCode::Up);
+    assert_eq!(app.cargo_inspection_scroll.get(), 0);
+    assert!(app.operation.is_none());
+    assert!(app.marked.is_empty());
 }
 
 /// `k` states the new value and what it means; the legend keeps filter,

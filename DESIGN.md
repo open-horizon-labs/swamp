@@ -4,11 +4,11 @@ The UI presents disk growth as a table that opens into a project tree. Size, sig
 
 ## Rows and hierarchy
 
-Each row contains a name, bytes, signed growth, a change bar, and any visible facts. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
+Each row contains a name and measured size. Show signed change only where the view has recorded change values, notes only where rows have facts, and change bars only where at least one change is nonzero. A measured zero stays `0B`; an unknown measurement never becomes zero. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
 
-Column headings name the thing being compared: Project, Folder, Build output, Dependencies, Ecosystem, Storage kind, Unassigned storage, Storage item, Docker object, Tool location, Agent storage, Disk allocation, or Location. Name truncation and padding use grapheme-aware terminal-cell widths. Badges have separating spaces. Build drilldowns and Reclaim reserve a removal-consequence column at 80 columns and hide numeric change below 100 columns. Disk views omit change entirely and show measurement facts. These decision-oriented views cap names at 64 cells. Other views hide bars below 140 columns and show facts only in selected-row details below 100 columns. Zero and unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+Column headings name the thing being compared: Project, Folder, Build output, Dependencies, Ecosystem, Storage kind, Unassigned storage, Storage item, Docker object, Tool location, Agent storage, Disk allocation, or Location. Name truncation and padding use grapheme-aware terminal-cell widths. Badges have separating spaces. Build drilldowns reserve Notes at 80 columns; Reclaim reserves If removed. Both hide numeric change below 100 columns. Disk views omit change entirely and label facts Measurement. These views cap names at 64 cells only when notes need the remaining width. Other views hide bars below 140 columns and show facts only in selected-row details below 100 columns. Zero and unknown changes have no vertical bar. Keep the selected row visible when scrolling.
 
-Readable labels lead with the tool or category; exact paths remain in selected details and action review. Current use, unique-copy, sharing, and unknown facts precede secondary metadata in the fixed-height detail pane. Last use keeps its source and is separate from modification age.
+Build and dependency labels lead with the project and checkout-relative path; additional checkouts carry a discriminator. Unassigned rows lead with their path. Tool labels keep the detector and identifying path suffix. Exact paths remain in selected details and action review. Reclaim table costs come from the typed regeneration class; original wording and source remain in the details. Current use, unique-copy, sharing, and unknown facts precede secondary metadata in the fixed-height detail pane. Last use keeps its source and is separate from modification age.
 
 Collapsed build categories lead with a recommendation and removal consequence:
 start with compiler caches (slower next build), review tests/examples (rebuild
@@ -62,7 +62,7 @@ not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
 
 The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to all changes in the current view, including off-screen rows. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
 
-Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy. Sorting or reversing keeps the same item selected. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
+Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy; Tree, Reclaim and Disk ignore sort/reverse keys and omit those hints. Sorting or reversing keeps the same item selected. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
 
 ## Color
 
@@ -295,13 +295,7 @@ rows. A result says what moved to Trash and what was removed for good, and that
 space is freed when Trash is emptied; it carries no measured free-space figure,
 because a move to Trash on the same volume frees nothing yet.
 
-Keys move by row, by page (PgUp, PgDn) and to the ends (Home, End) in the list,
-the help, the blocked list, the cargo popup and the picker. `v` names the view
-and its place (`builds of mole (3 of 10 · v next · Esc: projects)`), each view
-remembers its cursor, and an empty list says why and what to press. `k` says
-which way it flipped and what that means, since it is remembered. The key legend
-keeps `/ filter  v view  R refresh  ⌫ delete  ? help  q quit` at 80 columns and
-drops movement keys first.
+Keys move by row, by page (PgUp, PgDn) and to the ends (Home, End) in the main list. Help, blocked reasons and Cargo inspection scroll by displayed lines and clamp after resize so wrapped text remains reachable. The picker moves between fields with arrows; its project field accepts literal letters, digits and spaces. Esc cancels everywhere; q also closes the picker outside its project field. `v` names the view and its place; each view remembers its cursor, and an empty list says why and what to press. `k` says which way it flipped and what that means. Footer hints describe the current action: `⌫ review`, a manager list, or `A review all`; fixed-order views omit sorting. Hints drop whole at narrow widths and preserve help and quit.
 
 The UI paints only when something changed: a key, a resize, a worker's result,
 anything busy (every 200 ms, for the glyph and the clock), or a clock-driven part
@@ -318,3 +312,5 @@ Keep the footer visible. Use overlays for help, the filter form, and action revi
 ## Human-readable values
 
 Human output shares decimal byte units across CLI and TUI, with whole KB and one decimal for larger units, carrying rounded boundaries into the next unit. Counts use digit grouping where needed. Elapsed durations use whole seconds, subsecond work reads `<1s`, and stored timestamps show dates or coarse relative ages with a named timezone where relevant. Machine-readable JSON, logs, and ledger records retain exact values.
+
+Unsupported Ctrl, Alt, Super, Hyper and Meta chords do not invoke plain-key commands. Ctrl-C retains its explicit cancel/quit behavior; Shift commands and BackTab remain available. Only key press events dispatch actions. Manager confirmation names Y as the execution key; Enter only reviews its list selection.

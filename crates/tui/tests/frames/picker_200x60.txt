@@ -3,9 +3,11 @@
 "disk ledger: not measured yet · 3 Disk for details                                                                                                                                                      "
 "1 Projects  2 Tools  3 Disk                                                                                                                                                                             "
 "Projects · filter: growth > 100MB in 7d · Compare project size, growth, and activity                                                                                                                    "
-"Project                                                                                                           Size     Change Change bar    Details                                                 "
-"mole  🔨                                                                                                         2.6GB     +1.3GB       │█████▌                                                         " Hidden by multi-width symbols: [(7, " ")]
-"swamp  🐳 🔨                                                                                                     8.1GB     +2.6GB       │██████                                                         " Hidden by multi-width symbols: [(8, " "), (11, " ")]
+"Project                                                                                                                                                                   Size     Change Change bar    "
+"mole  🔨                                                                                                                                                                 2.6GB     +1.3GB       │█████▌ " Hidden by multi-width symbols: [(7, " ")]
+"swamp  🐳 🔨                                                                                                                                                             8.1GB     +2.6GB       │██████ " Hidden by multi-width symbols: [(8, " "), (11, " ")]
+"                                                                                                                                                                                                        "
+"                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
@@ -32,11 +34,9 @@
 "                                                             │  age            any                                                        │                                                             "
 "                                                             │                                                                            │                                                             "
 "                                                             │  filter: growth > 100MB in 7d kind:BuildOutput    → 2 rows                 │                                                             "
-"                                                             │                                                                            │                                                             "
-"                                                             │                                                                            │                                                             "
-"                                                             │                                                                            │                                                             "
-"                                                             │                                                                            │                                                             "
 "                                                             └────────────────────────────────────────────────────────────────────────────┘                                                             "
+"                                                                                                                                                                                                        "
+"                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "

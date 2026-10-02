@@ -466,7 +466,7 @@ struct ViewCursor {
 pub struct App {
     /// Ephemeral on-demand details; never persisted in the observation store.
     pub cargo_inspection: Option<Vec<String>>,
-    pub cargo_inspection_scroll: u16,
+    pub cargo_inspection_scroll: std::cell::Cell<usize>,
     /// The tool-managed removal sheet (#177), when open.
     pub tool_sheet: Option<crate::tool_sheet::ToolSheet>,
     /// The one tool worker in flight (listing, review or removal): one at
@@ -500,8 +500,8 @@ pub struct App {
     /// keeps marks made any other way.
     last_check_marks: Vec<String>,
     pub blocked_open: bool,
-    /// First blocked item shown in the blocked list.
-    pub blocked_scroll: usize,
+    /// First wrapped display line shown in the blocked list.
+    pub blocked_scroll: std::cell::Cell<usize>,
     /// First body row shown; moves only when the selection leaves the
     /// window, so one keypress moves the selection one row.
     pub scroll_offset: std::cell::Cell<usize>,
@@ -878,7 +878,7 @@ impl App {
         let root = roots.first().cloned().unwrap_or_default();
         App {
             cargo_inspection: None,
-            cargo_inspection_scroll: 0,
+            cargo_inspection_scroll: std::cell::Cell::new(0),
             tool_sheet: None,
             tool_rx: None,
             confirm_drain: false,
@@ -894,7 +894,7 @@ impl App {
             refusal_ctx: None,
             blocked: Vec::new(),
             blocked_open: false,
-            blocked_scroll: 0,
+            blocked_scroll: std::cell::Cell::new(0),
             scroll_offset: std::cell::Cell::new(0),
             frame: 0,
             last_check: None,
@@ -1470,6 +1470,12 @@ impl App {
     }
 
     pub fn set_sort(&mut self, sort: Sort) {
+        if matches!(
+            self.view,
+            ViewKind::Tree | ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps
+        ) {
+            return;
+        }
         let anchor = self.selected_row_key();
         self.sort = if self.sort == sort { Sort::None } else { sort };
         self.restore_selection(anchor);
@@ -1478,6 +1484,12 @@ impl App {
 
     /// `r`: flip the order of whatever sort is active.
     pub fn toggle_reverse(&mut self) {
+        if matches!(
+            self.view,
+            ViewKind::Tree | ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps
+        ) {
+            return;
+        }
         let anchor = self.selected_row_key();
         self.reverse = !self.reverse;
         self.restore_selection(anchor);
@@ -3037,7 +3049,7 @@ impl App {
                     self.operation = None;
                     self.operation_rx = None;
                     self.cargo_inspection = Some(lines);
-                    self.cargo_inspection_scroll = 0;
+                    self.cargo_inspection_scroll.set(0);
                     break;
                 }
                 OperationEvent::OpenFileCheck(active) => {
@@ -3200,7 +3212,7 @@ impl App {
     pub fn open_blocked(&mut self) {
         if !self.blocked.is_empty() {
             self.blocked_open = true;
-            self.blocked_scroll = 0;
+            self.blocked_scroll.set(0);
         }
     }
 
@@ -4838,6 +4850,18 @@ mod tests {
     }
 
     #[test]
+    fn fixed_order_views_do_not_persist_sort_changes() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Tree);
+        let sort = app.sort;
+        let reverse = app.reverse;
+        app.set_sort(Sort::Name);
+        app.toggle_reverse();
+        assert_eq!(app.sort, sort);
+        assert_eq!(app.reverse, reverse);
+    }
+
+    #[test]
     fn view_cursor_restores_identity_after_reorder_and_falls_back_after_removal() {
         let home = tempfile::tempdir().unwrap();
         let mut units = fixture_agent_units(home.path());
@@ -4972,7 +4996,13 @@ mod tests {
             let rows = app.rows();
             let second_root = rows
                 .iter()
-                .position(|row| row.depth == 1 && row.label.contains("/root/mole-linked"))
+                .position(|row| {
+                    row.depth == 1
+                        && row
+                            .unit
+                            .as_ref()
+                            .is_some_and(|unit| unit.0 == "/root/mole-linked")
+                })
                 .expect("the linked worktree row is present");
             let child = rows
                 .iter()
@@ -4986,7 +5016,10 @@ mod tests {
             app.leave_row();
             assert_eq!(app.view, ViewKind::Tree);
             assert_eq!(app.selected, second_root);
-            assert!(app.rows()[app.selected].label.contains("/root/mole-linked"));
+            assert_eq!(
+                app.rows()[app.selected].unit.as_ref().unwrap().0,
+                "/root/mole-linked"
+            );
             app.leave_row();
             assert_eq!(app.view, ViewKind::Tree);
             assert_eq!(app.selected, second_root);
@@ -6099,7 +6132,14 @@ mod tests {
         app.set_view(ViewKind::External);
         let rows = app.rows();
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].label.starts_with("standalone Cargo target"));
+        assert_eq!(rows[0].label, "/fixture/scratch-target");
+        assert!(
+            rows[0]
+                .table_note
+                .as_deref()
+                .unwrap()
+                .contains("cargo build")
+        );
         assert!(rows[0].unit.is_some(), "plannable from this view");
     }
 
@@ -6133,12 +6173,14 @@ mod tests {
         app.set_view(ViewKind::Unowned);
         let rows = app.rows();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, dir.display().to_string());
         assert!(
-            rows[0].label.contains("standalone Cargo target"),
-            "{}",
-            rows[0].label
+            rows[0]
+                .table_note
+                .as_deref()
+                .unwrap()
+                .contains("cargo build")
         );
-        assert!(rows[0].label.contains("cargo build"));
         let row = rows[0].clone();
         app.mark_row(&row);
         let marked = app

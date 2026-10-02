@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- TUI tables give more room to identifying names: checkout-relative build paths, path-first unassigned rows, concise recovery costs and no empty columns. Unknown sizes are labelled. Wrapped blocked reasons and Cargo details stay reachable when paging or resizing. Key hints now match bulk review, fixed-order views and manager confirmation; unsupported modifier chords cannot invoke plain commands, and project-name filter input accepts spaces and command letters.
+
 - The TUI keeps marked counts, selected bytes and Trash/permanent Docker destinations visible between actions. List position and contextual hints help with long views; blocked reasons remain accessible. Invalid filter expressions stay open for correction or Esc, preserving the previous filter, marks and position.
 
 - All thirteen TUI views use clearer titles and column headings, with view-specific empty states. The top panel keeps one total and one coverage line; allocation details remain in Disk. Reclaim shows removal cost at 80 columns, Disk views omit empty change columns, and filter labels name ignored predicates. Tool and agent rows use readable labels while selected details retain exact paths and prioritize current use, recovery, shared bytes and unknown facts. Existing navigation and review keys are unchanged.

@@ -1301,13 +1301,13 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 |---|---|
 | Up / Down | Move selection |
 | PgUp / PgDn | Move one screenful; in help, the blocked list and the picker they scroll or jump the same way |
-| Home / End | First / last row (or first / last help line, blocked item, picker field) |
+| Home / End | First / last row (or first / last displayed help or blocked line, picker field) |
 | Right / Left | Open or expand / collapse an expanded row, select its parent, or return to projects |
 | Enter | Open a project or confirm the pending action |
 | Esc | Cancel the current interaction or return to projects |
 | Space | Mark or unmark a row |
 | Backspace | Request removal of the selected row or marked set |
-| `A` | Mark actionable rows in the current view, excluding the checkout fallback |
+| `A` | Review all actionable rows in the current view, excluding the checkout fallback; opens the plan before any action |
 | `k` | Toggle keeping supported compiled outputs before removal. The result line says whether it is now on or off; the choice is remembered |
 | `b` / `d` | List what the last check or delete could not include, with the reason and next step (`d` on the plan). Inside the list, `r` checks again |
 | `/` | Open the filter form |
@@ -1316,10 +1316,10 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | `Tab` / `Shift-Tab` | Next / previous section: Projects, Tools, Disk. While you type a filter, Tab completes it as before |
 | `v` | Next view inside the current section, wrapping around |
 | `1`, `2`, `3` | Jump to a section: 1 Projects, 2 Tools, 3 Disk (help lists them; the legend does not) |
-| `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age |
-| `r` | Reverse the sort |
+| `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age; Project folders, Reclaim and Disk keep their fixed order |
+| `r` | Reverse the sort in views that support sorting |
 | `?` | Show help |
-| `q` | Quit (closes help, the list or the picker first; while a check or a move runs, it stops it after the current item) |
+| `q` | Quit; closes help and inspection lists first. Closes the picker except in its project field, where it types q. While a check or move runs, stops it after the current item |
 
 The initial filter is `growth > 100MB in 7d`. Filter, sort, reverse, and keep-executables choices are saved in `ui_state.json`. Clear the filter if the first observation shows no matching rows.
 
@@ -1330,6 +1330,10 @@ Below the list, the status area keeps your marked count and selected size visibl
 If Enter rejects a raw filter expression, keep typing to correct it or press Esc to restore the accepted expression. The previous filter, selection and marks stay in place until a valid expression is applied; invalid drafts are not saved.
 
 Rows show size and signed growth. Red bars extend right for increases; green bars extend left for decreases. Bar length is logarithmic, so use the number to compare exact changes.
+
+The filter form’s project field accepts literal text, including q, e, 0 and spaces; arrows choose a match and Enter applies it. Elsewhere in the form, q closes, e opens text editing and 0 clears. Blocked reasons and Cargo inspection scroll through wrapped lines with arrows, PgUp/PgDn and Home/End, including after resize. Unsupported Ctrl/Alt/Super/Hyper/Meta chords are ignored rather than acting like plain commands; Ctrl-C retains its explicit cancel/quit behavior.
+
+Build and dependency tables show project-relative paths; selected details and review retain exact paths. Reclaim uses concise recovery labels with full original wording and source in details. Empty note/change columns and all-zero bars are omitted. A recorded zero stays visible; an unread or unmeasured folder is labelled explicitly.
 
 ## Report views
 

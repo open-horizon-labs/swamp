@@ -56,6 +56,8 @@ fn stored_views_render_cost() {
     for view in [
         ViewKind::Projects,
         ViewKind::Tree,
+        ViewKind::Builds,
+        ViewKind::Deps,
         ViewKind::Agents,
         ViewKind::Reclaim,
     ] {
@@ -84,4 +86,31 @@ fn stored_views_render_cost() {
         assert_eq!(work.files_statted, 0, "rendering cannot stat");
         assert_eq!(work.subprocess_spawns, 0, "rendering cannot launch probes");
     }
+    // Action-sized blocked review: wrapping the whole explanation enables
+    // truthful End/resize navigation. Measure it instead of guessing cost.
+    let root = PathBuf::from("/synthetic/blocked-render");
+    let mut blocked = App::new(swamp_core::report::Report::empty(root.clone()), root);
+    blocked.blocked = (0..499).map(|i| swamp_tui::app::BlockedItem {
+        name: format!("project-{i} / target/debug/deps/test-member-{i}"),
+        reason: "A writer still has this selected build output open; the process and its recorded paths need to be reviewed before retrying.".into(),
+        next: "Stop the writer, then press r to check this selection again.".into(),
+    }).collect();
+    blocked.blocked_open = true;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut samples = Vec::new();
+    let (_, work) = swamp_core::work_counters::measured(|| {
+        for _ in 0..25 {
+            let start = Instant::now();
+            terminal.draw(|f| ui::draw(f, &blocked)).unwrap();
+            samples.push(start.elapsed().as_micros());
+        }
+    });
+    samples.sort_unstable();
+    eprintln!(
+        "view=Blocked items=499 median_us={} p95_us={} dirs={} stats={} spawns={}",
+        samples[12], samples[23], work.dirs_listed, work.files_statted, work.subprocess_spawns
+    );
+    assert_eq!(work.dirs_listed, 0);
+    assert_eq!(work.files_statted, 0);
+    assert_eq!(work.subprocess_spawns, 0);
 }

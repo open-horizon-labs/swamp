@@ -345,6 +345,7 @@ fn footer_legend(
     blocked: bool,
     markable: bool,
     filterable: bool,
+    sortable: bool,
     backspace_hint: Option<&str>,
 ) -> String {
     const BASE: [&str; 11] = [
@@ -353,7 +354,7 @@ fn footer_legend(
         "v view",
         "/ filter",
         "R refresh",
-        "A mark all",
+        "A review all",
         "↑↓ move",
         "→/← in/out",
         "g/s/n/t/a sort",
@@ -368,10 +369,13 @@ fn footer_legend(
     if !filterable {
         items.retain(|k| *k != "/ filter");
     }
+    if !sortable {
+        items.retain(|k| !matches!(*k, "g/s/n/t/a sort" | "r reverse"));
+    }
     if !markable {
         // A view whose rows cannot be marked shows no key that only
         // answers with a refusal.
-        items.retain(|k| !matches!(*k, "Space mark" | "A mark all"));
+        items.retain(|k| !matches!(*k, "Space mark" | "A review all"));
     }
     if blocked {
         // What the last check could not include, one key from the list.
@@ -438,65 +442,6 @@ fn clip_end(s: &str, width: usize) -> String {
     }
     out.push('…');
     out
-}
-
-/// Whole lines that fit `cap` rows once wrapped at `width`; what does not
-/// fit is counted in a last line instead of being cut mid-sentence.
-fn fit_lines(
-    lines: &[(String, Color)],
-    width: usize,
-    cap: usize,
-    more: &dyn Fn(usize) -> String,
-) -> Vec<(String, Color)> {
-    let mut used = 0usize;
-    let mut fit: Vec<(String, Color)> = Vec::new();
-    for (i, (l, c)) in lines.iter().enumerate() {
-        let rows = wrapped_rows(l, width);
-        let left = lines.len() - i - 1;
-        // Keep one row for the "+N more" line when something is left over.
-        let reserve = usize::from(left > 0);
-        if used + rows + reserve > cap && !fit.is_empty() {
-            // Rows are left but not enough for the whole line. A count or
-            // a reason is worth its start (it leads with the fact); a
-            // warning is never cut mid-sentence, it is counted instead.
-            let room = cap.saturating_sub(used + reserve);
-            if room > 0 && !l.starts_with('⚠') {
-                fit.push((clip_end(l, (room * width).saturating_sub(room)), *c));
-                if left > 0 {
-                    fit.push((more(left), Color::Yellow));
-                }
-            } else {
-                fit.push((more(left + 1), Color::Yellow));
-            }
-            return fit;
-        }
-        used += rows;
-        fit.push((l.clone(), *c));
-    }
-    fit
-}
-
-/// Rows a greedy word wrap of `text` takes at `width` columns.
-fn wrapped_rows(text: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut rows = 1usize;
-    let mut cur = 0usize;
-    for word in text.split_whitespace() {
-        let wl = word.chars().count();
-        if cur == 0 {
-            cur = wl;
-        } else if cur + 1 + wl <= width {
-            cur += 1 + wl;
-        } else {
-            rows += 1;
-            cur = wl;
-        }
-        while cur > width {
-            rows += 1;
-            cur -= width;
-        }
-    }
-    rows
 }
 
 fn confirm_lines(app: &App) -> Vec<(String, Color)> {
@@ -697,49 +642,69 @@ fn draw_confirm_overlay(frame: &mut Frame, app: &App, screen: Rect) {
     );
 }
 
-/// The blocked sheet: each item, why, and what to do next.
-fn blocked_sheet(app: &App) -> Vec<(String, Color)> {
-    let mut out = Vec::new();
-    for b in app.blocked.iter().skip(app.blocked_scroll) {
-        out.push((format!("{}  {}", b.name, b.reason), Color::Reset));
-        out.push((format!("  next: {}", b.next), Color::Yellow));
-    }
-    out
-}
-
-/// A sheet over the bottom of the body: bordered, fixed height, whole
-/// lines with a count of what did not fit.
-fn draw_sheet(
-    frame: &mut Frame,
-    body: Rect,
-    rows: u16,
-    title: &str,
-    lines: &[(String, Color)],
-    more: &dyn Fn(usize) -> String,
-) {
-    let h = rows.min(body.height);
-    if h < 3 {
+/// Reasons and recovery are scrolled as wrapped lines, so even one long
+/// entry remains completely reachable at a narrow width.
+fn draw_blocked_sheet(frame: &mut Frame, app: &App, body: Rect) {
+    let height = SHEET_ROWS.min(body.height);
+    if height < 3 {
         return;
     }
     let area = Rect {
-        y: body.y + body.height - h,
-        height: h,
+        y: body.y + body.height - height,
+        height,
         ..body
     };
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "));
+    let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
-    let fit = fit_lines(lines, inner.width as usize, inner.height as usize, more);
-    let text: Vec<Line> = fit
+    let lines: Vec<Line> = app
+        .blocked
         .iter()
-        .map(|(l, c)| Line::styled(l.clone(), tone(*c)))
+        .flat_map(|item| {
+            let mut lines: Vec<Line> = wrap_confirm_text(
+                &format!("{}  {}", item.name, item.reason),
+                inner.width as usize,
+            )
+            .into_iter()
+            .map(Line::raw)
+            .collect();
+            lines.extend(
+                wrap_confirm_text(&format!("  next: {}", item.next), inner.width as usize)
+                    .into_iter()
+                    .map(|line| Line::styled(line, Style::default().add_modifier(Modifier::BOLD))),
+            );
+            lines
+        })
         .collect();
+    let visible = inner.height as usize;
+    let top = app
+        .blocked_scroll
+        .get()
+        .min(lines.len().saturating_sub(visible));
+    app.blocked_scroll.set(top);
+    app.page.set(visible.saturating_sub(1).max(1));
+    let count = |n: usize| swamp_core::render::human_count(n as u64);
+    let title = fit_clauses(
+        &[
+            format!("Blocked: {}", count(app.blocked.len())),
+            format!(
+                "lines {}-{} of {}",
+                count((top + 1).min(lines.len())),
+                count((top + visible).min(lines.len())),
+                count(lines.len())
+            ),
+        ],
+        inner.width as usize,
+    );
+    frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(text)
-            .block(block)
-            .wrap(ratatui::widgets::Wrap { trim: false }),
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(top)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        )
+        .block(block.title(format!(" {title} "))),
         area,
     );
 }
@@ -1021,50 +986,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_filter_line(frame, app, chunks[3]);
     let rows = app.rows();
     draw_body(frame, app, chunks[4], &rows);
-    if app.operation.is_none() && app.blocked_open {
-        // Two rows per item.
-        app.page
-            .set((usize::from(SHEET_ROWS.min(chunks[4].height)).saturating_sub(2) / 2).max(1));
-        draw_sheet(
-            frame,
-            chunks[4],
-            SHEET_ROWS,
-            &if app.blocked_scroll > 0 {
-                format!(
-                    "Blocked: {} · from item {}",
-                    app.blocked.len(),
-                    app.blocked_scroll + 1
-                )
-            } else {
-                format!("Blocked: {}", app.blocked.len())
-            },
-            &blocked_sheet(app),
-            &|_| "more below (↓ to scroll)".to_string(),
-        );
+    if app.operation.is_none() && app.blocked_open && !app.confirm_open {
+        draw_blocked_sheet(frame, app, chunks[4]);
     }
     draw_status(frame, app, &summary, &rows, chunks[5]);
     if app.confirm_open {
         draw_confirm_overlay(frame, app, size);
         if app.blocked_open {
-            app.page
-                .set((usize::from(SHEET_ROWS.min(chunks[4].height)).saturating_sub(2) / 2).max(1));
-            let title = if app.blocked_scroll > 0 {
-                format!(
-                    "Blocked: {} · from item {} · Esc returns to plan",
-                    app.blocked.len(),
-                    app.blocked_scroll + 1
-                )
-            } else {
-                format!("Blocked: {} · Esc returns to plan", app.blocked.len())
-            };
-            draw_sheet(
-                frame,
-                chunks[4],
-                SHEET_ROWS,
-                &title,
-                &blocked_sheet(app),
-                &|_| "more below (↓ to scroll)".to_string(),
-            );
+            draw_blocked_sheet(frame, app, chunks[4]);
         }
     }
 
@@ -1148,18 +1077,31 @@ pub fn draw(frame: &mut Frame, app: &App) {
             });
         }
         fit_hints(&clauses, fw)
-    } else if app.picker.is_some() {
-        fit_hints(
-            &[
-                "↑↓ field",
-                "←→ value",
-                "Enter apply",
-                "Esc cancel",
-                "e edit as text",
-                "0 clear",
-            ],
-            fw,
-        )
+    } else if let Some(picker) = &app.picker {
+        if picker.field == 3 {
+            fit_hints(
+                &[
+                    "Type project name",
+                    "↑↓ field",
+                    "←→ match",
+                    "Enter apply",
+                    "Esc cancel",
+                ],
+                fw,
+            )
+        } else {
+            fit_hints(
+                &[
+                    "↑↓ field",
+                    "←→ value",
+                    "Enter apply",
+                    "Esc cancel",
+                    "e edit as text",
+                    "0 clear",
+                ],
+                fw,
+            )
+        }
     } else if app.editing_filter {
         fit_hints(&["Tab complete", "Enter apply", "Esc cancel"], fw)
     } else {
@@ -1196,6 +1138,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             !app.blocked.is_empty(),
             markable,
             app.view.uses_filter(),
+            !matches!(
+                app.view,
+                crate::app::ViewKind::Tree
+                    | crate::app::ViewKind::Reclaim
+                    | crate::app::ViewKind::Disk
+                    | crate::app::ViewKind::DiskGaps
+            ),
             backspace_hint.as_deref(),
         )
     };
@@ -1226,9 +1175,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .collect();
         let inner_h = usize::from(popup.height.saturating_sub(2));
         app.page.set(inner_h.saturating_sub(1).max(1));
+        let top = app
+            .cargo_inspection_scroll
+            .get()
+            .min(wrapped.len().saturating_sub(inner_h));
+        app.cargo_inspection_scroll.set(top);
         let visible: Vec<Line> = wrapped
             .iter()
-            .skip(app.cargo_inspection_scroll as usize)
+            .skip(top)
             .take(inner_h)
             .map(|s| Line::from(s.as_str()))
             .collect();
@@ -1463,7 +1417,7 @@ fn draw_tool_sheet(frame: &mut Frame, sheet: &crate::tool_sheet::ToolSheet, size
 
 fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
     let w = area.width.min(78);
-    let h = area.height.min(18);
+    let h = area.height.min((p.lines().len() + 4) as u16);
     let popup = Rect {
         x: (area.width.saturating_sub(w)) / 2,
         y: (area.height.saturating_sub(h)) / 2,
@@ -1913,34 +1867,55 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
     });
     use crate::app::ViewKind as V;
     let disk_view = matches!(app.view, V::Disk | V::DiskGaps);
-    let decision_view = cleanup_view || app.view == V::Reclaim || disk_view;
-    let show_growth = !disk_view && (!decision_view || width >= 100);
-    let half: usize = if width >= 140 && !decision_view { 6 } else { 0 };
+    let decision_view =
+        cleanup_view || matches!(app.view, V::Builds | V::Deps | V::Reclaim) || disk_view;
+    let show_growth = !disk_view
+        && rows.iter().any(|row| row.growth.is_some())
+        && (!decision_view || width >= 100);
+    let has_notes = rows.iter().any(|row| {
+        row.table_note.is_some() || row.cleanup_summary.is_some() || !row.signals.is_empty()
+    });
+    let half: usize = if show_growth && max_abs > 0 && width >= 140 && !decision_view {
+        6
+    } else {
+        0
+    };
     // name | bytes(10) | sp | growth(10) | sp | half│half | sp | signals
     let bar_width = if half > 0 { half * 2 + 2 } else { 0 };
-    let fixed = if show_growth { 24 + bar_width } else { 13 };
+    let size_width = rows
+        .iter()
+        .filter_map(|row| row.size_text.as_deref())
+        .map(crate::model::display_width)
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 16);
+    let fixed = size_width + 3 + if show_growth { 11 + bar_width } else { 0 };
     let flexible = width.saturating_sub(fixed);
-    let signals_width = if disk_view {
+    let signals_width = if !has_notes {
+        0
+    } else if disk_view {
         flexible * 2 / 5
     } else if decision_view {
-        (flexible / 2).min(64)
+        // Short consequence labels fit beside an identifiable item at 80
+        // columns. Wider terminals can show the original supporting facts.
+        (flexible / 2).min(if width < 100 { 32 } else { 64 })
     } else if width >= 100 {
         flexible / 3
     } else {
         0
     };
-    let name_width = if decision_view {
+    let name_width = if decision_view && has_notes {
         flexible.saturating_sub(signals_width).min(64)
     } else {
         flexible.saturating_sub(signals_width)
     };
-    let signals_width = if decision_view {
+    let signals_width = if decision_view && has_notes {
         flexible.saturating_sub(name_width)
     } else {
         signals_width
     };
     let heading = format!(
-        "{}{:>10} {}{}{}",
+        "{}  {:>size_width$} {}{}{}",
         pad_display(
             match app.view {
                 V::Projects => "Project",
@@ -1959,7 +1934,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
             },
             name_width
         ),
-        if cleanup_view { "Size*" } else { "Size" },
+        "Size",
         if show_growth {
             format!("{:>10} ", "Change")
         } else {
@@ -1967,12 +1942,12 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         },
         pad_display(if half > 0 { "Change bar" } else { "" }, bar_width),
         pad_display(
-            if cleanup_view || reclaim_line.is_some() {
+            if reclaim_line.is_some() {
                 "If removed"
             } else if disk_view {
                 "Measurement"
             } else {
-                "Details"
+                "Notes"
             },
             signals_width
         )
@@ -2070,9 +2045,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
             truncate_middle(&rest, name_width.saturating_sub(rail_width).max(1))
         );
         let bytes = format!(
-            "{:>10}",
+            "{:>size_width$}",
             match &row.size_text {
-                Some(text) => clip_end(text, 10),
+                Some(text) => clip_end(text, size_width),
                 None => format!(
                     "{}{}",
                     human_bytes(row.bytes),
@@ -2107,10 +2082,13 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         // uses width up to 200 ... signals spell out."
         // Narrow terminals show the two most decision-relevant signals
         // spelled out (never a glyph code); wide ones show them all.
-        let mut signals_text = if let Some(summary) = &row.cleanup_summary {
+        let mut signals_text = if let Some(note) = &row.table_note {
+            note.clone()
+        } else if let Some(summary) = &row.cleanup_summary {
             // Drop secondary statistics before clipping the decision itself.
             let mut parts: Vec<_> = summary.split(" · ").collect();
-            while parts.len() > 1 && parts.join(" · ").chars().count() > signals_width {
+            while parts.len() > 1 && crate::model::display_width(&parts.join(" · ")) > signals_width
+            {
                 parts.pop();
             }
             parts.join(" · ")
@@ -2123,12 +2101,14 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         } else {
             row.signals.join(" · ")
         };
-        if row.cleanup_summary.is_none() && signals_text.chars().count() > signals_width {
+        if row.cleanup_summary.is_none()
+            && crate::model::display_width(&signals_text) > signals_width
+        {
             // Never overflow the row: prefer the loud signals, then cut.
-            if app.view != V::Reclaim {
+            if app.view != V::Reclaim && row.table_note.is_none() {
                 signals_text = pick_signals(&row.signals, 3).join(" · ");
             }
-            if signals_text.chars().count() > signals_width {
+            if crate::model::display_width(&signals_text) > signals_width {
                 signals_text = clip_end(&signals_text, signals_width);
             }
         }
@@ -2147,6 +2127,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         };
         let spans = vec![
             Span::styled(pad_display(&name, name_width), name_style),
+            Span::raw("  "),
             Span::raw(bytes),
             Span::raw(" "),
             // The signed number and its bar are one diffstat token: same
@@ -2443,7 +2424,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "A",
-        "mark every row here that swamp has a cleanup rule for. Rows it keeps by default or has no rule for are marked one at a time with Space; in Reclaim and External each unit is marked once",
+        "review all rows here that swamp has a cleanup rule for. Opens the plan before any action. Rows it keeps by default or has no rule for are marked one at a time with Space; in Reclaim and External each unit is marked once",
     );
     entry(
         &mut out,
@@ -2468,7 +2449,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "",
-        "mise installs and simulator runtimes: Backspace on an unmarked row opens the manager's own list and dry run, then its command, permanently: no Trash. Space marks the folder for Trash instead.",
+        "mise installs and simulator runtimes: Backspace on an unmarked row opens the manager's list. Enter reviews the selection and command; Y runs the reviewed command permanently, with no Trash. Space marks the folder for Trash instead.",
     );
     entry(
         &mut out,
@@ -2483,7 +2464,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "/",
-        "filter picker (a form) · : edits the filter as text, Tab completes · 0 clears it",
+        "filter picker (a form): type a name in its project field, including spaces; Esc cancels. Elsewhere q also closes, e edits as text, and 0 clears. In the main view : edits the filter as text; Tab completes",
     );
     entry(
         &mut out,
@@ -2503,7 +2484,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "g s n t a",
-        "sort by growth, size, name, type, age; press again to turn the sort off · r reverses it · remembered",
+        "sort by growth, size, name, type, age; press again to turn the sort off · r reverses it · remembered. Project folders, Reclaim and Disk keep their fixed order",
     );
     entry(
         &mut out,
@@ -2552,12 +2533,12 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     heading(&mut out, "Columns");
     plain(
         &mut out,
-        "  Size, then growth over the window with its bar around the centre axis: left green shrank, right red grew, log-scaled, a dim tick below 1MB. Then facts.",
+        "  Size is measured storage. Change appears where recorded; 0B means no change and — means unknown. Empty note columns and all-zero bars are omitted. Bars are log-scaled: left green shrank, right red grew. Reclaim names recovery cost; Disk names measurement state.",
         2,
     );
     plain(
         &mut out,
-        "  [tracked] [ignored] [untracked] is git status; untracked has no copy anywhere.",
+        "  [tracked] [ignored] [untracked] is Git status. Untracked files are not recorded in Git; other backups are not established here.",
         2,
     );
     blank(&mut out);
