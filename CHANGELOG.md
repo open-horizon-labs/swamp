@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+## 0.8.2 — 2026-10-02
+
 - Project tables name their comparison period (`Change 7d`) and offer `w` to change it. Period and growth-filter changes now recalculate from stored history without scanning projects. Shorter available history is labelled approximately; clearing the filter preserves the period.
 
 - Trash review now separates decision facts from supporting details: concise restore cost, sourced last use and consequential exceptions appear in the summary; `l` retains original warnings, sources and every path. Build advice drops oldest-age and cleanup-rule boilerplate. Generic accuracy badges disappear while unknown sizes and lower bounds remain labelled.
