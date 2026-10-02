@@ -39,6 +39,23 @@ pub fn growth_window_secs(f: &Filter) -> Option<u64> {
     })
 }
 
+/// A stored all-history choice keeps exact seconds in the grammar, while
+/// the read-only view line uses the same coarse period as its Change column.
+pub fn display_text(raw: &str) -> String {
+    let mut words: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
+    for i in 0..words.len().saturating_sub(4) {
+        if words[i] == "growth"
+            && words[i + 3] == "in"
+            && let Some(seconds) = words[i + 4]
+                .strip_suffix('s')
+                .and_then(|value| value.parse().ok())
+        {
+            words[i + 4] = crate::picker::comparison_span(seconds);
+        }
+    }
+    words.join(" ")
+}
+
 pub fn project_name(f: &Filter) -> Option<&str> {
     f.predicates.iter().find_map(|p| match p {
         Predicate::Project(n) => Some(n.as_str()),

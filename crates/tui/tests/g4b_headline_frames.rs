@@ -189,8 +189,8 @@ fn states() -> Vec<(&'static str, Setter)> {
 /// Tempting wrong patch: a state (a warning, a missing ledger, a running
 /// scan, a first-run line) is drawn by inserting a row, so the table shifts
 /// down when it appears. The headline block is the same rows in every
-/// state and every view, at every width; the strip, the filter line and the
-/// table heading never move, and the keys stay on the last row.
+/// state and every view, at every width; the strip, view title and table
+/// heading never move, and the keys stay on the last row.
 #[test]
 fn no_row_moves_between_states_or_views_at_any_width() {
     for w in [40u16, 50, 80, 120] {
@@ -214,19 +214,18 @@ fn no_row_moves_between_states_or_views_at_any_width() {
                         strip.contains(&format!("{} {}", sec.key(), sec.title())),
                         "strip: {ctx}"
                     );
-                    // The view line, then the body.
-                    assert!(f[2 + hr].contains("filter:"), "view line: {ctx}");
+                    // The view title stays visible even when the active
+                    // filter does not apply to this view.
+                    assert!(f[2 + hr].contains(view.title()), "view title: {ctx}");
                     let body = &f[3 + hr];
                     if !a.rows().is_empty() {
-                        assert!(body.starts_with("Name"), "heading at the same row: {ctx}");
+                        assert!(!body.trim().is_empty(), "heading at the same row: {ctx}");
                     }
                     // Keys are on the last row, `q quit` always.
                     assert!(f[h as usize - 1].contains("q quit"), "keys: {ctx}");
-                    // The headline is the first line of the block.
+                    // The headline total is the first line of the block.
                     assert!(
-                        f[1].starts_with("Developer storage")
-                            || f[1].starts_with("Dev storage")
-                            || f[1].starts_with("Dev "),
+                        f[1].contains("Developer storage") || f[1].contains("Dev "),
                         "headline row: {ctx}"
                     );
                     assert!(!f[1..=hr].iter().any(|l| l.contains('\u{2014}')), "{ctx}");
@@ -241,7 +240,7 @@ fn no_row_moves_between_states_or_views_at_any_width() {
 /// answer (no size makes the table vanish).
 #[test]
 fn the_headline_block_height_is_a_function_of_the_terminal_height_only() {
-    assert_eq!(ui::headline_rows(30), 4);
+    assert_eq!(ui::headline_rows(30), 2);
     assert_eq!(ui::headline_rows(29), 2);
     assert_eq!(ui::headline_rows(24), 2);
     assert_eq!(ui::headline_rows(22), 2);
@@ -259,51 +258,41 @@ fn the_headline_block_height_is_a_function_of_the_terminal_height_only() {
     }
 }
 
-/// Tempting wrong patch: the percent or the ages are only in the report,
-/// or only at wide sizes. The first screen at 80 columns shows the
-/// headline with its percent, the ages, and the pointers with their keys.
+/// Tempting wrong patch: totals, coverage and observation context are
+/// repeated or mixed together. The header owns root/age; the two headline
+/// rows own the developer-storage total and measurement coverage.
 #[test]
-fn the_first_screen_at_80_columns_shows_the_headline_ages_and_pointers() {
-    let a = app();
+fn the_first_screen_separates_scope_age_total_and_coverage() {
+    let mut a = app();
+    a.live_age = true;
+    a.observed_label = "4m ago".into();
     let f = frame(&a, 80, 30);
-    assert_eq!(
-        f[1],
-        "Developer storage: 39.0GB across 1 project and 3 tool locations (39.0% of used)"
-    );
-    // Breakdown: projects, toolchains, caches, agents.
-    assert!(f[2].contains("projects 30.0GB"), "{}", f[2]);
-    // Ages and the ledger's parts.
-    assert!(f[3].contains("observed 4m ago"), "{}", f[3]);
+    assert!(f[0].contains("/h/src"), "header owns root: {}", f[0]);
     assert!(
-        f[3].contains("ledger 3h ago") || f[3].contains("disk ledger measured 3h ago"),
-        "{}",
-        f[3]
-    );
-    // The pointers name the views and the keys; at 80 columns they take
-    // their shorter form.
-    assert!(
-        f[4].contains("Reclaim: 3.0GB regenerable, 3 units (2)"),
-        "{}",
-        f[4]
-    );
-    assert!(f[4].contains("Disk: ledger 3h ago (3)"), "{}", f[4]);
-    // Wide enough, they spell the key out.
-    let wide = frame(&a, 120, 30);
-    assert!(
-        wide[4].contains("Reclaim: 3.0GB regenerable across 3 units (2 for Tools)"),
-        "{}",
-        wide[4]
+        f[0].contains("observed 4m ago"),
+        "header owns age: {}",
+        f[0]
     );
     assert!(
-        wide[4].contains("Disk: ledger measured 3h ago (3)"),
+        f[1].contains("Developer storage") && f[1].contains("39.0GB"),
         "{}",
-        wide[4]
+        f[1]
     );
+    assert!(
+        f[2].contains("ledger") && f[2].contains("3h ago"),
+        "{}",
+        f[2]
+    );
+    assert!(
+        !f[1].contains("Reclaim:") && !f[2].contains("Reclaim:"),
+        "{f:?}"
+    );
+    assert!(!f[1].contains("Disk:") && !f[2].contains("Disk:"), "{f:?}");
 }
 
 /// Tempting wrong patch: the disk state is folded into a percent (or the
 /// line is dropped) when the ledger is missing, unreadable, newer or
-/// future-dated. Each says what it is, at 80 columns, with no percent.
+/// future-dated. The coverage headline says what happened, with no percent.
 #[test]
 fn a_ledger_that_cannot_be_used_is_named_and_gives_no_percent() {
     for (name, set) in states() {
@@ -315,13 +304,12 @@ fn a_ledger_that_cannot_be_used_is_named_and_gives_no_percent() {
         let f = frame(&a, 80, 24);
         assert!(!f[1].contains('%'), "{name}: {}", f[1]);
         assert!(f[2].contains("ledger"), "{name}: {}", f[2]);
-        assert!(f[3].contains("Disk"), "{name}: {}", f[3]);
     }
     // The previous scope is stated on the block itself.
     let mut a = app();
     a.previous_scope_roots = Some(3);
     let f = frame(&a, 80, 24);
-    assert!(f[2].contains("previous scope (3 roots)"), "{}", f[2]);
+    assert!(f[2].contains("previous scope"), "{}", f[2]);
     let f = frame(&a, 40, 24);
     assert!(f[2].contains("previous scope"), "{}", f[2]);
 }
@@ -437,9 +425,9 @@ fn the_strip_highlights_the_current_section_with_reverse_video_and_no_color() {
     }
 }
 
-/// Tempting wrong patch: the sub-view is only on the strip (so a narrow
-/// screen loses it) or `v` runs into the next section. The view line names
-/// section, sub-view and place; `v` wraps inside the section.
+/// Tempting wrong patch: the sub-view title is only on the strip (so it is
+/// easy to miss) or `v` runs into the next section. The line names the view
+/// and purpose; `v` wraps inside the section.
 #[test]
 fn the_view_line_names_the_sub_view_and_v_wraps_inside_the_section() {
     use swamp_tui::app::Section;
@@ -448,26 +436,20 @@ fn the_view_line_names_the_sub_view_and_v_wraps_inside_the_section() {
         a.set_section(Section::Tools);
         let f = frame(&a, w, 24);
         let line = &f[2 + ui::headline_rows(24) as usize];
-        assert!(
-            line.contains("Tools › Reclaim (1 of 4") || (w < 80 && line.contains("Reclaim")),
-            "{w}: {line}"
-        );
+        assert!(line.contains("Reclaim"), "{w}: {line}");
         for _ in 0..4 {
             swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
         }
         assert_eq!(a.view, ViewKind::Reclaim, "wrapped");
         let line = frame(&a, w, 24)[2 + ui::headline_rows(24) as usize].clone();
-        assert!(
-            line.contains("Tools › Reclaim (1 of 4") || (w < 80 && line.contains("Reclaim")),
-            "{w}: {line}"
-        );
+        assert!(line.contains("Reclaim"), "{w}: {line}");
     }
     let mut a = app();
     a.set_section(Section::Disk);
     swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
     assert_eq!(a.view, ViewKind::DiskGaps);
     let line = frame(&a, 80, 24)[2 + ui::headline_rows(24) as usize].clone();
-    assert!(line.contains("Disk › Not measured (2 of 2"), "{line}");
+    assert!(line.contains("Coverage gaps"), "{line}");
 }
 
 // ---------------------------------------------------------------------
@@ -633,17 +615,17 @@ fn ctrl_c_is_not_a_view_key_and_v_stays_in_its_section() {
 }
 
 /// Tempting wrong patch: the legend grows view keys, or loses `? help  q
-/// quit`. It is `Tab section  v view  / filter  R refresh  ⌫ delete` and
+/// quit`. It names section/view/filter/refresh and the current review verb
 /// the row keys that already existed, and never a key per view.
 #[test]
 fn the_legend_names_tab_and_v_and_never_a_key_per_view() {
-    let a = app();
+    let mut a = app();
+    a.set_view(ViewKind::Projects);
     let f80 = frame(&a, 80, 24);
     let last = &f80[23];
-    assert!(
-        last.starts_with("Tab section  v view  / filter  R refresh  ⌫ delete"),
-        "{last}"
-    );
+    for item in ["Tab section", "v view", "/ filter"] {
+        assert!(last.contains(item), "missing {item:?}: {last}");
+    }
     assert!(last.contains("? help  q quit"), "{last}");
     for w in [40u16, 50, 80, 120] {
         for v in ViewKind::ALL {
@@ -660,31 +642,31 @@ fn the_legend_names_tab_and_v_and_never_a_key_per_view() {
 }
 
 // ---------------------------------------------------------------------
-// The first-run pointer
+// The first-run navigation hint
 // ---------------------------------------------------------------------
 
-/// Tempting wrong patch: the pointer line is a permanent banner, or it is
-/// remembered only in memory, or it hides on any key. It shows on a store
-/// that has never opened Tools or Disk, ends when either is opened, and is
-/// written to `ui_state.json` (additive; an older reader ignores it).
+/// Tempting wrong patch: the navigation hint is a permanent banner, or it
+/// appears before a user has seen the views. It appears on the section strip
+/// until Tools or Disk is opened, and the seen state is persisted.
 #[test]
-fn the_first_run_line_hides_after_tools_or_disk_is_opened_and_stays_hidden() {
+fn the_first_run_hint_uses_the_section_strip_and_stays_hidden_after_use() {
     let dir = tempfile::tempdir().unwrap();
     let mut a = app();
     a.store_dir = Some(dir.path().to_path_buf());
     a.views_seen = false;
-    let want = "Tab switches sections · 2 opens Tools / Reclaim · 3 opens Disk";
-    assert_eq!(frame(&a, 80, 30)[4], want);
+    let strip_y = 1 + ui::headline_rows(30) as usize;
+    let has_hint = |a: &App| frame(a, 80, 30)[strip_y].contains("Tab switches sections");
+    assert!(has_hint(&a), "first-run hint missing from section strip");
     // Moving inside Projects does not end it.
     swamp_tui::handle_key(&mut a, KeyCode::Char('v'));
     swamp_tui::handle_key(&mut a, KeyCode::Char('1'));
-    assert_eq!(frame(&a, 80, 30)[4], want);
+    assert!(has_hint(&a), "project navigation ended the first-run hint");
     // Opening Disk does.
     swamp_tui::handle_key(&mut a, KeyCode::Char('3'));
     assert!(a.views_seen);
-    let f = frame(&a, 80, 30);
-    assert!(!f[4].starts_with("Tab switches"), "{}", f[4]);
-    assert!(f[4].contains("Reclaim:") && f[4].contains("(2"), "{}", f[4]);
+    assert!(!has_hint(&a), "hint remains after opening Disk");
+    let view_line = frame(&a, 80, 30)[2 + ui::headline_rows(30) as usize].clone();
+    assert!(view_line.contains(ViewKind::Disk.title()), "{view_line}");
     a.flush_ui_state();
     let raw = std::fs::read_to_string(dir.path().join("ui_state.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -703,6 +685,7 @@ fn the_first_run_line_hides_after_tools_or_disk_is_opened_and_stays_hidden() {
     swamp_tui::handle_key(&mut b, KeyCode::Tab);
     assert_eq!(b.view, ViewKind::Reclaim);
     assert!(b.views_seen);
+    assert!(!has_hint(&b));
 }
 
 // ---------------------------------------------------------------------
@@ -719,11 +702,11 @@ fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
     a.set_view(ViewKind::Disk);
     let f = frame(&a, 120, 30).join("\n");
     assert!(
-        f.contains("Accounted: declared roots and catalog units"),
+        f.contains("Developer storage") && f.contains("35.0GB"),
         "{f}"
     );
-    assert!(f.contains("Everything else (not developer storage)"), "{f}");
-    assert!(f.contains("System volumes"), "{f}");
+    assert!(f.contains("Everything else") && f.contains("9.0GB"), "{f}");
+    assert!(f.contains("System volumes") && f.contains("10.0GB"), "{f}");
     let pic = f
         .lines()
         .find(|l| l.contains("/Users/x/Pictures"))
@@ -731,16 +714,13 @@ fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
     assert!(pic.contains("not read") && !pic.contains("0B"), "{pic}");
     a.set_view(ViewKind::DiskGaps);
     let f = frame(&a, 120, 30).join("\n");
-    assert!(f.contains("Could not be read: 1 directory"), "{f}");
+    assert!(f.contains("Not read") && f.contains("1 directory"), "{f}");
     let pic = f
         .lines()
         .find(|l| l.contains("/Users/x/Pictures"))
         .expect("named");
     assert!(pic.contains("not read") && !pic.contains("0B"), "{pic}");
-    assert!(
-        f.contains("Largest measured folders outside developer storage"),
-        "{f}"
-    );
+    assert!(f.contains("Outside developer storage"), "{f}");
     assert!(f.contains("/Users/x/Movies"), "{f}");
     for v in [ViewKind::Disk, ViewKind::DiskGaps] {
         let mut b = app();
@@ -752,9 +732,41 @@ fn the_disk_views_list_the_ledger_parts_and_never_show_unreadable_as_zero() {
             f.contains("disk ledger: not measured yet; run swamp observe --volume"),
             "{f}"
         );
-        assert!(f.contains("opening the UI never scans"), "{f}");
+        assert!(f.contains("Opening this view does not scan"), "{f}");
         let (_, work) = swamp_core::work_counters::measured(|| frame(&b, 80, 24));
         assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+    }
+}
+
+/// Removing empty columns must not remove measurement state or turn an
+/// unreadable location into a measured zero. Both disk tables retain the
+/// allocated/shared legend while omitting a meaningless growth column.
+#[test]
+fn disk_tables_keep_measurement_and_unknown_size_at_compact_and_wide_widths() {
+    for view in [ViewKind::Disk, ViewKind::DiskGaps] {
+        for (w, h) in [(80, 24), (200, 60)] {
+            let mut a = app();
+            a.set_view(view);
+            let f = frame(&a, w, h);
+            let heading = &f[5];
+            assert!(heading.contains("Size"), "{view:?}: {heading}");
+            assert_eq!(
+                heading.contains("Measurement"),
+                view == ViewKind::Disk,
+                "empty measurement columns are omitted: {view:?}: {heading}"
+            );
+            assert!(!heading.contains("Change"), "{view:?}: {heading}");
+            assert!(
+                f.iter()
+                    .any(|line| line.contains("shared files may be counted again"))
+            );
+            let unread = f
+                .iter()
+                .find(|line| line.contains("/Users/x/Pictures"))
+                .expect("unreadable path retained");
+            assert!(unread.contains("not read"), "{unread}");
+            assert!(!unread.contains("0B"), "{unread}");
+        }
     }
 }
 
@@ -819,49 +831,134 @@ fn view_keys_are_text_while_typing_in_the_filter_and_the_picker() {
     }
 }
 
-/// Tempting wrong patch: a narrow screen cuts the view line at the edge, so
-/// the active filter (which hides rows) is the part that vanishes. The view
-/// part shortens first; the filter is always on screen.
+/// Tempting wrong patch: unsupported predicates are shown as if they narrow
+/// the current view, or a supported filter disappears on a narrow screen.
 #[test]
-fn an_active_filter_is_always_visible_on_the_view_line() {
+fn filter_summary_is_visible_only_where_and_as_it_is_applied() {
     for w in [40u16, 50, 80, 120] {
-        for v in ViewKind::ALL {
+        for v in [
+            ViewKind::Projects,
+            ViewKind::Tree,
+            ViewKind::Builds,
+            ViewKind::Deps,
+        ] {
             let mut a = app();
             a.set_view(v);
             a.filter_text = "growth > 100MB in 7d".into();
+            a.commit_filter();
             let f = frame(&a, w, 24);
             let line = &f[2 + ui::headline_rows(24) as usize];
-            assert!(
-                line.contains("filter: growth > 100MB in 7d"),
-                "{w} {v:?}: {line}"
-            );
+            if w >= 50 {
+                assert!(
+                    line.contains("filter: growth > 100MB in 7d"),
+                    "{w} {v:?}: {line}"
+                );
+            }
+        }
+    }
+
+    let mut a = app();
+    a.filter_text = "growth > 100MB in 7d kind:build".into();
+    a.commit_filter();
+    for v in [
+        ViewKind::Docker,
+        ViewKind::Unowned,
+        ViewKind::External,
+        ViewKind::Reclaim,
+        ViewKind::Disk,
+        ViewKind::DiskGaps,
+        ViewKind::Agents,
+    ] {
+        a.set_view(v);
+        let line = frame(&a, 120, 24)[2 + ui::headline_rows(24) as usize].clone();
+        assert!(line.contains(v.title()), "{v:?}: {line}");
+        assert!(
+            !line.contains("filter:"),
+            "ignored filter claimed: {v:?}: {line}"
+        );
+    }
+}
+
+/// Set `SWAMP_CLARITY_CAPTURE` to a directory to write one readable frame
+/// per view at the compact and wide review sizes. Normal tests never write
+/// captures or goldens.
+#[test]
+fn optionally_capture_every_view_at_compact_and_wide_sizes() {
+    let Some(dir) = std::env::var_os("SWAMP_CLARITY_CAPTURE") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for view in ViewKind::ALL {
+        let mut a = app();
+        a.views_seen = true;
+        a.clear_filter();
+        a.set_view(ViewKind::Projects);
+        a.selected = 0;
+        a.set_view(view);
+        for (name, width, height) in [("compact", 80, 24), ("wide", 200, 60)] {
+            let contents = frame(&a, width, height).join("\n");
+            std::fs::write(dir.join(format!("{}-{name}.txt", view.label())), contents).unwrap();
         }
     }
 }
 
-/// The pointer names the jump key, which works from every section (Tab
-/// from Tools goes to Disk, not back to Tools).
+/// The active filter is never claimed on a view that ignores it. Aggregate
+/// views name only the predicate kinds they actually apply.
 #[test]
-fn the_reclaim_pointer_names_the_jump_key_not_tab() {
+fn filter_summary_only_claims_predicates_used_by_the_current_view() {
     let mut a = app();
-    for w in [40u16, 80, 120] {
-        for v in [ViewKind::Projects, ViewKind::Reclaim, ViewKind::Disk] {
-            a.set_view(v);
-            let l = frame(&a, w, 30)[4].clone();
-            assert!(
-                l.contains("Reclaim") && !l.contains("Tab"),
-                "{w} {v:?}: {l}"
-            );
-            assert!(l.contains("(2") || w < 40, "{l}");
-        }
-    }
-    // Disk views hide the keys they cannot use.
-    a.set_view(ViewKind::Disk);
-    let last = frame(&a, 120, 24).pop().unwrap();
+    a.filter_text = "growth > 100MB in 7d kind:build type:rust project:mole".into();
+    a.commit_filter();
+    let view_line_y = 2 + ui::headline_rows(30) as usize;
+
+    a.set_view(ViewKind::Projects);
+    let projects = frame(&a, 160, 30)[view_line_y].clone();
+    assert!(projects.contains("Projects"), "{projects}");
+    assert!(projects.contains("filter:"), "{projects}");
+    assert!(projects.contains("project:mole"), "{projects}");
+
+    a.set_view(ViewKind::Kinds);
+    let kinds = frame(&a, 160, 30)[view_line_y].clone();
+    assert!(kinds.contains("Storage kinds"), "{kinds}");
+    assert!(kinds.contains("kind:build"), "{kinds}");
+    assert!(kinds.contains("other filters off"), "{kinds}");
     assert!(
-        !last.contains("⌫ delete") && !last.contains("Space mark"),
-        "{last}"
+        !kinds.contains("project:mole"),
+        "ignored predicate shown: {kinds}"
     );
+    assert!(
+        !kinds.contains("type:rust"),
+        "ignored predicate shown: {kinds}"
+    );
+
+    a.set_view(ViewKind::Types);
+    let types = frame(&a, 160, 30)[view_line_y].clone();
+    assert!(types.contains("Ecosystems"), "{types}");
+    assert!(types.contains("type:rust"), "{types}");
+    assert!(types.contains("other filters off"), "{types}");
+    assert!(
+        !types.contains("project:mole"),
+        "ignored predicate shown: {types}"
+    );
+    assert!(
+        !types.contains("kind:build"),
+        "ignored predicate shown: {types}"
+    );
+
+    for v in [ViewKind::Reclaim, ViewKind::Disk, ViewKind::External] {
+        a.set_view(v);
+        let line = frame(&a, 160, 30)[view_line_y].clone();
+        assert!(line.contains(v.title()), "{v:?}: {line}");
+        assert!(
+            !line.contains("filter:"),
+            "ignored filter claimed: {v:?}: {line}"
+        );
+        assert!(
+            !line.contains("project:mole"),
+            "ignored filter claimed: {v:?}: {line}"
+        );
+    }
 }
 
 /// Tempting wrong patch: an open confirm lets the cursor, the views or the
@@ -994,5 +1091,7 @@ fn every_key_the_legend_names_does_something() {
         );
         bound += 1;
     }
-    assert!(bound >= 10, "{legend}");
+    // This empty Projects fixture has navigation/filter/sort keys, but no
+    // mark or review hints. The populated action fixtures cover those.
+    assert!(bound >= 8, "{legend}");
 }

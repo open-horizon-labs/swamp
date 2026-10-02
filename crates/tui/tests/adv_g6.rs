@@ -182,7 +182,7 @@ fn adv_a_merged_plan_never_hides_which_folder_a_warning_is_about() {
     wait(&mut a);
     assert_eq!(a.marked.len(), 13, "{:?}", a.refusal_active());
     let s = a.confirm_summary();
-    assert!(s.contains("Cannot be regenerated"), "{s}");
+    assert!(s.contains("Cannot be downloaded or rebuilt"), "{s}");
     let fits = a.confirm_fits(200, 60);
     assert!(
         !fits || s.contains(&state.display().to_string()),

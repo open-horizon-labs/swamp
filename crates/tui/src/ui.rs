@@ -74,21 +74,15 @@ fn draw_spark(frame: &mut Frame, series: &[Option<u64>], area: Rect) {
     );
 }
 
-/// The growth window the header reports. When the asked-for window is
-/// longer than the observations the store holds, the effective window is
-/// the history itself, and the label says so instead of implying a week
-/// of growth from four hours of data.
+/// The comparison window attached to the displayed values, independent
+/// of a cleared filter or a pending request for another period.
 fn since_label(app: &App) -> Option<String> {
-    let asked = crate::filter::growth_window_secs(&app.filter)?;
-    Some(match app.history_secs {
-        Some(hist) if hist < asked => format!(
-            "{} (asked {}; history is {})",
-            human_duration(hist),
-            human_duration(asked),
-            human_duration(hist)
-        ),
-        _ => human_duration(asked),
-    })
+    let seconds = if app.view.uses_filter() {
+        app.report.series_window_secs
+    } else {
+        app.stored_window_secs
+    };
+    (seconds > 0).then(|| crate::picker::comparison_span(seconds))
 }
 
 fn human_duration(secs: u64) -> String {
@@ -114,49 +108,28 @@ fn header_line(app: &App, width: usize) -> String {
         .flat_map(|p| &p.worktrees)
         .flat_map(|w| &w.artifacts)
         .any(|a| a.dedup_stale);
-    let projects = swamp_core::render::human_count(app.report.projects.len() as u64);
-    let attributed: u64 = app
-        .report
-        .projects
-        .iter()
-        .flat_map(|p| &p.worktrees)
-        .flat_map(|w| &w.artifacts)
-        .map(|a| a.bytes)
-        .sum();
-    let docker_unowned = crate::model::docker_unowned_bytes(&app.report);
-    let unowned: u64 = app
-        .report
-        .unowned
-        .iter()
-        .map(|u| u.bytes)
-        .sum::<u64>()
-        .saturating_sub(docker_unowned);
-    // Walk counters reset between roots and are not whole-observation progress.
-    // The activity chip keeps the run-wide elapsed clock visible throughout.
-    let obs = if app.observing.is_some() {
+    let warn = stale_warning(app);
+    let observed = if app.observing.is_some() {
         format!(
             "updating {} root{}",
-            app.roots.len(),
+            swamp_core::render::human_count(app.roots.len() as u64),
             if app.roots.len() == 1 { "" } else { "s" }
         )
-    } else {
+    } else if warn.is_none() {
         format!("observed {}", age_label(app))
+    } else {
+        String::new()
     };
-    let warn = stale_warning(app);
-    let since = since_label(app)
-        .map(|s| format!(" · since {s}"))
-        .unwrap_or_default();
-    // Clauses in priority order; the renderer drops trailing clauses that
-    // do not fit the terminal width rather than truncating mid-word.
+    // The headline owns totals. This line owns scope, freshness and activity.
     let clauses = vec![
         app.disk_banner.clone().unwrap_or_default(),
         app.status.clone().unwrap_or_default(),
         if app.new_data_waiting() {
-            "new data available".to_string()
+            "new data available".into()
         } else {
             String::new()
         },
-        warn.clone().unwrap_or_default(),
+        warn.unwrap_or_default(),
         if stale
             || app
                 .report
@@ -165,36 +138,20 @@ fn header_line(app: &App, width: usize) -> String {
                 .as_ref()
                 .is_some_and(|u| u.needs_reconciliation)
         {
-            format!("unique totals not recomputed · {}", app.root.display())
+            if width >= 120 {
+                "unique totals not recomputed (needs reconciliation)".into()
+            } else {
+                "unique totals not recomputed".into()
+            }
         } else {
-            app.root.display().to_string()
+            String::new()
         },
-        if warn.is_some() {
-            since.trim_start_matches(" · ").to_string()
-        } else {
-            format!("{obs}{since}")
-        },
-        app.report
-            .reconciliation
-            .unique_estimate
-            .as_ref()
-            .map(|u| {
-                format!(
-                    "{} unique{}",
-                    human_bytes(u.bytes),
-                    if u.needs_reconciliation {
-                        " (needs reconciliation)"
-                    } else {
-                        " (reconciled)"
-                    }
-                )
-            })
-            .unwrap_or_default(),
-        format!("{projects} projects"),
-        format!("{} attributed", human_bytes(attributed)),
-        format!("{} unowned", human_bytes(unowned)),
-        format!("docker {} unowned", human_bytes(docker_unowned)),
         app.scope_note.clone().unwrap_or_default(),
+        observed,
+        app.root.display().to_string(),
+        since_label(app)
+            .map(|s| format!("change over {s}"))
+            .unwrap_or_default(),
         app.declared_note.clone().unwrap_or_default(),
     ];
     // The chip owns the left edge at every width; the clauses share what
@@ -377,15 +334,21 @@ fn fit_hints_once(hints: &[&str], width: usize) -> String {
 /// person reaches for first: filter, view, refresh and delete come before
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
-fn footer_legend(width: usize, blocked: bool, markable: bool, trash: bool) -> String {
-    const BASE: [&str; 12] = [
+fn footer_legend(
+    width: usize,
+    blocked: bool,
+    markable: bool,
+    filterable: bool,
+    sortable: bool,
+    backspace_hint: Option<&str>,
+) -> String {
+    const BASE: [&str; 11] = [
+        "Space mark",
         "Tab section",
         "v view",
         "/ filter",
         "R refresh",
-        "⌫ delete",
-        "Space mark",
-        "A mark all",
+        "A review all",
         "↑↓ move",
         "→/← in/out",
         "g/s/n/t/a sort",
@@ -394,19 +357,19 @@ fn footer_legend(width: usize, blocked: bool, markable: bool, trash: bool) -> St
     ];
     const TAIL: &str = "q quit";
     let mut items: Vec<&str> = BASE.to_vec();
-    if trash {
-        // Reclaim and External: what Backspace does on a row that has a
-        // mark to make is the Trash confirm.
-        for k in items.iter_mut() {
-            if *k == "⌫ delete" {
-                *k = "⌫ trash";
-            }
-        }
+    if let Some(hint) = backspace_hint {
+        items.insert(1, hint);
+    }
+    if !filterable {
+        items.retain(|k| *k != "/ filter");
+    }
+    if !sortable {
+        items.retain(|k| !matches!(*k, "g/s/n/t/a sort" | "r reverse"));
     }
     if !markable {
         // A view whose rows cannot be marked shows no key that only
         // answers with a refusal.
-        items.retain(|k| !matches!(*k, "⌫ delete" | "⌫ trash" | "Space mark" | "A mark all"));
+        items.retain(|k| !matches!(*k, "Space mark" | "A review all"));
     }
     if blocked {
         // What the last check could not include, one key from the list.
@@ -475,65 +438,6 @@ fn clip_end(s: &str, width: usize) -> String {
     out
 }
 
-/// Whole lines that fit `cap` rows once wrapped at `width`; what does not
-/// fit is counted in a last line instead of being cut mid-sentence.
-fn fit_lines(
-    lines: &[(String, Color)],
-    width: usize,
-    cap: usize,
-    more: &dyn Fn(usize) -> String,
-) -> Vec<(String, Color)> {
-    let mut used = 0usize;
-    let mut fit: Vec<(String, Color)> = Vec::new();
-    for (i, (l, c)) in lines.iter().enumerate() {
-        let rows = wrapped_rows(l, width);
-        let left = lines.len() - i - 1;
-        // Keep one row for the "+N more" line when something is left over.
-        let reserve = usize::from(left > 0);
-        if used + rows + reserve > cap && !fit.is_empty() {
-            // Rows are left but not enough for the whole line. A count or
-            // a reason is worth its start (it leads with the fact); a
-            // warning is never cut mid-sentence, it is counted instead.
-            let room = cap.saturating_sub(used + reserve);
-            if room > 0 && !l.starts_with('⚠') {
-                fit.push((clip_end(l, (room * width).saturating_sub(room)), *c));
-                if left > 0 {
-                    fit.push((more(left), Color::Yellow));
-                }
-            } else {
-                fit.push((more(left + 1), Color::Yellow));
-            }
-            return fit;
-        }
-        used += rows;
-        fit.push((l.clone(), *c));
-    }
-    fit
-}
-
-/// Rows a greedy word wrap of `text` takes at `width` columns.
-fn wrapped_rows(text: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut rows = 1usize;
-    let mut cur = 0usize;
-    for word in text.split_whitespace() {
-        let wl = word.chars().count();
-        if cur == 0 {
-            cur = wl;
-        } else if cur + 1 + wl <= width {
-            cur += 1 + wl;
-        } else {
-            rows += 1;
-            cur = wl;
-        }
-        while cur > width {
-            rows += 1;
-            cur -= width;
-        }
-    }
-    rows
-}
-
 fn confirm_lines(app: &App) -> Vec<(String, Color)> {
     let cargo_conflict = crate::app::selective_cargo_keep_conflict(
         app.keep_executables,
@@ -563,7 +467,7 @@ fn confirm_lines(app: &App) -> Vec<(String, Color)> {
         app.marked.values().any(|u| u.cargo_unit.is_some()),
     ) {
         lines.push((
-            "Saved Keep executables setting conflicts with selective Cargo removal; press k to turn it off.".into(),
+            "Turn off Keep executables with k to remove these Cargo items.".into(),
             Color::Yellow,
         ));
     }
@@ -702,9 +606,9 @@ fn draw_confirm_overlay(frame: &mut Frame, app: &App, screen: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(if app.confirm_details_open {
-            " All action paths · Esc summary "
+            " Details · Esc summary "
         } else {
-            " Review actions · l inspect paths "
+            " Review actions · l details "
         });
     let inner = block.inner(area);
     let visible = usize::from(inner.height);
@@ -732,49 +636,69 @@ fn draw_confirm_overlay(frame: &mut Frame, app: &App, screen: Rect) {
     );
 }
 
-/// The blocked sheet: each item, why, and what to do next.
-fn blocked_sheet(app: &App) -> Vec<(String, Color)> {
-    let mut out = Vec::new();
-    for b in app.blocked.iter().skip(app.blocked_scroll) {
-        out.push((format!("{}  {}", b.name, b.reason), Color::Reset));
-        out.push((format!("  next: {}", b.next), Color::Yellow));
-    }
-    out
-}
-
-/// A sheet over the bottom of the body: bordered, fixed height, whole
-/// lines with a count of what did not fit.
-fn draw_sheet(
-    frame: &mut Frame,
-    body: Rect,
-    rows: u16,
-    title: &str,
-    lines: &[(String, Color)],
-    more: &dyn Fn(usize) -> String,
-) {
-    let h = rows.min(body.height);
-    if h < 3 {
+/// Reasons and recovery are scrolled as wrapped lines, so even one long
+/// entry remains completely reachable at a narrow width.
+fn draw_blocked_sheet(frame: &mut Frame, app: &App, body: Rect) {
+    let height = SHEET_ROWS.min(body.height);
+    if height < 3 {
         return;
     }
     let area = Rect {
-        y: body.y + body.height - h,
-        height: h,
+        y: body.y + body.height - height,
+        height,
         ..body
     };
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "));
+    let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
-    let fit = fit_lines(lines, inner.width as usize, inner.height as usize, more);
-    let text: Vec<Line> = fit
+    let lines: Vec<Line> = app
+        .blocked
         .iter()
-        .map(|(l, c)| Line::styled(l.clone(), tone(*c)))
+        .flat_map(|item| {
+            let mut lines: Vec<Line> = wrap_confirm_text(
+                &format!("{}  {}", item.name, item.reason),
+                inner.width as usize,
+            )
+            .into_iter()
+            .map(Line::raw)
+            .collect();
+            lines.extend(
+                wrap_confirm_text(&format!("  next: {}", item.next), inner.width as usize)
+                    .into_iter()
+                    .map(|line| Line::styled(line, Style::default().add_modifier(Modifier::BOLD))),
+            );
+            lines
+        })
         .collect();
+    let visible = inner.height as usize;
+    let top = app
+        .blocked_scroll
+        .get()
+        .min(lines.len().saturating_sub(visible));
+    app.blocked_scroll.set(top);
+    app.page.set(visible.saturating_sub(1).max(1));
+    let count = |n: usize| swamp_core::render::human_count(n as u64);
+    let title = fit_clauses(
+        &[
+            format!("Blocked: {}", count(app.blocked.len())),
+            format!(
+                "lines {}-{} of {}",
+                count((top + 1).min(lines.len())),
+                count((top + visible).min(lines.len())),
+                count(lines.len())
+            ),
+        ],
+        inner.width as usize,
+    );
+    frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(text)
-            .block(block)
-            .wrap(ratatui::widgets::Wrap { trim: false }),
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(top)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        )
+        .block(block.title(format!(" {title} "))),
         area,
     );
 }
@@ -847,7 +771,123 @@ fn operation_rows(app: &App, op: &crate::app::Operation) -> [String; 2] {
     }
 }
 
-fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
+fn idle_status_rows(app: &App, rows: &[crate::model::Row], width: usize) -> [String; 2] {
+    let marked = app.marked.len();
+    let trash = app
+        .marked
+        .values()
+        .filter(|unit| unit.docker.is_none())
+        .count();
+    let permanent = app
+        .marked
+        .values()
+        .filter(|unit| unit.docker.is_some())
+        .count();
+    let selected_bytes = app
+        .marked
+        .values()
+        .fold(0u64, |total, unit| total.saturating_add(unit.bytes));
+    let count = |n: usize| swamp_core::render::human_count(n as u64);
+
+    let first = if app.editing_filter {
+        app.filter_error
+            .as_ref()
+            .map(|error| {
+                format!(
+                    "Filter not applied: {}",
+                    error.strip_prefix("filter: ").unwrap_or(error)
+                )
+            })
+            .unwrap_or_default()
+    } else if marked > 0 {
+        let mut parts = vec![format!("{} marked", count(marked))];
+        if permanent > 0 {
+            parts.push(format!("{} Docker permanent", count(permanent)));
+        }
+        if trash > 0 {
+            parts.push(format!("{} Trash", count(trash)));
+        }
+        parts.push(format!("{} selected", human_bytes(selected_bytes)));
+        fit_clauses(&parts, width)
+    } else if !app.blocked.is_empty() {
+        format!("{} blocked · b reasons", count(app.blocked.len()))
+    } else {
+        String::new()
+    };
+
+    let row_position = if rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Row {} of {}",
+            count(app.selected.saturating_add(1)),
+            count(rows.len())
+        )
+    };
+    let context = rows
+        .get(app.selected)
+        .and_then(|row| {
+            let is_marked = row
+                .unit
+                .as_ref()
+                .is_some_and(|unit| app.marked.contains_key(&unit.0));
+            if let Some(manager) = row.tool.filter(|_| !is_marked) {
+                if marked > 0 {
+                    Some("Space mark folder for Trash".to_string())
+                } else {
+                    Some(format!("Backspace opens {} list", manager.name()))
+                }
+            } else if marked > 0 {
+                Some("Backspace review".to_string())
+            } else if row.expandable {
+                Some(
+                    if app.view == crate::app::ViewKind::Projects
+                        || row.collapsed_children.is_some()
+                    {
+                        "Enter open".to_string()
+                    } else {
+                        "Enter close".to_string()
+                    },
+                )
+            } else {
+                None
+            }
+        })
+        .or_else(|| (marked > 0).then(|| "Backspace review".to_string()));
+
+    let second = if app.editing_filter {
+        if app.filter_error.is_some() {
+            fit_clauses(&["Edit filter".into(), "Esc cancel".into()], width)
+        } else {
+            String::new()
+        }
+    } else {
+        let mut parts = Vec::new();
+        if marked > 0 && !app.blocked.is_empty() {
+            parts.push(format!("{} blocked · b reasons", count(app.blocked.len())));
+        }
+        if !row_position.is_empty() {
+            parts.push(row_position);
+        }
+        if let Some(context) = context {
+            parts.push(context);
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            fit_clauses(&parts, width)
+        }
+    };
+    [clip_end(&first, width), clip_end(&second, width)]
+}
+
+fn draw_status(
+    frame: &mut Frame,
+    app: &App,
+    summary: &[String],
+    rows: &[crate::model::Row],
+    area: Rect,
+) {
     let w = area.width as usize;
     if let Some(op) = &app.operation {
         let rows = operation_rows(app, op);
@@ -862,6 +902,26 @@ fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
                 area,
             );
         }
+    } else if app.help_open
+        || app.picker.is_some()
+        || app.tool_sheet.is_some()
+        || app.cargo_inspection.is_some()
+        || app.blocked_open
+    {
+        // Sheets and editors own their own context; idle list feedback must
+        // not bleed through them.
+    } else if app.editing_filter && app.filter_error.is_some() {
+        let lines = idle_status_rows(app, rows, w);
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .style(Style::default().fg(Color::Red)),
+            area,
+        );
     } else if let Some(msg) = app.refusal_active() {
         frame.render_widget(
             Paragraph::new(msg.to_string())
@@ -874,6 +934,17 @@ fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
             Paragraph::new(r.to_string())
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .style(Style::default()),
+            area,
+        );
+    } else {
+        let lines = idle_status_rows(app, rows, w);
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.clone()))
+                    .collect::<Vec<_>>(),
+            ),
             area,
         );
     }
@@ -907,51 +978,16 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_headline(frame, app, chunks[1]);
     draw_view_strip(frame, app, chunks[2]);
     draw_filter_line(frame, app, chunks[3]);
-    draw_body(frame, app, chunks[4]);
-    if app.operation.is_none() && app.blocked_open {
-        // Two rows per item.
-        app.page
-            .set((usize::from(SHEET_ROWS.min(chunks[4].height)).saturating_sub(2) / 2).max(1));
-        draw_sheet(
-            frame,
-            chunks[4],
-            SHEET_ROWS,
-            &if app.blocked_scroll > 0 {
-                format!(
-                    "Blocked: {} · from item {}",
-                    app.blocked.len(),
-                    app.blocked_scroll + 1
-                )
-            } else {
-                format!("Blocked: {}", app.blocked.len())
-            },
-            &blocked_sheet(app),
-            &|_| "more below (↓ to scroll)".to_string(),
-        );
+    let rows = app.rows();
+    draw_body(frame, app, chunks[4], &rows);
+    if app.operation.is_none() && app.blocked_open && !app.confirm_open {
+        draw_blocked_sheet(frame, app, chunks[4]);
     }
-    draw_status(frame, app, &summary, chunks[5]);
+    draw_status(frame, app, &summary, &rows, chunks[5]);
     if app.confirm_open {
         draw_confirm_overlay(frame, app, size);
         if app.blocked_open {
-            app.page
-                .set((usize::from(SHEET_ROWS.min(chunks[4].height)).saturating_sub(2) / 2).max(1));
-            let title = if app.blocked_scroll > 0 {
-                format!(
-                    "Blocked: {} · from item {} · Esc returns to plan",
-                    app.blocked.len(),
-                    app.blocked_scroll + 1
-                )
-            } else {
-                format!("Blocked: {} · Esc returns to plan", app.blocked.len())
-            };
-            draw_sheet(
-                frame,
-                chunks[4],
-                SHEET_ROWS,
-                &title,
-                &blocked_sheet(app),
-                &|_| "more below (↓ to scroll)".to_string(),
-            );
+            draw_blocked_sheet(frame, app, chunks[4]);
         }
     }
 
@@ -1022,7 +1058,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             clauses.push("d blocked");
         }
         if !app.confirm_details_open && app.confirm_fits(size.width, size.height) {
-            clauses.insert(1, "l inspect paths");
+            clauses.insert(1, "l details");
         }
         // Selective Cargo groups cannot use the executable-copy mode.
         if !app.marked.values().all(|u| u.reclaim.is_some())
@@ -1035,39 +1071,77 @@ pub fn draw(frame: &mut Frame, app: &App) {
             });
         }
         fit_hints(&clauses, fw)
-    } else if app.picker.is_some() {
-        fit_hints(
-            &[
-                "↑↓ field",
-                "←→ value",
-                "Enter apply",
-                "Esc cancel",
-                "e edit as text",
-                "0 clear",
-            ],
-            fw,
-        )
+    } else if app.change_period.is_some() {
+        fit_hints(&["←/→ period", "Enter apply", "Esc cancel"], fw)
+    } else if let Some(picker) = &app.picker {
+        if picker.field == 3 {
+            fit_hints(
+                &[
+                    "Type project name",
+                    "↑↓ field",
+                    "←→ match",
+                    "Enter apply",
+                    "Esc cancel",
+                ],
+                fw,
+            )
+        } else {
+            fit_hints(
+                &[
+                    "↑↓ field",
+                    "←→ value",
+                    "Enter apply",
+                    "Esc cancel",
+                    "e edit as text",
+                    "0 clear",
+                ],
+                fw,
+            )
+        }
     } else if app.editing_filter {
         fit_hints(&["Tab complete", "Enter apply", "Esc cancel"], fw)
     } else {
+        let markable = !rows.is_empty()
+            && match app.view {
+                crate::app::ViewKind::Reclaim
+                | crate::app::ViewKind::Disk
+                | crate::app::ViewKind::DiskGaps => {
+                    rows.get(app.selected).is_some_and(|row| row.unit.is_some())
+                }
+                crate::app::ViewKind::Kinds | crate::app::ViewKind::Types => false,
+                _ => true,
+            };
+        let backspace_hint = match rows.get(app.selected) {
+            Some(row) => {
+                let is_marked = row
+                    .unit
+                    .as_ref()
+                    .is_some_and(|unit| app.marked.contains_key(&unit.0));
+                match row.tool {
+                    Some(manager) if !is_marked && app.marked.is_empty() => {
+                        Some(format!("⌫ {} list", manager.name()))
+                    }
+                    Some(_) if !is_marked => None,
+                    _ if markable || !app.marked.is_empty() => Some("⌫ review".to_string()),
+                    _ => None,
+                }
+            }
+            None if !app.marked.is_empty() => Some("⌫ review".to_string()),
+            None => None,
+        };
         footer_legend(
             size.width as usize,
             !app.blocked.is_empty(),
-            match app.view {
-                // The keys are named only while the row under the cursor
-                // has a mark to make; a row that is not a folder shows why
-                // in the detail pane instead.
-                crate::app::ViewKind::Reclaim
-                | crate::app::ViewKind::Disk
-                | crate::app::ViewKind::DiskGaps => app.selected_row_markable(),
-                _ => true,
-            },
-            matches!(
+            markable,
+            app.view.uses_filter(),
+            !matches!(
                 app.view,
-                crate::app::ViewKind::Reclaim
+                crate::app::ViewKind::Tree
+                    | crate::app::ViewKind::Reclaim
                     | crate::app::ViewKind::Disk
                     | crate::app::ViewKind::DiskGaps
             ),
+            backspace_hint.as_deref(),
         )
     };
     frame.render_widget(Paragraph::new(footer_text), chunks[6]);
@@ -1077,6 +1151,32 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     if let Some(p) = &app.picker {
         draw_picker(frame, app, p, size);
+    }
+    if let Some(p) = &app.change_period {
+        let width = size.width.min(64);
+        let height = size.height.min(6);
+        let popup = Rect::new(
+            size.x + (size.width - width) / 2,
+            size.y + (size.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, popup);
+        let text = format!(
+            "Period: {}\nHistory available: {}\nRecalculates from stored observations.",
+            p.choices[p.selected],
+            crate::picker::comparison_span(app.history_secs.unwrap_or(0))
+        );
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" Change period "),
+                ),
+            popup,
+        );
     }
     if let Some(sheet) = &app.tool_sheet {
         draw_tool_sheet(frame, sheet, size);
@@ -1097,9 +1197,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .collect();
         let inner_h = usize::from(popup.height.saturating_sub(2));
         app.page.set(inner_h.saturating_sub(1).max(1));
+        let top = app
+            .cargo_inspection_scroll
+            .get()
+            .min(wrapped.len().saturating_sub(inner_h));
+        app.cargo_inspection_scroll.set(top);
         let visible: Vec<Line> = wrapped
             .iter()
-            .skip(app.cargo_inspection_scroll as usize)
+            .skip(top)
             .take(inner_h)
             .map(|s| Line::from(s.as_str()))
             .collect();
@@ -1112,16 +1217,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Rows the developer-storage headline block takes on a terminal `height`
-/// rows tall: four when there is room for a useful table under them (the
-/// headline, the breakdown, the disk state, and the pointers to Reclaim and
-/// Disk), two on a shorter terminal (the headline and the pointers), one
-/// under 16 rows (the headline itself), none under 12. Fixed for a given
-/// height: no view and no state changes it, so no row moves.
+/// Fixed height across views and states: total plus coverage, or just the
+/// total on terminals shorter than sixteen rows. Leave the rest for the table.
 pub fn headline_rows(height: u16) -> u16 {
-    if height >= 30 {
-        4
-    } else if height >= 16 {
+    if height >= 16 {
         2
     } else if height >= 12 {
         1
@@ -1169,229 +1268,110 @@ fn fit_tiered(clauses: &[Vec<String>], width: usize) -> String {
     }
 }
 
-/// The four lines of the headline block, each already fitted to `width`.
-/// Only as many as `headline_rows` gives are drawn: all four, the first and
-/// the fourth, or the first.
-pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 4] {
+/// One total and one coverage line. Detailed allocation lives in Disk.
+pub fn headline_lines(app: &App, width: usize, now: u64) -> [String; 2] {
     use swamp_core::headline::Disk;
     if !app.has_index {
         return [
-            fit_tiered(
-                &[vec![
-                    "Developer storage: not measured yet · press R to scan".to_string(),
-                    "Developer storage: not measured yet".to_string(),
-                    "Dev storage: not measured yet".to_string(),
-                ]],
-                width,
-            ),
-            String::new(),
-            String::new(),
-            pointer_line(app, None, width, now),
+            clip_end("Developer storage: not measured yet", width),
+            clip_end("Press R to scan; saved observations appear here.", width),
         ];
     }
     let h = app.headline();
-    // Line 1: the headline, with the figures unchanged at every width.
-    let first = fit_tiered(&[h.line_tiers()], width);
-    // Line 2: the breakdown rows. They add up to the headline exactly;
-    // a narrow screen shows the largest and counts the rest.
-    let rows: Vec<&swamp_core::headline::CategoryRow> =
-        h.categories.iter().filter(|c| c.bytes > 0).collect();
-    let second = if rows.is_empty() {
-        "no developer storage found in the stored observation".to_string()
-    } else {
-        let mut sorted = rows.clone();
-        sorted.sort_by_key(|c| std::cmp::Reverse(c.bytes));
-        let long: Vec<String> = sorted
-            .iter()
-            .map(|c| format!("{} {}", c.label, human_bytes(c.bytes)))
-            .collect();
-        let short: Vec<String> = sorted
-            .iter()
-            .map(|c| format!("{} {}", c.category.short(), human_bytes(c.bytes)))
-            .collect();
-        let fits = |v: &[String]| crate::model::display_width(&v.join(" · ")) <= width;
-        if fits(&long) {
-            long.join(" · ")
-        } else if fits(&short) {
-            short.join(" · ")
+    let mut coverage: Vec<Vec<String>> = Vec::new();
+    // A discrepancy changes how every number should be read, so it wins.
+    if h.audit_sentence().is_some() {
+        coverage.push(if width >= 64 {
+            vec!["FLAG: walk spot audit disagrees: see swamp report --view disk".into()]
         } else {
-            let mut n = short.len();
-            loop {
-                n -= 1;
-                let mut v: Vec<String> = short[..n].to_vec();
-                v.push(format!("+{} more", short.len() - n));
-                if n == 0 || fits(&v) {
-                    break clip_end(&v.join(" · "), width);
-                }
-            }
-        }
-    };
-    // Line 3: what covers or limits the numbers, then the ages, then the
-    // disk ledger's own parts. The first clauses are the ones that must
-    // survive a narrow screen.
-    let mut third: Vec<Vec<String>> = Vec::new();
+            vec!["FLAG: spot audit disagrees (3 Disk)".into()]
+        });
+    }
     if let Some(n) = h.previous_scope_roots {
-        third.push(vec![
-            format!("covers the previous scope ({n} roots)"),
-            format!("previous scope ({n} roots)"),
+        coverage.push(vec![
+            format!("previous scope ({n} roots) · R refresh"),
+            "previous scope · R refresh".into(),
         ]);
     }
     if h.scope == "explicit_root" {
-        third.push(vec![
-            "only the root named on the command line".to_string(),
-            "one root only".to_string(),
+        coverage.push(vec![
+            "only the root named on the command line".into(),
+            "one root only".into(),
         ]);
     }
-    // The spot audit is the one check that can catch an undercounting
-    // walk: when it disagrees, that is the first thing the block says.
-    if h.audit_sentence().is_some() {
-        // One form per width: the wording is never traded for the clauses
-        // after it, which give way instead.
-        third.push(if width >= 64 {
-            vec!["FLAG: walk spot audit disagrees: see swamp report --view disk".to_string()]
-        } else {
-            vec!["FLAG: spot audit disagrees (3)".to_string()]
-        });
-    }
-    match &h.disk {
-        Disk::Measured(m) if m.percent_of_used_tenths.is_none() && m.exceeds_used => {
-            third.push(vec![
-                "FLAG: more than the disk's used bytes; no percent".to_string(),
-                "FLAG: over used; no percent".to_string(),
-            ])
-        }
-        Disk::Measured(m) if m.percent_of_used_tenths.is_none() && h.scope == "current" => third
-            .push(vec![
-                "disk ledger: no used figure; no percent".to_string(),
-                "ledger: no percent".to_string(),
-            ]),
-        Disk::Measured(_) => {}
-        Disk::NotMeasured => third.push(vec![
-            "disk ledger: not measured yet; run swamp observe --volume".to_string(),
-            "disk ledger: not measured yet".to_string(),
-            "no disk ledger".to_string(),
-        ]),
-        Disk::Unreadable { .. } => third.push(vec![
-            "disk ledger: could not be read; run swamp observe --volume".to_string(),
-            "disk ledger: unreadable".to_string(),
-        ]),
-        Disk::Newer { .. } => third.push(vec![
-            "disk ledger: written by a newer swamp; not used".to_string(),
-            "disk ledger: newer swamp".to_string(),
-        ]),
-        Disk::FutureDated { .. } => third.push(vec![
-            "disk ledger: dated in the future; not used".to_string(),
-            "ledger: future date".to_string(),
-        ]),
-    }
-    let observed = if h.observed_at > 0 {
-        swamp_core::volume_ledger::age_text(h.observed_at, now)
-    } else {
-        "at an unknown time".to_string()
-    };
     match &h.disk {
         Disk::Measured(m) => {
-            let ledger = swamp_core::volume_ledger::age_text(m.measured_at, now);
-            let mut long = format!("observed {observed}; disk ledger measured {ledger}");
-            if m.older_than_observation_secs.is_some() {
-                long.push_str(" (older than the observation)");
+            if m.percent_of_used_tenths.is_none() && m.exceeds_used {
+                coverage.push(vec![
+                    "FLAG: more than the disk's used bytes; no percent".into(),
+                    "FLAG: over used; no percent".into(),
+                ]);
+            } else if m.percent_of_used_tenths.is_none() && h.scope == "current" {
+                coverage.push(if m.container_used == Some(0) {
+                    vec![
+                        "disk ledger: used bytes are zero; no percent".into(),
+                        "ledger: zero used; no percent".into(),
+                    ]
+                } else {
+                    vec![
+                        "disk ledger: no used figure; no percent".into(),
+                        "ledger: no used figure".into(),
+                    ]
+                });
             }
-            third.push(vec![long, format!("observed {observed} · ledger {ledger}")]);
-            third.push(vec![
-                format!("System volumes {}", human_bytes(m.system_volumes.bytes)),
-                format!("system {}", human_bytes(m.system_volumes.bytes)),
-            ]);
-            third.push(vec![
-                format!("Everything else {}", human_bytes(m.everything_else.bytes)),
-                format!("else {}", human_bytes(m.everything_else.bytes)),
-            ]);
-            third.push(vec![
-                format!(
-                    "Not measured: {} {}",
-                    swamp_core::render::human_count(m.not_measured.directories as u64),
-                    if m.not_measured.directories == 1 {
-                        "directory"
-                    } else {
-                        "directories"
-                    }
-                ),
-                format!(
-                    "not measured {}",
-                    swamp_core::render::human_count(m.not_measured.directories as u64)
-                ),
+            if m.not_measured.directories > 0 {
+                let count = swamp_core::render::human_count(m.not_measured.directories as u64);
+                coverage.push(vec![
+                    format!(
+                        "Not measured: {count} folder{}",
+                        if m.not_measured.directories == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                    format!(
+                        "{count} folder{} not measured",
+                        if m.not_measured.directories == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    ),
+                ]);
+            }
+            let age = swamp_core::volume_ledger::age_text(m.measured_at, now);
+            let older = if m.older_than_observation_secs.is_some() {
+                " (older than scan)"
+            } else {
+                ""
+            };
+            coverage.push(vec![
+                format!("disk ledger measured {age}{older}"),
+                format!("ledger {age}{older}"),
             ]);
         }
-        _ => third.push(vec![format!("observed {observed}")]),
+        Disk::NotMeasured => coverage.push(vec![
+            "disk ledger: not measured yet · 3 Disk for details".into(),
+            "disk ledger: not measured yet".into(),
+        ]),
+        Disk::Unreadable { .. } => coverage.push(vec![
+            "disk ledger: could not be read · 3 Disk for details".into(),
+            "disk ledger: unreadable".into(),
+        ]),
+        Disk::Newer { .. } => coverage.push(vec![
+            "disk ledger: written by a newer swamp; not used".into(),
+            "disk ledger: newer swamp; not used".into(),
+        ]),
+        Disk::FutureDated { .. } => coverage.push(vec![
+            "disk ledger: dated in the future; not used".into(),
+            "ledger: future date; not used".into(),
+        ]),
     }
     [
-        first,
-        second,
-        fit_tiered(&third, width),
-        pointer_line(app, Some(&h), width, now),
+        fit_tiered(&[h.line_tiers()], width),
+        fit_tiered(&coverage, width),
     ]
-}
-
-/// The fourth line: where Reclaim and Disk are and the key for each, or,
-/// until the person has opened either once, the one-time line saying so.
-/// The line is the same length class either way: no row moves when it goes.
-fn pointer_line(
-    app: &App,
-    h: Option<&swamp_core::headline::Headline>,
-    width: usize,
-    now: u64,
-) -> String {
-    use swamp_core::headline::Disk;
-    use swamp_core::volume_ledger::age_text;
-    if !app.views_seen {
-        return fit_tiered(
-            &[vec![
-                "Tab switches sections · 2 opens Tools / Reclaim · 3 opens Disk".to_string(),
-                "Tab switches sections · 2 Tools / Reclaim · 3 Disk".to_string(),
-                "Tab: Projects / Tools / Disk".to_string(),
-            ]],
-            width,
-        );
-    }
-    let reclaim: Vec<String> = match h {
-        Some(_) => {
-            let view = app.reclaim_view();
-            let n = view.totals.count;
-            let regen = human_bytes(view.totals.regenerable_bytes);
-            vec![
-                format!(
-                    "Reclaim: {regen} regenerable across {n} unit{} (2 for Tools)",
-                    if n == 1 { "" } else { "s" }
-                ),
-                format!(
-                    "Reclaim: {regen} regenerable, {n} unit{} (2)",
-                    if n == 1 { "" } else { "s" }
-                ),
-                "Reclaim (2)".to_string(),
-            ]
-        }
-        None => vec!["Reclaim (2)".to_string()],
-    };
-    let disk: Vec<String> = match h.map(|h| &h.disk) {
-        Some(Disk::Measured(m)) => {
-            let a = age_text(m.measured_at, now);
-            vec![
-                format!("Disk: ledger measured {a} (3)"),
-                format!("Disk: ledger {a} (3)"),
-                "Disk (3)".to_string(),
-            ]
-        }
-        Some(Disk::NotMeasured) | None => vec![
-            "Disk: not measured; run swamp observe --volume (3)".to_string(),
-            "Disk: not measured (3)".to_string(),
-            "Disk (3)".to_string(),
-        ],
-        Some(_) => vec![
-            "Disk: ledger not usable; run swamp observe --volume (3)".to_string(),
-            "Disk: ledger not usable (3)".to_string(),
-            "Disk (3)".to_string(),
-        ],
-    };
-    fit_tiered(&[reclaim, disk], width)
 }
 
 fn draw_headline(frame: &mut Frame, app: &App, area: Rect) {
@@ -1399,12 +1379,10 @@ fn draw_headline(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let all = headline_lines(app, area.width as usize, swamp_core::entities::now());
-    // Four rows: all. Two rows: the headline and its coverage/age. One: the
-    // headline.
-    let lines: Vec<&String> = match area.height {
-        1 => vec![&all[0]],
-        2 | 3 => vec![&all[0], if all[2].is_empty() { &all[3] } else { &all[2] }],
-        _ => all.iter().collect(),
+    let lines: Vec<&String> = if area.height == 1 && all[1].starts_with("FLAG:") {
+        vec![&all[1]]
+    } else {
+        all.iter().take(area.height as usize).collect()
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let rows: Vec<Line> = lines
@@ -1461,7 +1439,7 @@ fn draw_tool_sheet(frame: &mut Frame, sheet: &crate::tool_sheet::ToolSheet, size
 
 fn draw_picker(frame: &mut Frame, app: &App, p: &crate::picker::Picker, area: Rect) {
     let w = area.width.min(78);
-    let h = area.height.min(18);
+    let h = area.height.min((p.lines().len() + 4) as u16);
     let popup = Rect {
         x: (area.width.saturating_sub(w)) / 2,
         y: (area.height.saturating_sub(h)) / 2,
@@ -1587,7 +1565,11 @@ pub fn view_strip_spans(app: &App, width: usize) -> Vec<Span<'static>> {
         let name = cur.title().to_string();
         vec![clip_end(&name, width.max(1))]
     };
-    let hint = " · Tab section";
+    let hint = if app.views_seen {
+        ""
+    } else {
+        " · Tab switches sections"
+    };
     let quiet = Style::default().add_modifier(Modifier::DIM);
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, label) in labels.iter().enumerate() {
@@ -1617,147 +1599,238 @@ fn draw_view_strip(frame: &mut Frame, app: &App, area: Rect) {
 /// `filter: growth > 100MB in 7d · sort: size ↑`: what narrows and orders
 /// the rows.
 fn filter_clause(app: &App, width: usize) -> String {
-    let sort_name = match app.sort {
-        crate::model::Sort::Growth => Some("growth"),
-        crate::model::Sort::Size => Some("size"),
-        crate::model::Sort::Name => Some("name"),
-        crate::model::Sort::Type => Some("type"),
-        crate::model::Sort::Age => Some("age"),
-        crate::model::Sort::None => None,
-    };
-    let sort = match sort_name {
-        Some(n) if app.reverse => format!(" · sort: {n} ↑"),
-        Some(n) => format!(" · sort: {n}"),
-        None => String::new(),
-    };
-    let filter = if app.filter_text == "0" {
-        "none".to_string()
+    use crate::app::ViewKind as V;
+    use swamp_core::filter::Predicate;
+    let title = if app.view == V::Tree {
+        app.selected_project
+            .as_ref()
+            .map(|p| format!("{} › {p}", app.view.title()))
+            .unwrap_or_else(|| app.view.title().into())
     } else {
-        app.filter_text.clone()
+        app.view.title().to_string()
     };
-    let of = match (app.view, app.selected_project.as_deref()) {
-        (crate::app::ViewKind::Projects, _) | (_, None) => String::new(),
-        (_, Some(p)) => format!(" of {p}"),
-    };
-    let esc = if app.view == crate::app::ViewKind::Projects {
-        ""
-    } else {
-        " · Esc: projects"
-    };
-    let filt = format!("filter: {filter}{sort}");
-    let (sec, view) = (app.view.section().title(), app.view.title());
-    let (pos, n) = (app.view.position(), app.view.section().views().len());
-    // The filter hides rows, so it is never the part that is cut: the view
-    // part shortens first (the counts, then the section), and only a filter
-    // wider than the line itself is clipped.
-    let tiers = [
-        format!("view: {sec} › {view}{of} ({pos} of {n} · v next{esc})"),
-        format!("view: {sec} › {view}{of} ({pos} of {n})"),
-        format!("{sec} › {view}{of}"),
-        format!("{view}{of}"),
-    ];
-    let dw = crate::model::display_width;
-    for t in &tiers {
-        if dw(t) + 3 + dw(&filt) <= width {
-            return format!("{t} · {filt}");
+    let filter = if matches!(app.view, V::Kinds | V::Types) {
+        let relevant: Vec<_> = app
+            .filter
+            .predicates
+            .iter()
+            .filter_map(|p| match (app.view, p) {
+                (V::Kinds, Predicate::Kind(k)) => Some(format!("kind:{k}")),
+                (V::Types, Predicate::Type(t)) => Some(format!("type:{t}")),
+                _ => None,
+            })
+            .collect();
+        let others = relevant.len() < app.filter.predicates.len();
+        let value = if relevant.is_empty() {
+            "all".into()
+        } else {
+            relevant.join(" ")
+        };
+        format!(
+            "filter: {value}{}",
+            if others { " (other filters off)" } else { "" }
+        )
+    } else if app.view.uses_filter() {
+        let ignored: Vec<&str> = app
+            .filter
+            .predicates
+            .iter()
+            .filter_map(|p| match (app.view, p) {
+                (V::Projects | V::Builds | V::Deps, Predicate::Kind(_)) => Some("kind"),
+                (V::Tree, Predicate::Project(_)) => Some("project"),
+                (V::Tree, Predicate::Type(_)) => Some("type"),
+                (V::Builds | V::Deps, Predicate::IdleGreaterThan(_)) => Some("idle"),
+                (V::Builds | V::Deps, Predicate::MergeComplete) => Some("merge-complete"),
+                (V::Builds | V::Deps, Predicate::Pr(_)) => Some("pr"),
+                _ => None,
+            })
+            .collect();
+        let value = if app.filter_text.trim().is_empty() || app.filter_text == "0" {
+            "none".into()
+        } else {
+            crate::filter::display_text(&app.filter_text)
+        };
+        if ignored.is_empty() {
+            format!("filter: {value}")
+        } else {
+            format!("filter: ({} off) {value}", ignored.join(", "))
         }
+    } else {
+        String::new()
+    };
+    let sort = if matches!(app.view, V::Tree | V::Reclaim | V::Disk | V::DiskGaps) {
+        String::new()
+    } else {
+        let name = match app.sort {
+            crate::model::Sort::Growth => "growth",
+            crate::model::Sort::Size => "size",
+            crate::model::Sort::Name => "name",
+            crate::model::Sort::Type => "ecosystem",
+            crate::model::Sort::Age => "age",
+            crate::model::Sort::None => "",
+        };
+        if name.is_empty() {
+            String::new()
+        } else {
+            format!("sort: {name}{}", if app.reverse { " reversed" } else { "" })
+        }
+    };
+    if width < 64 && app.view.uses_filter() {
+        return fit_clauses(&[title, filter, "w period".into()], width);
     }
-    clip_end(&filt, width)
+    // The current view always has a name. Only settings used by this view
+    // are shown; purpose fills spare space instead of competing with them.
+    fit_clauses(
+        &[
+            title,
+            if app.view.uses_filter() {
+                if width < 100 && matches!(app.view, V::Tree | V::Builds | V::Deps) {
+                    format!(
+                        "change: {} · w period",
+                        since_label(app).unwrap_or_else(|| "?".into())
+                    )
+                } else {
+                    "w change period".into()
+                }
+            } else {
+                String::new()
+            },
+            filter,
+            sort,
+            if app.view == V::Tree {
+                "Esc: projects".into()
+            } else {
+                String::new()
+            },
+            app.view.purpose().into(),
+        ],
+        width,
+    )
 }
 
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = if app.editing_filter {
-        let hint = if app.completions.is_empty() {
-            "(Tab complete · Enter apply · Esc cancel)".to_string()
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let width = area.width as usize;
+        let prefix = "filter › ";
+        let room = width.saturating_sub(crate::model::display_width(prefix) + 1);
+        let draft = if crate::model::display_width(&app.filter_text) <= room {
+            app.filter_text.clone()
+        } else if room == 0 {
+            String::new()
         } else {
-            format!("(Tab: {})", app.completions.join("  "))
+            let mut used = 1; // Leading ellipsis names the hidden start.
+            let tail: Vec<&str> = app
+                .filter_text
+                .graphemes(true)
+                .rev()
+                .take_while(|g| {
+                    used += crate::model::display_width(g);
+                    used <= room
+                })
+                .collect();
+            format!("…{}", tail.into_iter().rev().collect::<String>())
         };
-        Line::from(format!("filter › {}▏  {hint}", app.filter_text))
+        let input = if width <= crate::model::display_width(prefix) {
+            "▏".to_string()
+        } else {
+            format!("{prefix}{draft}▏")
+        };
+        // The footer owns editing keys. Completion candidates use spare
+        // width only; the current insertion point never leaves the screen.
+        let completions = if app.completions.is_empty() {
+            String::new()
+        } else {
+            format!("Tab: {}", app.completions.join("  "))
+        };
+        Line::from(fit_clauses(&[input, completions], width))
     } else {
         Line::from(filter_clause(app, area.width as usize))
     };
     frame.render_widget(Paragraph::new(line), area);
-    if let Some(err) = &app.filter_error {
-        // Parse errors show inline in red under the line; with only one
-        // row budgeted here we overlay on the same line's tail instead
-        // of stealing a row from the body, keeping the one-screen rhythm.
-        let msg = format!("  parse error: {err}");
-        let x = area.x + (app.filter_text.len() as u16) + 9;
-        if x < area.x + area.width {
-            let sub = Rect {
-                x,
-                y: area.y,
-                width: area.width.saturating_sub(x - area.x),
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(msg).style(Style::default().fg(Color::Red)),
-                sub,
-            );
-        }
-    }
 }
 
 /// What an empty list says: why it is empty and what to press next.
 fn empty_state(app: &App) -> String {
     use crate::app::ViewKind as V;
-    // Only these views read the filter; the others are never emptied by it.
-    let filtered = matches!(
-        app.view,
-        V::Projects | V::Tree | V::Builds | V::Deps | V::Kinds | V::Types
-    );
-    if filtered && app.filter_text != "0" {
-        return format!(
-            "Nothing matches the filter \"{}\". Press / to change it, or 0 to clear it and see everything.",
-            app.filter_text
-        );
+    use swamp_core::filter::Predicate as P;
+    if !app.has_index && !matches!(app.view, V::Disk | V::DiskGaps) {
+        return if app.store_rebuild {
+            "Rebuilding observations from an older store in the background. Settings, protections and notes are kept; growth history starts again. Press R to scan.".into()
+        } else {
+            "No saved observations yet. Press R to scan in the background.".into()
+        };
+    }
+    let has_active_filter = app.filter.predicates.iter().any(|p| match app.view {
+        V::Projects => !matches!(p, P::Kind(_)),
+        V::Tree => !matches!(p, P::Project(_) | P::Type(_)),
+        V::Builds | V::Deps => matches!(
+            p,
+            P::Project(_) | P::Type(_) | P::Size { .. } | P::Growth { .. } | P::AgeGreaterThan(_)
+        ),
+        V::Kinds => matches!(p, P::Kind(_)),
+        V::Types => matches!(p, P::Type(_)),
+        _ => false,
+    });
+    if has_active_filter {
+        return "No matches for the active filters. Press / to edit, or 0 to clear.".into();
     }
     match app.view {
-        V::Projects if !app.has_index && app.store_rebuild => "This store was written by an older \
-             swamp, so its index is being rebuilt in the background. Your settings, protections \
-             and notes are kept; growth history starts again. R rescans."
-            .to_string(),
-        V::Projects if !app.has_index => {
-            "Nothing has been scanned yet. Press R to scan; it runs in the background.".to_string()
-        }
         V::Projects => format!(
-            "No projects found under {}. Press R to scan again.",
+            "No projects recorded under {}. Press R to scan again.",
             app.root.display()
         ),
-        V::Tree => {
-            "Nothing to show for this project. Esc goes back to the project list.".to_string()
-        }
+        V::Tree => "No folders recorded for this project. Press Esc for Projects.".into(),
         V::Builds => {
-            "No build output found. Press v for another view, or R to scan again.".to_string()
+            "No build outputs recorded. Press v for another view, or R to scan again.".into()
         }
         V::Deps => {
-            "No dependency folders found. Press v for another view, or R to scan again.".to_string()
+            "No dependency folders recorded. Press v for another view, or R to scan again.".into()
         }
+        V::Kinds => {
+            "No storage categories recorded. Press v for another view, or R to scan again.".into()
+        }
+        V::Types => {
+            "No project ecosystems recorded. Press v for another view, or R to scan again.".into()
+        }
+        V::Unowned => "No unassigned storage recorded. Press v for another view.".into(),
         V::Docker => {
-            "No Docker images, containers or volumes found. Press v for another view.".to_string()
+            "No Docker storage recorded. Press v for another view, or R to refresh observations."
+                .into()
+        }
+        V::External => {
+            "No tool storage recorded. Press v for another view, or R to scan again.".into()
         }
         V::Agents => {
-            "No AI-tool storage found. Press v for another view, or R to scan again.".to_string()
+            "No agent storage recorded. Press v for another view, or R to scan again.".into()
         }
         V::Reclaim => format!(
-            "No storage units in the stored observation. {}. Press v for another view, or R to scan again.",
+            "No storage units recorded. {}. Press v for another view, or R to scan again.",
             app.reclaim_view().scope.statement
         ),
         V::Disk | V::DiskGaps => {
             let h = app.headline();
-            let why = h
-                .disk_state_sentence()
-                .unwrap_or_else(|| "disk ledger: nothing recorded in it".to_string());
-            format!(
-                "{why}. The ledger is written by `swamp observe --volume` (a scheduled observe does it once a day); opening the UI never scans. Press v for another view."
-            )
+            if matches!(h.disk, swamp_core::headline::Disk::Measured(_)) {
+                "No coverage gaps recorded in the disk ledger. Press v for Disk usage.".into()
+            } else {
+                let why = h
+                    .disk_state_sentence()
+                    .unwrap_or_else(|| "No disk ledger recorded".into());
+                let next = if why.contains("swamp observe --volume") {
+                    ""
+                } else {
+                    " Run `swamp observe --volume` to measure the disk."
+                };
+                format!(
+                    "{why}.{next} Scheduled scans measure the disk daily. Opening this view does not scan."
+                )
+            }
         }
-        _ => "Nothing here yet. Press v for another view, or R to scan again.".to_string(),
     }
 }
 
-fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
-    let rows = app.rows();
+fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row]) {
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(empty_state(app)).wrap(ratatui::widgets::Wrap { trim: true }),
@@ -1780,56 +1853,141 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     let reclaim_line = (app.view == crate::app::ViewKind::Reclaim).then(|| {
         let view = app.reclaim_view();
         let notes = view.coverage_notes.len();
-        if notes == 0 {
+        let full = if notes == 0 {
             view.scope.statement.clone()
         } else {
             format!(
-                "{} · {notes} coverage note{} in swamp report --view reclaim",
-                view.scope.statement,
-                if notes == 1 { "" } else { "s" }
+                "{} · {notes} coverage notes in swamp report --view reclaim",
+                view.scope.statement
+            )
+        };
+        if crate::model::display_width(&full) <= width {
+            full
+        } else {
+            let scope = if view.scope.declared_roots > 0 {
+                format!(
+                    "{} declared root{}{}",
+                    view.scope.declared_roots,
+                    if view.scope.declared_roots == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    if view.scope.complete {
+                        ""
+                    } else {
+                        "; incomplete"
+                    }
+                )
+            } else if view
+                .scope
+                .incomplete_because
+                .iter()
+                .any(|r| r == "no source roots are declared")
+            {
+                "default roots only".into()
+            } else {
+                "incomplete scope".into()
+            };
+            format!(
+                "{} projects in {scope} · swamp report --view reclaim",
+                swamp_core::render::human_count(view.scope.projects as u64)
             )
         }
     });
-    let show_growth = !cleanup_view || width >= 100;
-    let half: usize = if width >= 140 && !cleanup_view { 6 } else { 0 };
+    use crate::app::ViewKind as V;
+    let disk_view = matches!(app.view, V::Disk | V::DiskGaps);
+    let decision_view =
+        cleanup_view || matches!(app.view, V::Builds | V::Deps | V::Reclaim) || disk_view;
+    let show_growth = !disk_view
+        && rows.iter().any(|row| row.growth.is_some())
+        && (!decision_view || width >= 100);
+    let has_notes = rows.iter().any(|row| {
+        row.table_note.is_some() || row.cleanup_summary.is_some() || !row.signals.is_empty()
+    });
+    let half: usize = if show_growth && max_abs > 0 && width >= 140 && !decision_view {
+        6
+    } else {
+        0
+    };
     // name | bytes(10) | sp | growth(10) | sp | half│half | sp | signals
     let bar_width = if half > 0 { half * 2 + 2 } else { 0 };
-    let fixed = if show_growth { 24 + bar_width } else { 13 };
+    let size_width = rows
+        .iter()
+        .filter_map(|row| row.size_text.as_deref())
+        .map(crate::model::display_width)
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 16);
+    let change_heading = since_label(app)
+        .map(|period| format!("Change {period}"))
+        .unwrap_or_else(|| "Change ?".into());
+    let growth_width = crate::model::display_width(&change_heading).max(10);
+    let fixed = size_width
+        + 3
+        + if show_growth {
+            growth_width + 1 + bar_width
+        } else {
+            0
+        };
     let flexible = width.saturating_sub(fixed);
-    let signals_width = if cleanup_view {
-        (flexible / 2).min(64)
+    let signals_width = if !has_notes {
+        0
+    } else if disk_view {
+        flexible * 2 / 5
+    } else if decision_view {
+        // Short consequence labels fit beside an identifiable item at 80
+        // columns. Wider terminals can show the original supporting facts.
+        (flexible / 2).min(if width < 100 { 32 } else { 64 })
     } else if width >= 100 {
         flexible / 3
     } else {
         0
     };
-    let name_width = if cleanup_view {
+    let name_width = if decision_view && has_notes {
         flexible.saturating_sub(signals_width).min(64)
     } else {
         flexible.saturating_sub(signals_width)
     };
-    let signals_width = if cleanup_view {
+    let signals_width = if decision_view && has_notes {
         flexible.saturating_sub(name_width)
     } else {
         signals_width
     };
     let heading = format!(
-        "{}{:>10} {}{}{}",
-        pad_display("Name", name_width),
-        if cleanup_view { "Size*" } else { "Size" },
+        "{}  {:>size_width$} {}{}{}",
+        pad_display(
+            match app.view {
+                V::Projects => "Project",
+                V::Tree => "Folder",
+                V::Builds => "Build output",
+                V::Deps => "Dependencies",
+                V::Types => "Ecosystem",
+                V::Kinds => "Storage kind",
+                V::Unowned => "Unassigned storage",
+                V::Reclaim => "Storage item",
+                V::Docker => "Docker object",
+                V::External => "Tool location",
+                V::Agents => "Agent storage",
+                V::Disk => "Disk allocation",
+                V::DiskGaps => "Location",
+            },
+            name_width
+        ),
+        "Size",
         if show_growth {
-            format!("{:>10} ", "Change")
+            format!("{change_heading:>growth_width$} ")
         } else {
             String::new()
         },
         pad_display(if half > 0 { "Change bar" } else { "" }, bar_width),
         pad_display(
-            if cleanup_view {
-                "Cleanup advice / consequence"
-            } else if reclaim_line.is_some() {
-                "Cost · last used · removal"
+            if reclaim_line.is_some() {
+                "If removed"
+            } else if disk_view {
+                "Measurement"
             } else {
-                "Cleanup / facts"
+                "Notes"
             },
             signals_width
         )
@@ -1838,10 +1996,8 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         heading,
         Style::default().add_modifier(Modifier::BOLD),
     )];
-    if cleanup_view {
-        lines.push(Line::raw(
-            "* allocated incl. shared links; not additive with report totals. Age = modified",
-        ));
+    if cleanup_view || rows.iter().any(|r| r.allocated) {
+        lines.push(Line::raw("* shared files may be counted again"));
     }
     if let Some(line) = &reclaim_line {
         lines.push(Line::styled(
@@ -1853,11 +2009,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     // the table never resizes under the cursor.
     let detail_height = DETAIL_ROWS.min(area.height / 3);
     let table_height = area.height.saturating_sub(detail_height);
-    let header_count = if cleanup_view || reclaim_line.is_some() {
-        2
-    } else {
-        1
-    };
+    let header_count = lines.len() as u16;
     let visible = table_height.saturating_sub(header_count) as usize;
     // One page is a screenful with a row of overlap.
     app.page.set(visible.saturating_sub(1).max(1));
@@ -1869,7 +2021,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     } else if visible > 0 && app.selected >= offset + visible {
         offset = app.selected + 1 - visible;
     }
-    offset = offset.min(rows.len().saturating_sub(visible));
+    // Preserve the selected row’s screen position when a branch shrinks.
+    // Refilling the bottom would move the entire tree under the cursor.
+    offset = offset.min(rows.len().saturating_sub(1));
     app.scroll_offset.set(offset);
     // Only visible rows need terminal-cell formatting and mark decoration.
     // The full row set above still owns ordering, totals and growth-bar scale.
@@ -1929,9 +2083,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             truncate_middle(&rest, name_width.saturating_sub(rail_width).max(1))
         );
         let bytes = format!(
-            "{:>10}",
+            "{:>size_width$}",
             match &row.size_text {
-                Some(text) => text.clone(),
+                Some(text) => clip_end(text, size_width),
                 None => format!(
                     "{}{}",
                     human_bytes(row.bytes),
@@ -1940,7 +2094,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             }
         );
         let growth = format!(
-            "{:>10}",
+            "{:>growth_width$}",
             row.growth
                 .map(human_signed_bytes)
                 .unwrap_or_else(|| "—".into())
@@ -1959,35 +2113,41 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         };
         let hidden = row
             .collapsed_children
+            .filter(|n| *n > 0)
             .map(|n| format!("  ▸ {n} more"))
             .unwrap_or_default();
         // DESIGN.md: "80x24 ... signals drop to a single glyph column;
         // uses width up to 200 ... signals spell out."
         // Narrow terminals show the two most decision-relevant signals
         // spelled out (never a glyph code); wide ones show them all.
-        let mut signals_text = if let Some(summary) = &row.cleanup_summary {
+        let mut signals_text = if let Some(note) = &row.table_note {
+            note.clone()
+        } else if let Some(summary) = &row.cleanup_summary {
             // Drop secondary statistics before clipping the decision itself.
             let mut parts: Vec<_> = summary.split(" · ").collect();
-            while parts.len() > 1 && parts.join(" · ").chars().count() > signals_width {
+            while parts.len() > 1 && crate::model::display_width(&parts.join(" · ")) > signals_width
+            {
                 parts.pop();
             }
             parts.join(" · ")
         } else if row.signals.is_empty() {
             String::new()
+        } else if app.view == V::Reclaim {
+            row.signals[0].clone()
         } else if narrow {
             pick_signals(&row.signals, 2).join(" · ")
         } else {
             row.signals.join(" · ")
         };
-        if row.cleanup_summary.is_none() && signals_text.chars().count() > signals_width {
+        if row.cleanup_summary.is_none()
+            && crate::model::display_width(&signals_text) > signals_width
+        {
             // Never overflow the row: prefer the loud signals, then cut.
-            signals_text = pick_signals(&row.signals, 3).join(" · ");
-            if signals_text.chars().count() > signals_width {
-                signals_text = signals_text
-                    .chars()
-                    .take(signals_width.saturating_sub(1))
-                    .collect::<String>()
-                    + "…";
+            if app.view != V::Reclaim && row.table_note.is_none() {
+                signals_text = pick_signals(&row.signals, 3).join(" · ");
+            }
+            if crate::model::display_width(&signals_text) > signals_width {
+                signals_text = clip_end(&signals_text, signals_width);
             }
         }
 
@@ -2005,6 +2165,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         };
         let spans = vec![
             Span::styled(pad_display(&name, name_width), name_style),
+            Span::raw("  "),
             Span::raw(bytes),
             Span::raw(" "),
             // The signed number and its bar are one diffstat token: same
@@ -2017,7 +2178,15 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
                     &if row.cleanup_summary.is_some() {
                         signals_text
                     } else {
-                        format!("{signals_text}{hidden}")
+                        // Keep the consequence intact; an expand glyph already
+                        // lives in the name, so the child count gives way first.
+                        if crate::model::display_width(&format!("{signals_text}{hidden}"))
+                            <= signals_width
+                        {
+                            format!("{signals_text}{hidden}")
+                        } else {
+                            signals_text
+                        }
                     },
                     signals_width,
                 ),
@@ -2098,7 +2267,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             let capacity = spare.saturating_sub(2) as usize;
             let mut preview = vec![Line::styled(
                 format!(
-                    "Oldest candidates · showing {} of {} · → expand to select",
+                    "Selected group · showing {} of {} · → expand",
                     candidates.len().min(capacity),
                     candidates.len()
                 ),
@@ -2257,6 +2426,11 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         "inspect the selected project or folder",
     );
     entry(&mut out, "s / g", "sort by size / growth");
+    entry(
+        &mut out,
+        "w",
+        "change the comparison period using stored history",
+    );
     entry(&mut out, "/ / 0", "filter the list / clear the filter");
     entry(
         &mut out,
@@ -2293,7 +2467,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "A",
-        "mark every row here that swamp has a cleanup rule for. Rows it keeps by default or has no rule for are marked one at a time with Space; in Reclaim and External each unit is marked once",
+        "review all rows here that swamp has a cleanup rule for. Opens the plan before any action. Rows it keeps by default or has no rule for are marked one at a time with Space; in Reclaim and External each unit is marked once",
     );
     entry(
         &mut out,
@@ -2318,7 +2492,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "",
-        "mise installs and simulator runtimes: Backspace on an unmarked row opens the manager's own list and dry run, then its command, permanently: no Trash. Space marks the folder for Trash instead.",
+        "mise installs and simulator runtimes: Backspace on an unmarked row opens the manager's list. Enter reviews the selection and command; Y runs the reviewed command permanently, with no Trash. Space marks the folder for Trash instead.",
     );
     entry(
         &mut out,
@@ -2333,7 +2507,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "/",
-        "filter picker (a form) · : edits the filter as text, Tab completes · 0 clears it",
+        "filter picker (a form): type a name in its project field, including spaces; Esc cancels. Elsewhere q also closes, e edits as text, and 0 clears. In the main view : edits the filter as text; Tab completes",
     );
     entry(
         &mut out,
@@ -2353,7 +2527,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     entry(
         &mut out,
         "g s n t a",
-        "sort by growth, size, name, type, age; press again to turn the sort off · r reverses it · remembered",
+        "sort by growth, size, name, type, age; press again to turn the sort off · r reverses it · remembered. Project folders, Reclaim and Disk keep their fixed order",
     );
     entry(
         &mut out,
@@ -2402,12 +2576,12 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     heading(&mut out, "Columns");
     plain(
         &mut out,
-        "  Size, then growth over the window with its bar around the centre axis: left green shrank, right red grew, log-scaled, a dim tick below 1MB. Then facts.",
+        "  Size is measured storage. Change appears where recorded; 0B means no change and — means unknown. Empty note columns and all-zero bars are omitted. Bars are log-scaled: left green shrank, right red grew. Reclaim names recovery cost; Disk names measurement state.",
         2,
     );
     plain(
         &mut out,
-        "  [tracked] [ignored] [untracked] is git status; untracked has no copy anywhere.",
+        "  [tracked] [ignored] [untracked] is Git status. Untracked files are not recorded in Git; other backups are not established here.",
         2,
     );
     blank(&mut out);

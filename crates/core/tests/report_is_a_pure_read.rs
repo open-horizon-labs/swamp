@@ -155,6 +155,24 @@ fn report_scope_from_store_does_no_io_after_observe() {
         serde_json::to_value(&snapshot.coverage).unwrap()
     );
 
+    let (short, work) = work_counters::measured(|| {
+        report::report_scope_from_store_with_window(&scope, &store, Some(60))
+    });
+    assert_eq!(
+        work,
+        WorkCounters::default(),
+        "changing period must remain a pure stored read"
+    );
+    let short = short.unwrap();
+    assert_eq!(short.report.series_window_secs, 60);
+    assert_eq!(short.report.observed_at, snapshot.report.observed_at);
+    let unchanged = report::report_scope_from_store(&scope, &store).unwrap();
+    assert_eq!(
+        serde_json::to_value(&unchanged.report).unwrap(),
+        after,
+        "period selection cannot rewrite the observation's window or facts"
+    );
+
     // Rendering off the round-tripped snapshot must be identical to
     // rendering off the freshly observed report: the same view, from
     // either source, is the same text.

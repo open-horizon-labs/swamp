@@ -3952,6 +3952,16 @@ pub fn report_scope_from_store(
     scope: &crate::scope::EffectiveScope,
     store_dir: &Path,
 ) -> std::result::Result<ReportSnapshot, NoObservation> {
+    report_scope_from_store_with_window(scope, store_dir, None)
+}
+
+/// Recompute project and directory comparisons from stored history only.
+/// `None` retains the observation's recorded comparison window.
+pub fn report_scope_from_store_with_window(
+    scope: &crate::scope::EffectiveScope,
+    store_dir: &Path,
+    window_secs: Option<u64>,
+) -> std::result::Result<ReportSnapshot, NoObservation> {
     // Do not parse caches from an incompatible generation. The observer
     // owns reset + rescan; report remains a pure read and reports no snapshot.
     if !crate::fs_gate::store::StoreDir::at(store_dir)
@@ -3985,7 +3995,7 @@ pub fn report_scope_from_store(
     // drill-down, an artifact's growth/allocation) is computed from the
     // facts rebuilt above and the volumes' history, never read from a
     // table of its own.
-    crate::growth::derive_report_views(store_dir, &key, &mut snapshot);
+    crate::growth::derive_report_views(store_dir, &key, &mut snapshot, window_secs);
     Ok(snapshot)
 }
 

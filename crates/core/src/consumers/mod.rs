@@ -11,6 +11,7 @@ mod ecosystem;
 mod gate;
 mod github;
 mod growth;
+pub(crate) use growth::{add_nested_history_rows, copy_nested_history};
 mod history;
 mod projects;
 mod signals;

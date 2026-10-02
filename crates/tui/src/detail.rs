@@ -120,29 +120,40 @@ fn unknown_name(kind: FactKind) -> &'static str {
 /// missing fact must not read as "nothing to worry about".
 pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
     let mut out = Vec::new();
-    if !row.signals.is_empty() {
-        out.push(row.signals.join(" · "));
-    } else if let Some(text) = row.kind.as_ref().and_then(what_it_is) {
-        out.push(if row.bytes > 0 {
-            format!("{} · {text}", human_bytes(row.bytes))
-        } else {
-            text.to_string()
-        });
-    }
-    // The last-used fact, worded with its source by the core, is one
-    // line of its own: never blended into the modification sentence
-    // below, which is a different fact.
-    out.extend(row.last_used.iter().cloned());
-    out.extend(row.detail_lines.iter().cloned());
     let mut facts: Vec<&Evidence> = row.evidence.iter().collect();
     facts.sort_by_key(|e| priority(e.kind));
-    out.extend(facts.iter().copied().filter_map(sentence));
+    out.extend(
+        facts
+            .iter()
+            .copied()
+            .filter(|e| e.kind == FactKind::CurrentUse)
+            .filter_map(sentence),
+    );
+    for kind in [FactKind::Recovery, FactKind::Consumer] {
+        out.extend(
+            facts
+                .iter()
+                .copied()
+                .filter(|e| e.kind == kind)
+                .filter_map(sentence),
+        );
+    }
+    out.extend(
+        facts
+            .iter()
+            .copied()
+            .filter(|e| e.kind == FactKind::Reclaimability)
+            .filter_map(sentence),
+    );
+    out.extend(sharing.iter().cloned());
+    // Recorded use belongs before bookkeeping and generic advice.
+    out.extend(row.last_used.iter().cloned());
     let mut unknown: Vec<&str> = Vec::new();
     for e in &facts {
         if matches!(
             e.status,
             FactStatus::Unknown { .. } | FactStatus::Unavailable { .. }
-        ) && !(e.kind == FactKind::CurrentUse)
+        ) && e.kind != FactKind::CurrentUse
         {
             let n = unknown_name(e.kind);
             if !unknown.contains(&n) {
@@ -153,7 +164,49 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
     if !unknown.is_empty() {
         out.push(format!("Unknown: {}.", unknown.join(" · ")));
     }
-    out.extend(sharing.iter().cloned());
+    out.extend(
+        row.detail_lines
+            .iter()
+            .filter(|line| line.starts_with("Removal:"))
+            .cloned(),
+    );
+    if !row.signals.is_empty() {
+        out.extend(row.signals.iter().cloned());
+    } else if let Some(text) = row.kind.as_ref().and_then(what_it_is) {
+        out.push(text.to_string());
+    }
+    out.extend(
+        row.detail_lines
+            .iter()
+            .filter(|line| !line.starts_with("Removal:") && line.starts_with("what it is:"))
+            .cloned(),
+    );
+    if let Some(unit) = &row.unit {
+        let label = match row.kind.as_ref() {
+            Some(
+                ArtifactKind::DockerImage
+                | ArtifactKind::DockerBuildCache
+                | ArtifactKind::DockerVolume,
+            ) => "Object ID",
+            _ => "Path",
+        };
+        out.push(format!("{label}: {}", unit.0));
+    }
+    out.extend(
+        row.detail_lines
+            .iter()
+            .filter(|line| !line.starts_with("Removal:") && !line.starts_with("what it is:"))
+            .cloned(),
+    );
+    out.extend(
+        facts
+            .iter()
+            .copied()
+            .filter(|e| e.kind == FactKind::Activity)
+            .filter_map(sentence),
+    );
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|line| seen.insert(line.clone()));
     out
 }
 
@@ -203,6 +256,122 @@ mod tests {
         row.evidence = vec![when, now];
         let l = lines(&row, &[]);
         assert_eq!(l, vec!["In use right now.", "Last changed 3d ago."]);
+    }
+
+    #[test]
+    fn selected_unit_keeps_its_exact_path_without_repeating_size() {
+        let mut row = Row::leaf(0, "Cargo cache".into(), 2_500_000_000, None);
+        row.unit = Some(crate::units::UnitId("/Users/me/.cargo/registry".into()));
+        row.signals = vec!["No declared consumers".into()];
+        let rendered = lines(&row, &[]);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "Path: /Users/me/.cargo/registry")
+        );
+        assert!(!rendered.iter().any(|line| line.contains("2.5GB")));
+    }
+
+    #[test]
+    fn use_and_shared_bytes_precede_last_use_and_supporting_notes() {
+        let current = Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::Process,
+            FactValue::Bool(true),
+            EvidenceSource::Inferred {
+                basis: "test".into(),
+            },
+            10,
+        );
+        let mut row = Row::leaf(0, "cache".into(), 0, None);
+        row.last_used = Some("Last used: no record (source unavailable)".into());
+        row.detail_lines = vec!["Regeneration source: registry".into()];
+        row.evidence = vec![current];
+        let rendered = lines(&row, &["Shared with another copy.".into()]);
+        let position = |needle: &str| rendered.iter().position(|line| line == needle).unwrap();
+        assert!(position("In use right now.") < position("Shared with another copy."));
+        assert!(
+            position("Shared with another copy.")
+                < position("Last used: no record (source unavailable)")
+        );
+        assert!(
+            position("Last used: no record (source unavailable)")
+                < position("Regeneration source: registry")
+        );
+    }
+
+    #[test]
+    fn the_first_four_detail_lines_keep_the_decision_facts_visible() {
+        let current = Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::Process,
+            FactValue::Bool(true),
+            EvidenceSource::Inferred {
+                basis: "test".into(),
+            },
+            10,
+        );
+        let recovery = Evidence::known(
+            FactKind::Recovery,
+            FactSubtype::PotentiallyUniqueLocalState,
+            FactValue::Text("PotentiallyUniqueLocalState".into()),
+            EvidenceSource::Inferred {
+                basis: "test".into(),
+            },
+            10,
+        );
+        let unknown = Evidence::unknown(
+            FactKind::Activity,
+            FactSubtype::Modified,
+            EvidenceSource::Inferred {
+                basis: "test".into(),
+            },
+            10,
+            Reason::fixed("no reliable timestamp"),
+        );
+        let mut row = Row::leaf(0, "Cargo cache".into(), 2_500_000_000, None);
+        row.unit = Some(crate::units::UnitId("/Users/me/.cargo/registry".into()));
+        row.signals = vec!["Rebuild takes longer".into()];
+        row.evidence = vec![unknown, recovery, current];
+        let rendered = lines(&row, &["Shared files count once.".into()]);
+        assert_eq!(
+            &rendered[..4],
+            [
+                "In use right now.",
+                "May be the only copy: nothing else has this.",
+                "Shared files count once.",
+                "Unknown: last use."
+            ]
+        );
+        assert_eq!(rendered[4], "Rebuild takes longer");
+        assert!(rendered.contains(&"Path: /Users/me/.cargo/registry".to_string()));
+    }
+
+    #[test]
+    fn a_short_detail_keeps_use_sharing_signal_and_path_in_the_visible_prefix() {
+        let current = Evidence::known(
+            FactKind::CurrentUse,
+            FactSubtype::Process,
+            FactValue::Bool(true),
+            EvidenceSource::Inferred {
+                basis: "test".into(),
+            },
+            10,
+        );
+        let mut row = Row::leaf(0, "Cargo home".into(), 0, None);
+        row.unit = Some(crate::units::UnitId("/Users/me/.cargo".into()));
+        row.signals = vec!["Can be fetched again".into()];
+        row.evidence = vec![current];
+        let rendered = lines(&row, &["Shared files count once.".into()]);
+        assert_eq!(
+            &rendered[..4],
+            [
+                "In use right now.",
+                "Shared files count once.",
+                "Can be fetched again",
+                "Path: /Users/me/.cargo"
+            ]
+        );
     }
 
     #[test]

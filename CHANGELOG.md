@@ -5,6 +5,19 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+## v0.8.2 — 2026-10-02
+
+- Project tables name their comparison period (`Change 7d`) and offer `w` to change it. Period and growth-filter changes now recalculate from stored history without scanning projects. Shorter available history is labelled approximately; clearing the filter preserves the period.
+
+- Trash review now separates decision facts from supporting details: concise restore cost, sourced last use and consequential exceptions appear in the summary; `l` retains original warnings, sources and every path. Build advice drops oldest-age and cleanup-rule boilerplate. Generic accuracy badges disappear while unknown sizes and lower bounds remain labelled.
+- Removed model manifests disappear immediately from cached TUI views while shared layers remain counted. Inspect directories keeps the cursor and viewport stable through expansion and collapse, without repeating the profile’s size.
+
+- TUI tables give more room to identifying names: checkout-relative build paths, path-first unassigned rows, concise recovery costs and no empty columns. Unknown sizes are labelled. Wrapped blocked reasons and Cargo details stay reachable when paging or resizing. Key hints now match bulk review, fixed-order views and manager confirmation; unsupported modifier chords cannot invoke plain commands, and project-name filter input accepts spaces and command letters.
+
+- The TUI keeps marked counts, selected bytes and Trash/permanent Docker destinations visible between actions. List position and contextual hints help with long views; blocked reasons remain accessible. Invalid filter expressions stay open for correction or Esc, preserving the previous filter, marks and position.
+
+- All thirteen TUI views use clearer titles and column headings, with view-specific empty states. The top panel keeps one total and one coverage line; allocation details remain in Disk. Reclaim shows removal cost at 80 columns, Disk views omit empty change columns, and filter labels name ignored predicates. Tool and agent rows use readable labels while selected details retain exact paths and prioritize current use, recovery, shared bytes and unknown facts. Existing navigation and review keys are unchanged.
+
 - Large TUI lists format only the rows on screen. Sorting and reversing keep the same item selected, and returning to a view restores its selection and scroll position. Left collapses an expanded row or selects its parent before returning to Projects.
 
 - Preparing selected Cargo build outputs no longer reads and hashes the compiled payloads. Payload manifests record metadata identity; small producer fingerprints still use content hashes. On one real 499-action selection, proposal preparation fell from 15.7 seconds to 0.27 seconds, and the full UI marking path took 0.93 seconds. These are local measurements, not timing guarantees.

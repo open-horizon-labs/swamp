@@ -242,12 +242,18 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
             rendered.contains("slower"),
             "selected consequence should remain visible: {rendered}"
         );
-        assert!(rendered.contains("Size*"));
-        assert!(rendered.contains("candidate"));
+        assert!(rendered.contains("Size"));
+        assert!(rendered.contains("* shared files may be counted again"));
+        assert!(
+            app.rows()[app.selected]
+                .cleanup_summary
+                .as_deref()
+                .is_none_or(|summary| !summary.contains("oldest"))
+        );
         if width >= 100 {
             assert!(rendered.contains("Change"));
         }
-        assert!(rendered.contains("Oldest candidates"));
+        assert!(rendered.contains("Selected group"));
         assert!(rendered.contains("showing 1 of 1"));
     }
     app.enter_row();
@@ -409,7 +415,7 @@ fn fixture_report() -> Report {
         notes: vec![],
         series_by_key: Default::default(),
         total_series: Vec::new(),
-        series_window_secs: 0,
+        series_window_secs: 7 * 86_400,
         summary: Default::default(),
     }
 }
@@ -440,15 +446,12 @@ fn an_older_generation_store_says_it_is_being_rebuilt_not_that_nothing_was_scann
     app.has_index = false;
     app.filter_text = "0".into();
     let plain = capture(&app, 120, 24);
-    assert!(plain.contains("Nothing has been scanned yet"), "{plain}");
+    assert!(plain.contains("No saved observations yet"), "{plain}");
     app.store_rebuild = true;
     let rebuild = capture(&app, 120, 24);
     assert!(rebuild.contains("older"), "{rebuild}");
-    assert!(rebuild.contains("rebuilt in the background"), "{rebuild}");
-    assert!(
-        !rebuild.contains("Nothing has been scanned yet"),
-        "{rebuild}"
-    );
+    assert!(rebuild.contains("in the background"), "{rebuild}");
+    assert!(!rebuild.contains("No saved observations yet"), "{rebuild}");
 }
 
 #[test]
@@ -575,6 +578,68 @@ fn cargo_cleanup_guidance_frames() {
 }
 
 #[test]
+fn physical_layout_expand_and_collapse_keep_the_anchor_on_its_screen_line() {
+    let mut report = fixture_report();
+    let root = "/Users/dev/src/mole/target";
+    for (rel, role) in std::iter::once(("debug".to_string(), "Profile"))
+        .chain((0..90).map(|n| (format!("debug/folder-{n:02}"), "Dependency")))
+    {
+        report.nested_artifacts.push(serde_json::from_value(serde_json::json!({
+            "id":rel,"path":format!("{root}/{rel}"),"relative_path":rel,
+            "parent_id":null,"container_id":"target","role":role,"membership":"Unknown",
+            "is_dir":true,"logical_bytes":0,"bytes":64000000,"physical_bytes":0,
+            "mtime_max":report.observed_at,"variant":{},"coverage":{"supported":true,"complete":true,"limits":[]},
+            "action_group":null,"present":true
+        })).unwrap());
+    }
+    for (width, height) in [(80, 24), (200, 60)] {
+        let mut app = App::new(report.clone(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.selected_project = Some("mole".into());
+        app.set_view(ViewKind::Tree);
+        let key = format!("layout:{root}/debug");
+        app.collapsed.insert(key.clone());
+        app.selected = app
+            .rows()
+            .iter()
+            .position(|r| r.expansion_key.as_ref() == Some(&key))
+            .unwrap();
+        assert!(app.rows()[app.selected].collapsed_children.is_some());
+        app.enter_row();
+        assert!(app.rows()[app.selected].expansion_key.as_ref() == Some(&key));
+        assert!(app.rows()[app.selected].collapsed_children.is_none());
+        // The human has scrolled into the layout and returned to its parent.
+        // Keep that parent at the top; collapsing must not refill the list
+        // from above and move the highlight to the bottom of the screen.
+        app.scroll_offset.set(app.selected);
+        let open = capture(&app, width, height);
+        let line = open
+            .lines()
+            .position(|s| s.contains("Inspect directories"))
+            .unwrap();
+        app.leave_row();
+        let closed = capture(&app, width, height);
+        assert_eq!(
+            closed
+                .lines()
+                .position(|s| s.contains("Inspect directories")),
+            Some(line)
+        );
+        assert_eq!(app.rows()[app.selected].expansion_key.as_ref(), Some(&key));
+        assert!(app.rows()[app.selected].collapsed_children.is_some());
+        app.enter_row();
+        let reopened = capture(&app, width, height);
+        assert_eq!(
+            reopened
+                .lines()
+                .position(|s| s.contains("Inspect directories")),
+            Some(line)
+        );
+        assert!(app.rows()[app.selected].expansion_key.as_ref() == Some(&key));
+    }
+}
+
+#[test]
 fn deleting_progress_and_cancellation_frames() {
     use std::sync::{
         Arc,
@@ -667,7 +732,12 @@ fn evidence_detail_area_frames() {
         app.set_view(ViewKind::Deps);
         app.selected = 0;
         let frame = capture(&app, w, h);
-        assert!(frame.contains("Last changed 1h ago"), "{frame}");
+        assert!(
+            swamp_tui::detail::lines(&app.rows()[app.selected], &[])
+                .iter()
+                .any(|line| line.contains("Last changed 1h ago")),
+            "modification evidence must remain available"
+        );
         assert!(
             frame.contains("Used by 2 projects: mole, swamp"),
             "multiple consumers must both be visible: {frame}"
@@ -1190,23 +1260,20 @@ fn drill_shows_view_scope_and_esc_returns_to_projects() {
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('0'));
     let before = capture(&app, 200, 60);
     assert!(before.contains("1 Projects"), "{before}");
-    assert!(
-        before.contains("view: Projects › Projects (1 of 7 · v next)"),
-        "{before}"
-    );
+    assert!(before.contains("Projects · w change period"), "{before}");
     assert!(before.contains("filter: none"), "{before}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
     assert_eq!(app.view, ViewKind::Tree);
     let tree = capture(&app, 200, 60);
     assert!(
-        tree.contains("view: Projects › Tree of "),
+        tree.contains("Project folders › "),
         "the view line must name the scope:\n{tree}"
     );
     assert!(tree.contains("Esc: projects"), "{tree}");
     swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
     assert_eq!(app.view, ViewKind::Projects);
     let back = capture(&app, 200, 60);
-    assert!(back.contains("view: Projects › Projects"), "{back}");
+    assert!(back.contains("Projects · w change period"), "{back}");
 }
 
 #[test]
@@ -1272,6 +1339,7 @@ fn worktree_rows_always_mark_and_carry_their_warnings() {
         expandable: false,
         expansion_key: None,
         cleanup_summary: None,
+        table_note: None,
         allocated: false,
         project: None,
         evidence: Vec::new(),
@@ -1605,13 +1673,15 @@ fn node_and_gradle_family_group_frames() {
         }
         assert!(
             all.iter()
-                .filter(|r| r
-                    .cleanup_summary
-                    .as_deref()
-                    .is_some_and(|s| s.contains("· oldest")))
+                .filter(|r| r.cleanup_summary.as_deref().is_some_and(|s| !s.is_empty()))
                 .count()
                 >= 5
         );
+        assert!(all.iter().all(|row| {
+            !row.cleanup_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("oldest"))
+        }));
         check(&format!("build_families_{w}x{h}"), &capture(&app, w, h));
 
         // Project tree, groups closed: the answer to "what is this made
@@ -1668,24 +1738,23 @@ fn node_and_gradle_family_group_frames() {
             "the consequence comes first: {:?}",
             classes.cleanup_summary
         );
+        assert!(classes.unit.is_some(), "individual paths remain selectable");
         assert!(
             classes
                 .signals
                 .iter()
-                .any(|s| s == "no cleanup rule; Space still moves this exact path to Trash"),
-            "{:?}",
-            classes.signals
+                .all(|s| !s.contains("no cleanup rule"))
         );
         let pnpm = tree
             .iter()
             .find(|r| r.label == ".pnpm")
             .expect("the pnpm virtual store member");
         assert!(
-            pnpm.signals
+            pnpm.detail_lines
                 .iter()
-                .any(|s| s.starts_with("no cleanup rule (")),
-            "a shared store says what no rule covers, separately from what it is: {:?}",
-            pnpm.signals
+                .any(|s| s.contains("hardlinks shared with pnpm's store")),
+            "supporting details retain the shared-store limitation: {:?}",
+            pnpm.detail_lines
         );
         check(
             &format!("build_families_tree_open_{w}x{h}"),
@@ -1710,6 +1779,84 @@ fn plain_unit(path: &str, bytes: u64) -> swamp_tui::actions::MarkedUnit {
         worktree: None,
         label: path.to_string(),
         warnings: Vec::new(),
+    }
+}
+
+#[test]
+fn change_column_names_its_actual_period_with_no_filter_and_in_the_picker() {
+    for (w, h) in [(80, 24), (200, 60)] {
+        let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.width = w;
+        app.height = h;
+        app.history_secs = Some(14 * 86_400);
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Change 7d"), "{frame}");
+        assert!(frame.contains("w change period"), "{frame}");
+        assert!(frame.contains("filter: none"), "{frame}");
+        check(&format!("change_period_{w}x{h}"), &frame);
+        app.change_period = Some(swamp_tui::app::ChangePeriod {
+            choices: vec!["24h".into(), "7d".into()],
+            selected: 0,
+        });
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Period: 24h"), "{frame}");
+        assert!(frame.contains("Enter apply"), "{frame}");
+        assert!(!frame.contains("0 clear"), "{frame}");
+        check(&format!("change_period_picker_{w}x{h}"), &frame);
+        app.change_period = None;
+        app.report.series_window_secs = 430_472;
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Change ~5d"), "{frame}");
+        assert!(!frame.contains("Change 7d"), "{frame}");
+    }
+}
+
+#[test]
+fn build_folder_and_model_reviews_show_decision_facts_with_optional_evidence() {
+    for (name, path, bytes, warnings) in [
+        (
+            "build_folder_review",
+            "/Users/dev/src/open-horizon-labs/swamp/target/debug/examples",
+            995_900_000,
+            vec![
+                "internal file history and subgroup hardlink attribution are not retained",
+                "moves only this selected path to Trash; stop its build before removing it; allocation is not guaranteed freed space",
+                "swamp identifies this (the cargo adapter) but has no cleanup rule for it: what else uses it is not established",
+                "swamp's selection rules for this build folder do not cover it: only this path moves, companions are not included",
+                "the next `cargo build --examples` relinks this example",
+            ],
+        ),
+        (
+            "ollama_review",
+            "/Users/dev/.ollama/models/manifests/registry.ollama.ai/library/qwen3/0.6b",
+            522_700_000,
+            vec![
+                "getting it back: downloaded again with `ollama pull qwen3:0.6b` when needed, if the registry has it (a model made with `ollama create` exists only here) (from the model's own row)",
+                "last used: Aug 30 (file access time of its model layer)",
+                "declared consumers: none found among 45 projects in 0 declared roots (incomplete)",
+                "moving this manifest frees none of its layers: the layers (522.7MB) stay in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses",
+            ],
+        ),
+    ] {
+        for (w, h) in [(80, 24), (200, 60)] {
+            let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+            app.width = w;
+            app.height = h;
+            let mut unit = plain_unit(path, bytes);
+            unit.warnings = warnings.iter().map(|warning| (*warning).into()).collect();
+            app.marked.insert(path.into(), unit);
+            app.confirm_open = true;
+            let frame = capture(&app, w, h);
+            assert!(frame.contains("Enter move to Trash"), "{frame}");
+            assert!(!frame.contains("companions are not included"), "{frame}");
+            assert!(!frame.contains("declared consumers"), "{frame}");
+            check(&format!("{name}_{w}x{h}"), &frame);
+            swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('l'));
+            let details = capture(&app, w, h);
+            assert!(!details.contains("Enter move to Trash"), "{details}");
+            check(&format!("{name}_details_{w}x{h}"), &details);
+        }
     }
 }
 
@@ -1760,7 +1907,7 @@ fn trash_review_scrolls_all_paths_and_mixed_docker_facts_before_enter() {
         assert_eq!(summary.matches(&long).count(), 1, "{summary}");
         swamp_tui::handle_key(&mut app, KeyCode::Char('l'));
         let details = capture(&app, w, h);
-        assert!(details.contains("All action and member paths"), "{details}");
+        assert!(details.contains("Paths and supporting facts"), "{details}");
         let inventory =
             swamp_tui::actions::confirm_details(&app.marked.values().cloned().collect::<Vec<_>>());
         for i in 0..5 {
@@ -1785,7 +1932,7 @@ fn trash_review_scrolls_all_paths_and_mixed_docker_facts_before_enter() {
         swamp_tui::handle_key(&mut app, KeyCode::End);
         let end = capture(&app, w, h);
         assert!(
-            end.contains("Docker items are removed permanently"),
+            end.contains("Docker has no Trash recovery"),
             "{w}x{h}:
 {end}"
         );
@@ -1868,7 +2015,7 @@ fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
     assert!(f.contains("Blocked: 2"), "{f}");
     assert!(f.contains("next: open the project"), "{f}");
     assert!(f.contains("Esc back to the plan"), "{f}");
-    // The list scrolls by item and never runs off the sheet.
+    // The list scrolls by displayed line and never runs off the sheet.
     app.blocked = (0..12)
         .map(|i| swamp_tui::app::BlockedItem {
             name: format!("project-{i}"),
@@ -1877,12 +2024,18 @@ fn blocked_items_are_counted_on_the_plan_and_listed_with_next_steps() {
         })
         .collect();
     let f = capture(&app, 80, 24);
-    assert!(f.contains("project-0") && f.contains("more below"), "{f}");
+    assert!(
+        f.contains("project-0") && f.contains("lines 1-8 of 24"),
+        "{f}"
+    );
     for _ in 0..7 {
         swamp_tui::handle_key(&mut app, KeyCode::Down);
     }
     let f = capture(&app, 80, 24);
-    assert!(f.contains("from item 8") && f.contains("project-7"), "{f}");
+    assert!(
+        f.contains("lines 8-15 of 24") && f.contains("project-7"),
+        "{f}"
+    );
     assert!(!f.contains("project-0"), "{f}");
     // Enter cannot move anything while the list is open.
     swamp_tui::handle_key(&mut app, KeyCode::Enter);
@@ -1909,7 +2062,7 @@ fn space_on_a_project_row_shows_marks_and_a_result() {
         f.contains("✗ ") || f.contains('~'),
         "no mark on the project row:\n{f}"
     );
-    assert!(f.contains("marked in all"), "no result line:\n{f}");
+    assert!(f.contains(" marked ("), "no result line:\n{f}");
     let (n, of) = app.project_mark_state("mole");
     assert!(n > 0 && n <= of, "{n}/{of}");
     swamp_tui::handle_key(&mut app, KeyCode::Char(' '));
@@ -2053,7 +2206,7 @@ fn table_rows_stay_put_from_idle_through_review_confirm_and_result() {
         let idle = capture(&app, w, 24);
         let header = idle
             .lines()
-            .position(|l| l.trim_start_matches('"').starts_with("Name"))
+            .position(|l| l.trim_start_matches('"').starts_with("Project "))
             .unwrap();
         // Header, two headline rows, the view strip, the filter line,
         // then the table.
@@ -2310,6 +2463,258 @@ fn many_rows_app(n: usize) -> App {
     app
 }
 
+#[test]
+fn summary_tables_reuse_empty_columns_without_hiding_measured_zero_change() {
+    let mut report = fixture_report();
+    for project in &mut report.projects {
+        for wt in &mut project.worktrees {
+            for artifact in &mut wt.artifacts {
+                artifact.growth_bytes = Some(0);
+            }
+        }
+    }
+    let mut app = App::new(report, "/Users/dev/src".into());
+    app.clear_filter();
+    app.set_view(ViewKind::Kinds);
+    for (w, h) in [(80, 24), (200, 60)] {
+        let f = capture(&app, w, h);
+        let heading = line_of(&f, 5);
+        assert!(
+            heading.contains("Change"),
+            "zero is measured change: {heading}"
+        );
+        assert!(!heading.contains("Notes"), "{heading}");
+        assert!(
+            !heading.contains("Change bar"),
+            "all-zero bars convey nothing: {heading}"
+        );
+        assert!(f.contains("0B"));
+        check(&format!("summary_columns_{w}x{h}"), &f);
+    }
+    app.set_view(ViewKind::Unowned);
+    let f = capture(&app, 80, 24);
+    assert!(
+        !line_of(&f, 5).contains("Change"),
+        "no recorded changes in this view:\n{f}"
+    );
+}
+
+#[test]
+fn build_tables_pair_relative_identity_with_recovery_and_keep_exact_action_paths() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.clear_filter();
+    for view in [ViewKind::Builds, ViewKind::Deps] {
+        app.set_view(view);
+        let rows = app.rows();
+        let first = &rows[0];
+        assert!(!first.label.contains("/Users/dev/src"), "{}", first.label);
+        assert!(
+            first
+                .unit
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("/Users/dev/src/")
+        );
+        for (w, h) in [(80, 24), (200, 60)] {
+            let f = capture(&app, w, h);
+            let details = swamp_tui::detail::lines(first, &[]).join("\n");
+            assert!(details.contains(&first.unit.as_ref().unwrap().0));
+            assert!(
+                details.contains(if view == ViewKind::Builds {
+                    "build tool makes it again"
+                } else {
+                    "Installing again"
+                }),
+                "{details}"
+            );
+            // Mixed structural/activity facts must not be labelled as a
+            // removal consequence just because some rows are cleanup groups.
+            assert!(!line_of(&f, 5).contains("If removed"), "{f}");
+            assert!(line_of(&f, 5).contains("Notes"), "{f}");
+            assert!(f.contains(first.table_note.as_deref().unwrap()), "{f}");
+            check(&format!("relative_{}_{w}x{h}", view.label()), &f);
+        }
+    }
+}
+
+/// Marks stay visible after the marking result clears, even when the selected
+/// items are outside the current page, filter or view. Position counts the
+/// whole current list, not just the viewport.
+#[test]
+fn pending_selection_keeps_its_place_across_navigation_and_filters() {
+    use crossterm::event::KeyCode;
+    let mut app = many_rows_app(80);
+    for (path, bytes) in [
+        ("/tmp/first", 2_000_000_000),
+        ("/tmp/second", 1_000_000_000),
+    ] {
+        app.marked.insert(path.into(), plain_unit(path, bytes));
+    }
+    app.set_result("Marked 2 items.".into());
+    let _ = capture(&app, 80, 24);
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    let total = app.rows().len();
+    for (w, h) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("2 marked"), "{frame}");
+        assert!(frame.contains("3.0GB selected"), "{frame}");
+        assert!(frame.contains("Backspace review"), "{frame}");
+        assert!(
+            frame.contains(&format!("Row {} of {total}", app.selected + 1)),
+            "{frame}"
+        );
+        check(&format!("pending_selection_{w}x{h}"), &frame);
+    }
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    for w in [80, 200] {
+        let frame = capture(&app, w, 24);
+        assert!(
+            frame.contains(&format!("Row {total} of {total}")),
+            "{frame}"
+        );
+        assert!(frame.contains("2 marked"));
+    }
+    app.start_filter_edit();
+    app.filter_text = "kind:BuildOutput".into();
+    app.commit_filter();
+    assert!(capture(&app, 80, 24).contains("2 marked"));
+    app.set_view(ViewKind::Builds);
+    app.start_filter_edit();
+    app.filter_text = "project:does-not-exist".into();
+    app.commit_filter();
+    assert!(app.rows().is_empty());
+    let empty = capture(&app, 80, 24);
+    assert!(empty.contains("2 marked"));
+    assert!(empty.contains("Backspace review"));
+    app.set_view(ViewKind::Projects);
+    assert!(capture(&app, 80, 24).contains("2 marked"));
+    app.marked.clear();
+    let cleared = capture(&app, 80, 24);
+    assert!(!cleared.contains("2 marked"));
+    assert!(!cleared.contains("3.0GB selected"));
+    app.clear_filter();
+    assert!(capture(&app, 80, 24).contains("Enter open"));
+    swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.view, ViewKind::Tree);
+    assert!(capture(&app, 80, 24).contains("Enter close"));
+}
+
+#[test]
+fn pending_selection_keeps_permanent_removal_and_blocked_counts_visible() {
+    let mut app = many_rows_app(80);
+    app.marked
+        .insert("trash".into(), plain_unit("/tmp/build", 2_000_000_000));
+    let mut docker = plain_unit("sha256:image", 1_000_000_000);
+    docker.docker = Some(swamp_core::docker::Removal::Image {
+        id: "sha256:image".into(),
+    });
+    app.marked.insert("docker".into(), docker);
+    app.blocked = ["protected folder", "unreadable folder"]
+        .into_iter()
+        .map(|name| swamp_tui::app::BlockedItem {
+            name: name.into(),
+            reason: name.into(),
+            next: "check the reason".into(),
+        })
+        .collect();
+    for w in [40, 80, 200] {
+        let frame = capture(&app, w, 24);
+        for fact in ["2 marked", "1 Docker permanent", "2 blocked", "b reasons"] {
+            assert!(frame.contains(fact), "{fact} at {w}:\n{frame}");
+        }
+        if w >= 80 {
+            assert!(frame.contains("3.0GB selected"), "{frame}");
+            assert!(frame.contains("Backspace review"), "{frame}");
+        }
+        check(&format!("pending_mixed_removal_{w}x24"), &frame);
+    }
+    app.set_result("Cancelled. Nothing was deleted.".into());
+    let frame = capture(&app, 80, 24);
+    assert!(frame.contains("Cancelled. Nothing was deleted."));
+    assert!(
+        !frame.contains("1 Docker permanent"),
+        "result owns the status rows"
+    );
+    app.last_result = None;
+    app.help_open = true;
+    let frame = capture(&app, 80, 24);
+    assert!(
+        !frame.contains("1 Docker permanent"),
+        "idle feedback stays behind help"
+    );
+    app.help_open = false;
+    app.marked.clear();
+    let frame = capture(&app, 80, 24);
+    assert_eq!(frame.matches("2 blocked · b reasons").count(), 1, "{frame}");
+}
+
+#[test]
+fn rejected_filter_is_visible_even_when_the_draft_fills_the_line() {
+    use crossterm::event::KeyCode;
+    let mut app = many_rows_app(80);
+    app.selected = 20;
+    let before = app.rows().len();
+    app.start_filter_edit();
+    app.filter_text = format!("{}終🧪e\u{301}", "invalid-expression-".repeat(12));
+    swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    assert!(app.editing_filter);
+    assert_eq!(app.selected, 20);
+    assert_eq!(app.rows().len(), before);
+    for (w, h) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Filter not applied:"), "{frame}");
+        assert!(!frame.contains("Filter not applied: filter:"));
+        assert!(frame.contains("filter › …"), "{frame}");
+        assert!(
+            frame.contains("終🧪e\u{301}▏"),
+            "the draft end and caret stay visible:\n{frame}"
+        );
+        assert!(frame.contains("Edit filter · Esc cancel"), "{frame}");
+        assert!(!frame.contains("Backspace review"));
+        check(&format!("filter_recovery_{w}x{h}"), &frame);
+    }
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+    assert!(!app.editing_filter);
+    assert_eq!(app.selected, 20);
+    assert!(!capture(&app, 80, 24).contains("Filter not applied:"));
+}
+
+#[test]
+fn manager_hint_follows_the_actual_selected_row_and_existing_marks() {
+    let mut app = reclaim_app(false);
+    let rows = app.rows();
+    app.selected = rows.iter().position(|row| row.tool.is_some()).unwrap();
+    let row = &rows[app.selected];
+    let manager = row.tool.unwrap();
+    let frame = capture(&app, 80, 24);
+    assert!(
+        frame.contains(&format!("Backspace opens {} list", manager.name())),
+        "{frame}"
+    );
+    assert!(
+        frame.contains(&format!("⌫ {} list", manager.name())),
+        "{frame}"
+    );
+    check("manager_context_80x24", &frame);
+    app.marked
+        .insert("elsewhere".into(), plain_unit("/tmp/elsewhere", 1_000_000));
+    let frame = capture(&app, 80, 24);
+    assert!(frame.contains("Space mark folder for Trash"), "{frame}");
+    assert!(!frame.contains("Backspace opens"));
+    assert!(!frame.contains("⌫ review"));
+    let key = row.unit.as_ref().unwrap().0.clone();
+    app.marked
+        .insert(key, plain_unit("/tmp/manager", 1_000_000));
+    assert!(capture(&app, 80, 24).contains("Backspace review"));
+    app.start_filter_edit();
+    let frame = capture(&app, 80, 24);
+    assert!(
+        !frame.contains("Backspace review"),
+        "draft keys do not execute commands"
+    );
+}
+
 /// PgDn, PgUp, Home and End move the list by a screenful and to its ends,
 /// and the selected row stays on screen.
 #[test]
@@ -2372,9 +2777,24 @@ fn scrolled_growth_bars_keep_the_offscreen_maximum() {
             )
         })
         .collect();
+    let template = report.projects[0].clone();
+    report.projects = template.worktrees[0]
+        .artifacts
+        .iter()
+        .enumerate()
+        .map(|(i, artifact)| {
+            let mut project = template.clone();
+            project.project_id = format!("project-{i}");
+            project.name = format!("pkg{i:03}");
+            project.remote = None;
+            project.worktrees[0].artifacts = vec![artifact.clone()];
+            project.worktrees[0].worktree_id = format!("worktree-{i}");
+            project
+        })
+        .collect();
     let mut app = App::new(report, "/Users/dev/src".into());
     app.clear_filter();
-    app.set_view(ViewKind::Deps);
+    app.set_view(ViewKind::Projects);
     app.sort = swamp_tui::model::Sort::Size;
     app.selected = app.rows().len() - 1;
     let frame = capture(&app, 200, 24);
@@ -2409,8 +2829,8 @@ fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('?'));
     let first = capture(&app, 80, 24);
     let row_with = |f: &str, needle: &str| f.lines().position(|l| l.contains(needle));
-    let a = row_with(&first, "mark every row here").expect("A entry");
-    let bs = row_with(&first, "Backspace  move what is under the cursor").expect("Backspace");
+    let a = row_with(&first, "review all rows here").expect("A entry");
+    let bs = row_with(&first, "Backspace  review paths, costs and warnings").expect("Backspace");
     assert_ne!(a, bs, "A and Backspace on separate rows:\n{first}");
     assert!(first.contains("1-2"), "position is shown:\n{first}");
     assert!(!first.contains("mark every row here the tool can act on  Ba"));
@@ -2418,6 +2838,10 @@ fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
     swamp_tui::handle_key(&mut app, KeyCode::PageDown);
     let second = capture(&app, 80, 24);
     assert_ne!(first, second, "PgDn scrolls the help");
+    assert!(
+        second.contains("Backspace  move what is under the cursor"),
+        "{second}"
+    );
     swamp_tui::handle_key(&mut app, KeyCode::End);
     let end = capture(&app, 80, 24);
     assert!(end.contains("Activity evidence"), "{end}");
@@ -2445,7 +2869,7 @@ fn help_is_readable_at_80x24_and_scrolls_to_its_end() {
     );
 }
 
-/// PgUp/PgDn/Home/End page the blocked list by whole items.
+/// PgUp/PgDn/Home/End page the wrapped reasons, keeping the last item reachable.
 #[test]
 fn the_blocked_list_pages_and_jumps() {
     use crossterm::event::KeyCode;
@@ -2460,13 +2884,80 @@ fn the_blocked_list_pages_and_jumps() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('b'));
     let _ = capture(&app, 80, 24);
     swamp_tui::handle_key(&mut app, KeyCode::PageDown);
-    assert!(app.blocked_scroll >= 3, "{}", app.blocked_scroll);
+    assert!(
+        app.blocked_scroll.get() >= 3,
+        "{}",
+        app.blocked_scroll.get()
+    );
     swamp_tui::handle_key(&mut app, KeyCode::End);
-    assert_eq!(app.blocked_scroll, 19);
     let f = capture(&app, 80, 24);
     assert!(f.contains("project-19"), "{f}");
     swamp_tui::handle_key(&mut app, KeyCode::Home);
-    assert_eq!(app.blocked_scroll, 0);
+    assert_eq!(app.blocked_scroll.get(), 0);
+}
+
+#[test]
+fn wrapped_reasons_and_cargo_inspection_remain_reachable_after_paging_and_resize() {
+    use crossterm::event::KeyCode;
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.blocked = (0..4)
+        .map(|i| swamp_tui::app::BlockedItem {
+            name: format!("item-{i}"),
+            reason: format!(
+                "{} REASON_END_{i}",
+                "A recorded reason needs context. ".repeat(30)
+            ),
+            next: format!(
+                "{} NEXT_END_{i}",
+                "A recovery instruction also needs context. ".repeat(20)
+            ),
+        })
+        .collect();
+    app.open_blocked();
+    let mut seen = String::new();
+    for _ in 0..200 {
+        seen.push_str(&capture(&app, 50, 24));
+        let old = app.blocked_scroll.get();
+        swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+        seen.push_str(&capture(&app, 50, 24));
+        if app.blocked_scroll.get() == old {
+            break;
+        }
+    }
+    for i in 0..4 {
+        for marker in [format!("REASON_END_{i}"), format!("NEXT_END_{i}")] {
+            assert!(seen.contains(&marker), "paging skipped {marker}");
+        }
+    }
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    let end = capture(&app, 50, 24);
+    assert!(end.contains("NEXT_END_3"));
+    check("blocked_wrapped_end_50x24", &end);
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+
+    app.cargo_inspection = Some(vec![format!(
+        "{} CARGO_TAIL",
+        "dependency evidence ".repeat(80)
+    )]);
+    let _ = capture(&app, 40, 12);
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    let tail = capture(&app, 40, 12);
+    assert!(
+        tail.contains("CARGO_TAIL"),
+        "one source line wraps far beyond one screen:\n{tail}"
+    );
+    assert!(app.cargo_inspection_scroll.get() > 0);
+    let wider = capture(&app, 200, 60);
+    assert!(wider.contains("CARGO_TAIL"));
+    assert_eq!(
+        app.cargo_inspection_scroll.get(),
+        0,
+        "resizing clamps the actual cursor"
+    );
+    swamp_tui::handle_key(&mut app, KeyCode::Up);
+    assert_eq!(app.cargo_inspection_scroll.get(), 0);
+    assert!(app.operation.is_none());
+    assert!(app.marked.is_empty());
 }
 
 /// `k` states the new value and what it means; the legend keeps filter,
@@ -2486,12 +2977,12 @@ fn k_says_what_it_changed_and_the_legend_keeps_the_common_keys() {
     swamp_tui::handle_key(&mut app, KeyCode::Down);
     let f = capture(&app, 80, 24);
     assert!(
-        f.contains("Tab section  v view  / filter  R refresh  ⌫ delete"),
+        f.contains("⌫ review  Tab section  v view"),
         "the four keys people reach for stay at 80 columns:\n{f}"
     );
     assert!(f.contains("? help  q quit"), "{f}");
     let f50 = capture(&app, 50, 24);
-    assert!(f50.contains("Tab section  v view  / filter"), "{f50}");
+    assert!(f50.contains("Space mark  ⌫ review  Tab section"), "{f50}");
     assert!(f50.contains("? help  q quit"), "{f50}");
 }
 
@@ -2507,7 +2998,8 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     swamp_tui::handle_key(&mut app, KeyCode::Char('v')); // builds
     assert_eq!(app.view, ViewKind::Builds);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("view: Projects › Builds of mole (3 of 7"), "{f}");
+    assert!(f.contains("Build outputs · change: 7d · w period"), "{f}");
+    assert!(f.contains("filter: none"), "{f}");
     app.set_view(ViewKind::Tree);
     assert_eq!(app.selected, at, "the tree cursor came back");
     // Esc to projects and back to the same project row.
@@ -2516,7 +3008,7 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     // No agent storage in the fixture: the empty view teaches.
     app.set_view(ViewKind::Agents);
     let f = capture(&app, 80, 24);
-    assert!(f.contains("No AI-tool storage found"), "{f}");
+    assert!(f.contains("No agent storage recorded"), "{f}");
     assert!(!f.contains("no rows match"), "{f}");
     assert!(f.contains("Press v for another view"), "{f}");
     // A filter that matches nothing names itself and both ways out.
@@ -2524,8 +3016,8 @@ fn views_keep_their_cursor_are_named_and_empty_states_teach() {
     app.filter_text = "growth > 900GB in 7d".into();
     app.commit_filter();
     let f = capture(&app, 80, 24);
-    assert!(f.contains("Nothing matches the filter"), "{f}");
-    assert!(f.contains("Press / to change it, or 0"), "{f}");
+    assert!(f.contains("No matches for the active filters"), "{f}");
+    assert!(f.contains("Press / to edit, or 0"), "{f}");
 }
 
 /// The picker prints its keys once (the footer); the box holds the form.
@@ -2951,10 +3443,7 @@ fn reclaim_view_says_what_its_consumer_evidence_was_checked_against_on_every_scr
     for w in [80u16, 120, 200] {
         let app = reclaim_app(false);
         let f = capture(&app, w, 24);
-        assert!(
-            f.contains("consumer evidence checked against 2 projects in 1 declared root"),
-            "w={w}\n{f}"
-        );
+        assert!(f.contains("2 projects in 1 declared root"), "w={w}\n{f}");
         let app = reclaim_app(true);
         let f = capture(&app, w, 24);
         assert!(f.contains("incomplete"), "w={w}\n{f}");
@@ -2997,32 +3486,34 @@ fn reclaim_view_keeps_the_layout_hints_and_rows_still() {
         assert!(reclaim_footer.contains("v view"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("q quit"), "{reclaim_footer}");
         assert!(reclaim_footer.contains("? help"), "{reclaim_footer}");
-        // Reclaim names `Space mark` and `⌫ trash` while the row under the
+        // Reclaim names `Space mark` and `⌫ review` while the row under the
         // cursor is a real path (a unit, or a listed folder), and never
         // the old "delete" word, which Reclaim did not do.
-        for want in ["⌫ trash", "Space mark"] {
+        for want in ["⌫ review", "Space mark"] {
             assert!(reclaim_footer.contains(want), "{reclaim_footer}");
         }
         assert!(!reclaim_footer.contains("⌫ delete"), "{reclaim_footer}");
-        // Every other view keeps its footer, on the same screen row.
-        let external = {
-            app.set_view(ViewKind::External);
-            footer_of(&app)
-        };
+        // Every view keeps navigation and exit hints on the same row;
+        // action/filter hints reflect whether that view can use them.
         for v in ViewKind::ALL {
-            // Reclaim and the two Disk views mark nothing: no delete keys.
-            if matches!(v, ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps) {
-                continue;
-            }
             app.set_view(v);
-            assert_eq!(footer_of(&app), external, "w={w} view={v:?}");
+            let footer = footer_of(&app);
+            for hint in ["Tab section", "v view", "? help", "q quit"] {
+                assert!(footer.contains(hint), "w={w} view={v:?}: {footer}");
+            }
+            if !v.uses_filter() {
+                assert!(!footer.contains("/ filter"));
+            }
         }
         app.set_view(ViewKind::Reclaim);
         // The heading is on the row every flat view puts it on.
         let heading = |app: &App| {
             capture(app, w, h)
                 .lines()
-                .position(|l| l.trim_start_matches('"').starts_with("Name"))
+                .position(|l| {
+                    l.contains("Size")
+                        && (l.contains("Storage item") || l.contains("Tool location"))
+                })
                 .unwrap()
         };
         let reclaim_heading = heading(&app);

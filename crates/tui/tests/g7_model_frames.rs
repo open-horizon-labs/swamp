@@ -425,7 +425,7 @@ fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
         let store_at = a
             .rows()
             .iter()
-            .position(|r| r.expandable && r.label.contains(&store_path))
+            .position(|r| r.expandable && r.unit.as_ref().is_some_and(|u| u.0 == store_path))
             .unwrap_or_else(|| panic!("{view_kind:?}: no hub row: {:?}", a.rows()));
         a.selected = store_at;
         handle_key(&mut a, KeyCode::Right);

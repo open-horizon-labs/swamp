@@ -46,16 +46,9 @@ cache, a package manager's own answer. File access time is the fallback, and
 25, file access time". swamp never says "unused". The build fails on verdict
 words in anything it prints.
 
-**It reports; you remove.** Anything you can see in the TUI you can mark and
-move to Trash after one confirm. The confirm lists every exact path and size,
-and every fact you might want first: "cannot be regenerated", "last used: no
-record", "in use right now by ...", "967 MB of this stays in the shared blobs
-folder". Those are lines on the confirm, not refusals. swamp refuses only when
-it could not do the thing correctly: a path that is not a real folder or
-file, an OS denial, a mark that changed since you reviewed it, an overlap
-with another mark, a ledger it cannot write, your own `swamp protect` entry,
-and its own ledger folder. Every move is written to a locked ledger before it
-happens. Trash is the way back.
+**It reports; you remove.** Mark a real path in the TUI and review it before moving it to Trash. The review shows destination totals, common warnings once, and item-specific exceptions: “cannot be regenerated”, “last used: no record”, “in use right now by ...”, “967 MB of this stays in the shared blobs folder”. Read the primary summary, then confirm; `l` opens the optional inventory of every exact path, size and member. Enter is disabled inside that inventory. Long selections no longer require every path to fit on one screen.
+
+These facts inform the decision. Swamp refuses when it cannot perform the move correctly: an invalid target, an OS denial, a mark changed since review, overlapping marks, an unwritable ledger, your own protect entry, or its own ledger folder. Every move is written to a locked ledger before it happens. Trash is the way back. The [usage guide](usage.md#terminal-controls) covers current controls and the difference between Trash and permanent manager removal.
 
 For the two managers whose removals cannot be undone (mise versions,
 simulator runtimes), the manager's own command runs only on `Y`, only after
@@ -67,7 +60,7 @@ shell history, editor recents or Spotlight to guess them. Every program it
 runs comes from a fixed location per platform, never from `PATH`. Symlinks
 are never followed. A store written by a newer swamp is read, never modified.
 
-## What 0.8.0 adds
+## What 0.8.0 added
 
 ```text
 Developer storage: 224.1GB across 40 projects and 77 tool locations (50.4% of used)
@@ -100,7 +93,7 @@ toolchains 57.1GB · projects 42.4GB · agents 40.7GB · other 39.3GB · VMs 23.
 The numbers are from [CHANGELOG.md](../CHANGELOG.md), measured on one
 machine. They are not performance guarantees.
 
-## What it does not do
+## Current limits
 
 - Promise how many bytes a deletion frees. Trash keeps the bytes until
   emptied; other hard links, APFS clones and snapshots can keep them longer.
@@ -111,11 +104,9 @@ machine. They are not performance guarantees.
 - Update a unit's "hard-linked" label when a link is made from outside a
   folder it replayed. The bytes stay exact; the label catches up when the
   folder changes.
-- Check the stored change cursor against the FSEvents database UUID. That is a
-  store-format change left for a later release.
-- Skip Docker or mise on an unchanged pass. Both are still asked every time.
-- Let an agent decide. The agent and JSON plan path still refuses what an AI
-  tool must not decide on its own.
+- Guarantee reuse after a gap in event history. On macOS, missing or invalid FSEvents history requires a full measurement; older cursors without the event-store UUID need one full pass before reuse resumes.
+- Promise live daemon facts from a stored report. Routine observations reuse Docker facts for up to five minutes and show their age; `swamp observe --enrich` requests fresh daemon facts.
+- Provide a CLI deletion command. Reports and JSON provide evidence; removal is a separate TUI action.
 - Replay history on Linux. Linux walks everything unless the opt-in collector
   has been running.
 

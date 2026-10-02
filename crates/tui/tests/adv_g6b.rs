@@ -126,6 +126,10 @@ fn select(a: &mut App, needle: &str) {
         .iter()
         .position(|r| r.label.trim() == needle)
         .or_else(|| rows.iter().position(|r| r.label.contains(needle)))
+        .or_else(|| {
+            rows.iter()
+                .position(|r| r.unit.as_ref().is_some_and(|u| u.0.contains(needle)))
+        })
         .unwrap_or_else(|| panic!("no row with {needle:?}"));
 }
 

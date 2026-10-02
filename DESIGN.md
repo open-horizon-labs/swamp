@@ -4,29 +4,15 @@ The UI presents disk growth as a table that opens into a project tree. Size, sig
 
 ## Rows and hierarchy
 
-Each row contains a name, bytes, signed growth, a change bar, and any visible facts. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
+Each row contains a name and measured size. Show signed change only where the view has recorded change values, notes only where rows have facts, and change bars only where at least one change is nonzero. A measured zero stays `0B`; an unknown measurement never becomes zero. Project rows group checkouts and linked worktrees; tree rows show artifacts and the remaining directories. Box-drawing rails preserve parent-child relationships. Names truncate in the middle; numbers align on the right.
 
-Column headings identify name, size, change, and cleanup/facts. Name truncation
-and padding use grapheme-aware terminal-cell widths. Badges have separating
-spaces. Build drilldowns reserve a compact candidates/oldest-modified column even
-at 80 columns, hide the change bar, and hide numeric change below 100 columns.
-Their name column caps at 64 cells. Other views hide bars below 140 columns and
-show facts only in selected-row details below 100 columns. Zero and
-unknown changes have no vertical bar. Keep the selected row visible when scrolling.
+Column headings name the thing being compared: Project, Folder, Build output, Dependencies, Ecosystem, Storage kind, Unassigned storage, Storage item, Docker object, Tool location, Agent storage, Disk allocation, or Location. Name truncation and padding use grapheme-aware terminal-cell widths. Badges have separating spaces. Build outputs, Dependencies and build drilldowns reserve Notes at 80 columns; Reclaim reserves If removed. These and Reclaim hide numeric change below 100 columns. Disk views omit change entirely and label facts Measurement. These views cap names at 64 cells only when notes need the remaining width. Other views hide bars below 140 columns and show facts only in selected-row details below 100 columns. Zero and unknown changes have no vertical bar. Keep the selected row visible when scrolling.
 
-Collapsed build categories lead with a recommendation and removal consequence:
-start with compiler caches (slower next build), review tests/examples (rebuild
-before rerunning), and lower-priority build-script output (scripts rerun).
-Counts, allocated candidate size, and oldest known modification age follow only
-when space permits; narrow views drop these statistics before clipping advice.
-Unknown age is `?`.
-Candidate directory descendants are not counted again. Final outputs say
-`Inspect only: removes built output`, without suggesting a supported selective action.
-Other unsupported rows say `Selective cleanup unsupported`, not a safety verdict.
-Nested allocated sizes have a `*` suffix and a persistent accounting legend.
-When space remains below the tree, preview the selected category's oldest
-candidates with paths, allocated sizes, ages, and rebuilding effects. This preview
-is read-only: expand the category to select exact groups.
+Build and dependency labels lead with the project and checkout-relative path; additional checkouts carry a discriminator. Unassigned rows lead with their path. Tool labels keep the detector and identifying path suffix. Exact paths remain in selected details and action review. Reclaim table costs come from the typed regeneration class; original wording and source remain in the details. Current use, unique-copy, sharing, sourced last use and unknown facts precede secondary metadata in the fixed-height detail pane. Last use keeps its source and is separate from modification age.
+
+Collapsed build categories lead with a recommendation and removal consequence: start with compiler caches (slower next build), review tests/examples (rebuild before rerunning), and lower-priority build-script output (scripts rerun). Item counts and selected bytes follow where space permits. Modification age belongs in supporting details, explicitly labelled; it is not last use. Final outputs say Rebuild before running again. Routine cleanup-rule and adapter explanations stay out of primary advice.
+
+Candidate directory descendants are not counted again. Nested allocated sizes have a `*` suffix and a persistent shared-file accounting legend. When space remains below the tree, preview a subset of the selected category with paths, allocated sizes, explicitly labelled modification times and rebuilding effects. This preview is read-only; expand the category to select individual members.
 
 Opening a project shows Cargo profiles with purpose-based cleanup groups:
 Compiler caches, Compiled tests & examples, and Build-script output. Groups
@@ -39,34 +25,13 @@ back newly added marks, preserving earlier selections. No virtual group is a
 directory deletion target. Age ordering applies within groups; individual members
 can be selected instead of the whole group.
 
-A build container whose interior an adapter identified in the neutral role
-vocabulary (a `node_modules`, a `dist`, a Gradle `build/`, a Maven `target/`)
-expands into one group per role family -- Build outputs, Test & coverage output,
-Caches & intermediates, Installed dependencies, Shared store entries, Tool
-metadata -- plus a Not identified group for unrecognised entries and bytes no
-unit claims. Groups start closed. Each group row leads with review guidance of at
-most 32 characters ("Start here: slower next build", "Review: reinstall from
-registry", "Shared: other projects may link"), then the count and oldest known
-modification; the adapter's own consequence, the accounting basis and
-what its cleanup rule does not cover are the row's details. That order is the point: an 80-column
-advice column shows the guidance whole and gives up the numbers first. An opened
-group lists its members oldest first (unknown ages last), each leading with its
-consequence in that ecosystem's words. Supported project-local output units can
-be selected for Trash by family; shared stores and units without a cleanup rule are marked one at a time on their own row.
-Action support comes from the adapter contract, not the role label alone. Which
-presentation a container gets follows the roles its units carry,
-never a comparison with an adapter id; Cargo containers keep the purpose groups
-above.
+A build container whose interior an adapter identified in the neutral role vocabulary (a `node_modules`, a `dist`, a Gradle `build/`, a Maven `target/`) expands into one group per role family -- Build outputs, Test & coverage output, Caches & intermediates, Installed dependencies, Shared store entries, Tool metadata -- plus a Not identified group for unrecognised entries and bytes no unit claims. Groups start closed. Each group row leads with review guidance of at most 32 characters ("Start here: slower next build", "Review: reinstall from registry", "Shared: other projects may link"), then the count; the adapter's own consequence, the accounting basis and what its cleanup rule does not cover are the row's details. That order is the point: an 80-column advice column shows the guidance whole and gives up the numbers first. An opened group lists its members oldest first (unknown ages last), each leading with its consequence in that ecosystem's words. Supported project-local output units can be selected for Trash by family; shared stores and units without a cleanup rule are marked one at a time on their own row. Action support comes from the adapter contract, not the role label alone. Which presentation a container gets follows the roles its units carry, never a comparison with an adapter id; Cargo containers keep the purpose groups above.
 
-The physical tree remains under a collapsed Inspect directories row; it is a
-second view of the same bytes, not additional storage. Physical category rows
-are navigation, not selective cleanup units. The selected-row detail area shows recommendations
-and rebuilding consequences. Compiler caches are a suggested starting point,
-not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
+Inspect directories is a structural navigation row without a duplicate size or accounting explanation. It opens the physical tree of the same storage. Expansion and collapse retain the selected item and its screen position, allowing blank rows at the bottom rather than refilling the viewport from above. Physical category rows are navigation, not selective cleanup units. The selected-row detail area shows recommendations and rebuilding consequences. Compiler caches are a suggested starting point, not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
 
-The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to all changes in the current view, including off-screen rows. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
+The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to all changes in the current view, including off-screen rows. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the rounded change; the bar is not a linear scale of bytes.
 
-Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy. Sorting or reversing keeps the same item selected. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
+Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy; Tree, Reclaim and Disk ignore sort/reverse keys and omit those hints. Sorting or reversing keeps the same item selected. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
 
 ## Color
 
@@ -76,13 +41,15 @@ The renderer uses the terminal's own colors and attributes. Committed frames exe
 
 ## Navigation and filters
 
-`→` opens or expands. `←` collapses an expanded row, selects the parent of a leaf or collapsed child, or returns to projects when there is no parent. Returning to a view restores the selected item and scroll position; if the item disappeared or an informational row has no unique identity, selection falls back to its previous position, clamped to the remaining rows. Enter opens a project or confirms an action. Esc cancels the active interaction or returns to projects. `/` opens the filter form; `:` edits the expression; `0` clears it. Parse errors retain the previous valid filter.
+`→` opens or expands. `←` collapses an expanded row, selects the parent of a leaf or collapsed child, or returns to projects when there is no parent. Returning to a view restores the selected item and scroll position; if the item disappeared or an informational row has no unique identity, selection falls back to its previous position, clamped to the remaining rows. Enter opens a project or confirms an action. Esc cancels the active interaction or returns to projects. `/` opens the filter form; `:` edits the expression; `0` clears it. Invalid expressions stay open for correction, with the error and recovery instruction in the status rows. The previous valid filter, marks and position remain active; Esc restores the accepted expression. Invalid drafts are never saved.
+
+When no operation or overlay owns the status area, its existing two rows keep pending marks visible across navigation, filtering and view changes. The summary names the count, selected stored size and Trash/permanent Docker split. Blocked items retain their count and `b` recovery route. Row position counts the full current list, with a contextual action hint when space permits. Narrow screens drop optional size, position and hints before permanent-removal or blocked facts. Manager hints follow the actual routing: a manager list opens only with no marks; other marks require selecting that folder for Trash or returning to the marked rows. These cues never appear as commands while editing a filter, and they add no scanning or extra row construction.
 
 The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take precedence on later runs. The views are nested in three sections (Projects, Tools, Disk): `Tab`/`Shift-Tab` move between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the current section. The [usage guide](docs/usage.md#terminal-controls) holds the full key table.
 
 ## Header, progress, and history
 
-The header shows the root, observation status, available history, and totals as space permits. It drops trailing clauses on narrow terminals, but the activity chip (`⠋ observing 12s`, or `⠋ another observation running (pid N, 1m 12s)`) owns the left edge at every width. The UI opens on the stored report at any age and never scans when one exists; with none, the first scan runs in the background and its progress shows in the header. `R` refreshes on demand, and says so, rather than starting a second walk, when another process already holds the observation lock. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
+The header shows the root, observation status, and available history as space permits. It drops trailing clauses on narrow terminals, but the activity chip (`⠋ observing 12s`, or `⠋ another observation running (pid N, 1m 12s)`) owns the left edge at every width. The UI opens on the stored report at any age and never scans when one exists; with none, the first scan runs in the background and its progress shows in the header. `R` refreshes on demand, and says so, rather than starting a second walk, when another process already holds the observation lock. That cache is the store's own typed Parquet tables (`swamp_core::growth::ReportSnapshot` assembles them into the one value both the TUI and `swamp report` read) -- not a JSON sidecar, and not a second data path from the one `swamp observe` writes.
 
 Observation progress keeps a whole-run elapsed clock. The CLI names the active work; the TUI names the scope being updated. Per-walk byte counters are not displayed as run totals because they reset between roots. There is no percentage, because the total is not known. The TUI opens no filesystem watch: nothing scans on a file event, so a stored report is exactly as old as the header says. A lock poll only notices when another process observes, shows it, and reloads the stored report when that run ends. The right side of the header is the history sparkline with the net change it covers and the window it is over (`-41.4GB in 1w`); body rows use change bars.
 
@@ -90,108 +57,22 @@ Human output shares decimal byte units, grouped counts, whole-second durations, 
 
 ### The developer-storage headline block and the view strip
 
-Under the header, on every view and in every state, sits a headline block of a
-fixed number of rows chosen by the terminal's height alone: four at 30 rows and
-up (the headline with its percent; the breakdown rows, largest first, with
-`+N more` when a narrow screen cannot name them all; the disk state with the
-ages and the ledger's parts; the pointers to Reclaim and Disk with their keys),
-two from 16 rows (headline and coverage/age), one from 12, none below. Nothing
-changes that height: a warning, a missing ledger, a running scan, a previous
-scope, the first-run line and every view draw into the same rows, so no row of
-the table moves. Lines that come in shorter forms step together to the form
-that keeps the most leading clauses; the wording of the spot-audit warning is
-never traded away, so the clauses after it give way instead. The first-run line
-("Tab switches sections · 2 opens Tools / Reclaim · 3 opens Disk") takes the
-pointer row until Tools or Disk is opened once, and is remembered in
-`ui_state.json`.
+Under the header, every view has a fixed two-row block: developer-storage total and coverage. It uses one row on terminals from 12 to 15 rows tall and none below that. Detailed allocation belongs in Disk usage. Missing or unreadable ledgers, previous scope, explicit-root scope, unmeasured folders, ledger age, and audit discrepancies remain visible in priority order. The spot-audit warning takes precedence over the total when only one row is available. State changes never move the table.
 
-Under the block is the section strip: one row naming the three sections (`1
-Projects  2 Tools  3 Disk`), the current one in reverse video (an attribute,
-never a color, so `NO_COLOR` and light themes keep it). The line below it names
-the view: `view: Tools › Reclaim (1 of 4 · v next)`, then the filter and sort.
-The only keys that move between views are `Tab`/`Shift-Tab` (sections), `v` (views
-inside a section, wrapping) and `1` `2` `3` (a section); the legend shows `Tab
-section  v view` and never a key per view. Every modal keeps its own keys first,
-so Tab completes in the filter and none of these switch anything while you type;
-a test reads the keymap and fails when a key is bound twice or a view is
-unreachable by those keys.
+The section strip names `1 Projects  2 Tools  3 Disk`, with the current section in reverse video so `NO_COLOR` and light themes keep it. Until Tools or Disk is opened once, spare width holds `Tab switches sections`; that choice is remembered in `ui_state.json`. The following line names the current view and shows its applicable filter, sort, and short purpose as width permits. Ignored predicates are identified, and views that ignore filtering show no filter clause. Only Project folders includes the selected project in its title.
 
-The Disk section's Summary view is the stored volume ledger as rows: accounted, everything else
+`Tab`/`Shift-Tab` change sections, `v` cycles views inside a section, and `1` `2` `3` open each section’s default view. Enter or → on a project opens Project folders; Esc returns to Projects. The legend shows `Tab section  v view`, without a key per view. Modals own their keys: Tab completes a raw filter instead of changing sections. Keymap tests check duplicate bindings and reachability.
+
+The Disk section's Disk usage view is the stored volume ledger as rows: accounted, everything else
 with its folders, system volumes, not measured (never a size), the protected
 folders estimate, the bookkeeping line and the walk's spot audit. It is read
 only and built from the stored ledger, so opening it lists nothing.
 
-### External and Agents rows, and a scope-coverage header clause
+### Tool storage, Agent storage and scope coverage
 
-`report_scope`/`external.rs` (#42/#43) and `agents.rs` (#91/#92) gave
-the TUI three facts recorded here as unimplemented intent by an earlier
-chunk; all three now ship:
-
-- **External rows.** `ViewKind::External` (`'9'`) lists `ExternalUnit`s
-  the same shape as `ViewKind::Unowned` lists unowned rows: path,
-  category, size, growth, consumer count. Every unit and listed folder
-  is a real path (`Row.unit` set): an external unit is shared,
-  detector-resolved storage (a package manager's cache, a toolchain
-  install), and Space marks it for the reviewed Trash move like any
-  path, the confirm saying what swamp does not know and that the
-  manager will not know it is gone. A unit whose manager swamp runs
-  removal for also opens that manager's own list on Backspace. A unit that is a
-  machine-wide build store (a Maven repository, Go's module cache,
-  DerivedData, the Android SDK, ...) is expandable: `Enter`/`→` opens it
-  onto the **same** family groups a project container shows (closed
-  until opened, guidance first, every row `blocked`, no `UnitId`), from
-  `ScopeObservation::store_interiors` of the same pass. The Docker view
-  gains one row per BuildKit builder that opens the same way; its member
-  rows say "created (daemon)" rather than "modified", because the time
-  is the daemon's record, not a file's. A unit that declares a last-use
-  source, and an unclassified root of 1 GiB or more, also opens onto its
-  depth-2 rows first (its top 15 child folders largest first, then one
-  remainder row that makes the rows sum to the unit's total; a folder that
-  could not be read draws `unmeasured` in the Size cell, a signed correction draws `-50MB adj`, and neither ever draws a size; a unit that also has an identified interior holds it under one closed "identified interior" header so no byte is listed twice). Every such
-  row is `blocked`, no `UnitId`, and the table layout is unchanged: the
-  last-used fact (`Last run or opened: Jul 8 (file access time)`) is the
-  first line under the signals in the selected-row detail pane, not a
-  column, so no width rule moves. An unowned row for a standalone Cargo
-  target directory is markable like any unowned row and its confirm line
-  says what it is and that `cargo build` remakes it.
-- **Agents rows.** `ViewKind::Agents` (Tools section, third view; `v` from
-  Reclaim or External) lists `AgentUnit`s the
-  same way: tool/category/relative-path/project-link facts. Every row
-  carries `Row.unit: Some(...)` (protected/unmarkable ones included):
-  `Space`/`Backspace` mark the selected unit through
-  `actions::propose_agents` and open the confirm banner with its
-  current facts (session-removal loss warnings, the linked project);
-  `Enter` moves it to the Trash through the ordinary background-worker
-  path (`actions::execute_plan_progress`) every other markable view
-  already uses -- never a new blocking call on the event/render thread,
-  and with no re-check between marking and moving. A protected row, or
-  one whose category has no Trash move at all, marks with a warning
-  (`propose_agents_for_human`: kept by default, no rule for the category,
-  database-like file); only the person's own `swamp protect` mark
-  refuses, and its reason becomes the status text, never a
-  generic "nothing to delete." Bulk marking (`Shift+A`,
-  `mark_all_in_view`) reaches agent rows too: since `model::agent_rows`
-  sets `Row.unit` but never `Row.kind` (there is no `ArtifactKind` for
-  an agent-storage unit), `mark_all_in_view` has a third branch
-  alongside its `row.kind`/`ArtifactKind` and projects-view
-  `row.project` ones -- when a row has neither but does carry `unit`, it
-  reuses `mark_row`'s own per-row refusal rather than duplicating that
-  logic, and counts a skip instead of a hard stop. The status rows name how
-  many agent rows were skipped and why whenever at least one row *was*
-  marked, never silently proceeding as if the skipped rows were not on
-  screen.
-- **Project tree's collapsed "Agent storage (linked)" row (#100
-  completion).** `ViewKind::Tree`'s own drill (`model::tree_rows_with_agents`,
-  built from the same `crate::tree::build_project_tree` the CLI's
-  `--project` text drill uses) now appends one row per tool
-  contributing linked agent storage to the selected project, after the
-  project's own worktrees. It is informational only (`unit: None`):
-  the row exists so "does this project have any linked agent storage,
-  from which tools, how much" is visible from the project drill itself
-  without also opening the separate Agents view -- acting on a specific
-  unit still happens there, where per-unit protections/occupancy are
-  checked. Absence of any linked unit means no row at all, never a
-  zero-byte placeholder.
+- **Tool storage.** `ViewKind::External`, third in Tools, lists `ExternalUnit`s with detector/category labels, sizes and recorded changes. Selected details retain exact paths, consumers and source notes. Enter or → expands stored folder rows or identified interior groups. Real path rows can be marked for Trash; structural and remainder rows are informational. Depth-2 folder rows name unmeasured allocations and corrections instead of treating them as measured sizes. Last use stays in details with its source. On a manager row, Backspace opens the manager’s list only when the row is unmarked and no marks are pending; Space selects the folder for Trash instead.
+- **Agent storage.** `ViewKind::Agents`, fourth in Tools, lists `AgentUnit`s with tool, category, project and item labels. Inferred associations stay labelled; details retain exact paths and link evidence. `actions::propose_agents_for_human` supplies the warnings for an individual mark, including kept-by-default, unknown-category and database-like rows. The human’s own protect entries block conflicting selections. `A` reviews eligible rows across the complete current list, skipping `individual_only` rows and reporting skips; these rows remain available for individual review with Space. Removal uses the ordinary background worker.
+- **Linked storage in Project folders.** `ViewKind::Tree` includes a collapsed Agent storage (linked) summary per contributing tool, built from the same project tree as the CLI drill. These rows are informational (`unit: None`); individual selection happens in Agent storage. No linked units means no summary row, rather than a zero-byte placeholder.
 - **Scope-coverage header clause, now driven by real observation
   outcome (#51).** `App::set_scope_note` adds one short header clause
   when there is more than one region or the one region is not simply
@@ -257,7 +138,7 @@ validation.
 
 ## Actions
 
-Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a content-sized review overlay with destination totals, selection context, shared warnings shown once, and item-specific exceptions. The primary summary must be displayed before Enter authorizes its action. Press `l` for the complete path, size, and member inventory; this detail view scrolls, and Esc returns to the summary. Inspecting every inventory row is optional. Esc from the summary cancels.
+Space marks a row. Backspace opens the confirmation for the current row or marked set. Confirmation is a content-sized review overlay with destination totals, selection context, shared warnings shown once, and item-specific exceptions. The primary summary must be displayed before Enter authorizes its action. Press `l` for the complete path, size, and member inventory; this detail view scrolls, Enter is disabled there, and Esc returns to the summary. Inspecting every inventory row is optional. Esc from the summary cancels.
 
 Human keep/protect intent (`swamp protect`) is checked before **any**
 row is marked, in both directions: a row beneath a protected path, and a
@@ -269,9 +150,9 @@ only for the two row kinds that happened to propose through core, which
 is how a one-directional protection bug survived every test; see
 `.oh/guardrails/protection-fails-closed.md`.
 
-Project rows expand to actionable artifacts. If none exist, a direct project action may offer the checkout. Bulk marking with `A` skips that fallback. Worktree and source-directory selections carry their own warnings; the `ignored` and `untracked` summary buckets are not individual paths to delete.
+Project rows expand to actionable artifacts. If none exist, a direct project action may offer the checkout. Bulk review with `A` skips that fallback and opens the plan before acting. Worktree and source-directory selections carry their own warnings; the `ignored` and `untracked` summary buckets are not individual paths to delete.
 
-Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Tool-managed removal (mise versions, simulator runtimes) has its own sheet over the screen, opened by Backspace on the mise installs or simulator runtimes row: the manager's own list, then a confirm whose rows keep a fixed order (what is removed, "No Trash recovery: this cannot be undone", the command heading, the command, never cut, then program, size, reinstall cost, open files, the manager's quoted reasons, warnings, what the dry run removes, and the dry run verbatim, bounded with a "+k more lines" row), and whose last inner row is always its keys (`Y remove (cannot be undone) · Esc cancel`: Enter only opens the review, and `Y` counts only after the confirm has been drawn and 1 s has passed). A refusal shows "Reason:" and "Next:" and that nothing ran; a result says what the manager's list showed afterwards. `Y` runs nothing on a terminal too small to show the whole command block. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals show in the status rows with their reason; what a check or a delete could not include is listed with `b` (or `d` on the plan), each with its whole reason and a next step, and `r` there checks again.
+Docker images and volumes must be named in the confirmation because their removal has no Trash recovery. Tool-managed removal (mise versions, simulator runtimes) has its own sheet over the screen, opened by Backspace on an unmarked mise installs or simulator runtimes row when no marks are pending: the manager's own list, then a confirm whose rows keep a fixed order (what is removed, "No Trash recovery: this cannot be undone", the command heading, the command, never cut, then program, size, reinstall cost, open files, the manager's quoted reasons, warnings, what the dry run removes, and the dry run verbatim, bounded with a "+k more lines" row), and whose last inner row is always its keys (`Y remove (cannot be undone) · Esc cancel`: Enter only opens the review, and `Y` counts only after the confirm has been drawn and 1 s has passed). A refusal shows "Reason:" and "Next:" and that nothing ran; a result says what the manager's list showed afterwards. `Y` runs nothing on a terminal too small to show the whole command block. Successful removals leave the displayed report, totals are adjusted, and the UI observes again. Refusals show in the status rows with their reason; what a check or a delete could not include is listed with `b` (or `d` on the plan), each with its whole reason and a next step, and `r` there checks again.
 
 The selected row's own decision evidence (#53/#60) renders below the
 table, in a fixed four-row detail pane (`crates/tui/src/detail.rs`): what
@@ -299,6 +180,8 @@ body, two status rows, and the key legend. Nothing resizes the body. A blocked l
 height sits under the list, and the list scrolls only when the selection leaves
 its window, so one Down moves the selection one row.
 
+The review summary shows restore cost, sourced last use and consequential exceptions. Known adapter, accounting, coverage and selection bookkeeping stays in optional `l` details with original wording and every path and size. Unrecognized warnings remain visible; no warning count or length cap hides them. Enter is disabled in details. Successful removals prune stored interior rows and invalidate derived caches immediately; model manifest removal retains shared payload allocation until observation remeasures it. Failed moves stay listed.
+
 Only rows inside that window are formatted into terminal cells. The complete row model still determines order, selection, totals, and growth-bar scale; scrolling does not change the scale or discard off-screen rows.
 
 Marking builds a plan and changes nothing. Check, ready and blocked are the
@@ -316,13 +199,7 @@ rows. A result says what moved to Trash and what was removed for good, and that
 space is freed when Trash is emptied; it carries no measured free-space figure,
 because a move to Trash on the same volume frees nothing yet.
 
-Keys move by row, by page (PgUp, PgDn) and to the ends (Home, End) in the list,
-the help, the blocked list, the cargo popup and the picker. `v` names the view
-and its place (`builds of mole (3 of 10 · v next · Esc: projects)`), each view
-remembers its cursor, and an empty list says why and what to press. `k` says
-which way it flipped and what that means, since it is remembered. The key legend
-keeps `/ filter  v view  R refresh  ⌫ delete  ? help  q quit` at 80 columns and
-drops movement keys first.
+Keys move by row, by page (PgUp, PgDn) and to the ends (Home, End) in the main list. Help, blocked reasons and Cargo inspection scroll by displayed lines and clamp after resize so wrapped text remains reachable. The picker moves between fields with arrows; its project field accepts literal letters, digits and spaces. Esc cancels everywhere; q also closes the picker outside its project field. `v` names the view and its place; each view remembers its cursor, and an empty list says why and what to press. `k` says which way it flipped and what that means. Footer hints describe the current action: `⌫ review`, a manager list, or `A review all`; fixed-order views omit sorting. Hints drop whole at narrow widths and preserve help and quit.
 
 The UI paints only when something changed: a key, a resize, a worker's result,
 anything busy (every 200 ms, for the glyph and the clock), or a clock-driven part
@@ -339,3 +216,7 @@ Keep the footer visible. Use overlays for help, the filter form, and action revi
 ## Human-readable values
 
 Human output shares decimal byte units across CLI and TUI, with whole KB and one decimal for larger units, carrying rounded boundaries into the next unit. Counts use digit grouping where needed. Elapsed durations use whole seconds, subsecond work reads `<1s`, and stored timestamps show dates or coarse relative ages with a named timezone where relevant. Machine-readable JSON, logs, and ledger records retain exact values.
+
+Unsupported Ctrl, Alt, Super, Hyper and Meta chords do not invoke plain-key commands. Ctrl-C retains its explicit cancel/quit behavior; Shift commands and BackTab remain available. Only key press events dispatch actions. Manager confirmation names Y as the execution key; Enter only reviews its list selection.
+
+Project tables put the applied period in the Change heading, with `w change period` beside the view title. The period picker reads stored observations in the background and saves the choice independently of the growth filter. Clearing the filter preserves the period. Headings follow the completed calculation, not a pending request; rounded available-history spans use `~`. History ends at the latest observation. Comparison replies update only matching rows’ deltas, preserving selection, current sizes and removed rows.

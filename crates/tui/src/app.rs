@@ -137,7 +137,7 @@ impl Section {
     pub fn describe(self) -> &'static str {
         match self {
             Section::Projects => "your projects and what they hold",
-            Section::Tools => "storage outside any project: toolchains, caches, AI tools",
+            Section::Tools => "developer tools, Docker, and storage units to review",
             Section::Disk => "where the whole disk went, from the stored volume ledger",
         }
     }
@@ -203,19 +203,54 @@ impl ViewKind {
     pub fn title(self) -> &'static str {
         match self {
             ViewKind::Projects => "Projects",
-            ViewKind::Tree => "Tree",
-            ViewKind::Builds => "Builds",
+            ViewKind::Tree => "Project folders",
+            ViewKind::Builds => "Build outputs",
             ViewKind::Deps => "Dependencies",
             ViewKind::Docker => "Docker",
-            ViewKind::Kinds => "Folder types",
-            ViewKind::Unowned => "Unowned",
+            ViewKind::Kinds => "Storage kinds",
+            ViewKind::Unowned => "Unassigned",
             ViewKind::Types => "Ecosystems",
-            ViewKind::External => "External",
+            ViewKind::External => "Tool storage",
             ViewKind::Reclaim => "Reclaim",
-            ViewKind::Disk => "Summary",
-            ViewKind::DiskGaps => "Not measured",
-            ViewKind::Agents => "Agents",
+            ViewKind::Disk => "Disk usage",
+            ViewKind::DiskGaps => "Coverage gaps",
+            ViewKind::Agents => "Agent storage",
         }
+    }
+
+    /// A short purpose line for navigation UI; intentionally independent
+    /// of `label()`, which is a stable machine-facing view identifier.
+    pub fn purpose(self) -> &'static str {
+        match self {
+            ViewKind::Projects => "Compare project size, growth, and activity",
+            ViewKind::Tree => "Browse a project's worktrees and folders",
+            ViewKind::Builds => "Compare build outputs across projects",
+            ViewKind::Deps => "Compare dependency folders across projects",
+            ViewKind::Docker => "Review Docker images, volumes, and build cache",
+            ViewKind::Kinds => "Compare storage by folder kind",
+            ViewKind::Unowned => "Review storage with unknown project ownership",
+            ViewKind::Types => "Compare storage by ecosystem",
+            ViewKind::External => "Review toolchains, caches, and stores",
+            ViewKind::Reclaim => "Review storage size, known use, and removal cost",
+            ViewKind::Disk => "See how measured disk space is accounted for",
+            ViewKind::DiskGaps => "See gaps and large folders outside developer storage",
+            ViewKind::Agents => "Review AI agent sessions, caches, and logs",
+        }
+    }
+
+    /// Whether this view reads the active filter when building rows.
+    /// The predicate support is view-specific; this only says the view
+    /// participates in filtering at all.
+    pub fn uses_filter(self) -> bool {
+        matches!(
+            self,
+            ViewKind::Projects
+                | ViewKind::Tree
+                | ViewKind::Builds
+                | ViewKind::Deps
+                | ViewKind::Kinds
+                | ViewKind::Types
+        )
     }
 
     /// One line on what the view shows, for `?` help.
@@ -227,18 +262,16 @@ impl ViewKind {
             ViewKind::Deps => "dependency folders across projects",
             ViewKind::Docker => "Docker images, volumes and build cache",
             ViewKind::Kinds => "storage grouped by kind of folder",
-            ViewKind::Unowned => "storage that belongs to no project",
+            ViewKind::Unowned => "storage with unknown or unassigned project ownership",
             ViewKind::Types => "storage grouped by ecosystem",
             ViewKind::External => "toolchains, caches and stores outside any project",
-            ViewKind::Reclaim => {
-                "regenerable developer storage by unit: what getting it back costs, last used"
-            }
+            ViewKind::Reclaim => "developer storage by unit: known use and removal consequences",
             ViewKind::Disk => {
                 "where the whole disk went: accounted, everything else, system volumes, not measured"
             }
             ViewKind::Agents => "AI coding tools' sessions, caches and logs",
             ViewKind::DiskGaps => {
-                "what could not be read or is not measured yet, and the largest measured folders outside developer storage"
+                "what could not be read or measured yet, plus the largest measured folders outside developer storage"
             }
         }
     }
@@ -433,7 +466,7 @@ struct ViewCursor {
 pub struct App {
     /// Ephemeral on-demand details; never persisted in the observation store.
     pub cargo_inspection: Option<Vec<String>>,
-    pub cargo_inspection_scroll: u16,
+    pub cargo_inspection_scroll: std::cell::Cell<usize>,
     /// The tool-managed removal sheet (#177), when open.
     pub tool_sheet: Option<crate::tool_sheet::ToolSheet>,
     /// The one tool worker in flight (listing, review or removal): one at
@@ -467,8 +500,8 @@ pub struct App {
     /// keeps marks made any other way.
     last_check_marks: Vec<String>,
     pub blocked_open: bool,
-    /// First blocked item shown in the blocked list.
-    pub blocked_scroll: usize,
+    /// First wrapped display line shown in the blocked list.
+    pub blocked_scroll: std::cell::Cell<usize>,
     /// First body row shown; moves only when the selection leaves the
     /// window, so one keypress moves the selection one row.
     pub scroll_offset: std::cell::Cell<usize>,
@@ -610,6 +643,11 @@ pub struct App {
     /// Seconds of observation history the store holds; bounds the growth
     /// windows a human may pick (the store cannot answer beyond it).
     pub history_secs: Option<u64>,
+    pub change_period: Option<ChangePeriod>,
+    pub requested_window_secs: Option<u64>,
+    pub stored_window_secs: u64,
+    comparison_rx: Option<std::sync::mpsc::Receiver<Result<Report, String>>>,
+    comparison_observed_at: u64,
     /// git tracking status per absolute path, filled when a project is
     /// opened (one exclude stack per worktree, reused for its rows).
     pub track: std::collections::HashMap<PathBuf, swamp_core::ignore::TrackState>,
@@ -687,6 +725,11 @@ pub struct BlockedItem {
     pub name: String,
     pub reason: String,
     pub next: String,
+}
+
+pub struct ChangePeriod {
+    pub choices: Vec<String>,
+    pub selected: usize,
 }
 
 /// The next step for a reason a check gave. Unknown reasons still get a
@@ -777,6 +820,8 @@ enum OperationEvent {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UiState {
     #[serde(default)]
+    pub comparison_window_secs: Option<u64>,
+    #[serde(default)]
     pub filter: String,
     #[serde(default)]
     pub sort: String,
@@ -844,8 +889,13 @@ impl App {
         let filter = filter::default_filter();
         let root = roots.first().cloned().unwrap_or_default();
         App {
+            change_period: None,
+            requested_window_secs: None,
+            stored_window_secs: report.series_window_secs,
+            comparison_rx: None,
+            comparison_observed_at: 0,
             cargo_inspection: None,
-            cargo_inspection_scroll: 0,
+            cargo_inspection_scroll: std::cell::Cell::new(0),
             tool_sheet: None,
             tool_rx: None,
             confirm_drain: false,
@@ -861,7 +911,7 @@ impl App {
             refusal_ctx: None,
             blocked: Vec::new(),
             blocked_open: false,
-            blocked_scroll: 0,
+            blocked_scroll: std::cell::Cell::new(0),
             scroll_offset: std::cell::Cell::new(0),
             frame: 0,
             last_check: None,
@@ -1143,6 +1193,8 @@ impl App {
         // the new report sorts it.
         let anchor = self.selected_row_key();
         self.report = report;
+        self.stored_window_secs = self.report.series_window_secs;
+        self.reload_comparison();
         self.headline_cache.borrow_mut().take();
         self.restore_selection(anchor);
     }
@@ -1437,6 +1489,12 @@ impl App {
     }
 
     pub fn set_sort(&mut self, sort: Sort) {
+        if matches!(
+            self.view,
+            ViewKind::Tree | ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps
+        ) {
+            return;
+        }
         let anchor = self.selected_row_key();
         self.sort = if self.sort == sort { Sort::None } else { sort };
         self.restore_selection(anchor);
@@ -1445,6 +1503,12 @@ impl App {
 
     /// `r`: flip the order of whatever sort is active.
     pub fn toggle_reverse(&mut self) {
+        if matches!(
+            self.view,
+            ViewKind::Tree | ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps
+        ) {
+            return;
+        }
         let anchor = self.selected_row_key();
         self.reverse = !self.reverse;
         self.restore_selection(anchor);
@@ -1562,19 +1626,246 @@ impl App {
     }
 
     pub fn open_picker(&mut self) {
-        self.picker = Some(crate::picker::Picker::from_report(
-            &self.report,
-            &self.filter_text,
-            self.history_secs,
-        ));
+        let mut picker =
+            crate::picker::Picker::from_report(&self.report, &self.filter_text, self.history_secs);
+        if filter::growth_window_secs(&self.filter).is_none() {
+            let current = self
+                .requested_window_secs
+                .unwrap_or(self.report.series_window_secs);
+            if let Some(index) = picker
+                .windows
+                .iter()
+                .position(|choice| crate::picker::window_secs(choice, self.history_secs) == current)
+            {
+                picker.window_ix = index;
+            }
+        }
+        self.picker = Some(picker);
     }
 
     pub fn apply_picker(&mut self) {
         if let Some(p) = self.picker.take() {
+            let window = crate::picker::window_secs(&p.windows[p.window_ix], p.history_secs);
             self.filter_text = p.compose();
             self.editing_filter = false;
             self.commit_filter();
+            if window > 0 && self.requested_window_secs != Some(window) {
+                self.requested_window_secs = Some(window);
+                self.reload_comparison();
+                self.persist_ui_state();
+            }
         }
+    }
+
+    pub fn open_change_period(&mut self) {
+        if !self.view.uses_filter() {
+            return;
+        }
+        if self.history_secs.is_none_or(|seconds| seconds == 0)
+            || self.store_dir.is_none()
+            || self.scope.is_none()
+        {
+            self.status =
+                Some("Change period unavailable: no stored history for this scope.".into());
+            return;
+        }
+        let choices = crate::picker::windows_for(self.history_secs);
+        let current = self
+            .requested_window_secs
+            .unwrap_or(self.report.series_window_secs);
+        let selected = choices
+            .iter()
+            .position(|choice| crate::picker::window_secs(choice, self.history_secs) == current)
+            .unwrap_or(choices.len().saturating_sub(1));
+        self.change_period = Some(ChangePeriod { choices, selected });
+    }
+
+    pub fn apply_change_period(&mut self) {
+        let Some(p) = self.change_period.take() else {
+            return;
+        };
+        let seconds = crate::picker::window_secs(&p.choices[p.selected], self.history_secs);
+        let period_text = if p.choices[p.selected].starts_with("all history") {
+            format!("{seconds}s")
+        } else {
+            p.choices[p.selected].clone()
+        };
+        // Keep existing growth thresholds and other predicates; only their
+        // comparison period changes. No growth filter is added when cleared.
+        let mut words: Vec<String> = self
+            .filter_text
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        for i in 0..words.len().saturating_sub(4) {
+            if words[i] == "growth" && words[i + 3] == "in" {
+                words[i + 4] = period_text.clone();
+            }
+        }
+        self.filter_text = words.join(" ");
+        self.filter = filter::parse(&self.filter_text).unwrap_or_else(|_| self.filter.clone());
+        self.requested_window_secs = Some(seconds);
+        self.reload_comparison();
+        self.persist_ui_state();
+    }
+
+    pub fn restore_comparison_window(&mut self, seconds: Option<u64>) {
+        if let Some(seconds) = seconds.filter(|s| *s > 0) {
+            self.requested_window_secs = Some(seconds);
+            self.reload_comparison();
+        }
+    }
+
+    fn reload_comparison(&mut self) {
+        self.comparison_rx = None;
+        let (Some(seconds), Some(scope), Some(store)) = (
+            self.requested_window_secs,
+            self.scope.clone(),
+            self.store_dir.clone(),
+        ) else {
+            return;
+        };
+        if self.report.series_window_secs
+            == seconds.min(self.history_secs.unwrap_or(seconds)).max(60)
+        {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.comparison_observed_at = self.report.observed_at;
+        self.comparison_rx = Some(rx);
+        self.status = Some(format!(
+            "Loading change over {} from stored history…",
+            crate::picker::comparison_span(seconds)
+        ));
+        crate::worker::spawn(move || {
+            let result = swamp_core::report::report_scope_from_store_with_window(
+                &scope,
+                &store,
+                Some(seconds),
+            )
+            .map(|snapshot| snapshot.report)
+            .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    pub fn poll_comparison(&mut self) -> bool {
+        if self.reload_must_wait() {
+            return false;
+        }
+        let result = match self.comparison_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                Err("history worker stopped; try again".into())
+            }
+            _ => return false,
+        };
+        self.comparison_rx = None;
+        if self.report.observed_at != self.comparison_observed_at {
+            return false;
+        }
+        match result {
+            Ok(compared) if compared.observed_at == self.report.observed_at => {
+                let anchor = self.selected_row_key();
+                // Copy comparisons only. A read of older stored facts must
+                // never restore removed paths or overwrite current sizes.
+                let mut artifacts_by_path = std::collections::HashMap::<_, Vec<_>>::new();
+                for artifact in compared
+                    .projects
+                    .iter()
+                    .flat_map(|p| &p.worktrees)
+                    .flat_map(|w| &w.artifacts)
+                {
+                    artifacts_by_path
+                        .entry(&artifact.path)
+                        .or_default()
+                        .push(artifact);
+                }
+                for project in &mut self.report.projects {
+                    for worktree in &mut project.worktrees {
+                        for artifact in &mut worktree.artifacts {
+                            artifact.growth_bytes = None;
+                            artifact.allocated_growth_bytes = None;
+                            if let Some(source) =
+                                artifacts_by_path.get(&artifact.path).and_then(|sources| {
+                                    sources.iter().find(|source| source.kind == artifact.kind)
+                                })
+                            {
+                                artifact.growth_bytes = (source.bytes == artifact.bytes)
+                                    .then_some(source.growth_bytes)
+                                    .flatten();
+                                artifact.allocated_growth_bytes = (source.allocated_bytes
+                                    == artifact.allocated_bytes)
+                                    .then_some(source.allocated_growth_bytes)
+                                    .flatten();
+                            }
+                        }
+                    }
+                }
+                if let (Some(dest), Some(source)) = (
+                    &mut self.report.dirs_by_worktree,
+                    &compared.dirs_by_worktree,
+                ) {
+                    for (key, rows) in dest {
+                        let values: std::collections::HashMap<_, _> = source
+                            .get(key)
+                            .into_iter()
+                            .flatten()
+                            .map(|row| (&row.rel_path, (row.allocated_total, row.growth_bytes)))
+                            .collect();
+                        for row in rows {
+                            row.growth_bytes = values
+                                .get(&row.rel_path)
+                                .filter(|(bytes, _)| *bytes == row.allocated_total)
+                                .and_then(|(_, growth)| *growth);
+                        }
+                    }
+                }
+                if let (Some(dest), Some(source)) = (
+                    &mut self.report.files_by_worktree,
+                    &compared.files_by_worktree,
+                ) {
+                    for (key, rows) in dest {
+                        let values: std::collections::HashMap<_, _> = source
+                            .get(key)
+                            .into_iter()
+                            .flatten()
+                            .map(|row| (&row.rel_path, (row.allocated, row.growth_bytes)))
+                            .collect();
+                        for row in rows {
+                            row.growth_bytes = values
+                                .get(&row.rel_path)
+                                .filter(|(bytes, _)| *bytes == row.allocated)
+                                .and_then(|(_, growth)| *growth);
+                        }
+                    }
+                }
+                self.report.series_window_secs = compared.series_window_secs;
+                let nested_by_id: std::collections::HashMap<_, _> = compared
+                    .nested_artifacts
+                    .iter()
+                    .map(|unit| (&unit.id, unit))
+                    .collect();
+                for unit in &mut self.report.nested_artifacts {
+                    unit.growth_bytes = nested_by_id
+                        .get(&unit.id)
+                        .filter(|source| source.bytes == unit.bytes)
+                        .and_then(|source| source.growth_bytes);
+                }
+                self.report.series_by_key = compared.series_by_key;
+                self.report.total_series = compared.total_series;
+                self.report.summary = swamp_core::report::summarize(&self.report.projects);
+                self.status = None;
+                self.restore_selection(anchor);
+            }
+            Ok(_) => {
+                self.status = Some(
+                    "New observation available; change the period again after it loads.".into(),
+                )
+            }
+            Err(error) => self.status = Some(format!("Could not load change period: {error}")),
+        }
+        true
     }
 
     /// `e` in the picker: carry its composed text into the raw line.
@@ -1591,6 +1882,7 @@ impl App {
     }
 
     pub fn filter_tab_complete(&mut self) {
+        self.filter_error = None;
         let projects: Vec<String> = self
             .report
             .projects
@@ -1606,11 +1898,13 @@ impl App {
         self.completions.clear();
         self.filter_text = std::mem::take(&mut self.filter_before_edit);
         self.editing_filter = false;
+        self.filter_error = None;
     }
 
     pub fn filter_input(&mut self, c: char) {
         self.filter_text.push(c);
         self.completions.clear();
+        self.filter_error = None;
     }
 
     /// Rows the current filter would show — for the picker's live count.
@@ -1625,24 +1919,34 @@ impl App {
 
     pub fn filter_backspace(&mut self) {
         self.filter_text.pop();
+        self.completions.clear();
+        self.filter_error = None;
     }
 
     pub fn commit_filter(&mut self) {
-        self.editing_filter = false;
-        self.completions.clear();
         match filter::parse(&self.filter_text) {
             Ok(f) => {
+                if let Some(seconds) = filter::growth_window_secs(&f)
+                    && self.requested_window_secs != Some(seconds)
+                {
+                    self.requested_window_secs = Some(seconds);
+                    self.reload_comparison();
+                }
                 self.filter = f;
+                self.editing_filter = false;
+                self.completions.clear();
                 self.filter_error = None;
                 self.persist_filter();
+                self.selected = 0;
+                self.view_cursor.clear();
             }
             Err(e) => {
+                self.completions.clear();
                 self.filter_error = Some(e);
-                // previous filter stays applied
+                // Keep the rejected draft open for correction. The prior
+                // filter and every view cursor remain exactly as they were.
             }
         }
-        self.selected = 0;
-        self.view_cursor.clear();
     }
 
     pub fn clear_filter(&mut self) {
@@ -1666,6 +1970,7 @@ impl App {
             return;
         };
         let state = UiState {
+            comparison_window_secs: self.requested_window_secs,
             filter: self.filter_text.clone(),
             sort: sort_to_str(self.sort).to_string(),
             reverse: self.reverse,
@@ -1778,11 +2083,12 @@ impl App {
         ) {
             return;
         }
+        let anchor = self.selected_row_key();
         if let Some(key) = self.selected_row().and_then(|r| r.expansion_key) {
             if !self.collapsed.remove(&key) {
                 self.collapsed.insert(key);
             }
-            self.selected = self.selected.min(self.rows().len().saturating_sub(1));
+            self.restore_selection(anchor);
         }
     }
 
@@ -2997,7 +3303,7 @@ impl App {
                     self.operation = None;
                     self.operation_rx = None;
                     self.cargo_inspection = Some(lines);
-                    self.cargo_inspection_scroll = 0;
+                    self.cargo_inspection_scroll.set(0);
                     break;
                 }
                 OperationEvent::OpenFileCheck(active) => {
@@ -3160,7 +3466,7 @@ impl App {
     pub fn open_blocked(&mut self) {
         if !self.blocked.is_empty() {
             self.blocked_open = true;
-            self.blocked_scroll = 0;
+            self.blocked_scroll.set(0);
         }
     }
 
@@ -3291,13 +3597,13 @@ impl App {
         let count = |n: usize| swamp_core::render::human_count(n as u64);
         let blocked = match self.blocked.len() {
             0 => String::new(),
-            n => format!(" {} blocked (b to see why).", count(n)),
+            n => format!("{} blocked (b to see why). ", count(n)),
         };
         if total == 0 {
             return if removed > 0 {
-                format!("Unmarked {}. Nothing is marked.{blocked}", count(removed))
+                format!("{blocked}Unmarked {}. Nothing is marked.", count(removed))
             } else {
-                format!("Nothing marked.{blocked}")
+                format!("{blocked}Nothing marked.")
             };
         }
         let change = if added > 0 {
@@ -3307,11 +3613,38 @@ impl App {
         } else {
             String::new()
         };
-        format!(
-            "{change}{} marked in all ({}). Nothing has been moved. Backspace moves them to Trash after you confirm.{blocked}",
+        let (mut trash_count, mut trash_bytes, mut docker_count, mut docker_bytes) =
+            (0usize, 0u64, 0usize, 0u64);
+        for unit in self.marked.values() {
+            if unit.docker.is_some() {
+                docker_count += 1;
+                docker_bytes = docker_bytes.saturating_add(unit.bytes);
+            } else {
+                trash_count += 1;
+                trash_bytes = trash_bytes.saturating_add(unit.bytes);
+            }
+        }
+        let mut line = format!(
+            "{blocked}{change}{} marked ({} selected)",
             count(total),
             model::human_bytes(bytes)
-        )
+        );
+        if trash_count > 0 {
+            line.push_str(&format!(
+                "; {} to Trash ({})",
+                count(trash_count),
+                model::human_bytes(trash_bytes)
+            ));
+        }
+        if docker_count > 0 {
+            line.push_str(&format!(
+                "; {} Docker removal (permanent; {})",
+                count(docker_count),
+                model::human_bytes(docker_bytes)
+            ));
+        }
+        line.push_str(". Backspace to review.");
+        line
     }
 
     /// Whether a review overlay can be drawn at this size. Enter also
@@ -3575,7 +3908,18 @@ impl App {
         if removed.is_empty() {
             return;
         }
+        self.comparison_rx = None;
+        let anchor = self.selected_row_key();
         self.prune_reclaim(&removed);
+        self.store_interiors.retain(|u| {
+            !removed
+                .iter()
+                .any(|r| u.path == *r || u.path.starts_with(r))
+        });
+        // Interior-only removals need not change the parent tool's recorded
+        // allocation (model blobs stay), but they do change derived views.
+        self.reclaim_cache.borrow_mut().take();
+        self.headline_cache.borrow_mut().take();
         if let Some(estimate) = self.report.reconciliation.unique_estimate.as_mut() {
             estimate.needs_reconciliation = true;
         }
@@ -3642,9 +3986,7 @@ impl App {
             self.track.remove(path);
             self.collapsed.remove(&format!("source:{}", path.display()));
         }
-        if self.selected >= self.rows().len() {
-            self.selected = self.rows().len().saturating_sub(1);
-        }
+        self.restore_selection(anchor);
     }
 
     /// Starts an incremental observation of every root in `self.roots`
@@ -4051,7 +4393,8 @@ impl App {
     /// Something on screen moves by itself: a check or a move, our own
     /// scan, or another process's. Only then does the UI paint on a timer.
     pub fn is_busy(&self) -> bool {
-        self.tool_rx.is_some()
+        self.comparison_rx.is_some()
+            || self.tool_rx.is_some()
             || self.operation.is_some()
             || self.observing.is_some()
             || self.pending.is_some()
@@ -4771,6 +5114,18 @@ mod tests {
     }
 
     #[test]
+    fn fixed_order_views_do_not_persist_sort_changes() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Tree);
+        let sort = app.sort;
+        let reverse = app.reverse;
+        app.set_sort(Sort::Name);
+        app.toggle_reverse();
+        assert_eq!(app.sort, sort);
+        assert_eq!(app.reverse, reverse);
+    }
+
+    #[test]
     fn view_cursor_restores_identity_after_reorder_and_falls_back_after_removal() {
         let home = tempfile::tempdir().unwrap();
         let mut units = fixture_agent_units(home.path());
@@ -4905,7 +5260,13 @@ mod tests {
             let rows = app.rows();
             let second_root = rows
                 .iter()
-                .position(|row| row.depth == 1 && row.label.contains("/root/mole-linked"))
+                .position(|row| {
+                    row.depth == 1
+                        && row
+                            .unit
+                            .as_ref()
+                            .is_some_and(|unit| unit.0 == "/root/mole-linked")
+                })
                 .expect("the linked worktree row is present");
             let child = rows
                 .iter()
@@ -4919,7 +5280,10 @@ mod tests {
             app.leave_row();
             assert_eq!(app.view, ViewKind::Tree);
             assert_eq!(app.selected, second_root);
-            assert!(app.rows()[app.selected].label.contains("/root/mole-linked"));
+            assert_eq!(
+                app.rows()[app.selected].unit.as_ref().unwrap().0,
+                "/root/mole-linked"
+            );
             app.leave_row();
             assert_eq!(app.view, ViewKind::Tree);
             assert_eq!(app.selected, second_root);
@@ -4938,6 +5302,128 @@ mod tests {
         rows.push(Row::leaf(1, "child two".into(), 1, None));
         assert_eq!(nearest_parent_row(&rows, 3), Some(2));
         assert_eq!(nearest_parent_row(&rows, 1), Some(0));
+    }
+
+    #[test]
+    fn comparison_updates_only_deltas_and_keeps_selection_sizes_and_removed_paths() {
+        let mut report = fixture_report();
+        report.series_window_secs = 7 * 86_400;
+        let original_path = report.projects[0].worktrees[0].artifacts[0].path.clone();
+        let original_bytes = report.projects[0].worktrees[0].artifacts[0].bytes;
+        let mut app = App::new(report.clone(), "/root".into());
+        app.clear_filter();
+        let anchor = app.selected_row_key();
+        let mut compared = report;
+        compared.series_window_secs = 3_600;
+        compared.projects[0].worktrees[0].artifacts[0].growth_bytes = Some(456);
+        compared.projects[0].worktrees[0].artifacts[1].bytes += 99;
+        let mut removed = compared.projects[0].worktrees[0].artifacts[0].clone();
+        removed.path = PathBuf::from("/removed/cache");
+        compared.projects[0].worktrees[0].artifacts.push(removed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.comparison_observed_at = app.report.observed_at;
+        app.comparison_rx = Some(rx);
+        tx.send(Ok(compared)).unwrap();
+        let (_, work) = swamp_core::work_counters::measured(|| assert!(app.poll_comparison()));
+        assert_eq!(work, swamp_core::work_counters::WorkCounters::default());
+        assert_eq!(app.selected_row_key(), anchor);
+        assert_eq!(app.report.series_window_secs, 3_600);
+        let artifacts = &app.report.projects[0].worktrees[0].artifacts;
+        let artifact = artifacts.iter().find(|a| a.path == original_path).unwrap();
+        assert_eq!(artifact.growth_bytes, Some(456));
+        assert_eq!(artifact.bytes, original_bytes);
+        assert!(
+            artifacts[1].growth_bytes.is_none(),
+            "a changed size cannot borrow an old observation's delta"
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|a| a.path == std::path::Path::new("/removed/cache"))
+        );
+        assert_eq!(app.filter_text, "0");
+    }
+
+    #[test]
+    fn a_period_reply_for_an_older_observation_is_discarded() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        let before = app.report.series_window_secs;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.comparison_observed_at = app.report.observed_at.saturating_sub(1);
+        app.comparison_rx = Some(rx);
+        let mut old = app.report.clone();
+        old.series_window_secs = 3_600;
+        tx.send(Ok(old)).unwrap();
+        assert!(!app.poll_comparison());
+        assert_eq!(app.report.series_window_secs, before);
+        assert!(!app.is_busy());
+    }
+
+    #[test]
+    fn removed_model_disappears_from_interiors_and_cached_reclaim_without_charging_blobs() {
+        use swamp_core::artifact::{AccountingBasis, ArtifactRole, ArtifactVariant};
+        use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
+        let path = PathBuf::from("/tools/ollama/models");
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_external_units(vec![drilled_unit(path.to_str().unwrap(), vec![])]);
+        let container = BuildContainer::shared_store_of(
+            "model-stores",
+            path.clone(),
+            swamp_core::locations::BuildStoreKind::OllamaModels,
+        );
+        let root = NestedUnitBuilder::new(&container, ArtifactRole::Container, path.clone())
+            .is_dir(true)
+            .bytes_on_basis(522_700_000, AccountingBasis::Allocated)
+            .build();
+        let model = |name: &str| {
+            NestedUnitBuilder::new(
+                &container,
+                ArtifactRole::SharedStoreEntry,
+                path.join(format!("manifests/{name}")),
+            )
+            .variant(ArtifactVariant {
+                package: Some(name.into()),
+                configuration: Some("ollama model".into()),
+                ..Default::default()
+            })
+            .bytes_on_basis(522_700_000, AccountingBasis::Allocated)
+            .build()
+        };
+        let gone = model("qwen3/0.6b");
+        let sibling = model("other/1b");
+        app.set_store_interiors(vec![root, gone.clone(), sibling.clone()]);
+        let before_bytes = app.external_units[0].bytes;
+        let cached = app.reclaim_view();
+        assert_eq!(cached.rows[0].models.len(), 2);
+        app.prune_removed(&[synthetic_unit_result(gone.path.to_str().unwrap(), false)]);
+        assert_eq!(
+            app.reclaim_view().rows[0].models.len(),
+            2,
+            "failed moves retain facts"
+        );
+        app.prune_removed(&[synthetic_unit_result(gone.path.to_str().unwrap(), true)]);
+        assert!(!app.store_interiors.iter().any(|u| u.path == gone.path));
+        assert!(app.store_interiors.iter().any(|u| u.path == sibling.path));
+        assert_eq!(
+            app.external_units[0].bytes, before_bytes,
+            "manifest move does not remove the model layers"
+        );
+        let after = app.reclaim_view();
+        assert_eq!(after.rows[0].models.len(), 1);
+        assert!(!std::sync::Arc::ptr_eq(&cached, &after));
+        for view in [ViewKind::Reclaim, ViewKind::External] {
+            app.set_view(view);
+            app.clear_filter();
+            app.selected = 0;
+            app.enter_row();
+            assert!(
+                !app.rows().iter().any(|r| r
+                    .unit
+                    .as_ref()
+                    .is_some_and(|id| id.0 == gone.path.to_str().unwrap())),
+                "{view:?} resurrected model"
+            );
+        }
     }
 
     #[test]
@@ -5173,6 +5659,182 @@ mod tests {
         assert!(app.filter_error.is_some());
     }
 
+    #[test]
+    fn failed_filter_commit_keeps_the_editor_selection_and_view_cursor() {
+        let store = tempfile::tempdir().unwrap();
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.clear_filter();
+        app.store_dir = Some(store.path().to_path_buf());
+        app.set_view(ViewKind::Tree);
+        app.selected = 2;
+        app.scroll_offset.set(7);
+        app.set_view(ViewKind::Projects);
+        app.set_view(ViewKind::Tree);
+        let cursor = app.view_cursor.get(&ViewKind::Tree).unwrap().clone();
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.scroll_offset.get(), 7);
+
+        let applied = app.filter.clone();
+        app.start_filter_edit();
+        app.filter_text = "bananas".into();
+        app.completions = vec!["stale completion".into()];
+        app.commit_filter();
+
+        assert!(
+            app.editing_filter,
+            "invalid input stays open for correction"
+        );
+        assert_eq!(app.filter_text, "bananas", "keep the draft visible");
+        assert_eq!(app.filter, applied, "the accepted filter remains applied");
+        assert!(app.filter_error.is_some());
+        assert!(app.completions.is_empty());
+        assert!(
+            app.ui_state_tx.is_none(),
+            "an invalid draft must not start persistence"
+        );
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.scroll_offset.get(), 7);
+        let kept = app.view_cursor.get(&ViewKind::Tree).unwrap();
+        assert_eq!(kept.key, cursor.key);
+        assert_eq!(kept.index, cursor.index);
+        assert_eq!(kept.scroll_offset, cursor.scroll_offset);
+    }
+
+    #[test]
+    fn mixed_mark_feedback_splits_trash_from_permanent_docker_early() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.marked.insert(
+            "/tmp/cache".into(),
+            MarkedUnit {
+                cargo_unit: None,
+                agent_unit: None,
+                session_members: None,
+                reclaim: None,
+                path: "/tmp/cache".into(),
+                docker: None,
+                worktree_path: "/root/project".into(),
+                bytes: 3_000_000_000,
+                observed_at: 0,
+                worktree: None,
+                label: "cache".into(),
+                warnings: Vec::new(),
+            },
+        );
+        app.marked.insert(
+            "docker:volume:db".into(),
+            MarkedUnit {
+                cargo_unit: None,
+                agent_unit: None,
+                session_members: None,
+                reclaim: None,
+                path: "docker:volume:db".into(),
+                docker: Some(swamp_core::docker::Removal::Volume { name: "db".into() }),
+                worktree_path: "/root/project".into(),
+                bytes: 2_000_000_000,
+                observed_at: 0,
+                worktree: None,
+                label: "db".into(),
+                warnings: Vec::new(),
+            },
+        );
+        app.blocked = vec![
+            BlockedItem {
+                name: "protected".into(),
+                reason: "protected".into(),
+                next: "review".into(),
+            },
+            BlockedItem {
+                name: "in use".into(),
+                reason: "in use".into(),
+                next: "close it".into(),
+            },
+        ];
+
+        let line = app.mark_state_line(2, 0);
+        assert!(line.starts_with("2 blocked (b to see why)."), "{line}");
+        assert!(line.contains("2 marked (5.0GB selected)"), "{line}");
+        assert!(line.contains("1 to Trash (3.0GB)"), "{line}");
+        assert!(
+            line.contains("1 Docker removal (permanent; 2.0GB)"),
+            "{line}"
+        );
+        assert!(line.ends_with("Backspace to review."), "{line}");
+    }
+
+    #[test]
+    fn invalid_filter_stays_editable_and_corrects_without_running_commands() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.clear_filter();
+        app.set_view(ViewKind::Tree);
+        app.selected = 2;
+        app.mark_selected();
+        assert!(!app.marked.is_empty(), "fixture selection should be marked");
+        let marks = app.marked.keys().cloned().collect::<Vec<_>>();
+
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char(':'));
+        for c in "bananas".chars() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.editing_filter, "invalid draft must remain open");
+        assert!(app.filter_error.is_some());
+        assert_eq!(
+            app.filter,
+            Filter::default(),
+            "accepted filter is unchanged"
+        );
+
+        // These are commands outside the editor. Here they remain ordinary
+        // draft characters and cannot quit, mark, or open a confirmation.
+        for c in ['q', 'A', ' '] {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        assert!(!app.quit);
+        assert!(!app.confirm_open);
+        assert_eq!(app.marked.keys().cloned().collect::<Vec<_>>(), marks);
+        assert!(app.filter_error.is_none(), "editing clears the stale error");
+
+        for _ in 0..app.filter_text.chars().count() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Backspace);
+        }
+        for c in "kind:BuildOutput".chars() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(!app.editing_filter);
+        assert!(app.filter_error.is_none());
+        assert_eq!(app.filter_text, "kind:BuildOutput");
+        assert!(!app.rows().is_empty(), "the corrected filter is applied");
+    }
+
+    #[test]
+    fn invalid_filter_escape_restores_accepted_text_and_clears_error() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.filter_text = "kind:BuildOutput".into();
+        app.commit_filter();
+        let accepted_filter = app.filter.clone();
+        let accepted_text = app.filter_text.clone();
+
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char(':'));
+        for _ in 0..app.filter_text.chars().count() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Backspace);
+        }
+        for c in "bananas".chars() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.editing_filter);
+        assert!(app.filter_error.is_some());
+        app.completions = vec!["stale completion".into()];
+
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(!app.editing_filter);
+        assert_eq!(app.filter_text, accepted_text);
+        assert_eq!(app.filter, accepted_filter);
+        assert!(app.filter_error.is_none());
+        assert!(app.completions.is_empty());
+    }
+
     fn region(
         path: &str,
         status: swamp_core::coverage::RegionStatus,
@@ -5295,6 +5957,43 @@ mod tests {
         for v in ViewKind::ALL {
             assert!(v.section().views().contains(&v), "{v:?}");
         }
+    }
+
+    #[test]
+    fn view_titles_purposes_and_filter_membership_are_explicit() {
+        let expected = [
+            (ViewKind::Projects, "Projects", "projects", true),
+            (ViewKind::Tree, "Project folders", "tree", true),
+            (ViewKind::Builds, "Build outputs", "builds", true),
+            (ViewKind::Deps, "Dependencies", "deps", true),
+            (ViewKind::Docker, "Docker", "docker", false),
+            (ViewKind::Kinds, "Storage kinds", "kinds", true),
+            (ViewKind::Unowned, "Unassigned", "unowned", false),
+            (ViewKind::Types, "Ecosystems", "types", true),
+            (ViewKind::External, "Tool storage", "external", false),
+            (ViewKind::Reclaim, "Reclaim", "reclaim", false),
+            (ViewKind::Disk, "Disk usage", "disk", false),
+            (ViewKind::DiskGaps, "Coverage gaps", "not-measured", false),
+            (ViewKind::Agents, "Agent storage", "agents", false),
+        ];
+
+        for (view, title, machine_label, uses_filter) in expected {
+            assert_eq!(view.title(), title, "{view:?}");
+            assert_eq!(view.label(), machine_label, "machine label for {view:?}");
+            assert_eq!(view.uses_filter(), uses_filter, "{view:?}");
+            assert!(
+                view.purpose().chars().count() <= 55,
+                "purpose too long for {view:?}: {} chars",
+                view.purpose().chars().count()
+            );
+        }
+
+        assert!(
+            !ViewKind::Unowned
+                .describe()
+                .contains("belongs to no project")
+        );
+        assert!(!ViewKind::Reclaim.describe().contains("regenerable"));
     }
 
     // -----------------------------------------------------------------
@@ -5783,7 +6482,11 @@ mod tests {
         // not among them.
         // Caches, its two folders, then go-build as its own top-level unit.
         assert_eq!(open.len(), 4, "{labels:?}");
-        assert!(labels[3].contains("go-build"), "{labels:?}");
+        assert_eq!(
+            open[3].unit.as_ref().map(|u| u.0.as_str()),
+            Some("/fixture/Caches/go-build"),
+            "{labels:?}"
+        );
         let shown: u64 = open[1..3].iter().map(|r| r.bytes).sum();
         assert_eq!(
             shown, 1_000,
@@ -5815,7 +6518,14 @@ mod tests {
         app.set_view(ViewKind::External);
         let rows = app.rows();
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].label.starts_with("standalone Cargo target"));
+        assert_eq!(rows[0].label, "/fixture/scratch-target");
+        assert!(
+            rows[0]
+                .table_note
+                .as_deref()
+                .unwrap()
+                .contains("cargo build")
+        );
         assert!(rows[0].unit.is_some(), "plannable from this view");
     }
 
@@ -5849,12 +6559,14 @@ mod tests {
         app.set_view(ViewKind::Unowned);
         let rows = app.rows();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, dir.display().to_string());
         assert!(
-            rows[0].label.contains("standalone Cargo target"),
-            "{}",
-            rows[0].label
+            rows[0]
+                .table_note
+                .as_deref()
+                .unwrap()
+                .contains("cargo build")
         );
-        assert!(rows[0].label.contains("cargo build"));
         let row = rows[0].clone();
         app.mark_row(&row);
         let marked = app
@@ -6098,7 +6810,7 @@ mod tests {
             crate::handle_key(app, crossterm::event::KeyCode::Char('r'));
         }
         let cases: [Case; 7] = [
-            ("check finished", check_finished, "marked in all", "Checked"),
+            ("check finished", check_finished, "1 marked (", "Checked"),
             ("confirm opens", confirm_opens, "Review actions", "Checked"),
             ("cancelled", cancelled, "Check stopped", "Stopping after"),
             (

@@ -426,6 +426,10 @@ const TUI_REPORT_API: &[&str] = &[
     // `EffectiveScope` the caller already resolved -- no bare root, no
     // walk.
     "@core::report::report_scope_from_store",
+    // Same scope-aware stored read with an explicit history window.
+    "@core::report::report_scope_from_store_with_window",
+    // Pure arithmetic over current rows after their deltas change.
+    "@core::report::summarize",
     // Whether the store holds an observation of any scope (two small
     // tables): the "is there an index" question before deciding to scan.
     "@core::report::store_has_observation",
