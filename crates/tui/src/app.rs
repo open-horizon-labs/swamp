@@ -1624,6 +1624,7 @@ impl App {
     }
 
     pub fn filter_tab_complete(&mut self) {
+        self.filter_error = None;
         let projects: Vec<String> = self
             .report
             .projects
@@ -1639,11 +1640,13 @@ impl App {
         self.completions.clear();
         self.filter_text = std::mem::take(&mut self.filter_before_edit);
         self.editing_filter = false;
+        self.filter_error = None;
     }
 
     pub fn filter_input(&mut self, c: char) {
         self.filter_text.push(c);
         self.completions.clear();
+        self.filter_error = None;
     }
 
     /// Rows the current filter would show — for the picker's live count.
@@ -1658,24 +1661,28 @@ impl App {
 
     pub fn filter_backspace(&mut self) {
         self.filter_text.pop();
+        self.completions.clear();
+        self.filter_error = None;
     }
 
     pub fn commit_filter(&mut self) {
-        self.editing_filter = false;
-        self.completions.clear();
         match filter::parse(&self.filter_text) {
             Ok(f) => {
                 self.filter = f;
+                self.editing_filter = false;
+                self.completions.clear();
                 self.filter_error = None;
                 self.persist_filter();
+                self.selected = 0;
+                self.view_cursor.clear();
             }
             Err(e) => {
+                self.completions.clear();
                 self.filter_error = Some(e);
-                // previous filter stays applied
+                // Keep the rejected draft open for correction. The prior
+                // filter and every view cursor remain exactly as they were.
             }
         }
-        self.selected = 0;
-        self.view_cursor.clear();
     }
 
     pub fn clear_filter(&mut self) {
@@ -3324,13 +3331,13 @@ impl App {
         let count = |n: usize| swamp_core::render::human_count(n as u64);
         let blocked = match self.blocked.len() {
             0 => String::new(),
-            n => format!(" {} blocked (b to see why).", count(n)),
+            n => format!("{} blocked (b to see why). ", count(n)),
         };
         if total == 0 {
             return if removed > 0 {
-                format!("Unmarked {}. Nothing is marked.{blocked}", count(removed))
+                format!("{blocked}Unmarked {}. Nothing is marked.", count(removed))
             } else {
-                format!("Nothing marked.{blocked}")
+                format!("{blocked}Nothing marked.")
             };
         }
         let change = if added > 0 {
@@ -3340,11 +3347,38 @@ impl App {
         } else {
             String::new()
         };
-        format!(
-            "{change}{} marked in all ({}). Nothing has been moved. Backspace moves them to Trash after you confirm.{blocked}",
+        let (mut trash_count, mut trash_bytes, mut docker_count, mut docker_bytes) =
+            (0usize, 0u64, 0usize, 0u64);
+        for unit in self.marked.values() {
+            if unit.docker.is_some() {
+                docker_count += 1;
+                docker_bytes = docker_bytes.saturating_add(unit.bytes);
+            } else {
+                trash_count += 1;
+                trash_bytes = trash_bytes.saturating_add(unit.bytes);
+            }
+        }
+        let mut line = format!(
+            "{blocked}{change}{} marked ({} selected)",
             count(total),
             model::human_bytes(bytes)
-        )
+        );
+        if trash_count > 0 {
+            line.push_str(&format!(
+                "; {} to Trash ({})",
+                count(trash_count),
+                model::human_bytes(trash_bytes)
+            ));
+        }
+        if docker_count > 0 {
+            line.push_str(&format!(
+                "; {} Docker removal (permanent; {})",
+                count(docker_count),
+                model::human_bytes(docker_bytes)
+            ));
+        }
+        line.push_str(". Backspace to review.");
+        line
     }
 
     /// Whether a review overlay can be drawn at this size. Enter also
@@ -5206,6 +5240,182 @@ mod tests {
         assert!(app.filter_error.is_some());
     }
 
+    #[test]
+    fn failed_filter_commit_keeps_the_editor_selection_and_view_cursor() {
+        let store = tempfile::tempdir().unwrap();
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.clear_filter();
+        app.store_dir = Some(store.path().to_path_buf());
+        app.set_view(ViewKind::Tree);
+        app.selected = 2;
+        app.scroll_offset.set(7);
+        app.set_view(ViewKind::Projects);
+        app.set_view(ViewKind::Tree);
+        let cursor = app.view_cursor.get(&ViewKind::Tree).unwrap().clone();
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.scroll_offset.get(), 7);
+
+        let applied = app.filter.clone();
+        app.start_filter_edit();
+        app.filter_text = "bananas".into();
+        app.completions = vec!["stale completion".into()];
+        app.commit_filter();
+
+        assert!(
+            app.editing_filter,
+            "invalid input stays open for correction"
+        );
+        assert_eq!(app.filter_text, "bananas", "keep the draft visible");
+        assert_eq!(app.filter, applied, "the accepted filter remains applied");
+        assert!(app.filter_error.is_some());
+        assert!(app.completions.is_empty());
+        assert!(
+            app.ui_state_tx.is_none(),
+            "an invalid draft must not start persistence"
+        );
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.scroll_offset.get(), 7);
+        let kept = app.view_cursor.get(&ViewKind::Tree).unwrap();
+        assert_eq!(kept.key, cursor.key);
+        assert_eq!(kept.index, cursor.index);
+        assert_eq!(kept.scroll_offset, cursor.scroll_offset);
+    }
+
+    #[test]
+    fn mixed_mark_feedback_splits_trash_from_permanent_docker_early() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.marked.insert(
+            "/tmp/cache".into(),
+            MarkedUnit {
+                cargo_unit: None,
+                agent_unit: None,
+                session_members: None,
+                reclaim: None,
+                path: "/tmp/cache".into(),
+                docker: None,
+                worktree_path: "/root/project".into(),
+                bytes: 3_000_000_000,
+                observed_at: 0,
+                worktree: None,
+                label: "cache".into(),
+                warnings: Vec::new(),
+            },
+        );
+        app.marked.insert(
+            "docker:volume:db".into(),
+            MarkedUnit {
+                cargo_unit: None,
+                agent_unit: None,
+                session_members: None,
+                reclaim: None,
+                path: "docker:volume:db".into(),
+                docker: Some(swamp_core::docker::Removal::Volume { name: "db".into() }),
+                worktree_path: "/root/project".into(),
+                bytes: 2_000_000_000,
+                observed_at: 0,
+                worktree: None,
+                label: "db".into(),
+                warnings: Vec::new(),
+            },
+        );
+        app.blocked = vec![
+            BlockedItem {
+                name: "protected".into(),
+                reason: "protected".into(),
+                next: "review".into(),
+            },
+            BlockedItem {
+                name: "in use".into(),
+                reason: "in use".into(),
+                next: "close it".into(),
+            },
+        ];
+
+        let line = app.mark_state_line(2, 0);
+        assert!(line.starts_with("2 blocked (b to see why)."), "{line}");
+        assert!(line.contains("2 marked (5.0GB selected)"), "{line}");
+        assert!(line.contains("1 to Trash (3.0GB)"), "{line}");
+        assert!(
+            line.contains("1 Docker removal (permanent; 2.0GB)"),
+            "{line}"
+        );
+        assert!(line.ends_with("Backspace to review."), "{line}");
+    }
+
+    #[test]
+    fn invalid_filter_stays_editable_and_corrects_without_running_commands() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.clear_filter();
+        app.set_view(ViewKind::Tree);
+        app.selected = 2;
+        app.mark_selected();
+        assert!(!app.marked.is_empty(), "fixture selection should be marked");
+        let marks = app.marked.keys().cloned().collect::<Vec<_>>();
+
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char(':'));
+        for c in "bananas".chars() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.editing_filter, "invalid draft must remain open");
+        assert!(app.filter_error.is_some());
+        assert_eq!(
+            app.filter,
+            Filter::default(),
+            "accepted filter is unchanged"
+        );
+
+        // These are commands outside the editor. Here they remain ordinary
+        // draft characters and cannot quit, mark, or open a confirmation.
+        for c in ['q', 'A', ' '] {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        assert!(!app.quit);
+        assert!(!app.confirm_open);
+        assert_eq!(app.marked.keys().cloned().collect::<Vec<_>>(), marks);
+        assert!(app.filter_error.is_none(), "editing clears the stale error");
+
+        for _ in 0..app.filter_text.chars().count() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Backspace);
+        }
+        for c in "kind:BuildOutput".chars() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(!app.editing_filter);
+        assert!(app.filter_error.is_none());
+        assert_eq!(app.filter_text, "kind:BuildOutput");
+        assert!(!app.rows().is_empty(), "the corrected filter is applied");
+    }
+
+    #[test]
+    fn invalid_filter_escape_restores_accepted_text_and_clears_error() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.filter_text = "kind:BuildOutput".into();
+        app.commit_filter();
+        let accepted_filter = app.filter.clone();
+        let accepted_text = app.filter_text.clone();
+
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Char(':'));
+        for _ in 0..app.filter_text.chars().count() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Backspace);
+        }
+        for c in "bananas".chars() {
+            crate::handle_key(&mut app, crossterm::event::KeyCode::Char(c));
+        }
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.editing_filter);
+        assert!(app.filter_error.is_some());
+        app.completions = vec!["stale completion".into()];
+
+        crate::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(!app.editing_filter);
+        assert_eq!(app.filter_text, accepted_text);
+        assert_eq!(app.filter, accepted_filter);
+        assert!(app.filter_error.is_none());
+        assert!(app.completions.is_empty());
+    }
+
     fn region(
         path: &str,
         status: swamp_core::coverage::RegionStatus,
@@ -6172,7 +6382,7 @@ mod tests {
             crate::handle_key(app, crossterm::event::KeyCode::Char('r'));
         }
         let cases: [Case; 7] = [
-            ("check finished", check_finished, "marked in all", "Checked"),
+            ("check finished", check_finished, "1 marked (", "Checked"),
             ("confirm opens", confirm_opens, "Review actions", "Checked"),
             ("cancelled", cancelled, "Check stopped", "Stopping after"),
             (

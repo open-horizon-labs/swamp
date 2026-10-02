@@ -1325,6 +1325,10 @@ The initial filter is `growth > 100MB in 7d`. Filter, sort, reverse, and keep-ex
 
 Sorting and reversing keep the same item selected. Returning to a view restores its selected item and scroll position. If that item disappeared, selection uses the closest remaining position. These per-view positions last for the current UI session.
 
+Below the list, the status area keeps your marked count and selected size visible as you navigate or change views. It distinguishes Trash from permanent Docker removals and retains blocked counts with `b` for reasons. The position indicator counts every row in the current list, including those off screen. These are selected bytes, not a promise of freed space.
+
+If Enter rejects a raw filter expression, keep typing to correct it or press Esc to restore the accepted expression. The previous filter, selection and marks stay in place until a valid expression is applied; invalid drafts are not saved.
+
 Rows show size and signed growth. Red bars extend right for increases; green bars extend left for decreases. Bar length is logarithmic, so use the number to compare exact changes.
 
 ## Report views

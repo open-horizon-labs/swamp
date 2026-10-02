@@ -19,6 +19,6 @@
 "Path: /Users/dev/src/mole/src                                                   "
 "                                                                                "
 "                                                                                "
-"                                                                                "
-"                                                                                "
+"1 marked · 1 Trash · 12.6MB selected                                            "
+"Row 4 of 4 · Backspace review                                                   "
 "Space mark  ⌫ review  Tab section  v view  / filter  R refresh  ? help  q quit  "

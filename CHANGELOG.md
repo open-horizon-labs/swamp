@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- The TUI keeps marked counts, selected bytes and Trash/permanent Docker destinations visible between actions. List position and contextual hints help with long views; blocked reasons remain accessible. Invalid filter expressions stay open for correction or Esc, preserving the previous filter, marks and position.
+
 - All thirteen TUI views use clearer titles and column headings, with view-specific empty states. The top panel keeps one total and one coverage line; allocation details remain in Disk. Reclaim shows removal cost at 80 columns, Disk views omit empty change columns, and filter labels name ignored predicates. Tool and agent rows use readable labels while selected details retain exact paths and prioritize current use, recovery, shared bytes and unknown facts. Existing navigation and review keys are unchanged.
 
 - Large TUI lists format only the rows on screen. Sorting and reversing keep the same item selected, and returning to a view restores its selection and scroll position. Left collapses an expanded row or selects its parent before returning to Projects.

@@ -56,5 +56,5 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"                                                                                                                                                                                                        "
+"Row 1 of 7                                                                                                                                                                                              "
 "Space mark  ⌫ review  Tab section  v view  / filter  R refresh  A mark all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                              "

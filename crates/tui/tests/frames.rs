@@ -1908,7 +1908,7 @@ fn space_on_a_project_row_shows_marks_and_a_result() {
         f.contains("✗ ") || f.contains('~'),
         "no mark on the project row:\n{f}"
     );
-    assert!(f.contains("marked in all"), "no result line:\n{f}");
+    assert!(f.contains(" marked ("), "no result line:\n{f}");
     let (n, of) = app.project_mark_state("mole");
     assert!(n > 0 && n <= of, "{n}/{of}");
     swamp_tui::handle_key(&mut app, KeyCode::Char(' '));
@@ -2307,6 +2307,183 @@ fn many_rows_app(n: usize) -> App {
     app.drill_into_selected();
     assert_eq!(app.view, ViewKind::Tree);
     app
+}
+
+/// Marks stay visible after the marking result clears, even when the selected
+/// items are outside the current page, filter or view. Position counts the
+/// whole current list, not just the viewport.
+#[test]
+fn pending_selection_keeps_its_place_across_navigation_and_filters() {
+    use crossterm::event::KeyCode;
+    let mut app = many_rows_app(80);
+    for (path, bytes) in [
+        ("/tmp/first", 2_000_000_000),
+        ("/tmp/second", 1_000_000_000),
+    ] {
+        app.marked.insert(path.into(), plain_unit(path, bytes));
+    }
+    app.set_result("Marked 2 items.".into());
+    let _ = capture(&app, 80, 24);
+    swamp_tui::handle_key(&mut app, KeyCode::PageDown);
+    let total = app.rows().len();
+    for (w, h) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("2 marked"), "{frame}");
+        assert!(frame.contains("3.0GB selected"), "{frame}");
+        assert!(frame.contains("Backspace review"), "{frame}");
+        assert!(
+            frame.contains(&format!("Row {} of {total}", app.selected + 1)),
+            "{frame}"
+        );
+        check(&format!("pending_selection_{w}x{h}"), &frame);
+    }
+    swamp_tui::handle_key(&mut app, KeyCode::End);
+    for w in [80, 200] {
+        let frame = capture(&app, w, 24);
+        assert!(
+            frame.contains(&format!("Row {total} of {total}")),
+            "{frame}"
+        );
+        assert!(frame.contains("2 marked"));
+    }
+    app.start_filter_edit();
+    app.filter_text = "kind:BuildOutput".into();
+    app.commit_filter();
+    assert!(capture(&app, 80, 24).contains("2 marked"));
+    app.set_view(ViewKind::Builds);
+    app.start_filter_edit();
+    app.filter_text = "project:does-not-exist".into();
+    app.commit_filter();
+    assert!(app.rows().is_empty());
+    let empty = capture(&app, 80, 24);
+    assert!(empty.contains("2 marked"));
+    assert!(empty.contains("Backspace review"));
+    app.set_view(ViewKind::Projects);
+    assert!(capture(&app, 80, 24).contains("2 marked"));
+    app.marked.clear();
+    let cleared = capture(&app, 80, 24);
+    assert!(!cleared.contains("2 marked"));
+    assert!(!cleared.contains("3.0GB selected"));
+    app.clear_filter();
+    assert!(capture(&app, 80, 24).contains("Enter open"));
+    swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    assert_eq!(app.view, ViewKind::Tree);
+    assert!(capture(&app, 80, 24).contains("Enter close"));
+}
+
+#[test]
+fn pending_selection_keeps_permanent_removal_and_blocked_counts_visible() {
+    let mut app = many_rows_app(80);
+    app.marked
+        .insert("trash".into(), plain_unit("/tmp/build", 2_000_000_000));
+    let mut docker = plain_unit("sha256:image", 1_000_000_000);
+    docker.docker = Some(swamp_core::docker::Removal::Image {
+        id: "sha256:image".into(),
+    });
+    app.marked.insert("docker".into(), docker);
+    app.blocked = ["protected folder", "unreadable folder"]
+        .into_iter()
+        .map(|name| swamp_tui::app::BlockedItem {
+            name: name.into(),
+            reason: name.into(),
+            next: "check the reason".into(),
+        })
+        .collect();
+    for w in [40, 80, 200] {
+        let frame = capture(&app, w, 24);
+        for fact in ["2 marked", "1 Docker permanent", "2 blocked", "b reasons"] {
+            assert!(frame.contains(fact), "{fact} at {w}:\n{frame}");
+        }
+        if w >= 80 {
+            assert!(frame.contains("3.0GB selected"), "{frame}");
+            assert!(frame.contains("Backspace review"), "{frame}");
+        }
+        check(&format!("pending_mixed_removal_{w}x24"), &frame);
+    }
+    app.set_result("Cancelled. Nothing was deleted.".into());
+    let frame = capture(&app, 80, 24);
+    assert!(frame.contains("Cancelled. Nothing was deleted."));
+    assert!(
+        !frame.contains("1 Docker permanent"),
+        "result owns the status rows"
+    );
+    app.last_result = None;
+    app.help_open = true;
+    let frame = capture(&app, 80, 24);
+    assert!(
+        !frame.contains("1 Docker permanent"),
+        "idle feedback stays behind help"
+    );
+    app.help_open = false;
+    app.marked.clear();
+    let frame = capture(&app, 80, 24);
+    assert_eq!(frame.matches("2 blocked · b reasons").count(), 1, "{frame}");
+}
+
+#[test]
+fn rejected_filter_is_visible_even_when_the_draft_fills_the_line() {
+    use crossterm::event::KeyCode;
+    let mut app = many_rows_app(80);
+    app.selected = 20;
+    let before = app.rows().len();
+    app.start_filter_edit();
+    app.filter_text = format!("{}終🧪e\u{301}", "invalid-expression-".repeat(12));
+    swamp_tui::handle_key(&mut app, KeyCode::Enter);
+    assert!(app.editing_filter);
+    assert_eq!(app.selected, 20);
+    assert_eq!(app.rows().len(), before);
+    for (w, h) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Filter not applied:"), "{frame}");
+        assert!(!frame.contains("Filter not applied: filter:"));
+        assert!(frame.contains("filter › …"), "{frame}");
+        assert!(
+            frame.contains("終🧪e\u{301}▏"),
+            "the draft end and caret stay visible:\n{frame}"
+        );
+        assert!(frame.contains("Edit filter · Esc cancel"), "{frame}");
+        assert!(!frame.contains("Backspace review"));
+        check(&format!("filter_recovery_{w}x{h}"), &frame);
+    }
+    swamp_tui::handle_key(&mut app, KeyCode::Esc);
+    assert!(!app.editing_filter);
+    assert_eq!(app.selected, 20);
+    assert!(!capture(&app, 80, 24).contains("Filter not applied:"));
+}
+
+#[test]
+fn manager_hint_follows_the_actual_selected_row_and_existing_marks() {
+    let mut app = reclaim_app(false);
+    let rows = app.rows();
+    app.selected = rows.iter().position(|row| row.tool.is_some()).unwrap();
+    let row = &rows[app.selected];
+    let manager = row.tool.unwrap();
+    let frame = capture(&app, 80, 24);
+    assert!(
+        frame.contains(&format!("Backspace opens {} list", manager.name())),
+        "{frame}"
+    );
+    assert!(
+        frame.contains(&format!("⌫ {} list", manager.name())),
+        "{frame}"
+    );
+    check("manager_context_80x24", &frame);
+    app.marked
+        .insert("elsewhere".into(), plain_unit("/tmp/elsewhere", 1_000_000));
+    let frame = capture(&app, 80, 24);
+    assert!(frame.contains("Space mark folder for Trash"), "{frame}");
+    assert!(!frame.contains("Backspace opens"));
+    assert!(!frame.contains("⌫ review"));
+    let key = row.unit.as_ref().unwrap().0.clone();
+    app.marked
+        .insert(key, plain_unit("/tmp/manager", 1_000_000));
+    assert!(capture(&app, 80, 24).contains("Backspace review"));
+    app.start_filter_edit();
+    let frame = capture(&app, 80, 24);
+    assert!(
+        !frame.contains("Backspace review"),
+        "draft keys do not execute commands"
+    );
 }
 
 /// PgDn, PgUp, Home and End move the list by a screenful and to its ends,

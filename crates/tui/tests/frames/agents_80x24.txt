@@ -20,5 +20,5 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
+"Row 1 of 1                                                                      "
 "Space mark  ⌫ review  Tab section  v view  R refresh  ? help  q quit            "

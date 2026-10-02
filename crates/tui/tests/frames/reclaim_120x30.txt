@@ -26,5 +26,5 @@
 "Last used: no record                                                                                                    "
 "Path: /Users/dev/.codex                                                                                                 "
 "                                                                                                                        "
-"                                                                                                                        "
+"Row 1 of 4                                                                                                              "
 "Space mark  ⌫ review  Tab section  v view  R refresh  A mark all  ↑↓ move  →/← in/out  ? help  q quit                   "

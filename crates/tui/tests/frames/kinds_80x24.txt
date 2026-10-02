@@ -20,5 +20,5 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                                "
+"Row 1 of 4                                                                      "
 "Tab section  v view  / filter  R refresh  ↑↓ move  ? help  q quit               "

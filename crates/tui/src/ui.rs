@@ -340,10 +340,15 @@ fn fit_hints_once(hints: &[&str], width: usize) -> String {
 /// person reaches for first: filter, view, refresh and delete come before
 /// movement (arrow keys need no legend). `? help  q quit` is always kept:
 /// it is how you find every other key. Items are dropped from the end.
-fn footer_legend(width: usize, blocked: bool, markable: bool, filterable: bool) -> String {
-    const BASE: [&str; 12] = [
+fn footer_legend(
+    width: usize,
+    blocked: bool,
+    markable: bool,
+    filterable: bool,
+    backspace_hint: Option<&str>,
+) -> String {
+    const BASE: [&str; 11] = [
         "Space mark",
-        "⌫ review",
         "Tab section",
         "v view",
         "/ filter",
@@ -357,13 +362,16 @@ fn footer_legend(width: usize, blocked: bool, markable: bool, filterable: bool) 
     ];
     const TAIL: &str = "q quit";
     let mut items: Vec<&str> = BASE.to_vec();
+    if let Some(hint) = backspace_hint {
+        items.insert(1, hint);
+    }
     if !filterable {
         items.retain(|k| *k != "/ filter");
     }
     if !markable {
         // A view whose rows cannot be marked shows no key that only
         // answers with a refusal.
-        items.retain(|k| !matches!(*k, "⌫ review" | "Space mark" | "A mark all"));
+        items.retain(|k| !matches!(*k, "Space mark" | "A mark all"));
     }
     if blocked {
         // What the last check could not include, one key from the list.
@@ -804,7 +812,123 @@ fn operation_rows(app: &App, op: &crate::app::Operation) -> [String; 2] {
     }
 }
 
-fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
+fn idle_status_rows(app: &App, rows: &[crate::model::Row], width: usize) -> [String; 2] {
+    let marked = app.marked.len();
+    let trash = app
+        .marked
+        .values()
+        .filter(|unit| unit.docker.is_none())
+        .count();
+    let permanent = app
+        .marked
+        .values()
+        .filter(|unit| unit.docker.is_some())
+        .count();
+    let selected_bytes = app
+        .marked
+        .values()
+        .fold(0u64, |total, unit| total.saturating_add(unit.bytes));
+    let count = |n: usize| swamp_core::render::human_count(n as u64);
+
+    let first = if app.editing_filter {
+        app.filter_error
+            .as_ref()
+            .map(|error| {
+                format!(
+                    "Filter not applied: {}",
+                    error.strip_prefix("filter: ").unwrap_or(error)
+                )
+            })
+            .unwrap_or_default()
+    } else if marked > 0 {
+        let mut parts = vec![format!("{} marked", count(marked))];
+        if permanent > 0 {
+            parts.push(format!("{} Docker permanent", count(permanent)));
+        }
+        if trash > 0 {
+            parts.push(format!("{} Trash", count(trash)));
+        }
+        parts.push(format!("{} selected", human_bytes(selected_bytes)));
+        fit_clauses(&parts, width)
+    } else if !app.blocked.is_empty() {
+        format!("{} blocked · b reasons", count(app.blocked.len()))
+    } else {
+        String::new()
+    };
+
+    let row_position = if rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Row {} of {}",
+            count(app.selected.saturating_add(1)),
+            count(rows.len())
+        )
+    };
+    let context = rows
+        .get(app.selected)
+        .and_then(|row| {
+            let is_marked = row
+                .unit
+                .as_ref()
+                .is_some_and(|unit| app.marked.contains_key(&unit.0));
+            if let Some(manager) = row.tool.filter(|_| !is_marked) {
+                if marked > 0 {
+                    Some("Space mark folder for Trash".to_string())
+                } else {
+                    Some(format!("Backspace opens {} list", manager.name()))
+                }
+            } else if marked > 0 {
+                Some("Backspace review".to_string())
+            } else if row.expandable {
+                Some(
+                    if app.view == crate::app::ViewKind::Projects
+                        || row.collapsed_children.is_some()
+                    {
+                        "Enter open".to_string()
+                    } else {
+                        "Enter close".to_string()
+                    },
+                )
+            } else {
+                None
+            }
+        })
+        .or_else(|| (marked > 0).then(|| "Backspace review".to_string()));
+
+    let second = if app.editing_filter {
+        if app.filter_error.is_some() {
+            fit_clauses(&["Edit filter".into(), "Esc cancel".into()], width)
+        } else {
+            String::new()
+        }
+    } else {
+        let mut parts = Vec::new();
+        if marked > 0 && !app.blocked.is_empty() {
+            parts.push(format!("{} blocked · b reasons", count(app.blocked.len())));
+        }
+        if !row_position.is_empty() {
+            parts.push(row_position);
+        }
+        if let Some(context) = context {
+            parts.push(context);
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            fit_clauses(&parts, width)
+        }
+    };
+    [clip_end(&first, width), clip_end(&second, width)]
+}
+
+fn draw_status(
+    frame: &mut Frame,
+    app: &App,
+    summary: &[String],
+    rows: &[crate::model::Row],
+    area: Rect,
+) {
     let w = area.width as usize;
     if let Some(op) = &app.operation {
         let rows = operation_rows(app, op);
@@ -819,6 +943,26 @@ fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
                 area,
             );
         }
+    } else if app.help_open
+        || app.picker.is_some()
+        || app.tool_sheet.is_some()
+        || app.cargo_inspection.is_some()
+        || app.blocked_open
+    {
+        // Sheets and editors own their own context; idle list feedback must
+        // not bleed through them.
+    } else if app.editing_filter && app.filter_error.is_some() {
+        let lines = idle_status_rows(app, rows, w);
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .style(Style::default().fg(Color::Red)),
+            area,
+        );
     } else if let Some(msg) = app.refusal_active() {
         frame.render_widget(
             Paragraph::new(msg.to_string())
@@ -831,6 +975,17 @@ fn draw_status(frame: &mut Frame, app: &App, summary: &[String], area: Rect) {
             Paragraph::new(r.to_string())
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .style(Style::default()),
+            area,
+        );
+    } else {
+        let lines = idle_status_rows(app, rows, w);
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.clone()))
+                    .collect::<Vec<_>>(),
+            ),
             area,
         );
     }
@@ -887,7 +1042,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             &|_| "more below (↓ to scroll)".to_string(),
         );
     }
-    draw_status(frame, app, &summary, chunks[5]);
+    draw_status(frame, app, &summary, &rows, chunks[5]);
     if app.confirm_open {
         draw_confirm_overlay(frame, app, size);
         if app.blocked_open {
@@ -1008,23 +1163,40 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else if app.editing_filter {
         fit_hints(&["Tab complete", "Enter apply", "Esc cancel"], fw)
     } else {
+        let markable = !rows.is_empty()
+            && match app.view {
+                crate::app::ViewKind::Reclaim
+                | crate::app::ViewKind::Disk
+                | crate::app::ViewKind::DiskGaps => {
+                    rows.get(app.selected).is_some_and(|row| row.unit.is_some())
+                }
+                crate::app::ViewKind::Kinds | crate::app::ViewKind::Types => false,
+                _ => true,
+            };
+        let backspace_hint = match rows.get(app.selected) {
+            Some(row) => {
+                let is_marked = row
+                    .unit
+                    .as_ref()
+                    .is_some_and(|unit| app.marked.contains_key(&unit.0));
+                match row.tool {
+                    Some(manager) if !is_marked && app.marked.is_empty() => {
+                        Some(format!("⌫ {} list", manager.name()))
+                    }
+                    Some(_) if !is_marked => None,
+                    _ if markable || !app.marked.is_empty() => Some("⌫ review".to_string()),
+                    _ => None,
+                }
+            }
+            None if !app.marked.is_empty() => Some("⌫ review".to_string()),
+            None => None,
+        };
         footer_legend(
             size.width as usize,
             !app.blocked.is_empty(),
-            !rows.is_empty()
-                && match app.view {
-                    // The keys are named only while the row under the cursor
-                    // has a mark to make; a row that is not a folder shows why
-                    // in the detail pane instead.
-                    crate::app::ViewKind::Reclaim
-                    | crate::app::ViewKind::Disk
-                    | crate::app::ViewKind::DiskGaps => {
-                        rows.get(app.selected).is_some_and(|row| row.unit.is_some())
-                    }
-                    crate::app::ViewKind::Kinds | crate::app::ViewKind::Types => false,
-                    _ => true,
-                },
+            markable,
             app.view.uses_filter(),
+            backspace_hint.as_deref(),
         )
     };
     frame.render_widget(Paragraph::new(footer_text), chunks[6]);
@@ -1554,35 +1726,45 @@ fn filter_clause(app: &App, width: usize) -> String {
 
 fn draw_filter_line(frame: &mut Frame, app: &App, area: Rect) {
     let line = if app.editing_filter {
-        let hint = if app.completions.is_empty() {
-            "(Tab complete · Enter apply · Esc cancel)".to_string()
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let width = area.width as usize;
+        let prefix = "filter › ";
+        let room = width.saturating_sub(crate::model::display_width(prefix) + 1);
+        let draft = if crate::model::display_width(&app.filter_text) <= room {
+            app.filter_text.clone()
+        } else if room == 0 {
+            String::new()
         } else {
-            format!("(Tab: {})", app.completions.join("  "))
+            let mut used = 1; // Leading ellipsis names the hidden start.
+            let tail: Vec<&str> = app
+                .filter_text
+                .graphemes(true)
+                .rev()
+                .take_while(|g| {
+                    used += crate::model::display_width(g);
+                    used <= room
+                })
+                .collect();
+            format!("…{}", tail.into_iter().rev().collect::<String>())
         };
-        Line::from(format!("filter › {}▏  {hint}", app.filter_text))
+        let input = if width <= crate::model::display_width(prefix) {
+            "▏".to_string()
+        } else {
+            format!("{prefix}{draft}▏")
+        };
+        // The footer owns editing keys. Completion candidates use spare
+        // width only; the current insertion point never leaves the screen.
+        let completions = if app.completions.is_empty() {
+            String::new()
+        } else {
+            format!("Tab: {}", app.completions.join("  "))
+        };
+        Line::from(fit_clauses(&[input, completions], width))
     } else {
         Line::from(filter_clause(app, area.width as usize))
     };
     frame.render_widget(Paragraph::new(line), area);
-    if let Some(err) = &app.filter_error {
-        // Parse errors show inline in red under the line; with only one
-        // row budgeted here we overlay on the same line's tail instead
-        // of stealing a row from the body, keeping the one-screen rhythm.
-        let msg = format!("  parse error: {err}");
-        let x = area.x + (app.filter_text.len() as u16) + 9;
-        if x < area.x + area.width {
-            let sub = Rect {
-                x,
-                y: area.y,
-                width: area.width.saturating_sub(x - area.x),
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(msg).style(Style::default().fg(Color::Red)),
-                sub,
-            );
-        }
-    }
 }
 
 /// What an empty list says: why it is empty and what to press next.

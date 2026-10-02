@@ -20,5 +20,5 @@
 "Installed dependencies. Installing again brings them back, usually over the net…"
 "Path: /Users/dev/src/mole/node_modules                                          "
 "                                                                                "
-"                                                                                "
+"Row 1 of 1                                                                      "
 "Space mark  ⌫ review  Tab section  v view  / filter  R refresh  ? help  q quit  "

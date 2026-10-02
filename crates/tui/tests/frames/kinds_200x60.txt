@@ -56,5 +56,5 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
-"                                                                                                                                                                                                        "
+"Row 1 of 4                                                                                                                                                                                              "
 "Tab section  v view  / filter  R refresh  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                                                                "
