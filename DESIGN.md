@@ -64,9 +64,9 @@ are navigation, not selective cleanup units. The selected-row detail area shows 
 and rebuilding consequences. Compiler caches are a suggested starting point,
 not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
 
-The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to visible changes. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
+The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to all changes in the current view, including off-screen rows. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the actual value; the bar is not a linear scale of bytes.
 
-Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
+Growth sorts descending by signed change. Other sorts cover size, name, ecosystem, and age. Tree traversal preserves hierarchy. Sorting or reversing keeps the same item selected. Ecosystem glyphs follow project names; linked-worktree and build-output badges add context.
 
 ## Color
 
@@ -76,7 +76,7 @@ The renderer uses the terminal's own colors and attributes. Committed frames exe
 
 ## Navigation and filters
 
-`→` opens or expands; `←` collapses or returns to projects. Enter opens a project or confirms an action. Esc cancels the active interaction or returns to projects. `/` opens the filter form; `:` edits the expression; `0` clears it. Parse errors retain the previous valid filter.
+`→` opens or expands. `←` collapses an expanded row, selects the parent of a leaf or collapsed child, or returns to projects when there is no parent. Returning to a view restores the selected item and scroll position; if the item disappeared or an informational row has no unique identity, selection falls back to its previous position, clamped to the remaining rows. Enter opens a project or confirms an action. Esc cancels the active interaction or returns to projects. `/` opens the filter form; `:` edits the expression; `0` clears it. Parse errors retain the previous valid filter.
 
 The initial filter is `growth > 100MB in 7d`. Saved filter and sort choices take precedence on later runs. The views are nested in three sections (Projects, Tools, Disk): `Tab`/`Shift-Tab` move between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the current section. The [usage guide](docs/usage.md#terminal-controls) holds the full key table.
 
@@ -298,6 +298,8 @@ The chrome is the same rows in every state: header, view and filter line, the
 body, two status rows, and the key legend. Nothing resizes the body. A blocked list is a fixed 10-row sheet drawn over the bottom of the list. A plan uses a content-sized overlay, up to the terminal height minus its persistent action footer; long warning summaries scroll, while the complete path inventory is a separate optional detail view. A result stays in the status rows until the next key. A detail pane of fixed
 height sits under the list, and the list scrolls only when the selection leaves
 its window, so one Down moves the selection one row.
+
+Only rows inside that window are formatted into terminal cells. The complete row model still determines order, selection, totals, and growth-bar scale; scrolling does not change the scale or discard off-screen rows.
 
 Marking builds a plan and changes nothing. Check, ready and blocked are the
 words (never successful and refused), with `Nothing has been changed` while a

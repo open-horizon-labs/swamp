@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- Large TUI lists format only the rows on screen. Sorting and reversing keep the same item selected, and returning to a view restores its selection and scroll position. Left collapses an expanded row or selects its parent before returning to Projects.
+
 - Preparing selected Cargo build outputs no longer reads and hashes the compiled payloads. Payload manifests record metadata identity; small producer fingerprints still use content hashes. On one real 499-action selection, proposal preparation fell from 15.7 seconds to 0.27 seconds, and the full UI marking path took 0.93 seconds. These are local measurements, not timing guarantees.
 
 - Human output uses readable dates, rounded durations, grouped counts, and shared decimal byte units. `observe` reports one elapsed clock and active work instead of per-root byte counters that reset; `observe --verbose` retains detailed diagnostics. JSON and persisted measurement precision are unchanged.

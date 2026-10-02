@@ -1300,7 +1300,7 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | Up / Down | Move selection |
 | PgUp / PgDn | Move one screenful; in help, the blocked list and the picker they scroll or jump the same way |
 | Home / End | First / last row (or first / last help line, blocked item, picker field) |
-| Right / Left | Open or expand / collapse or return |
+| Right / Left | Open or expand / collapse an expanded row, select its parent, or return to projects |
 | Enter | Open a project or confirm the pending action |
 | Esc | Cancel the current interaction or return to projects |
 | Space | Mark or unmark a row |
@@ -1320,6 +1320,8 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | `q` | Quit (closes help, the list or the picker first; while a check or a move runs, it stops it after the current item) |
 
 The initial filter is `growth > 100MB in 7d`. Filter, sort, reverse, and keep-executables choices are saved in `ui_state.json`. Clear the filter if the first observation shows no matching rows.
+
+Sorting and reversing keep the same item selected. Returning to a view restores its selected item and scroll position. If that item disappeared, selection uses the closest remaining position. These per-view positions last for the current UI session.
 
 Rows show size and signed growth. Red bars extend right for increases; green bars extend left for decreases. Bar length is logarithmic, so use the number to compare exact changes.
 

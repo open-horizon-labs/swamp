@@ -410,6 +410,26 @@ impl RefreshedObservation {
 /// against it).
 type HeadlineKey = (u64, Option<usize>, bool, u64);
 
+fn nearest_parent_row(rows: &[Row], selected: usize) -> Option<usize> {
+    let depth = rows.get(selected)?.depth;
+    if depth == 0 {
+        return None;
+    }
+    let root_depth = rows.iter().map(|row| row.depth).min().unwrap_or(depth);
+    let root = (0..selected)
+        .rev()
+        .find(|&i| rows[i].depth == root_depth)
+        .unwrap_or(0);
+    (root..selected).rev().find(|&i| rows[i].depth < depth)
+}
+
+#[derive(Clone, Debug)]
+struct ViewCursor {
+    key: Option<String>,
+    index: usize,
+    scroll_offset: usize,
+}
+
 pub struct App {
     /// Ephemeral on-demand details; never persisted in the observation store.
     pub cargo_inspection: Option<Vec<String>>,
@@ -464,9 +484,10 @@ pub struct App {
     /// First help line shown. The drawer clamps it to the real end, so
     /// `End` may set it as far as it likes.
     pub help_scroll: std::cell::Cell<usize>,
-    /// Where the cursor was in each view when it was last left, so coming
-    /// back (Esc, `v`) lands on the same row instead of the top.
-    view_cursor: std::collections::HashMap<ViewKind, usize>,
+    /// Where the cursor was in each view when it was last left. Stable row
+    /// identity survives data changes; the index is the fallback for
+    /// unkeyed or removed rows.
+    view_cursor: std::collections::HashMap<ViewKind, ViewCursor>,
     /// Per-project mark counts for the projects view, kept until the marks
     /// or the report change (computing one is a tree build per project).
     mark_cache: std::sync::Mutex<Option<(u64, std::sync::Arc<MarkStates>)>>,
@@ -1280,25 +1301,62 @@ impl App {
         ));
     }
 
-    /// Identity of the selected row: its unit path when it has one
-    /// (stable across re-sorts), otherwise its label.
+    /// Stable identity for selection continuity. Duplicate structural
+    /// labels have no key and use the saved index instead.
+    fn row_cursor_keys(&self, rows: &[Row]) -> Vec<Option<String>> {
+        let mut project_ids = std::collections::HashMap::<&str, Option<&str>>::new();
+        for project in &self.report.projects {
+            project_ids
+                .entry(project.name.as_str())
+                .and_modify(|id| *id = None)
+                .or_insert(Some(project.project_id.as_str()));
+        }
+        let mut keys: Vec<Option<String>> = rows
+            .iter()
+            .map(|row| {
+                if let Some(unit) = &row.unit {
+                    Some(format!("unit:{}", unit.0))
+                } else if let Some(expansion) = &row.expansion_key {
+                    Some(format!("group:{expansion}"))
+                } else {
+                    row.project.as_ref().and_then(|name| {
+                        project_ids
+                            .get(name.as_str())
+                            .copied()
+                            .flatten()
+                            .map(|id| format!("project:{id}"))
+                    })
+                }
+            })
+            .collect();
+        let mut label_counts = std::collections::HashMap::<&str, usize>::new();
+        for (row, key) in rows.iter().zip(&keys) {
+            if key.is_none() {
+                *label_counts.entry(&row.label).or_default() += 1;
+            }
+        }
+        for (row, key) in rows.iter().zip(&mut keys) {
+            if key.is_none() && label_counts.get(row.label.as_str()) == Some(&1) {
+                *key = Some(format!("label:{}", row.label));
+            }
+        }
+        keys
+    }
+
     fn selected_row_key(&self) -> Option<String> {
-        self.rows()
-            .into_iter()
-            .nth(self.selected)
-            .map(|r| r.unit.map(|u| u.0).unwrap_or(r.label))
+        let rows = self.rows();
+        self.row_cursor_keys(&rows)
+            .get(self.selected)
+            .cloned()
+            .flatten()
     }
 
     fn restore_selection(&mut self, key: Option<String>) {
         let rows = self.rows();
+        let keys = self.row_cursor_keys(&rows);
         let found = key.and_then(|k| {
-            rows.iter().position(|r| {
-                r.unit
-                    .as_ref()
-                    .map(|u| u.0.clone())
-                    .unwrap_or_else(|| r.label.clone())
-                    == k
-            })
+            keys.iter()
+                .position(|candidate| candidate.as_ref() == Some(&k))
         });
         self.selected = found.unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
     }
@@ -1379,13 +1437,17 @@ impl App {
     }
 
     pub fn set_sort(&mut self, sort: Sort) {
+        let anchor = self.selected_row_key();
         self.sort = if self.sort == sort { Sort::None } else { sort };
+        self.restore_selection(anchor);
         self.persist_ui_state();
     }
 
     /// `r`: flip the order of whatever sort is active.
     pub fn toggle_reverse(&mut self) {
+        let anchor = self.selected_row_key();
         self.reverse = !self.reverse;
+        self.restore_selection(anchor);
         self.persist_ui_state();
     }
 
@@ -1421,7 +1483,14 @@ impl App {
         if v == self.view {
             return;
         }
-        self.view_cursor.insert(self.view, self.selected);
+        self.view_cursor.insert(
+            self.view,
+            ViewCursor {
+                key: self.selected_row_key(),
+                index: self.selected,
+                scroll_offset: self.scroll_offset.get(),
+            },
+        );
         self.view = v;
         // Opening either of the two views the first-run hint points at
         // ends the hint, for good.
@@ -1429,13 +1498,22 @@ impl App {
             self.views_seen = true;
             self.persist_ui_state();
         }
-        let len = self.rows().len();
-        self.selected = self
-            .view_cursor
-            .get(&v)
-            .copied()
-            .unwrap_or(0)
-            .min(len.saturating_sub(1));
+        let rows = self.rows();
+        let keys = self.row_cursor_keys(&rows);
+        if let Some(cursor) = self.view_cursor.get(&v) {
+            self.selected = cursor
+                .key
+                .as_ref()
+                .and_then(|key| {
+                    keys.iter()
+                        .position(|candidate| candidate.as_ref() == Some(key))
+                })
+                .unwrap_or_else(|| cursor.index.min(rows.len().saturating_sub(1)));
+            self.scroll_offset.set(cursor.scroll_offset);
+        } else {
+            self.selected = 0;
+            self.scroll_offset.set(0);
+        }
     }
 
     /// `Tab`, `Shift-Tab` and `1`-`3`: open a section on its first view.
@@ -1668,11 +1746,23 @@ impl App {
         if self.view == ViewKind::Projects {
             return;
         }
-        let expanded = self
-            .selected_row()
-            .is_some_and(|r| r.expandable && r.collapsed_children.is_none());
+        let rows = self.rows();
+        let Some(selected) = rows.get(self.selected) else {
+            self.set_view(ViewKind::Projects);
+            return;
+        };
+        let expanded = selected.expandable && selected.collapsed_children.is_none();
         if expanded {
             self.toggle_expand();
+        } else if selected.depth > 0 {
+            // Search only within this row's current top-level tree. Flat
+            // views can contain multiple independent roots; never let Left
+            // jump from a child to the preceding root's row.
+            if let Some(parent) = nearest_parent_row(&rows, self.selected) {
+                self.selected = parent;
+            } else {
+                self.set_view(ViewKind::Projects);
+            }
         } else {
             self.set_view(ViewKind::Projects);
         }
@@ -3982,6 +4072,20 @@ mod tests {
         ArtifactKind, ArtifactRow, ProjectRow, Reconciliation, Source, WorktreeKind, WorktreeRow,
     };
 
+    fn assert_navigation_did_no_io(app: &App, work: swamp_core::work_counters::WorkCounters) {
+        assert_eq!(work.dirs_listed, 0);
+        assert_eq!(work.files_statted, 0);
+        assert_eq!(work.subprocess_spawns, 0);
+        assert!(
+            app.store_dir.is_none(),
+            "fixture must not start a state writer"
+        );
+        assert!(
+            app.ui_state_tx.is_none(),
+            "navigation must not start a worker"
+        );
+    }
+
     #[test]
     fn keep_executables_cannot_be_enabled_from_a_selective_cargo_confirm() {
         assert_eq!(keep_executables_toggle(false, true), None);
@@ -4633,6 +4737,207 @@ mod tests {
             ViewKind::Projects,
             "the second left comes back out"
         );
+    }
+
+    #[test]
+    fn sort_and_reverse_keep_the_selected_unit() {
+        let home = tempfile::tempdir().unwrap();
+        let mut units = fixture_agent_units(home.path());
+        assert_eq!(units.len(), 2);
+        units[0].tool_name = "zulu".into();
+        units[0].relative_path = "z-item".into();
+        units[0].bytes = 10;
+        units[0].path = home.path().join("z-item");
+        units[1].tool_name = "alpha".into();
+        units[1].relative_path = "a-item".into();
+        units[1].bytes = 5;
+        units[1].path = home.path().join("a-item");
+
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units);
+        app.selected = 0;
+        let selected = app.selected_row_key();
+
+        let (_, work) = swamp_core::work_counters::measured(|| {
+            app.set_sort(Sort::Name);
+            assert_eq!(app.selected, 1, "name order moves the selected row");
+            assert_eq!(app.selected_row_key(), selected);
+            app.toggle_reverse();
+            assert_eq!(app.selected, 0, "reverse moves it back to the first row");
+            assert_eq!(app.selected_row_key(), selected);
+        });
+        assert_navigation_did_no_io(&app, work);
+    }
+
+    #[test]
+    fn view_cursor_restores_identity_after_reorder_and_falls_back_after_removal() {
+        let home = tempfile::tempdir().unwrap();
+        let mut units = fixture_agent_units(home.path());
+        assert_eq!(units.len(), 2);
+        units[0].bytes = 10;
+        units[0].path = home.path().join("first");
+        units[0].relative_path = "first".into();
+        units[1].bytes = 20;
+        units[1].path = home.path().join("second");
+        units[1].relative_path = "second".into();
+        let selected_path = units[1].path.clone();
+
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_view(ViewKind::Agents);
+        app.set_agent_units(units.clone());
+        app.selected = 0;
+        let selected = app.selected_row_key().unwrap();
+        app.scroll_offset.set(7);
+        let (_, work) = swamp_core::work_counters::measured(|| {
+            app.set_view(ViewKind::External);
+
+            units[0].bytes = 30;
+            units[1].bytes = 2;
+            app.set_agent_units(units.clone());
+            app.set_view(ViewKind::Agents);
+            assert_eq!(app.selected_row_key().as_deref(), Some(selected.as_str()));
+            assert_eq!(app.selected, 1, "the row moved when measured sizes changed");
+            assert_eq!(app.scroll_offset.get(), 7);
+
+            app.set_view(ViewKind::External);
+            units.retain(|u| u.path != selected_path);
+            app.set_agent_units(units);
+            app.set_view(ViewKind::Agents);
+            assert_eq!(
+                app.selected, 0,
+                "missing identity uses the clamped old index"
+            );
+            assert_eq!(app.rows().len(), 1);
+        });
+        assert_navigation_did_no_io(&app, work);
+    }
+
+    #[test]
+    fn duplicate_group_labels_keep_distinct_cursor_identities() {
+        let mut first = Row::leaf(0, "Other".into(), 1, None);
+        first.expansion_key = Some("family-open:/one:Other".into());
+        first.project = Some("mole".into());
+        let mut second = Row::leaf(0, "Other".into(), 1, None);
+        second.expansion_key = Some("family-open:/two:Other".into());
+        second.project = Some("mole".into());
+        let app = App::new(fixture_report(), "/root".into());
+        assert_ne!(
+            app.row_cursor_keys(&[first.clone(), second.clone()])[0],
+            app.row_cursor_keys(&[first, second])[1]
+        );
+    }
+
+    #[test]
+    fn duplicate_project_names_do_not_share_a_project_cursor_key() {
+        let mut report = fixture_report();
+        let mut same_name = report.projects[0].clone();
+        same_name.project_id = "p2".into();
+        report.projects.push(same_name);
+        let app = App::new(report, "/root".into());
+        let mut first = Row::leaf(0, "mole · first root".into(), 1, None);
+        first.project = Some("mole".into());
+        let mut second = Row::leaf(0, "mole · second root".into(), 1, None);
+        second.project = Some("mole".into());
+
+        let keys = app.row_cursor_keys(&[first, second]);
+        assert_eq!(keys[0], Some("label:mole · first root".into()));
+        assert_eq!(keys[1], Some("label:mole · second root".into()));
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn duplicate_unkeyed_group_labels_use_index_fallback() {
+        let mut first_parent = Row::leaf(0, "container one".into(), 1, None);
+        first_parent.expansion_key = Some("container:/one".into());
+        let first_child = Row::leaf(1, "Other".into(), 1, None);
+        let mut second_parent = Row::leaf(0, "container two".into(), 1, None);
+        second_parent.expansion_key = Some("container:/two".into());
+        let second_child = Row::leaf(1, "Other".into(), 1, None);
+        let rows = vec![first_parent, first_child, second_parent, second_child];
+        let app = App::new(fixture_report(), "/root".into());
+        let keys = app.row_cursor_keys(&rows);
+        assert_eq!(keys[1], None);
+        assert_eq!(keys[3], None);
+        assert_eq!(
+            app.row_cursor_keys(&[rows[1].clone()])[0],
+            Some("label:Other".into())
+        );
+    }
+
+    #[test]
+    fn left_from_tree_child_selects_parent_then_collapses_then_exits() {
+        let mut app = App::new(fixture_report(), "/root".into());
+        let (_, work) = swamp_core::work_counters::measured(|| {
+            app.enter_row();
+            assert_eq!(app.view, ViewKind::Tree);
+            app.selected = 1; // node_modules, below the worktree row
+            assert_eq!(app.rows()[app.selected].depth, 2);
+            app.leave_row();
+            assert_eq!(app.view, ViewKind::Tree);
+            assert_eq!(app.selected, 0, "left selects the containing worktree");
+            app.leave_row();
+            assert_eq!(app.view, ViewKind::Tree, "expanded parent collapses first");
+            assert!(app.rows()[app.selected].collapsed_children.is_some());
+            app.leave_row();
+            assert_eq!(app.view, ViewKind::Projects);
+        });
+        assert_navigation_did_no_io(&app, work);
+    }
+
+    #[test]
+    fn left_in_second_worktree_stays_with_that_worktree() {
+        let mut report = fixture_report();
+        let first = report.projects[0].worktrees[0].clone();
+        let first_path = first.path.clone();
+        let mut second = first;
+        second.worktree_id = "w2".into();
+        second.path = "/root/mole-linked".into();
+        for artifact in &mut second.artifacts {
+            let relative = artifact.path.strip_prefix(&first_path).unwrap();
+            artifact.path = second.path.join(relative);
+        }
+        report.projects[0].worktrees.push(second);
+        let mut app = App::new(report, "/root".into());
+
+        let (_, work) = swamp_core::work_counters::measured(|| {
+            app.enter_row();
+            let rows = app.rows();
+            let second_root = rows
+                .iter()
+                .position(|row| row.depth == 1 && row.label.contains("/root/mole-linked"))
+                .expect("the linked worktree row is present");
+            let child = rows
+                .iter()
+                .enumerate()
+                .skip(second_root + 1)
+                .find(|(_, row)| row.depth == 2 && row.label.contains("node_modules"))
+                .map(|(index, _)| index)
+                .expect("the second worktree has its own dependency child");
+
+            app.selected = child;
+            app.leave_row();
+            assert_eq!(app.view, ViewKind::Tree);
+            assert_eq!(app.selected, second_root);
+            assert!(app.rows()[app.selected].label.contains("/root/mole-linked"));
+            app.leave_row();
+            assert_eq!(app.view, ViewKind::Tree);
+            assert_eq!(app.selected, second_root);
+            assert!(app.rows()[app.selected].collapsed_children.is_some());
+            app.leave_row();
+            assert_eq!(app.view, ViewKind::Projects);
+        });
+        assert_navigation_did_no_io(&app, work);
+    }
+
+    #[test]
+    fn left_never_uses_a_parent_from_the_previous_root() {
+        let mut rows = vec![Row::leaf(0, "root one".into(), 1, None)];
+        rows.push(Row::leaf(1, "child one".into(), 1, None));
+        rows.push(Row::leaf(0, "root two".into(), 1, None));
+        rows.push(Row::leaf(1, "child two".into(), 1, None));
+        assert_eq!(nearest_parent_row(&rows, 3), Some(2));
+        assert_eq!(nearest_parent_row(&rows, 1), Some(0));
     }
 
     #[test]

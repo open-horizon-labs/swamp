@@ -1849,8 +1849,32 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
+    // The detail pane is the same height whichever row is selected, so
+    // the table never resizes under the cursor.
+    let detail_height = DETAIL_ROWS.min(area.height / 3);
+    let table_height = area.height.saturating_sub(detail_height);
+    let header_count = if cleanup_view || reclaim_line.is_some() {
+        2
+    } else {
+        1
+    };
+    let visible = table_height.saturating_sub(header_count) as usize;
+    // One page is a screenful with a row of overlap.
+    app.page.set(visible.saturating_sub(1).max(1));
+    // Stateful window: it moves only when the selection leaves it, so one
+    // keypress moves the selection one row.
+    let mut offset = app.scroll_offset.get();
+    if app.selected < offset {
+        offset = app.selected;
+    } else if visible > 0 && app.selected >= offset + visible {
+        offset = app.selected + 1 - visible;
+    }
+    offset = offset.min(rows.len().saturating_sub(visible));
+    app.scroll_offset.set(offset);
+    // Only visible rows need terminal-cell formatting and mark decoration.
+    // The full row set above still owns ordering, totals and growth-bar scale.
     let mark_states = app.project_mark_states();
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().skip(offset).take(visible) {
         let mut marked = row
             .unit
             .as_ref()
@@ -2029,36 +2053,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(line);
     }
-    // The detail pane is the same height whichever row is selected, so
-    // the table never resizes under the cursor.
-    let detail_height = DETAIL_ROWS.min(area.height / 3);
-    let table_height = area.height.saturating_sub(detail_height);
-    let header_count = if cleanup_view || reclaim_line.is_some() {
-        2
-    } else {
-        1
-    };
-    let visible = table_height.saturating_sub(header_count) as usize;
-    // One page is a screenful with a row of overlap.
-    app.page.set(visible.saturating_sub(1).max(1));
-    // Stateful window: it moves only when the selection leaves it, so one
-    // keypress moves the selection one row.
-    let mut offset = app.scroll_offset.get();
-    if app.selected < offset {
-        offset = app.selected;
-    } else if visible > 0 && app.selected >= offset + visible {
-        offset = app.selected + 1 - visible;
-    }
-    offset = offset.min(rows.len().saturating_sub(visible));
-    app.scroll_offset.set(offset);
-    let headers: Vec<_> = lines.drain(..header_count as usize).collect();
-    let shown = headers
-        .into_iter()
-        .chain(lines.into_iter().skip(offset).take(visible))
-        .collect::<Vec<_>>();
-    let shown_count = shown.len() as u16;
+    let shown_count = lines.len() as u16;
     frame.render_widget(
-        Paragraph::new(shown),
+        Paragraph::new(lines),
         Rect {
             height: table_height,
             ..area
