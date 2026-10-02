@@ -1484,7 +1484,11 @@ impl App {
             }
             ViewKind::DiskGaps => return model::disk_gaps_rows(&self.ledger),
         };
-        model::apply_sort(&mut rows, self.sort, self.reverse);
+        if self.view == ViewKind::External {
+            model::apply_root_sort(&mut rows, self.sort, self.reverse);
+        } else {
+            model::apply_sort(&mut rows, self.sort, self.reverse);
+        }
         rows
     }
 
