@@ -2330,12 +2330,73 @@ fn page_and_home_end_keys_move_the_list() {
     assert_eq!(app.selected, total - 1);
     let f = capture(&app, 80, 24);
     assert!(f.contains("pkg000"), "End shows the last row:\n{f}");
+    // A viewport optimization must keep the tail reachable after a resize;
+    // retaining only a top-N display cache would lose this selected row.
+    for (width, height) in [(80, 16), (120, 30), (200, 60), (80, 24)] {
+        let resized = capture(&app, width, height);
+        assert!(
+            resized.contains("pkg000"),
+            "tail after resize {width}x{height}:\n{resized}"
+        );
+        assert_eq!(
+            app.rows().len(),
+            total,
+            "rendering must not truncate the data"
+        );
+        assert_eq!(app.selected, total - 1);
+    }
     swamp_tui::handle_key(&mut app, KeyCode::PageDown);
     assert_eq!(app.selected, total - 1, "PgDn stops at the end");
     swamp_tui::handle_key(&mut app, KeyCode::Home);
     assert_eq!(app.selected, 0);
     swamp_tui::handle_key(&mut app, KeyCode::PageUp);
     assert_eq!(app.selected, 0, "PgUp stops at the top");
+}
+
+#[test]
+fn scrolled_growth_bars_keep_the_offscreen_maximum() {
+    let mut report = fixture_report();
+    report.projects.truncate(1);
+    report.projects[0].worktrees.truncate(1);
+    report.projects[0].worktrees[0].artifacts = (0..80)
+        .map(|i| {
+            art(
+                ArtifactKind::DependencyTree,
+                &format!("/Users/dev/src/project/pkg{i:03}/node_modules"),
+                1_000_000 + i,
+                Some(if i == 79 {
+                    1_000_000_000_000
+                } else {
+                    2_000_000
+                }),
+            )
+        })
+        .collect();
+    let mut app = App::new(report, "/Users/dev/src".into());
+    app.clear_filter();
+    app.set_view(ViewKind::Deps);
+    app.sort = swamp_tui::model::Sort::Size;
+    app.selected = app.rows().len() - 1;
+    let frame = capture(&app, 200, 24);
+    assert!(
+        !frame.contains("pkg079"),
+        "maximum must be outside the viewport"
+    );
+    let line = frame.lines().find(|line| line.contains("pkg000")).unwrap();
+    let (left, axis, right) =
+        swamp_tui::model::diverging_bar(Some(2_000_000), 1_000_000_000_000, 6);
+    let expected = format!("{left}{axis}{right}");
+    let (left, axis, right) = swamp_tui::model::diverging_bar(Some(2_000_000), 2_000_000, 6);
+    let viewport_only = format!("{left}{axis}{right}");
+    assert_ne!(
+        expected, viewport_only,
+        "fixture must distinguish global and viewport scales"
+    );
+    assert!(
+        line.contains(&expected),
+        "growth scale changed on scroll: {line}"
+    );
+    assert!(!line.contains(&viewport_only));
 }
 
 /// Help at 80x24: every entry on its own row (the A and Backspace entries
