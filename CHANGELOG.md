@@ -5,7 +5,7 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
-## 0.8.2 — 2026-10-02
+## v0.8.2 — 2026-10-02
 
 - Project tables name their comparison period (`Change 7d`) and offer `w` to change it. Period and growth-filter changes now recalculate from stored history without scanning projects. Shorter available history is labelled approximately; clearing the filter preserves the period.
 
