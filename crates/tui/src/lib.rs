@@ -1357,7 +1357,7 @@ mod tests {
                     "No actions marked",
                     "Read every line before action",
                     "Terminal too small to review",
-                    "l inspect paths",
+                    "l details",
                 ],
             ),
             (

@@ -750,7 +750,11 @@ fn disk_tables_keep_measurement_and_unknown_size_at_compact_and_wide_widths() {
             let f = frame(&a, w, h);
             let heading = &f[5];
             assert!(heading.contains("Size"), "{view:?}: {heading}");
-            assert!(heading.contains("Measurement"), "{view:?}: {heading}");
+            assert_eq!(
+                heading.contains("Measurement"),
+                view == ViewKind::Disk,
+                "empty measurement columns are omitted: {view:?}: {heading}"
+            );
             assert!(!heading.contains("Change"), "{view:?}: {heading}");
             assert!(
                 f.iter()

@@ -1830,11 +1830,12 @@ impl App {
         ) {
             return;
         }
+        let anchor = self.selected_row_key();
         if let Some(key) = self.selected_row().and_then(|r| r.expansion_key) {
             if !self.collapsed.remove(&key) {
                 self.collapsed.insert(key);
             }
-            self.selected = self.selected.min(self.rows().len().saturating_sub(1));
+            self.restore_selection(anchor);
         }
     }
 
@@ -3654,7 +3655,17 @@ impl App {
         if removed.is_empty() {
             return;
         }
+        let anchor = self.selected_row_key();
         self.prune_reclaim(&removed);
+        self.store_interiors.retain(|u| {
+            !removed
+                .iter()
+                .any(|r| u.path == *r || u.path.starts_with(r))
+        });
+        // Interior-only removals need not change the parent tool's recorded
+        // allocation (model blobs stay), but they do change derived views.
+        self.reclaim_cache.borrow_mut().take();
+        self.headline_cache.borrow_mut().take();
         if let Some(estimate) = self.report.reconciliation.unique_estimate.as_mut() {
             estimate.needs_reconciliation = true;
         }
@@ -3721,9 +3732,7 @@ impl App {
             self.track.remove(path);
             self.collapsed.remove(&format!("source:{}", path.display()));
         }
-        if self.selected >= self.rows().len() {
-            self.selected = self.rows().len().saturating_sub(1);
-        }
+        self.restore_selection(anchor);
     }
 
     /// Starts an incremental observation of every root in `self.roots`
@@ -5038,6 +5047,73 @@ mod tests {
         rows.push(Row::leaf(1, "child two".into(), 1, None));
         assert_eq!(nearest_parent_row(&rows, 3), Some(2));
         assert_eq!(nearest_parent_row(&rows, 1), Some(0));
+    }
+
+    #[test]
+    fn removed_model_disappears_from_interiors_and_cached_reclaim_without_charging_blobs() {
+        use swamp_core::artifact::{AccountingBasis, ArtifactRole, ArtifactVariant};
+        use swamp_core::build_adapters::{BuildContainer, NestedUnitBuilder};
+        let path = PathBuf::from("/tools/ollama/models");
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.set_external_units(vec![drilled_unit(path.to_str().unwrap(), vec![])]);
+        let container = BuildContainer::shared_store_of(
+            "model-stores",
+            path.clone(),
+            swamp_core::locations::BuildStoreKind::OllamaModels,
+        );
+        let root = NestedUnitBuilder::new(&container, ArtifactRole::Container, path.clone())
+            .is_dir(true)
+            .bytes_on_basis(522_700_000, AccountingBasis::Allocated)
+            .build();
+        let model = |name: &str| {
+            NestedUnitBuilder::new(
+                &container,
+                ArtifactRole::SharedStoreEntry,
+                path.join(format!("manifests/{name}")),
+            )
+            .variant(ArtifactVariant {
+                package: Some(name.into()),
+                configuration: Some("ollama model".into()),
+                ..Default::default()
+            })
+            .bytes_on_basis(522_700_000, AccountingBasis::Allocated)
+            .build()
+        };
+        let gone = model("qwen3/0.6b");
+        let sibling = model("other/1b");
+        app.set_store_interiors(vec![root, gone.clone(), sibling.clone()]);
+        let before_bytes = app.external_units[0].bytes;
+        let cached = app.reclaim_view();
+        assert_eq!(cached.rows[0].models.len(), 2);
+        app.prune_removed(&[synthetic_unit_result(gone.path.to_str().unwrap(), false)]);
+        assert_eq!(
+            app.reclaim_view().rows[0].models.len(),
+            2,
+            "failed moves retain facts"
+        );
+        app.prune_removed(&[synthetic_unit_result(gone.path.to_str().unwrap(), true)]);
+        assert!(!app.store_interiors.iter().any(|u| u.path == gone.path));
+        assert!(app.store_interiors.iter().any(|u| u.path == sibling.path));
+        assert_eq!(
+            app.external_units[0].bytes, before_bytes,
+            "manifest move does not remove the model layers"
+        );
+        let after = app.reclaim_view();
+        assert_eq!(after.rows[0].models.len(), 1);
+        assert!(!std::sync::Arc::ptr_eq(&cached, &after));
+        for view in [ViewKind::Reclaim, ViewKind::External] {
+            app.set_view(view);
+            app.clear_filter();
+            app.selected = 0;
+            app.enter_row();
+            assert!(
+                !app.rows().iter().any(|r| r
+                    .unit
+                    .as_ref()
+                    .is_some_and(|id| id.0 == gone.path.to_str().unwrap())),
+                "{view:?} resurrected model"
+            );
+        }
     }
 
     #[test]

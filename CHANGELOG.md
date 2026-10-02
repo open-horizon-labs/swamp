@@ -5,6 +5,9 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- Trash review now separates decision facts from supporting details: concise restore cost, sourced last use and consequential exceptions appear in the summary; `l` retains original warnings, sources and every path. Build advice drops oldest-age and cleanup-rule boilerplate. Generic accuracy badges disappear while unknown sizes and lower bounds remain labelled.
+- Removed model manifests disappear immediately from cached TUI views while shared layers remain counted. Inspect directories keeps the cursor and viewport stable through expansion and collapse, without repeating the profile’s size.
+
 - TUI tables give more room to identifying names: checkout-relative build paths, path-first unassigned rows, concise recovery costs and no empty columns. Unknown sizes are labelled. Wrapped blocked reasons and Cargo details stay reachable when paging or resizing. Key hints now match bulk review, fixed-order views and manager confirmation; unsupported modifier chords cannot invoke plain commands, and project-name filter input accepts spaces and command letters.
 
 - The TUI keeps marked counts, selected bytes and Trash/permanent Docker destinations visible between actions. List position and contextual hints help with long views; blocked reasons remain accessible. Invalid filter expressions stay open for correction or Esc, preserving the previous filter, marks and position.

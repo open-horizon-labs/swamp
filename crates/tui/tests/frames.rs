@@ -243,12 +243,17 @@ fn cargo_tree_opens_in_context_and_keeps_exact_group_selection() {
             "selected consequence should remain visible: {rendered}"
         );
         assert!(rendered.contains("Size"));
-        assert!(rendered.contains("* allocated bytes"));
-        assert!(rendered.contains("candidate"));
+        assert!(rendered.contains("* shared files may be counted again"));
+        assert!(
+            app.rows()[app.selected]
+                .cleanup_summary
+                .as_deref()
+                .is_none_or(|summary| !summary.contains("oldest"))
+        );
         if width >= 100 {
             assert!(rendered.contains("Change"));
         }
-        assert!(rendered.contains("Oldest candidates"));
+        assert!(rendered.contains("Selected group"));
         assert!(rendered.contains("showing 1 of 1"));
     }
     app.enter_row();
@@ -569,6 +574,68 @@ fn cargo_cleanup_guidance_frames() {
         app.mark_row(&group);
         assert!(app.marked.is_empty());
         assert!(app.refusal_active().is_some());
+    }
+}
+
+#[test]
+fn physical_layout_expand_and_collapse_keep_the_anchor_on_its_screen_line() {
+    let mut report = fixture_report();
+    let root = "/Users/dev/src/mole/target";
+    for (rel, role) in std::iter::once(("debug".to_string(), "Profile"))
+        .chain((0..90).map(|n| (format!("debug/folder-{n:02}"), "Dependency")))
+    {
+        report.nested_artifacts.push(serde_json::from_value(serde_json::json!({
+            "id":rel,"path":format!("{root}/{rel}"),"relative_path":rel,
+            "parent_id":null,"container_id":"target","role":role,"membership":"Unknown",
+            "is_dir":true,"logical_bytes":0,"bytes":64000000,"physical_bytes":0,
+            "mtime_max":report.observed_at,"variant":{},"coverage":{"supported":true,"complete":true,"limits":[]},
+            "action_group":null,"present":true
+        })).unwrap());
+    }
+    for (width, height) in [(80, 24), (200, 60)] {
+        let mut app = App::new(report.clone(), "/Users/dev/src".into());
+        app.clear_filter();
+        app.selected_project = Some("mole".into());
+        app.set_view(ViewKind::Tree);
+        let key = format!("layout:{root}/debug");
+        app.collapsed.insert(key.clone());
+        app.selected = app
+            .rows()
+            .iter()
+            .position(|r| r.expansion_key.as_ref() == Some(&key))
+            .unwrap();
+        assert!(app.rows()[app.selected].collapsed_children.is_some());
+        app.enter_row();
+        assert!(app.rows()[app.selected].expansion_key.as_ref() == Some(&key));
+        assert!(app.rows()[app.selected].collapsed_children.is_none());
+        // The human has scrolled into the layout and returned to its parent.
+        // Keep that parent at the top; collapsing must not refill the list
+        // from above and move the highlight to the bottom of the screen.
+        app.scroll_offset.set(app.selected);
+        let open = capture(&app, width, height);
+        let line = open
+            .lines()
+            .position(|s| s.contains("Inspect directories"))
+            .unwrap();
+        app.leave_row();
+        let closed = capture(&app, width, height);
+        assert_eq!(
+            closed
+                .lines()
+                .position(|s| s.contains("Inspect directories")),
+            Some(line)
+        );
+        assert_eq!(app.rows()[app.selected].expansion_key.as_ref(), Some(&key));
+        assert!(app.rows()[app.selected].collapsed_children.is_some());
+        app.enter_row();
+        let reopened = capture(&app, width, height);
+        assert_eq!(
+            reopened
+                .lines()
+                .position(|s| s.contains("Inspect directories")),
+            Some(line)
+        );
+        assert!(app.rows()[app.selected].expansion_key.as_ref() == Some(&key));
     }
 }
 
@@ -1606,13 +1673,15 @@ fn node_and_gradle_family_group_frames() {
         }
         assert!(
             all.iter()
-                .filter(|r| r
-                    .cleanup_summary
-                    .as_deref()
-                    .is_some_and(|s| s.contains("· oldest")))
+                .filter(|r| r.cleanup_summary.as_deref().is_some_and(|s| !s.is_empty()))
                 .count()
                 >= 5
         );
+        assert!(all.iter().all(|row| {
+            !row.cleanup_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("oldest"))
+        }));
         check(&format!("build_families_{w}x{h}"), &capture(&app, w, h));
 
         // Project tree, groups closed: the answer to "what is this made
@@ -1669,24 +1738,23 @@ fn node_and_gradle_family_group_frames() {
             "the consequence comes first: {:?}",
             classes.cleanup_summary
         );
+        assert!(classes.unit.is_some(), "individual paths remain selectable");
         assert!(
             classes
                 .signals
                 .iter()
-                .any(|s| s == "no cleanup rule; Space still moves this exact path to Trash"),
-            "{:?}",
-            classes.signals
+                .all(|s| !s.contains("no cleanup rule"))
         );
         let pnpm = tree
             .iter()
             .find(|r| r.label == ".pnpm")
             .expect("the pnpm virtual store member");
         assert!(
-            pnpm.signals
+            pnpm.detail_lines
                 .iter()
-                .any(|s| s.starts_with("no cleanup rule (")),
-            "a shared store says what no rule covers, separately from what it is: {:?}",
-            pnpm.signals
+                .any(|s| s.contains("hardlinks shared with pnpm's store")),
+            "supporting details retain the shared-store limitation: {:?}",
+            pnpm.detail_lines
         );
         check(
             &format!("build_families_tree_open_{w}x{h}"),
@@ -1711,6 +1779,54 @@ fn plain_unit(path: &str, bytes: u64) -> swamp_tui::actions::MarkedUnit {
         worktree: None,
         label: path.to_string(),
         warnings: Vec::new(),
+    }
+}
+
+#[test]
+fn build_folder_and_model_reviews_show_decision_facts_with_optional_evidence() {
+    for (name, path, bytes, warnings) in [
+        (
+            "build_folder_review",
+            "/Users/dev/src/open-horizon-labs/swamp/target/debug/examples",
+            995_900_000,
+            vec![
+                "internal file history and subgroup hardlink attribution are not retained",
+                "moves only this selected path to Trash; stop its build before removing it; allocation is not guaranteed freed space",
+                "swamp identifies this (the cargo adapter) but has no cleanup rule for it: what else uses it is not established",
+                "swamp's selection rules for this build folder do not cover it: only this path moves, companions are not included",
+                "the next `cargo build --examples` relinks this example",
+            ],
+        ),
+        (
+            "ollama_review",
+            "/Users/dev/.ollama/models/manifests/registry.ollama.ai/library/qwen3/0.6b",
+            522_700_000,
+            vec![
+                "getting it back: downloaded again with `ollama pull qwen3:0.6b` when needed, if the registry has it (a model made with `ollama create` exists only here) (from the model's own row)",
+                "last used: Aug 30 (file access time of its model layer)",
+                "declared consumers: none found among 45 projects in 0 declared roots (incomplete)",
+                "moving this manifest frees none of its layers: the layers (522.7MB) stay in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses",
+            ],
+        ),
+    ] {
+        for (w, h) in [(80, 24), (200, 60)] {
+            let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+            app.width = w;
+            app.height = h;
+            let mut unit = plain_unit(path, bytes);
+            unit.warnings = warnings.iter().map(|warning| (*warning).into()).collect();
+            app.marked.insert(path.into(), unit);
+            app.confirm_open = true;
+            let frame = capture(&app, w, h);
+            assert!(frame.contains("Enter move to Trash"), "{frame}");
+            assert!(!frame.contains("companions are not included"), "{frame}");
+            assert!(!frame.contains("declared consumers"), "{frame}");
+            check(&format!("{name}_{w}x{h}"), &frame);
+            swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('l'));
+            let details = capture(&app, w, h);
+            assert!(!details.contains("Enter move to Trash"), "{details}");
+            check(&format!("{name}_details_{w}x{h}"), &details);
+        }
     }
 }
 
@@ -1761,7 +1877,7 @@ fn trash_review_scrolls_all_paths_and_mixed_docker_facts_before_enter() {
         assert_eq!(summary.matches(&long).count(), 1, "{summary}");
         swamp_tui::handle_key(&mut app, KeyCode::Char('l'));
         let details = capture(&app, w, h);
-        assert!(details.contains("All action and member paths"), "{details}");
+        assert!(details.contains("Paths and supporting facts"), "{details}");
         let inventory =
             swamp_tui::actions::confirm_details(&app.marked.values().cloned().collect::<Vec<_>>());
         for i in 0..5 {
@@ -1786,7 +1902,7 @@ fn trash_review_scrolls_all_paths_and_mixed_docker_facts_before_enter() {
         swamp_tui::handle_key(&mut app, KeyCode::End);
         let end = capture(&app, w, h);
         assert!(
-            end.contains("Docker items are removed permanently"),
+            end.contains("Docker has no Trash recovery"),
             "{w}x{h}:
 {end}"
         );

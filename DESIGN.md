@@ -8,21 +8,11 @@ Each row contains a name and measured size. Show signed change only where the vi
 
 Column headings name the thing being compared: Project, Folder, Build output, Dependencies, Ecosystem, Storage kind, Unassigned storage, Storage item, Docker object, Tool location, Agent storage, Disk allocation, or Location. Name truncation and padding use grapheme-aware terminal-cell widths. Badges have separating spaces. Build outputs, Dependencies and build drilldowns reserve Notes at 80 columns; Reclaim reserves If removed. These and Reclaim hide numeric change below 100 columns. Disk views omit change entirely and label facts Measurement. These views cap names at 64 cells only when notes need the remaining width. Other views hide bars below 140 columns and show facts only in selected-row details below 100 columns. Zero and unknown changes have no vertical bar. Keep the selected row visible when scrolling.
 
-Build and dependency labels lead with the project and checkout-relative path; additional checkouts carry a discriminator. Unassigned rows lead with their path. Tool labels keep the detector and identifying path suffix. Exact paths remain in selected details and action review. Reclaim table costs come from the typed regeneration class; original wording and source remain in the details. Current use, unique-copy, sharing, and unknown facts precede secondary metadata in the fixed-height detail pane. Last use keeps its source and is separate from modification age.
+Build and dependency labels lead with the project and checkout-relative path; additional checkouts carry a discriminator. Unassigned rows lead with their path. Tool labels keep the detector and identifying path suffix. Exact paths remain in selected details and action review. Reclaim table costs come from the typed regeneration class; original wording and source remain in the details. Current use, unique-copy, sharing, sourced last use and unknown facts precede secondary metadata in the fixed-height detail pane. Last use keeps its source and is separate from modification age.
 
-Collapsed build categories lead with a recommendation and removal consequence:
-start with compiler caches (slower next build), review tests/examples (rebuild
-before rerunning), and lower-priority build-script output (scripts rerun).
-Counts, allocated candidate size, and oldest known modification age follow only
-when space permits; narrow views drop these statistics before clipping advice.
-Unknown age is `?`.
-Candidate directory descendants are not counted again. Final outputs say
-`Inspect only: removes built output`, without suggesting a supported selective action.
-Other unsupported rows say `Selective cleanup unsupported`, not a safety verdict.
-Nested allocated sizes have a `*` suffix and a persistent accounting legend.
-When space remains below the tree, preview the selected category's oldest
-candidates with paths, allocated sizes, ages, and rebuilding effects. This preview
-is read-only: expand the category to select exact groups.
+Collapsed build categories lead with a recommendation and removal consequence: start with compiler caches (slower next build), review tests/examples (rebuild before rerunning), and lower-priority build-script output (scripts rerun). Item counts and selected bytes follow where space permits. Modification age belongs in supporting details, explicitly labelled; it is not last use. Final outputs say Rebuild before running again. Routine cleanup-rule and adapter explanations stay out of primary advice.
+
+Candidate directory descendants are not counted again. Nested allocated sizes have a `*` suffix and a persistent shared-file accounting legend. When space remains below the tree, preview a subset of the selected category with paths, allocated sizes, explicitly labelled modification times and rebuilding effects. This preview is read-only; expand the category to select individual members.
 
 Opening a project shows Cargo profiles with purpose-based cleanup groups:
 Compiler caches, Compiled tests & examples, and Build-script output. Groups
@@ -35,30 +25,9 @@ back newly added marks, preserving earlier selections. No virtual group is a
 directory deletion target. Age ordering applies within groups; individual members
 can be selected instead of the whole group.
 
-A build container whose interior an adapter identified in the neutral role
-vocabulary (a `node_modules`, a `dist`, a Gradle `build/`, a Maven `target/`)
-expands into one group per role family -- Build outputs, Test & coverage output,
-Caches & intermediates, Installed dependencies, Shared store entries, Tool
-metadata -- plus a Not identified group for unrecognised entries and bytes no
-unit claims. Groups start closed. Each group row leads with review guidance of at
-most 32 characters ("Start here: slower next build", "Review: reinstall from
-registry", "Shared: other projects may link"), then the count and oldest known
-modification; the adapter's own consequence, the accounting basis and
-what its cleanup rule does not cover are the row's details. That order is the point: an 80-column
-advice column shows the guidance whole and gives up the numbers first. An opened
-group lists its members oldest first (unknown ages last), each leading with its
-consequence in that ecosystem's words. Supported project-local output units can
-be selected for Trash by family; shared stores and units without a cleanup rule are marked one at a time on their own row.
-Action support comes from the adapter contract, not the role label alone. Which
-presentation a container gets follows the roles its units carry,
-never a comparison with an adapter id; Cargo containers keep the purpose groups
-above.
+A build container whose interior an adapter identified in the neutral role vocabulary (a `node_modules`, a `dist`, a Gradle `build/`, a Maven `target/`) expands into one group per role family -- Build outputs, Test & coverage output, Caches & intermediates, Installed dependencies, Shared store entries, Tool metadata -- plus a Not identified group for unrecognised entries and bytes no unit claims. Groups start closed. Each group row leads with review guidance of at most 32 characters ("Start here: slower next build", "Review: reinstall from registry", "Shared: other projects may link"), then the count; the adapter's own consequence, the accounting basis and what its cleanup rule does not cover are the row's details. That order is the point: an 80-column advice column shows the guidance whole and gives up the numbers first. An opened group lists its members oldest first (unknown ages last), each leading with its consequence in that ecosystem's words. Supported project-local output units can be selected for Trash by family; shared stores and units without a cleanup rule are marked one at a time on their own row. Action support comes from the adapter contract, not the role label alone. Which presentation a container gets follows the roles its units carry, never a comparison with an adapter id; Cargo containers keep the purpose groups above.
 
-The physical tree remains under a collapsed Inspect directories row; it is a
-second view of the same bytes, not additional storage. Physical category rows
-are navigation, not selective cleanup units. The selected-row detail area shows recommendations
-and rebuilding consequences. Compiler caches are a suggested starting point,
-not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
+Inspect directories is a structural navigation row without a duplicate size or accounting explanation. It opens the physical tree of the same storage. Expansion and collapse retain the selected item and its screen position, allowing blank rows at the bottom rather than refilling the viewport from above. Physical category rows are navigation, not selective cleanup units. The selected-row detail area shows recommendations and rebuilding consequences. Compiler caches are a suggested starting point, not a claim of obsolescence. No age-only or newest-hash-wins verdicts.
 
 The change bar grows right for an increase and left for a decrease. Its length uses a logarithmic scale relative to all changes in the current view, including off-screen rows. Changes below 1 MB use a small tick and dimmed text. The signed number supplies the rounded change; the bar is not a linear scale of bytes.
 
@@ -210,6 +179,8 @@ The chrome is the same rows in every state: header, view and filter line, the
 body, two status rows, and the key legend. Nothing resizes the body. A blocked list is a fixed 10-row sheet drawn over the bottom of the list. A plan uses a content-sized overlay, up to the terminal height minus its persistent action footer; long warning summaries scroll, while the complete path inventory is a separate optional detail view. A result stays in the status rows until the next key. A detail pane of fixed
 height sits under the list, and the list scrolls only when the selection leaves
 its window, so one Down moves the selection one row.
+
+The review summary shows restore cost, sourced last use and consequential exceptions. Known adapter, accounting, coverage and selection bookkeeping stays in optional `l` details with original wording and every path and size. Unrecognized warnings remain visible; no warning count or length cap hides them. Enter is disabled in details. Successful removals prune stored interior rows and invalidate derived caches immediately; model manifest removal retains shared payload allocation until observation remeasures it. Failed moves stay listed.
 
 Only rows inside that window are formatted into terminal cells. The complete row model still determines order, selection, totals, and growth-bar scale; scrolling does not change the scale or discard off-screen rows.
 

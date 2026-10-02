@@ -176,10 +176,10 @@ fn a_reclaim_unit_and_a_depth_two_folder_mark_and_move_to_trash() {
         "{summary}"
     );
     assert!(summary.contains("7B"), "{summary}");
-    assert!(summary.contains("Cost unknown"), "{summary}");
+    assert!(summary.contains("Cost to restore · unknown"), "{summary}");
     assert!(summary.contains("Last used · no record"), "{summary}");
     assert!(
-        summary.contains("Trash can be restored until emptied"),
+        summary.contains("Recoverable from Trash until emptied"),
         "{summary}"
     );
     let res = run_plan(&a, &f);
@@ -276,7 +276,7 @@ fn no_category_and_not_the_caches_root_is_refused() {
         );
     }
     let s = a.confirm_summary();
-    assert!(s.contains("Cannot be regenerated"), "{s}");
+    assert!(s.contains("Cannot be downloaded or rebuilt"), "{s}");
 }
 
 /// Tempting wrong patch: a protected folder is markable without telling
@@ -538,7 +538,7 @@ fn an_unreviewed_plan_offers_no_enter_even_when_the_overlay_fits() {
     a.height = 50;
     assert!(a.confirm_fits(120, 50));
     let big = frame(&a, 120, 50);
-    assert!(big.contains("Cost unknown"), "{big}");
+    assert!(big.contains("Cost to restore · unknown"), "{big}");
     assert!(big.contains("Last used · no record"), "{big}");
     assert!(a.confirm_review_is_complete(120, 50));
 }
@@ -875,10 +875,10 @@ fn a_tool_managed_row_marks_for_trash_and_keeps_its_own_command_on_backspace() {
     assert!(a.tool_sheet.is_some() || a.operation.is_some());
 }
 
-/// Long Reclaim plans scroll, and `k keep executables` is not offered for
-/// Reclaim folders alone.
+/// Grouping repeated facts lets this six-item review fit even at 60×14;
+/// `k keep executables` is not offered for Reclaim folders alone.
 #[test]
-fn the_does_not_fit_footer_is_true_and_k_is_not_offered_for_reclaim_plans() {
+fn concise_reclaim_review_fits_and_k_is_not_offered_for_reclaim_plans() {
     let f = fx();
     let mut units = Vec::new();
     for i in 0..6 {
@@ -895,7 +895,8 @@ fn the_does_not_fit_footer_is_true_and_k_is_not_offered_for_reclaim_plans() {
     assert!(a.confirm_fits(60, 14));
     let small = frame(&a, 60, 14);
     let last = small.lines().last().unwrap();
-    assert!(last.contains("Read every line"), "{last}");
+    assert!(last.contains("Enter move to Trash"), "{last}");
+    assert!(a.confirm_review_is_complete(60, 14));
     assert!(small.contains("Review actions"), "{small}");
     a.width = 200;
     a.height = 80;

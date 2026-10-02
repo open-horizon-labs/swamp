@@ -146,6 +146,8 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
             .filter_map(sentence),
     );
     out.extend(sharing.iter().cloned());
+    // Recorded use belongs before bookkeeping and generic advice.
+    out.extend(row.last_used.iter().cloned());
     let mut unknown: Vec<&str> = Vec::new();
     for e in &facts {
         if matches!(
@@ -173,10 +175,6 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
     } else if let Some(text) = row.kind.as_ref().and_then(what_it_is) {
         out.push(text.to_string());
     }
-    // The last-used fact, worded with its source by the core, is one
-    // line of its own: never blended into the modification sentence
-    // below, which is a different fact.
-    out.extend(row.last_used.iter().cloned());
     out.extend(
         row.detail_lines
             .iter()

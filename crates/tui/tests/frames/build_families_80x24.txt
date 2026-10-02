@@ -4,7 +4,7 @@
 "1 Projects  2 Tools  3 Disk                                                     "
 "Build outputs · filter: none · Compare build outputs across projects            "
 "Build output                               Size Notes                           "
-"* allocated bytes; shared files may be counted again. Age = modified            "
+"* shared files may be counted again                                             "
 "mole · target                             2.1GB Rebuild; next build slower      "
 "mole · build                            943.7MB                                 "
 "├─ Build outputs                       524.3MB* Review: a build regenerates     "

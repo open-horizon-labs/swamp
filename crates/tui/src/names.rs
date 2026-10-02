@@ -212,6 +212,67 @@ pub fn compact_warning(warning: &str) -> String {
         .unwrap_or(text)
 }
 
+/// Decision facts for the primary review. Only known bookkeeping is
+/// disclosed in details instead; unfamiliar warnings always remain visible.
+pub fn decision_warning(warning: &str) -> Option<String> {
+    let text = swamp_core::reclaim_trash::plain(warning);
+    if is_member_warning(&text)
+        || [
+            "internal file history and subgroup hardlink attribution",
+            "swamp identifies this",
+            "swamp's selection rules for this build folder",
+            "size is selected allocation, not promised free space",
+            "declared consumers: none found",
+            "who needs it: not established for this path",
+            "this is the whole folder, including the ",
+        ]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+    {
+        return None;
+    }
+    if text.starts_with("moves only this selected path to Trash;")
+        || text.starts_with("exact selected build, NOT proven obsolete;")
+    {
+        return Some("Stop builds using this folder.".into());
+    }
+    if text.starts_with("moving this manifest frees none of its layers:")
+        && let Some(bytes) = text
+            .split("the layers (")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+    {
+        return Some(format!("Model layers ({bytes}) stay in blobs/."));
+    }
+    if let Some(rest) = text.strip_prefix("last used:") {
+        return Some(format!(
+            "Last used · {}",
+            rest.trim().replace(" of its model layer", "")
+        ));
+    }
+    if text.starts_with("regeneration cost not established") {
+        return Some("Cost to restore · unknown".into());
+    }
+    if text.starts_with("getting it back:") {
+        if let Some(command) = text.split('`').nth(1) {
+            return Some(format!("Restore · {command} (if available)"));
+        }
+        let words = text.strip_prefix("getting it back:").unwrap().trim();
+        let words = words.split(" (from ").next().unwrap_or(words);
+        return Some(format!("Restore · {words}"));
+    }
+    if text.starts_with("cannot be regenerated") {
+        return Some("Cannot be downloaded or rebuilt.".into());
+    }
+    Some(compact_warning(&text))
+}
+
+pub fn decision_fact_is_note(fact: &str) -> bool {
+    ["Last used", "Restore", "Cost to restore"]
+        .iter()
+        .any(|prefix| fact.starts_with(prefix))
+}
+
 /// Whether a warning is the per-member path echo also represented in the
 /// full action inventory. Keep prefix parsing in this presentation module.
 pub fn is_member_warning(warning: &str) -> bool {

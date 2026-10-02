@@ -57,7 +57,7 @@ swamp protect remove <path>
 
 ## Removing agent-storage units: TUI only
 
-There is no CLI command that removes an agent-storage unit. Point the human to Agent storage in the TUI: `2`, then `v` three times. Space marks the unit; Backspace opens review, naming the linked project and history lost. Enter confirms after the primary summary has been displayed. `l` opens the optional path/member inventory; Esc returns to the summary, or cancels from there. See [terminal controls](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls).
+There is no CLI command that removes an agent-storage unit. Point the human to Agent storage in the TUI: `2`, then `v` three times. Space marks the unit; Backspace opens review, naming the linked project and history lost. Enter confirms after the primary summary has been displayed. `l` opens optional details with all paths, member sizes and original warnings; Esc returns to the summary, or cancels from there. See [terminal controls](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls).
 
 A session removal that partially fails (some members moved, then a
 later one could not be) leaves a `restore.json` manifest inside its

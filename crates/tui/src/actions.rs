@@ -649,7 +649,9 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
             {
                 continue;
             }
-            unit_warnings.insert(crate::names::compact_warning(warning));
+            if let Some(fact) = crate::names::decision_warning(warning) {
+                unit_warnings.insert(fact);
+            }
         }
         if u.worktree.as_ref().is_some_and(|t| t.whole_checkout) {
             unit_warnings.insert("includes the working copy, .git and source".to_string());
@@ -661,7 +663,11 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
     for (warning, targets) in warnings {
         if targets.len() == 1 {
             if units.len() == 1 {
-                lines.push(format!("! {warning}"));
+                lines.push(if crate::names::decision_fact_is_note(&warning) {
+                    warning
+                } else {
+                    format!("! {warning}")
+                });
             } else {
                 lines.push(format!("! {warning} · {}", targets[0]));
             }
@@ -673,32 +679,11 @@ pub fn confirm_summary(units: &[MarkedUnit]) -> String {
         }
     }
 
-    if units.len() > 1
-        || units.first().is_some_and(|u| {
-            u.cargo_unit
-                .as_ref()
-                .is_some_and(|p| p.cargo_group().is_some())
-                || u.session_members.is_some()
-        })
-    {
-        lines.push("Enter applies this plan · l inspects every action and member path.".into());
-    } else {
-        lines.push("Enter applies this action.".into());
-    }
-
     if trash_n > 0 {
-        lines.push(
-            "Trash can be restored until emptied; space is freed when Trash is emptied.".into(),
-        );
+        lines.push("Recoverable from Trash until emptied.".into());
     }
     if docker_n > 0 {
-        lines.push("Docker items are removed permanently; Docker has no Trash recovery.".into());
-    }
-    if units.iter().any(|u| u.reclaim.is_some()) {
-        lines.push(
-            "Enter rechecks each folder and whether anything holds it open before moving it."
-                .into(),
-        );
+        lines.push("Docker has no Trash recovery.".into());
     }
     lines.join("\n")
 }
@@ -755,9 +740,7 @@ fn common_parent(paths: &[PathBuf]) -> String {
 /// Full path inventory is deliberately separate from the compact summary.
 pub fn confirm_details(units: &[MarkedUnit]) -> String {
     let count = |n: usize| swamp_core::render::human_count(n as u64);
-    let mut lines = vec![
-        "All action and member paths; member byte figures are details, not extra totals.".into(),
-    ];
+    let mut lines = vec!["Paths and supporting facts".into()];
     for u in units {
         let action_kind = u.docker.as_ref().map(|removal| match removal {
             swamp_core::docker::Removal::Image { .. } => "Docker image",
@@ -787,7 +770,7 @@ pub fn confirm_details(units: &[MarkedUnit]) -> String {
             {
                 continue;
             }
-            unit_warnings.insert(crate::names::compact_warning(warning));
+            unit_warnings.insert(swamp_core::reclaim_trash::plain(warning));
         }
         for warning in unit_warnings {
             lines.push(format!("  ! {warning}"));
@@ -864,7 +847,7 @@ mod tests {
         assert!(!summary.to_lowercase().contains("permanent"));
         assert!(summary.contains("Review 1 action"));
         assert!(summary.contains("TRASH · 10B · /x"));
-        assert!(summary.contains("Trash can be restored until emptied"));
+        assert!(summary.contains("Recoverable from Trash until emptied"));
     }
 
     #[test]
@@ -879,15 +862,80 @@ mod tests {
             ],
             ..unit("/cache/model", 1024, None)
         };
-        let summary = confirm_summary(&[u]);
+        let summary = confirm_summary(std::slice::from_ref(&u));
+        let details = confirm_details(&[u]);
+        assert!(summary.contains("Cost to restore · unknown"), "{summary}");
         assert!(
-            summary
-                .contains("Cost unknown · no record of its download source · source the model row"),
-            "{summary}"
+            details.contains("no record of its download source (from the model row)"),
+            "{details}"
         );
         assert!(summary.contains("Last used · no record"), "{summary}");
-        assert!(summary.contains("Consumers · not established"), "{summary}");
+        assert!(
+            !summary.contains("Consumers · not established"),
+            "{summary}"
+        );
+        assert!(
+            details.contains("who needs it: not established"),
+            "{details}"
+        );
         assert!(summary.contains("shared blobs remain"), "{summary}");
+    }
+
+    #[test]
+    fn model_review_leads_with_use_and_the_layers_left_behind() {
+        let u = MarkedUnit {
+            warnings: vec![
+                "getting it back: downloaded again with `ollama pull qwen3:0.6b` when needed, if the registry has it (a model made with `ollama create` exists only here); size 522.7MB (from the model's own row)".into(),
+                "last used: Aug 30 (file access time of its model layer)".into(),
+                "declared consumers: none found among 45 projects in 0 declared roots (incomplete)".into(),
+                "moving this manifest frees none of its layers: the layers (522.7MB) stay in blobs/; `ollama rm qwen3:0.6b` removes the model and the layers no other model uses".into(),
+            ],
+            ..unit("/home/me/.ollama/models/manifests/library/qwen3/0.6b", 522_700_000, None)
+        };
+        let summary = confirm_summary(std::slice::from_ref(&u));
+        assert!(summary.lines().count() <= 6, "{summary}");
+        assert!(summary.contains("Restore · ollama pull qwen3:0.6b (if available)"));
+        assert!(summary.contains("Last used · Aug 30 (file access time)"));
+        assert!(summary.contains("Model layers (522.7MB) stay in blobs/."));
+        assert!(!summary.contains("declared roots"));
+        let details = confirm_details(&[u]);
+        assert!(details.contains("ollama create"));
+        assert!(details.contains("45 projects"));
+        assert!(details.contains("ollama rm qwen3:0.6b"));
+    }
+
+    #[test]
+    fn known_bookkeeping_is_disclosed_but_unfamiliar_and_destructive_facts_stay_visible() {
+        let u = MarkedUnit {
+            warnings: vec![
+                "internal file history and subgroup hardlink attribution are not retained".into(),
+                "swamp's selection rules for this build folder do not cover it: only this path moves, companions are not included".into(),
+                "moves only this selected path to Trash; stop its build before removing it; allocation is not guaranteed freed space".into(),
+                "cannot be regenerated: unique local data (from sessions)".into(),
+                "in use right now: compiler pid 123".into(),
+                "swamp keeps this by default (credentials): the tool may sign out".into(),
+                "new adapter warning: destroys the only recovery key".into(),
+            ],
+            ..unit("/work/project/examples", 1000, None)
+        };
+        let summary = confirm_summary(std::slice::from_ref(&u));
+        for fact in [
+            "Cannot be downloaded or rebuilt",
+            "compiler pid 123",
+            "swamp keeps this by default",
+            "destroys the only recovery key",
+            "Stop builds",
+        ] {
+            assert!(summary.contains(fact), "missing {fact}: {summary}");
+        }
+        for bookkeeping in [
+            "internal file history",
+            "selection rules",
+            "companions are not included",
+        ] {
+            assert!(!summary.contains(bookkeeping), "{summary}");
+            assert!(confirm_details(std::slice::from_ref(&u)).contains(bookkeeping));
+        }
     }
 
     #[test]

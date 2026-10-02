@@ -906,8 +906,7 @@ pub fn tree_rows_with_agents(
                     if closed { "▸" } else { "▾" }
                 );
                 out_row.collapsed_children = closed.then_some(cargo_children.len());
-                out_row.signals =
-                    vec!["build folders below · disk use, not what deleting frees".into()];
+                out_row.signals.clear();
                 out.push(out_row);
                 if !closed {
                     out.extend(cargo_children);
@@ -989,7 +988,7 @@ const FAMILY_MEMBERS_SHOWN: usize = 25;
 /// accounts for.
 ///
 /// Each group row leads with **review guidance and what removing it
-/// costs** (`family_guidance`), then the count and oldest modification,
+/// costs** (`family_guidance`), then the count,
 /// so a narrow terminal gives up the numbers before the meaning -- the
 /// same ordering as Cargo's purpose groups. The adapter's own
 /// consequence, the accounting basis and the action capability are the
@@ -1056,19 +1055,10 @@ fn family_tree_children_of(
         row.allocated = true;
         row.mtime_max = f.oldest_modified.unwrap_or(0);
         row.cleanup_summary = Some(format!(
-            "{} · {} {} · oldest {}{}",
+            "{} · {} {}",
             f.recommendation,
             f.count,
-            if f.count == 1 { "item" } else { "items" },
-            match f.oldest_modified {
-                Some(t) => age_label(Some(observed_at.saturating_sub(t))),
-                None => "unknown".into(),
-            },
-            if f.unknown_age > 0 {
-                format!(" · {} of unknown age", f.unknown_age)
-            } else {
-                String::new()
-            }
+            if f.count == 1 { "item" } else { "items" }
         ));
         let mut signals = vec![match (&f.consequence, f.other_consequences) {
             (Some(c), 0) => c.clone(),
@@ -1081,11 +1071,9 @@ fn family_tree_children_of(
             .filter(|u| u.action == swamp_core::artifact::NestedActionCapability::TrashPath)
             .count();
         signals.push(if actionable > 0 {
-            format!(
-                "Space marks {actionable} exact paths; any other item is marked one at a time, on its own row"
-            )
+            format!("Space selects {actionable} items; expand to choose individually")
         } else {
-            "no cleanup rule covers these: Space on an item moves that exact path to Trash".into()
+            "Expand to choose individual items".into()
         });
         signals.push(match f.basis {
             swamp_core::artifact::AccountingBasis::Unknown => {
@@ -1208,29 +1196,11 @@ fn family_member_row(
             None => "unknown".into(),
         }
     ));
-    let action = match &u.action {
-        swamp_core::artifact::NestedActionCapability::TrashPath => {
-            "Space marks this exact path for Trash".into()
-        }
-        swamp_core::artifact::NestedActionCapability::Unsupported { reason } => {
-            format!("no cleanup rule ({reason}); Space still moves this exact path to Trash")
-        }
-        swamp_core::artifact::NestedActionCapability::InspectionOnly => {
-            "no cleanup rule; Space still moves this exact path to Trash".into()
-        }
-    };
-    row.signals = vec![
-        u.role.label().to_string(),
-        action,
-        format!(
-            "{} bytes ({})",
-            u.basis.label(),
-            u.adapter
-                .clone()
-                .unwrap_or_else(|| "unknown adapter".into())
-        ),
-    ];
+    row.signals = vec![u.role.label().to_string()];
     row.signals.extend(u.coverage.limits.iter().cloned());
+    if let swamp_core::artifact::NestedActionCapability::Unsupported { reason } = &u.action {
+        row.detail_lines.push(reason.clone());
+    }
     // A model's own facts: what it is leads the label and the detail pane.
     if u.adapter.as_deref() == Some("model-stores")
         && let Some(m) = swamp_core::build_adapters::model_stores::model_row_of(u, observed_at)
@@ -1238,6 +1208,7 @@ fn family_member_row(
         if let Some(a) = &m.about {
             row.label = format!("{} · {a}", row.label);
         }
+        row.last_used = Some(format!("Last used: {}", m.last_read));
         row.detail_lines.extend(model_detail_lines(&m));
     }
     // Every present path is one the person may move to Trash. A path no
@@ -1343,40 +1314,27 @@ fn cargo_children_from_index(
         row.cleanup_summary = Some(if unit.bytes == 0 {
             "Empty".into()
         } else if swamp_core::cargo_cleanup::candidate(unit) {
-            format!(
-                "{advice} · modified {}",
-                age_label(swamp_core::cargo_cleanup::modified_age_secs(
-                    unit,
-                    observed_at
-                ))
-            )
+            advice.to_string()
         } else if candidates > 0 {
-            row.signals.push(format!("{candidates} items you can clean · {} · oldest changed {} ago. Expand to pick; freed space may be less.", human_bytes(bytes), age_label(oldest)));
+            row.detail_lines.push(format!(
+                "{candidates} selected items · {} · oldest modified {} ago",
+                human_bytes(bytes),
+                age_label(oldest)
+            ));
             format!(
-                "{advice} · {candidates} {} · {} · oldest {}",
+                "{advice} · {candidates} {} · {}",
                 if candidates == 1 {
                     "candidate"
                 } else {
                     "candidates"
                 },
-                human_bytes(bytes),
-                age_label(oldest)
+                human_bytes(bytes)
             )
         } else if unit.role == swamp_core::artifact::ArtifactRole::FinalOutput {
-            row.signals.insert(
-                0,
-                "Compiled output: Space moves this exact path to Trash; companions are not included"
-                    .into(),
-            );
-            format!(
-                "Removes built output · modified {}",
-                age_label(swamp_core::cargo_cleanup::modified_age_secs(
-                    unit,
-                    observed_at
-                ))
-            )
+            row.signals.insert(0, "Rebuild before running again".into());
+            "Rebuild before running again".into()
         } else {
-            "No cleanup rule covers it; Space moves this exact path to Trash".into()
+            "".into()
         });
         row.mtime_max = unit.mtime_max;
         row.unit = Some(UnitId::for_artifact(&unit.path));
@@ -1406,8 +1364,9 @@ fn cargo_children_from_index(
                 );
                 layout.expandable = true;
                 layout.expansion_key = Some(layout_key.clone());
-                layout.allocated = true;
-                layout.cleanup_summary = Some("Same bytes by path; not extra storage".into());
+                // Structural navigation repeats the profile, not another allocation.
+                layout.size_text = Some(String::new());
+                layout.collapsed_children = collapsed.contains(&layout_key).then_some(count);
                 rows.push(layout);
                 if !collapsed.contains(&layout_key) {
                     rows.extend(cargo_children_from_index(
@@ -1570,10 +1529,6 @@ fn append_cleanup_group(
         return;
     }
     let bytes = members.iter().map(|u| u.bytes).sum();
-    let oldest = members
-        .iter()
-        .filter_map(|u| swamp_core::cargo_cleanup::modified_age_secs(u, report.observed_at))
-        .max();
     let mut row = Row::leaf(depth, label.into(), bytes, None);
     row.rail = format!(
         "{prefix}{}{}",
@@ -1588,16 +1543,13 @@ fn append_cleanup_group(
     row.expansion_key = Some(key.clone());
     row.allocated = true;
     row.cleanup_summary = Some(format!(
-        "{effect} · {} items · oldest {}",
+        "{effect} · {} {}",
         members.len(),
-        age_label(oldest)
+        if members.len() == 1 { "item" } else { "items" }
     ));
     row.signals = vec![
         effect.into(),
-        format!(
-            "Space marks all {} items; → lists them. Source and unrelated dependencies are never picked. Freed space may be less than the size.",
-            members.len()
-        ),
+        format!("Space selects {} items; → lists them", members.len()),
     ];
     rows.push(row);
     if collapsed.contains(&key) {
@@ -2002,7 +1954,7 @@ fn kind_filtered_rows(report: &Report, kinds: &[ArtifactKind], filter: &Filter) 
 /// The ordering inside a row is deliberate and is the same one the
 /// Cargo purpose groups use: **what this is and what losing it costs**
 /// comes first, because that is the question, and the count, size and
-/// oldest modification follow when the width allows. A row that has to
+/// selected item count follow when the width allows. A row that has to
 /// be truncated loses the numbers, not the consequence.
 ///
 /// These rows are not selectable. Cargo's groups carry a `unit` because
@@ -2546,7 +2498,7 @@ fn model_tag_row(m: &swamp_core::build_adapters::model_stores::ModelRow, last: b
         format!("last read {}", m.last_read),
         "its layers are the bytes of blobs/ above, not more".to_string(),
     ];
-    row.last_used = Some(format!("Last read: {}", m.last_read));
+    row.last_used = Some(format!("Last used: {}", m.last_read));
     row.detail_lines = model_detail_lines(m);
     row.unit = Some(UnitId::for_artifact(std::path::Path::new(&m.path)));
     row.individual_only = true;
@@ -3008,18 +2960,15 @@ pub fn disk_rows(
             "├─ ".into()
         };
         c.allocated = true;
-        c.signals = vec![
-            r.exactness.as_str().replace('_', " "),
-            format!(
-                "{} {}",
-                if r.bytes.is_some() {
-                    "measured"
-                } else {
-                    "recorded"
-                },
-                age(r.measured_at)
-            ),
-        ];
+        c.signals = vec![format!(
+            "{} {}",
+            if r.bytes.is_some() {
+                "measured"
+            } else {
+                "recorded"
+            },
+            age(r.measured_at)
+        )];
         // A measured folder is a real path the person may move to Trash.
         // A ledger row for "files directly here" is a figure, not a path.
         if r.bytes.is_some()
@@ -3088,7 +3037,7 @@ pub fn disk_rows(
             "├─ ".into()
         };
         c.allocated = true;
-        c.signals = vec![v.exactness.as_str().replace('_', " ")];
+        c.signals = Vec::new();
         rows.push(c);
     }
 
@@ -3311,7 +3260,7 @@ pub fn disk_gaps_rows(ledger: &swamp_core::volume_ledger::LedgerReading) -> Vec<
             "├─ ".into()
         };
         c.allocated = true;
-        c.signals = vec![r.exactness.as_str().replace('_', " ")];
+        c.signals = Vec::new();
         if r.bytes.is_some()
             && std::path::Path::new(&r.path).is_absolute()
             && !r

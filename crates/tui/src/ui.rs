@@ -473,7 +473,7 @@ fn confirm_lines(app: &App) -> Vec<(String, Color)> {
         app.marked.values().any(|u| u.cargo_unit.is_some()),
     ) {
         lines.push((
-            "Saved Keep executables setting conflicts with selective Cargo removal; press k to turn it off.".into(),
+            "Turn off Keep executables with k to remove these Cargo items.".into(),
             Color::Yellow,
         ));
     }
@@ -612,9 +612,9 @@ fn draw_confirm_overlay(frame: &mut Frame, app: &App, screen: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(if app.confirm_details_open {
-            " All action paths · Esc summary "
+            " Details · Esc summary "
         } else {
-            " Review actions · l inspect paths "
+            " Review actions · l details "
         });
     let inner = block.inner(area);
     let visible = usize::from(inner.height);
@@ -1064,7 +1064,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             clauses.push("d blocked");
         }
         if !app.confirm_details_open && app.confirm_fits(size.width, size.height) {
-            clauses.insert(1, "l inspect paths");
+            clauses.insert(1, "l details");
         }
         // Selective Cargo groups cannot use the executable-copy mode.
         if !app.marked.values().all(|u| u.reclaim.is_some())
@@ -1957,11 +1957,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         Style::default().add_modifier(Modifier::BOLD),
     )];
     if cleanup_view || rows.iter().any(|r| r.allocated) {
-        lines.push(Line::raw(if cleanup_view {
-            "* allocated bytes; shared files may be counted again. Age = modified"
-        } else {
-            "* allocated bytes; shared files may be counted again"
-        }));
+        lines.push(Line::raw("* shared files may be counted again"));
     }
     if let Some(line) = &reclaim_line {
         lines.push(Line::styled(
@@ -1985,7 +1981,9 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
     } else if visible > 0 && app.selected >= offset + visible {
         offset = app.selected + 1 - visible;
     }
-    offset = offset.min(rows.len().saturating_sub(visible));
+    // Preserve the selected row’s screen position when a branch shrinks.
+    // Refilling the bottom would move the entire tree under the cursor.
+    offset = offset.min(rows.len().saturating_sub(1));
     app.scroll_offset.set(offset);
     // Only visible rows need terminal-cell formatting and mark decoration.
     // The full row set above still owns ordering, totals and growth-bar scale.
@@ -2229,7 +2227,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
             let capacity = spare.saturating_sub(2) as usize;
             let mut preview = vec![Line::styled(
                 format!(
-                    "Oldest candidates · showing {} of {} · → expand to select",
+                    "Selected group · showing {} of {} · → expand",
                     candidates.len().min(capacity),
                     candidates.len()
                 ),
