@@ -458,6 +458,26 @@ pub fn max_abs_growth<'a>(rows: impl Iterator<Item = &'a Row>) -> i64 {
 /// tag in table order then size, age oldest first (unknown age last). A
 /// stable sort keeps report order as the tiebreak; `reverse` flips the
 /// whole order.
+/// Sort tool roots while preserving each expanded subtree.
+pub fn apply_root_sort(rows: &mut Vec<Row>, sort: Sort, reverse: bool) {
+    let mut groups: Vec<Vec<Row>> = Vec::new();
+    for row in std::mem::take(rows) {
+        if row.depth == 0 || groups.is_empty() {
+            groups.push(Vec::new());
+        }
+        groups.last_mut().unwrap().push(row);
+    }
+    let mut roots: Vec<Row> = groups.iter().map(|g| g[0].clone()).collect();
+    apply_sort(&mut roots, sort, reverse);
+    for root in roots {
+        let at = groups
+            .iter()
+            .position(|g| g[0].unit == root.unit && g[0].label == root.label)
+            .unwrap();
+        rows.extend(groups.remove(at));
+    }
+}
+
 pub fn apply_sort(rows: &mut [Row], sort: Sort, reverse: bool) {
     fn type_rank(r: &Row) -> usize {
         r.ecosystems
@@ -4033,5 +4053,30 @@ mod tests {
             nested_artifacts: Vec::new(),
         };
         assert_eq!(docker_unowned_bytes(&report), 100);
+    }
+}
+
+#[cfg(test)]
+mod tool_root_sort_tests {
+    use super::*;
+    #[test]
+    fn sorting_tool_roots_keeps_versions_with_their_parent() {
+        let mut rows = vec![
+            Row::leaf(0, "rustup".into(), 100, None),
+            Row::leaf(1, "stable".into(), 90, None),
+            Row::leaf(1, "nightly".into(), 10, None),
+            Row::leaf(0, "mise".into(), 200, None),
+            Row::leaf(1, "python".into(), 150, None),
+        ];
+        apply_root_sort(&mut rows, Sort::Size, false);
+        assert_eq!(
+            rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+            ["mise", "python", "rustup", "stable", "nightly"]
+        );
+        apply_root_sort(&mut rows, Sort::Size, true);
+        assert_eq!(
+            rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(),
+            ["rustup", "stable", "nightly", "mise", "python"]
+        );
     }
 }
