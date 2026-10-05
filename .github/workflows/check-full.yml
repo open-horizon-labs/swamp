@@ -53,71 +53,82 @@ jobs:
   linux-x86_64-check-full:
     name: Linux x86_64 (check-full)
     if: github.event_name != 'pull_request' || github.event.label.name == 'full-check'
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && github.repository == 'open-horizon-labs/swamp' && (github.event_name
+      != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","builder:3555d11a4f2605e479b2"]')
+      || 'ubuntu-24.04' }}
     timeout-minutes: 90
     env:
-      # Test fixtures make git commits; never let them reach a signing
-      # agent on the runner.
-      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_COUNT: '1'
       GIT_CONFIG_KEY_0: commit.gpgsign
-      GIT_CONFIG_VALUE_0: "false"
+      GIT_CONFIG_VALUE_0: 'false'
+      GH_BUILDER_ID: 2ee3d075093275c6064c1c27cc625f9b4ce4e29c50795e4dd445ab72e8027f94
+      SCCACHE_S3_KEY_PREFIX: builders/open-horizon-labs/swamp/2ee3d075093275c6064c1c27cc625f9b4ce4e29c50795e4dd445ab72e8027f94/
+      RUSTC_WRAPPER: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && github.repository == 'open-horizon-labs/swamp' && (github.event_name
+        != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'sccache' || '' }}
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
-          components: rustfmt, clippy
-
-      - name: Cargo cache
-        if: vars.LOCAL_LINUX_CI_ENABLED != 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: check-full-linux-x86_64
-
-      # The sweep already passed for this clippy version and these inputs?
-      # The key is both, so a new clippy or a changed input misses and the
-      # sweep runs. The marker is saved only after it passes (below).
-      - name: Mutation sweep key
-        id: sweepkey
-        run: |
-          clippy=$(cargo clippy --version | tr -c 'A-Za-z0-9.\n' '-')
-          echo "key=mutation-sweep-passed-$clippy-${{ hashFiles('crates/source-audit/**', 'crates/*/clippy.toml', 'crates/core/src/fs_gate/**', 'crates/core/src/lib.rs', 'crates/cli/src/main.rs', 'crates/tui/src/lib.rs', '.oh/guardrails/**', 'rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}" >> "$GITHUB_OUTPUT"
-
-      - name: Mutation sweep already passed?
-        id: sweeppassed
-        uses: actions/cache/restore@v4
-        with:
-          path: sweep-passed
-          key: ${{ steps.sweepkey.outputs.key }}
-          lookup-only: true
-
-      - name: Mutation sweep needed?
-        id: sweep
-        run: echo "verdict=$(scripts/sweep-needed.sh '${{ steps.sweeppassed.outputs.cache-hit }}')" >> "$GITHUB_OUTPUT"
-
-      # scripts/check-full.sh runs scripts/check.sh, then the compile-fail
-      # cases, the mutation sweep and the cost test once each. The cost
-      # test's own Linux contract (`reviewer_cost_measurement_stack3`'s
-      # `linux_contract`) only runs where this job runs it.
-      - name: scripts/check-full.sh
-        env:
-          SWAMP_SKIP_MUTATION_SWEEP: ${{ steps.sweep.outputs.verdict == 'skip' && '1' || '' }}
-        run: scripts/check-full.sh
-
-      # Reached only when the whole tier passed, so a marker exists only
-      # for a sweep that passed.
-      - name: Record that the mutation sweep passed
-        if: steps.sweep.outputs.verdict == 'run'
-        run: mkdir -p sweep-passed && date -u > sweep-passed/at
-
-      - name: Save the mutation sweep marker
-        if: steps.sweep.outputs.verdict == 'run'
-        uses: actions/cache/save@v4
-        with:
-          path: sweep-passed
-          key: ${{ steps.sweepkey.outputs.key }}
+    - name: Activate shared builder
+      shell: bash
+      run: |
+        echo 'CARGO_HOME=/opt/gh-builder/cargo' >> "$GITHUB_ENV"
+        echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
+        cat /opt/gh-builder/path >> "$GITHUB_PATH"
+        cat /opt/gh-builder/env >> "$GITHUB_ENV"
+        export CARGO_HOME=/opt/gh-builder/cargo RUSTUP_HOME=/opt/gh-builder/rustup
+        export PATH=/opt/gh-builder/cargo/bin:$PATH
+        export RUSTUP_TOOLCHAIN=stable
+        rustup update stable --no-self-update
+        rustup component add rustfmt clippy --toolchain stable
+        rustup target add x86_64-unknown-linux-gnu --toolchain stable
+        echo 'RUSTUP_TOOLCHAIN=stable' >> "$GITHUB_ENV"
+        compiler=$(rustc -vV | sed -n 's/^commit-hash: //p')
+        echo "SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX}${compiler}/" >> "$GITHUB_ENV"
+    - uses: actions/checkout@v5
+    - name: Cargo cache
+      if: vars.LOCAL_LINUX_CI_ENABLED != 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: check-full-linux-x86_64
+    - name: Mutation sweep key
+      id: sweepkey
+      run: |
+        clippy=$(cargo clippy --version | tr -c 'A-Za-z0-9.\n' '-')
+        echo "key=mutation-sweep-passed-$clippy-${{ hashFiles('crates/source-audit/**', 'crates/*/clippy.toml', 'crates/core/src/fs_gate/**', 'crates/core/src/lib.rs', 'crates/cli/src/main.rs', 'crates/tui/src/lib.rs', '.oh/guardrails/**', 'rust-toolchain.toml', 'Cargo.toml', 'Cargo.lock') }}" >> "$GITHUB_OUTPUT"
+    - name: Mutation sweep already passed?
+      id: sweeppassed
+      uses: actions/cache/restore@v4
+      with:
+        path: sweep-passed
+        key: ${{ steps.sweepkey.outputs.key }}
+        lookup-only: true
+    - name: Mutation sweep needed?
+      id: sweep
+      run: echo "verdict=$(scripts/sweep-needed.sh '${{ steps.sweeppassed.outputs.cache-hit }}')" >> "$GITHUB_OUTPUT"
+    - name: scripts/check-full.sh
+      env:
+        SWAMP_SKIP_MUTATION_SWEEP: ${{ steps.sweep.outputs.verdict == 'skip' && '1' || '' }}
+      run: scripts/check-full.sh
+    - name: Record that the mutation sweep passed
+      if: steps.sweep.outputs.verdict == 'run'
+      run: mkdir -p sweep-passed && date -u > sweep-passed/at
+    - name: Save the mutation sweep marker
+      if: steps.sweep.outputs.verdict == 'run'
+      uses: actions/cache/save@v4
+      with:
+        path: sweep-passed
+        key: ${{ steps.sweepkey.outputs.key }}
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ !(vars.LOCAL_LINUX_CI_ENABLED == 'true' && github.repository == 'open-horizon-labs/swamp' && (github.event_name
+        != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && 'ghcr.io/open-horizon-labs/swamp@sha256:c63025de4b0d4a84336fa59a1df33119497755a9b1d7e04b1d910ee3e2b004d7'
+        || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
   macos-arm64-check-full:
     name: macOS arm64 (check-full)

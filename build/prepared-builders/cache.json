@@ -1,0 +1,8 @@
+{
+  "repository": "open-horizon-labs/swamp",
+  "builder_identity": "2ee3d075093275c6064c1c27cc625f9b4ce4e29c50795e4dd445ab72e8027f94",
+  "sccache_s3_key_prefix": "builders/open-horizon-labs/swamp/2ee3d075093275c6064c1c27cc625f9b4ce4e29c50795e4dd445ab72e8027f94/",
+  "mutable_state": "isolated per job",
+  "target_snapshot": "not enabled; measure before integrating",
+  "compiler_suffix": "active rustc commit appended at activation"
+}

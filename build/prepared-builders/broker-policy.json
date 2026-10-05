@@ -1,0 +1,13 @@
+{
+  "builderImages": {
+    "builder:3555d11a4f2605e479b2": {
+      "image": "192.168.1.36:5443/fleet/rust-stable-linux@sha256:c1bae7784779aa6a9ad83deba1b82db3a6b7d534b2023e7805d27f1a9ad30965",
+      "repositories": [
+        "open-horizon-labs/swamp"
+      ],
+      "capability": "linux-general",
+      "cpu": 8,
+      "memory": "12g"
+    }
+  }
+}
