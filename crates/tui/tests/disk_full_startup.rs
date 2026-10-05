@@ -94,6 +94,9 @@ fn startup_on_a_full_disk_shows_the_stored_report_and_banner_without_observing()
         "no observation worker may be started"
     );
     assert!(app.observing.is_none());
+    // Drain any queued writer before checking: otherwise an asynchronous write
+    // can land after the assertion and make this regression timing-dependent.
+    app.flush_ui_state();
     assert_eq!(listing(store.path()), before, "startup wrote to the store");
 
     let backend = TestBackend::new(200, 24);

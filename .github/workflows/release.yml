@@ -115,62 +115,88 @@ jobs:
 
   linux-x86_64:
     name: Linux x86_64 (Ubuntu 24.04)
-    # The selected validation baseline. The binary built here links the
-    # glibc of this image; the smoke step records the newest glibc symbol
-    # version it requires, which is the documented minimum.
-    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && fromJSON('["self-hosted","linux","x64","linux-general"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && github.repository == 'open-horizon-labs/swamp' && (github.event_name
+      != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","linux","x64","builder:3555d11a4f2605e479b2"]')
+      || 'ubuntu-24.04' }}
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Cargo cache
-        if: vars.LOCAL_LINUX_CI_ENABLED != 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-linux-x86_64
-
-      - name: Version
-        id: v
-        run: ./scripts/release-version.sh >> "$GITHUB_OUTPUT"
-
-      # swamp-core's `testing` feature is test-fixture API. Only
-      # `[dev-dependencies]` enable it, and resolver 2 never unifies those
-      # into this build; refuse a graph that says otherwise before
-      # building what ships (the full-check test job has it on by design).
-      - name: Release graph has no test-fixture API
-        run: |
-          set -euo pipefail
-          if cargo tree -p swamp -e normal,build,features --prefix none --locked --target x86_64-unknown-linux-gnu |
-            grep -q 'swamp-core feature "testing"'; then
-            echo 'the swamp binary would enable swamp-core/testing' >&2
-            exit 1
-          fi
-
-      - name: Build (release, x86_64-unknown-linux-gnu, generic x86-64)
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p swamp
-
-      - name: Package
-        run: ./scripts/package-release.sh x86_64-unknown-linux-gnu "${{ steps.v.outputs.version }}" target/x86_64-unknown-linux-gnu/release/swamp dist
-
-      - name: Smoke, linkage and minimum glibc (the extracted archive)
-        run: |
-          set -euo pipefail
-          ./scripts/release-smoke.sh "dist/swamp-${{ steps.v.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" "${{ steps.v.outputs.version }}" dist/smoke
-          ./scripts/release-smoke.sh dist/swamp-x86_64-unknown-linux-gnu.tar.gz "${{ steps.v.outputs.version }}"
-          ./scripts/platform-isolation.sh linkage target/x86_64-unknown-linux-gnu/release/swamp
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: swamp-x86_64-unknown-linux-gnu
-          path: |
-            dist/*.tar.gz
-            dist/*.sha256
-            dist/smoke/*
+    - name: Activate shared builder
+      shell: bash
+      run: |
+        echo 'CARGO_HOME=/opt/gh-builder/cargo' >> "$GITHUB_ENV"
+        echo 'RUSTUP_HOME=/opt/gh-builder/rustup' >> "$GITHUB_ENV"
+        cat /opt/gh-builder/path >> "$GITHUB_PATH"
+        cat /opt/gh-builder/env >> "$GITHUB_ENV"
+        export CARGO_HOME=/opt/gh-builder/cargo RUSTUP_HOME=/opt/gh-builder/rustup
+        export PATH=/opt/gh-builder/cargo/bin:$PATH
+        export RUSTUP_TOOLCHAIN=stable
+        rustup update stable --no-self-update
+        rustup component add rustfmt clippy --toolchain stable
+        rustup target add x86_64-unknown-linux-gnu --toolchain stable
+        echo 'RUSTUP_TOOLCHAIN=stable' >> "$GITHUB_ENV"
+        compiler=$(rustc -vV | sed -n 's/^commit-hash: //p')
+        export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX}${compiler}/"
+        echo "SCCACHE_S3_KEY_PREFIX=$SCCACHE_S3_KEY_PREFIX" >> "$GITHUB_ENV"
+        if [ "${RUSTC_WRAPPER:-}" = sccache ]; then
+          # The base runner starts its daemon before Actions provides job env.
+          # Restart before compiling so the daemon adopts this consumer's namespace.
+          sccache --stop-server >/dev/null 2>&1 || true
+          sccache --start-server
+          sccache --show-stats
+        fi
+    - uses: actions/checkout@v5
+    - name: Cargo cache
+      if: vars.LOCAL_LINUX_CI_ENABLED != 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: release-linux-x86_64
+    - name: Version
+      id: v
+      run: ./scripts/release-version.sh >> "$GITHUB_OUTPUT"
+    - name: Release graph has no test-fixture API
+      run: |
+        set -euo pipefail
+        if cargo tree -p swamp -e normal,build,features --prefix none --locked --target x86_64-unknown-linux-gnu |
+          grep -q 'swamp-core feature "testing"'; then
+          echo 'the swamp binary would enable swamp-core/testing' >&2
+          exit 1
+        fi
+    - name: Build (release, x86_64-unknown-linux-gnu, generic x86-64)
+      run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p swamp
+    - name: Package
+      run: ./scripts/package-release.sh x86_64-unknown-linux-gnu "${{ steps.v.outputs.version }}" target/x86_64-unknown-linux-gnu/release/swamp
+        dist
+    - name: Smoke, linkage and minimum glibc (the extracted archive)
+      run: |
+        set -euo pipefail
+        ./scripts/release-smoke.sh "dist/swamp-${{ steps.v.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz" "${{ steps.v.outputs.version }}" dist/smoke
+        ./scripts/release-smoke.sh dist/swamp-x86_64-unknown-linux-gnu.tar.gz "${{ steps.v.outputs.version }}"
+        ./scripts/platform-isolation.sh linkage target/x86_64-unknown-linux-gnu/release/swamp
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: swamp-x86_64-unknown-linux-gnu
+        path: |
+          dist/*.tar.gz
+          dist/*.sha256
+          dist/smoke/*
+    env:
+      GH_BUILDER_ID: 2ee3d075093275c6064c1c27cc625f9b4ce4e29c50795e4dd445ab72e8027f94
+      SCCACHE_S3_KEY_PREFIX: builders/open-horizon-labs/swamp/2ee3d075093275c6064c1c27cc625f9b4ce4e29c50795e4dd445ab72e8027f94/
+      RUSTC_WRAPPER: ${{ vars.LOCAL_LINUX_CI_ENABLED == 'true' && github.repository == 'open-horizon-labs/swamp' && (github.event_name
+        != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'sccache' || '' }}
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: write
+      packages: read
+    container:
+      image: ${{ !(vars.LOCAL_LINUX_CI_ENABLED == 'true' && github.repository == 'open-horizon-labs/swamp' && (github.event_name
+        != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) && 'ghcr.io/open-horizon-labs/swamp@sha256:c63025de4b0d4a84336fa59a1df33119497755a9b1d7e04b1d910ee3e2b004d7'
+        || '' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
 
   linux-x86_64-newer:
     name: Linux x86_64 (newest hosted Ubuntu, archive-only)

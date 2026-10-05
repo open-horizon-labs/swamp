@@ -1,0 +1,10 @@
+{
+  "tools_package": "ghcr.io/open-horizon-labs/swamp",
+  "consuming_repository": "open-horizon-labs/swamp",
+  "required_package_permission": "Actions read access for this repository; workflow packages:read alone does not grant it",
+  "fleet_registry": "192.168.1.36:5443",
+  "policy_merge": "extend existing repositories without replacing current approvals",
+  "verification": [
+    "https://github.com/open-horizon-labs/swamp/actions/runs/37299544875"
+  ]
+}

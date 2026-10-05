@@ -1,0 +1,14 @@
+{
+  "job": [
+    "linux-x86_64",
+    "linux-x86_64-package"
+  ],
+  "bake_step": [
+    "Rust toolchain (stable)"
+  ],
+  "rust_channel": "stable",
+  "image_repository": "ghcr.io/open-horizon-labs/swamp",
+  "runner_base_image": "fleet-runner:2.337.0",
+  "runner_image_repository": "192.168.1.36:5443/fleet/rust-stable-linux",
+  "ghcr_auth": true
+}

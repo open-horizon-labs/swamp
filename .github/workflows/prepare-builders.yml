@@ -1,0 +1,67 @@
+name: Prepare stable Linux builder
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - build/prepared-builders/source.yml
+      - build/prepared-builders/profile.json
+      - .github/workflows/prepare-builders.yml
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: prepare-stable-linux-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check out the reviewed converter
+        uses: actions/checkout@v5
+        with:
+          repository: open-horizon-labs/homelab-infra
+          ref: 738a889bbfd743e00780cc9494a0ff6fcdf7f2ac
+          ssh-key: ${{ secrets.BUILDER_INFRA_SSH_KEY }}
+          persist-credentials: false
+          path: .builder-infra
+          sparse-checkout: runner/builder
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r .builder-infra/runner/builder/requirements.txt
+      - name: Resolve current stable and generate reviewed recipe
+        shell: bash
+        run: |
+          curl --fail --show-error --location https://static.rust-lang.org/dist/channel-rust-stable.toml -o "$RUNNER_TEMP/stable.toml"
+          release=$(python -c 'import os,tomllib; print(tomllib.load(open(os.environ["RUNNER_TEMP"]+"/stable.toml","rb"))["pkg"]["rust"]["version"].split()[0])')
+          python .builder-infra/runner/builder/convert.py build/prepared-builders/source.yml \
+            --config build/prepared-builders/profile.json --rust-version "$release" \
+            --output "$RUNNER_TEMP/prepared-builder"
+          cp "$RUNNER_TEMP/stable.toml" "$RUNNER_TEMP/prepared-builder/resolved-stable.toml"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tools once
+        shell: bash
+        run: |
+          image=$(python -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/prepared-builder/manifest.json"))["image"])')
+          if ! docker pull "$image"; then
+            docker build --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" --tag "$image" "$RUNNER_TEMP/prepared-builder"
+            docker push "$image"
+          fi
+          docker inspect "$image" --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/prepared-builder/tools-digests.json"
+          docker save "$image" | gzip -1 > "$RUNNER_TEMP/prepared-tools.tar.gz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prepared-tools
+          path: ${{ runner.temp }}/prepared-tools.tar.gz
+          compression-level: 0
+          retention-days: 3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prepared-builder
+          path: ${{ runner.temp }}/prepared-builder/
+          retention-days: 30

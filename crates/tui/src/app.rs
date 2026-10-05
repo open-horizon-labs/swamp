@@ -1970,6 +1970,11 @@ impl App {
     /// returns at once. Writes never wait on the event thread; when several
     /// arrive together only the newest is written.
     fn persist_ui_state(&mut self) {
+        // A nearly-full disk opens the stored report without writing, including
+        // the filter restoration performed during startup.
+        if self.disk_banner.is_some() {
+            return;
+        }
         let Some(store) = self.store_dir.clone() else {
             return;
         };
