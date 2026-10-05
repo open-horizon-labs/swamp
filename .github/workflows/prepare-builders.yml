@@ -21,7 +21,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: open-horizon-labs/homelab-infra
-          ref: 0661922d9604ce74eef427604c0dd42cbb0236d4
+          ref: 738a889bbfd743e00780cc9494a0ff6fcdf7f2ac
           ssh-key: ${{ secrets.BUILDER_INFRA_SSH_KEY }}
           persist-credentials: false
           path: .builder-infra
