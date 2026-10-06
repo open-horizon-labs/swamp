@@ -22,7 +22,37 @@ struct Saved(std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>);
 unsafe impl Sync for Saved {}
 
 static SAVED: Saved = Saved(std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()));
+static TERMINAL: std::sync::OnceLock<std::os::fd::OwnedFd> = std::sync::OnceLock::new();
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Initialize the terminal reader with stdin detached so it opens and owns
+/// /dev/tty instead of borrowing descriptor zero. Call before starting workers.
+/// An owned reader survives descriptor zero being closed or replaced.
+pub fn initialize_input(initialize: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: dup returns a new descriptor, transferred to its sole owner.
+    let saved = unsafe { libc::dup(0) };
+    if saved < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let saved = unsafe { OwnedFd::from_raw_fd(saved) };
+    struct Restore(OwnedFd);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // SAFETY: the saved descriptor is live throughout this call.
+            unsafe { libc::dup2(self.0.as_raw_fd(), 0) };
+        }
+    }
+    let restore = Restore(saved);
+    let null = std::fs::File::open("/dev/null")?;
+    // SAFETY: both descriptors are live; initialization runs before workers.
+    if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = initialize();
+    drop(restore);
+    result
+}
 
 /// Saves the terminal's current settings so a fatal signal or process exit
 /// can restore them, and makes sure the signal handlers are installed.
@@ -34,9 +64,21 @@ pub fn arm() -> bool {
     if ARMED.load(Ordering::Acquire) {
         return true;
     }
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if TERMINAL.get().is_none() {
+        // SAFETY: duplicate stdin while it is still the terminal. Keep this
+        // descriptor alive for the process, including async signal handlers.
+        let fd = unsafe { libc::dup(0) };
+        if fd < 0 {
+            return false;
+        }
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let _ = TERMINAL.set(owned);
+    }
+    let fd = TERMINAL.get().unwrap().as_raw_fd();
     let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
     // SAFETY: tcgetattr fills `t` when it returns 0.
-    if unsafe { libc::tcgetattr(0, t.as_mut_ptr()) } != 0 {
+    if unsafe { libc::tcgetattr(fd, t.as_mut_ptr()) } != 0 {
         return false;
     }
     // SAFETY: no reader touches the slot while `ARMED` is false.
@@ -60,7 +102,10 @@ pub(super) fn restore_signal_safe() {
     // calls are on the async-signal-safe list.
     unsafe {
         libc::write(1, RESTORE.as_ptr().cast::<libc::c_void>(), RESTORE.len());
-        libc::tcsetattr(0, libc::TCSANOW, (*SAVED.0.get()).as_ptr());
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = TERMINAL.get() {
+            libc::tcsetattr(fd.as_raw_fd(), libc::TCSANOW, (*SAVED.0.get()).as_ptr());
+        }
     }
 }
 

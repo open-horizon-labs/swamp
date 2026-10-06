@@ -80,6 +80,9 @@ impl TerminalGuard {
         ACTIVE.store(true, Ordering::SeqCst);
         let built = (|| -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
             crossterm::terminal::enable_raw_mode()?;
+            swamp_core::fs_gate::terminal::initialize_input(|| {
+                crossterm::event::poll(std::time::Duration::ZERO).map(|_| ())
+            })?;
             let mut stdout = std::io::stdout();
             // Bracketed paste: a paste arrives as one `Event::Paste`, never
             // as keys, so pasted text cannot press `Y` on a confirm.
