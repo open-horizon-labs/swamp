@@ -1,7 +1,7 @@
 "observed just now · /Users/dev/src · change over 7d                                                                                                                                                     "
 "Developer storage: 10.9GB across 2 projects                                                                                                                                                             "
 "disk ledger: not measured yet · 3 Disk for details                                                                                                                                                      "
-"1 Projects  2 Tools  3 Disk                                                                                                                                                                             "
+"4 Storage  1 Projects  2 Tools  3 Disk                                                                                                                                                                  "
 "Project folders › mole · w change period · filter: none · Esc: projects · Browse a project's worktrees and folders                                                                                      "
 "Folder                                                                                                              Size  Change 7d Change bar    Notes                                                 "
 "└─ ▾ Main checkout                                                                                                 2.7GB     +1.3GB       │██████ clean                                                 "

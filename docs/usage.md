@@ -993,21 +993,21 @@ Space marks a unit; Backspace opens review of its consequences, including sessio
 
 ## The TUI's sections and views
 
-The TUI has three sections, each holding a few views. `Tab` and `Shift-Tab` move
-between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the
-current section (wrapping). Enter or → on a project opens Project folders; Esc returns to Projects.
+The TUI opens on Storage: all measured projects, tool locations, agent storage, Docker objects, and unassigned storage ranked by current size. Enter or → expands project and tool folders in place. Storage ignores saved project and growth filters, so unchanged items remain visible regardless of the comparison period. Sizes come from the stored observation; opening the inventory starts no scan. Missing measurements remain visible in Disk coverage gaps.
+
+The TUI has four sections. `Tab` and `Shift-Tab` move between sections, `4` `1` `2` `3` jump to one, and `v` cycles the views inside the current section (wrapping). Enter or → on a project in Projects opens Project folders; Esc returns to Projects.
 
 | Section | Views (first is the default) |
 |---|---|
+| 4 Storage | All measured developer storage, largest first, with folder expansion |
 | 1 Projects | Projects, Project folders, Build outputs, Dependencies, Ecosystems, Storage kinds, Unassigned |
 | 2 Tools | Reclaim, Docker, Tool storage, Agent storage |
 | 3 Disk | Disk usage (the stored volume ledger’s parts), Coverage gaps (unreadable and not-yet-measured folders, and the largest measured folders outside developer storage) |
 
-A row under the headline names the three sections with the current one in reverse
+A row under the headline names the four sections with the current one in reverse
 video; the line below it names the view, its applicable filter and sort, and its purpose when space permits. Views that ignore filtering show no filter clause; partially applied filters name the ignored predicates. The CLI view identifiers are unchanged.
 `?` help lists every section and view with a line on each. **Changed in 0.8.0:** in
-0.7.x the digits `1`-`9` selected views; now `1`-`3` select sections and the old
-digits are unbound.
+0.7.x the digits `1`-`9` selected views; now `1`-`3` select sections. `4` opens the global Storage inventory; `5`-`9` are unbound.
 
 ## Developer storage: the headline
 
@@ -1300,7 +1300,7 @@ With no subcommand, `swamp` opens the UI at the current directory. It paints the
 | `0` | Clear the filter |
 | `Tab` / `Shift-Tab` | Next / previous section: Projects, Tools, Disk. While you type a filter, Tab completes it as before |
 | `v` | Next view inside the current section, wrapping around |
-| `1`, `2`, `3` | Jump to a section: 1 Projects, 2 Tools, 3 Disk (help lists them; the legend does not) |
+| `4`, `1`, `2`, `3` | Jump to a section: 4 Storage, 1 Projects, 2 Tools, 3 Disk (help lists them; the legend does not) |
 | `g`, `s`, `n`, `t`, `a` | Sort by growth, size, name, ecosystem, or age; Project folders, Reclaim and Disk keep their fixed order |
 | `r` | Reverse the sort in views that support sorting |
 | `R` | Refresh observations; shows when another observation is already running |

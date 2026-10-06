@@ -3701,3 +3701,131 @@ fn frames_do_not_depend_on_the_wall_clock() {
         }
     }
 }
+
+#[test]
+fn global_storage_keeps_all_sizes_despite_project_and_growth_filters() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    app.report.projects[0].worktrees[0].artifacts.push(art(
+        ArtifactKind::Git,
+        "/Users/dev/src/mole/.git",
+        500_000_000,
+        Some(0),
+    ));
+    for project in &mut app.report.projects {
+        for wt in &mut project.worktrees {
+            for artifact in &mut wt.artifacts {
+                artifact.growth_bytes = Some(0);
+            }
+        }
+    }
+    app.set_external_units(vec![reclaim_unit(
+        "cargo-home",
+        swamp_core::locations::StorageCategory::Cache,
+        "/Users/dev/.cargo/registry",
+        9_000_000_000,
+        vec![reclaim_child(
+            swamp_core::drilldown::ChildKind::Entry,
+            "cache",
+            Some(9_000_000_000),
+        )],
+    )]);
+    app.set_agent_units(vec![swamp_core::agents::AgentUnit {
+        tool_id: "claude-code".into(),
+        tool_name: "Claude Code".into(),
+        tool_home: PathBuf::from("/Users/dev/.claude"),
+        category: swamp_core::agents::AgentCategory::Sessions,
+        id: "fixture-session-1".into(),
+        relative_path: "projects/-Users-dev-src-mole/fixture-session.jsonl".into(),
+        path: PathBuf::from(
+            "/Users/dev/.claude/projects/-Users-dev-src-mole/fixture-session.jsonl",
+        ),
+        members: Vec::new(),
+        bytes: 4_200_000,
+        hardlinked: true,
+        complete: true,
+        growth_bytes: Some(100_000),
+        regrowth_count: 0,
+        observed_at: 1_700_000_000,
+        mtime_max: 1_699_990_000,
+        protected: false,
+        protect_reason: None,
+        project_link: swamp_core::agents::ProjectLinkState::Linked {
+            project_id: "fixture-project".into(),
+            project_name: "mole".into(),
+            project_path: PathBuf::from("/Users/dev/src/mole"),
+            source: swamp_core::agents::LinkSource::Declared,
+            fallback_reason: None,
+            worktree_kind: "main".into(),
+        },
+        action: swamp_core::agents::AgentActionCapability::SessionRemoval,
+        note: None,
+        evidence: Vec::new(),
+    }]);
+    app.filter = swamp_tui::filter::parse("project:does-not-exist growth > 1GB in 7d").unwrap();
+    app.filter_text = "project:does-not-exist growth > 1GB in 7d".into();
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Char('4'));
+    assert_eq!(app.view, ViewKind::Storage);
+    let rows = app.rows();
+    let roots: Vec<_> = rows.iter().filter(|r| r.depth == 0).collect();
+    assert!(roots.windows(2).all(|pair| pair[0].bytes >= pair[1].bytes));
+    for project in &app.report.projects {
+        assert!(
+            rows.iter()
+                .any(|r| r.label == swamp_tui::model::project_display_name(project))
+        );
+    }
+    assert!(rows.iter().any(|r| r.label.contains("Cargo")));
+    assert!(rows.iter().any(|r| r.label.contains("leftover")));
+    let tool_at = rows.iter().position(|r| r.label.contains("Cargo")).unwrap();
+    app.selected = tool_at;
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(
+        app.rows()
+            .iter()
+            .any(|r| r.depth > 0 && r.label.contains("cache"))
+    );
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+    assert!(rows.iter().any(|r| {
+        r.unit
+            .as_ref()
+            .is_some_and(|u| u.0.contains("fixture-session"))
+    }));
+    let first = rows
+        .iter()
+        .position(|r| r.expansion_key.as_deref() == Some("storage-project:mole"))
+        .unwrap();
+    app.selected = first;
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+    let open = app.rows();
+    assert!(open.len() > rows.len());
+    assert!(
+        open.iter()
+            .any(|r| r.kind == Some(ArtifactKind::BuildOutput) && r.growth == Some(0))
+    );
+    assert!(open.iter().any(|r| r.kind == Some(ArtifactKind::Source)));
+    assert!(open.iter().any(|r| r.kind == Some(ArtifactKind::Git)));
+    let expanded = app.rows();
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Esc);
+    assert_eq!(app.view, ViewKind::Storage);
+    assert!(app.rows().len() < expanded.len());
+    swamp_tui::handle_key(&mut app, crossterm::event::KeyCode::Enter);
+    app.report.series_window_secs = 7 * 86400;
+    app.filter_text.clear();
+    app.filter = Default::default();
+    assert_eq!(
+        expanded
+            .iter()
+            .map(|r| (&r.label, r.bytes))
+            .collect::<Vec<_>>(),
+        app.rows()
+            .iter()
+            .map(|r| (&r.label, r.bytes))
+            .collect::<Vec<_>>()
+    );
+    for (w, h) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("Storage"), "{frame}");
+        assert!(frame.contains("largest first"), "{frame}");
+        check(&format!("storage_{w}x{h}"), &frame);
+    }
+}

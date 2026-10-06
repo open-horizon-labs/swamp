@@ -1,7 +1,7 @@
 "observed just now · /Users/dev/src · change over 7d                                                                                                                                                     "
 "Developer storage: 13.4GB across 2 projects and 1 tool location                                                                                                                                         "
 "disk ledger: not measured yet · 3 Disk for details                                                                                                                                                      "
-"1 Projects  2 Tools  3 Disk                                                                                                                                                                             "
+"4 Storage  1 Projects  2 Tools  3 Disk                                                                                                                                                                  "
 "Tool storage · Review toolchains, caches, and stores                                                                                                                                                    "
 "Tool location                                                                                                                                                             Size  Change 7d Change bar    "
 "Cargo home · Cache                                                                                                                                                       2.5GB    +50.0MB       │██████ "

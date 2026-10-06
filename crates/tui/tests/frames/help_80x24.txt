@@ -1,6 +1,6 @@
-"┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-22 of 130 ──────────────┐"
+"┌ help · ↑↓ PgUp PgDn Home End scroll · Esc closes · 1-22 of 133 ──────────────┐"
 "│Common tasks                                                                  │"
-"│  1  2  3    Projects · Tools and Reclaim · Disk                              │"
+"│  4  1  2  3 Storage · Projects · Tools and Reclaim · Disk                    │"
 "│  → / Enter  inspect the selected project or folder                           │"
 "│  s / g      sort by size / growth                                            │"
 "│  w          change the comparison period using stored history                │"

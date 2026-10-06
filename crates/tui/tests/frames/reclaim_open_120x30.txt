@@ -1,7 +1,7 @@
 "observed just now · /Users/dev/src · change over 7d · 1 declared root                                                   "
 "Developer storage: 26.7GB across 2 projects and 4 tool locations                                                        "
 "disk ledger: not measured yet · 3 Disk for details                                                                      "
-"1 Projects  2 Tools  3 Disk                                                                                             "
+"4 Storage  1 Projects  2 Tools  3 Disk                                                                                  "
 "Reclaim · Review storage size, known use, and removal cost                                                              "
 "Storage item                                                  Size If removed                                           "
 "* shared files may be counted again                                                                                     "

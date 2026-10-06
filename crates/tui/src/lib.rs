@@ -251,7 +251,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
                 | KeyCode::Left
                 | KeyCode::Right
                 | KeyCode::Backspace
-                | KeyCode::Char('v' | '0'..='3' | '/' | ':' | ' ' | 'A')
+                | KeyCode::Char('v' | '0'..='4' | '/' | ':' | ' ' | 'A')
         )
     {
         return;
@@ -280,6 +280,8 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
                 } else {
                     app.cancel_confirm();
                 }
+            } else if app.view == app::ViewKind::Storage {
+                app.leave_row();
             } else if app.view != app::ViewKind::Projects {
                 app.set_view(app::ViewKind::Projects);
             }
@@ -293,13 +295,13 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('w') => app.open_change_period(),
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
-        // Three sections, and the views inside them: Tab and Shift-Tab move
+        // Four sections, and the views inside them: Tab and Shift-Tab move
         // between sections, `1` `2` `3` jump to one, `v` cycles the views of
         // the current section. Nothing else opens a view.
         KeyCode::Tab => app.set_section(app.view.section().next()),
         KeyCode::BackTab => app.set_section(app.view.section().prev()),
         KeyCode::Char('v') => app.set_view(app.view.next()),
-        KeyCode::Char(k @ '1'..='3') => {
+        KeyCode::Char(k @ '1'..='4') => {
             if let Some(sec) = app::Section::from_key(k) {
                 app.set_section(sec);
             }
@@ -507,6 +509,7 @@ pub fn run(root: &Path) -> Result<()> {
             coverage_from_scope(&scope)
         });
     finish_startup(&mut app, &store, coverage.as_deref());
+    app.set_view(app::ViewKind::Storage);
     start_background_services(&mut app, has_index);
     run_terminal_loop(guard, &mut app)
 }
@@ -567,6 +570,7 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
             app
         }
     };
+    app.set_view(app::ViewKind::Storage);
     start_background_services(&mut app, has_index);
     run_terminal_loop(guard, &mut app)
 }
@@ -782,6 +786,10 @@ fn advance(app: &mut App, gate: &mut RedrawGate, size: Option<(u16, u16)>) {
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut gate = RedrawGate::default();
     loop {
+        // Honor exit before installing a large observation or repainting.
+        if app.quit {
+            return Ok(());
+        }
         let size = terminal.size().ok().map(|sz| (sz.width, sz.height));
         advance(app, &mut gate, size);
         if gate.due(app) {
@@ -874,6 +882,32 @@ mod tests {
         assert!(!app.editing_filter);
         assert!(app.filter_error.is_none(), "{:?}", app.filter_error);
         assert!(app.filter_text.ends_with("idle > 48h"));
+    }
+
+    #[test]
+    fn observation_does_not_capture_quit_or_ctrl_c() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        for code in [KeyCode::Char('q'), KeyCode::Char('c')] {
+            let mut app = App::new(empty_report(), "/root".into());
+            let (_sender, receiver) = std::sync::mpsc::channel();
+            app.pending = Some(receiver);
+            app.observing = Some((0, 0));
+            let modifiers = if code == KeyCode::Char('c') {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            handle_terminal_key(&mut app, KeyEvent::new(code, modifiers));
+            assert!(app.quit);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let before = terminal.backend().buffer().clone();
+            event_loop(&mut terminal, &mut app).unwrap();
+            assert_eq!(
+                terminal.backend().buffer(),
+                &before,
+                "quit must not redraw or await observation"
+            );
+        }
     }
 
     #[test]
