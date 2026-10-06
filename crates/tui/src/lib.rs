@@ -882,13 +882,7 @@ mod tests {
             let store = tempfile::tempdir().unwrap();
             std::fs::write(
                 store.path().join("ui_state.json"),
-                serde_json::to_vec(&app::UiState {
-                    filter: filter.into(),
-                    sort: "growth".into(),
-                    reverse: true,
-                    ..Default::default()
-                })
-                .unwrap(),
+                format!(r#"{{"filter":"{filter}","sort":"growth","reverse":true}}"#),
             )
             .unwrap();
             let mut app = App::new(empty_report(), "/root".into());
