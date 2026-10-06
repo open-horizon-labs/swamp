@@ -849,17 +849,6 @@ pub fn load_ui_state(store: &std::path::Path) -> UiState {
     .unwrap_or_default()
 }
 
-pub fn sort_from_str(s: &str) -> Sort {
-    match s {
-        "growth" => Sort::Growth,
-        "size" => Sort::Size,
-        "name" => Sort::Name,
-        "type" => Sort::Type,
-        "age" => Sort::Age,
-        _ => Sort::None,
-    }
-}
-
 pub fn sort_to_str(s: Sort) -> &'static str {
     match s {
         Sort::Growth => "growth",
