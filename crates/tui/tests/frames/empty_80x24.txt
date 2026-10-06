@@ -21,4 +21,4 @@
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"Tab section  v view  / filter  R refresh  ↑↓ move  ? help  q quit               "
+"Tab section  v view  / filter  R refresh  Home top  ↑↓ move  ? help  q quit     "

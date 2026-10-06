@@ -9,11 +9,12 @@ serde.workspace = true
 serde_json.workspace = true
 swamp-core = { path = "../core" }
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.13"
 
 [dev-dependencies]
+libc = "0.2"
 swamp-core = { path = "../core", features = ["testing"] }
 tempfile.workspace = true
 

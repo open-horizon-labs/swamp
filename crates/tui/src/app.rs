@@ -849,17 +849,6 @@ pub fn load_ui_state(store: &std::path::Path) -> UiState {
     .unwrap_or_default()
 }
 
-pub fn sort_from_str(s: &str) -> Sort {
-    match s {
-        "growth" => Sort::Growth,
-        "size" => Sort::Size,
-        "name" => Sort::Name,
-        "type" => Sort::Type,
-        "age" => Sort::Age,
-        _ => Sort::None,
-    }
-}
-
 pub fn sort_to_str(s: Sort) -> &'static str {
     match s {
         Sort::Growth => "growth",
@@ -869,6 +858,131 @@ pub fn sort_to_str(s: Sort) -> &'static str {
         Sort::Age => "age",
         Sort::None => "none",
     }
+}
+
+fn prune_report_paths(report: &mut Report, removed: &[PathBuf], known: &[(&PathBuf, u64)]) {
+    let under = |p: &std::path::Path| removed.iter().any(|r| p == r || p.starts_with(r));
+    for unit in &mut report.nested_artifacts {
+        let bytes: u64 = known
+            .iter()
+            .filter(|(path, _)| *path != &unit.path && path.starts_with(&unit.path))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        unit.bytes = unit.bytes.saturating_sub(bytes);
+        if bytes > 0 {
+            unit.growth_bytes = None;
+        }
+    }
+    // Companion paths are part of the exact group, not just the selected
+    // executable. Suppress stale nested facts until the observer refreshes.
+    report.nested_artifacts.retain(|u| {
+        !under(&u.path)
+            && !removed.iter().any(|r| {
+                u.path == r.with_extension("d") || u.path.starts_with(r.with_extension("dSYM"))
+            })
+    });
+    let mut freed = 0u64;
+    let wt_paths: std::collections::HashMap<String, PathBuf> = report
+        .projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .map(|w| (w.worktree_id.clone(), w.path.clone()))
+        .collect();
+    for p in &mut report.projects {
+        p.worktrees.retain(|wt| {
+            if under(&wt.path) {
+                freed += wt.artifacts.iter().map(|a| a.bytes).sum::<u64>();
+                false
+            } else {
+                true
+            }
+        });
+        for wt in &mut p.worktrees {
+            let removed_tracks: std::collections::HashMap<_, _> = known
+                .iter()
+                .filter_map(|(path, _)| {
+                    report
+                        .dirs_by_worktree
+                        .as_ref()?
+                        .get(&wt.worktree_id)?
+                        .iter()
+                        .find(|d| wt.path.join(&d.rel_path) == **path)
+                        .map(|d| ((*path).clone(), d.track))
+                })
+                .collect();
+            let artifact_paths: Vec<_> = wt
+                .artifacts
+                .iter()
+                .filter(|a| !a.kind.is_worktree_remainder())
+                .map(|a| a.path.clone())
+                .collect();
+            for a in &mut wt.artifacts {
+                let removed_bytes: u64 = known
+                    .iter()
+                    .filter(|(path, _)| {
+                        *path != &a.path
+                            && path.starts_with(&a.path)
+                            && (!a.kind.is_worktree_remainder()
+                                || (!artifact_paths
+                                    .iter()
+                                    .any(|boundary| path.starts_with(boundary))
+                                    && match removed_tracks.get(*path).copied().flatten() {
+                                        Some(track) => a.track == Some(track),
+                                        None => a.kind == swamp_core::report::ArtifactKind::Source,
+                                    }))
+                    })
+                    .map(|(_, bytes)| *bytes)
+                    .sum();
+                if removed_bytes > 0 {
+                    a.allocated_bytes = Some(
+                        a.allocated_bytes
+                            .unwrap_or(a.bytes)
+                            .saturating_sub(removed_bytes),
+                    );
+                    a.allocated_growth_bytes = None;
+                    if a.hardlinked {
+                        a.dedup_stale = true;
+                    } else {
+                        let charged = a.bytes.min(removed_bytes);
+                        a.bytes -= charged;
+                        a.local_bytes = a.local_bytes.saturating_sub(charged);
+                        freed += charged;
+                    }
+                }
+            }
+            wt.artifacts.retain(|a| {
+                if under(&a.path) {
+                    freed += a.bytes;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+    report.projects.retain(|p| !p.worktrees.is_empty());
+    if let Some(map) = report.dirs_by_worktree.as_mut() {
+        for (wt_id, rows) in map.iter_mut() {
+            let Some(base) = wt_paths.get(wt_id) else {
+                continue;
+            };
+            for d in rows.iter_mut() {
+                let path = base.join(&d.rel_path);
+                let removed_bytes: u64 = known
+                    .iter()
+                    .filter(|(removed, _)| **removed != path && removed.starts_with(&path))
+                    .map(|(_, bytes)| *bytes)
+                    .sum();
+                d.allocated_total = d.allocated_total.saturating_sub(removed_bytes);
+                d.growth_bytes = None;
+            }
+            rows.retain(|d| !under(&base.join(&d.rel_path)));
+        }
+    }
+    // Known removals update local totals without walking other roots.
+    let rec = &mut report.reconciliation;
+    rec.attributed = rec.attributed.saturating_sub(freed);
+    rec.walked_total = rec.walked_total.saturating_sub(freed);
 }
 
 impl App {
@@ -1499,9 +1613,9 @@ impl App {
         ) {
             return;
         }
-        let anchor = self.selected_row_key();
         self.sort = if self.sort == sort { Sort::None } else { sort };
-        self.restore_selection(anchor);
+        self.selected = 0;
+        self.scroll_offset.set(0);
         self.persist_ui_state();
     }
 
@@ -1513,9 +1627,9 @@ impl App {
         ) {
             return;
         }
-        let anchor = self.selected_row_key();
         self.reverse = !self.reverse;
-        self.restore_selection(anchor);
+        self.selected = 0;
+        self.scroll_offset.set(0);
         self.persist_ui_state();
     }
 
@@ -1610,6 +1724,7 @@ impl App {
     /// Home.
     pub fn select_first(&mut self) {
         self.selected = 0;
+        self.scroll_offset.set(0);
     }
 
     /// End.
@@ -3692,7 +3807,7 @@ impl App {
 
     /// Enter on the confirm banner: this keypress at the keyboard is the
     /// human authorization for this one plan. Drives plan -> grant ->
-    /// execute -> ledger, then re-observes the affected worktrees only.
+    /// execute -> ledger, then applies the known removed paths locally.
     pub fn confirm_delete(&mut self) {
         self.start_delete(
             swamp_core::fs_gate::StoreDir::resolved(),
@@ -3862,11 +3977,10 @@ impl App {
             format!("{moved}{}", could_not(failed.len()))
         });
         self.blocked = failed;
-        // What just left the disk leaves the screen now; the store and the
-        // header follow from a background incremental observe (FSEvents
-        // narrows it to the touched trees), the same path startup uses.
+        // The successful paths are already known. Apply them immediately;
+        // do not replay every root's events or rediscover tools and agents.
+        // Unique allocation remains explicitly stale until a later refresh.
         self.prune_removed(&results);
-        self.observe_in_background();
     }
 
     /// Drops every row under a successfully removed path from the
@@ -3933,57 +4047,22 @@ impl App {
             estimate.needs_reconciliation = true;
         }
         let under = |p: &std::path::Path| removed.iter().any(|r| p == r || p.starts_with(r));
-        // Companion paths are part of the exact group, not just the selected
-        // executable. Suppress stale nested facts until the observer refreshes.
-        self.report.nested_artifacts.retain(|u| {
-            !under(&u.path)
-                && !removed.iter().any(|r| {
-                    u.path == r.with_extension("d") || u.path.starts_with(r.with_extension("dSYM"))
-                })
-        });
-        let mut freed = 0u64;
-        let wt_paths: std::collections::HashMap<String, PathBuf> = self
-            .report
-            .projects
+        let known: Vec<_> = results
             .iter()
-            .flat_map(|p| p.worktrees.iter())
-            .map(|w| (w.worktree_id.clone(), w.path.clone()))
+            .filter_map(|r| {
+                r.outcome
+                    .as_ref()
+                    .ok()
+                    .map(|outcome| (&r.path, outcome.intended_bytes))
+            })
             .collect();
-        for p in &mut self.report.projects {
-            p.worktrees.retain(|wt| {
-                if under(&wt.path) {
-                    freed += wt.artifacts.iter().map(|a| a.bytes).sum::<u64>();
-                    false
-                } else {
-                    true
-                }
-            });
-            for wt in &mut p.worktrees {
-                wt.artifacts.retain(|a| {
-                    if under(&a.path) {
-                        freed += a.bytes;
-                        false
-                    } else {
-                        true
-                    }
-                });
+        prune_report_paths(&mut self.report, &removed, &known);
+        for report in self.reports_by_root.values_mut() {
+            prune_report_paths(report, &removed, &known);
+            if let Some(estimate) = report.reconciliation.unique_estimate.as_mut() {
+                estimate.needs_reconciliation = true;
             }
         }
-        self.report.projects.retain(|p| !p.worktrees.is_empty());
-        if let Some(map) = self.report.dirs_by_worktree.as_mut() {
-            for (wt_id, rows) in map.iter_mut() {
-                let Some(base) = wt_paths.get(wt_id) else {
-                    continue;
-                };
-                rows.retain(|d| !under(&base.join(&d.rel_path)));
-            }
-        }
-        // Bytes of a removed Source directory were counted inside the
-        // worktree's Source row; the re-observe corrects that row. The
-        // totals shrink by what we know left.
-        let rec = &mut self.report.reconciliation;
-        rec.attributed = rec.attributed.saturating_sub(freed);
-        rec.walked_total = rec.walked_total.saturating_sub(freed);
         // Agent and external unit rows for exactly the successful
         // outcomes. Without this the agents view kept showing storage
         // that had just been moved to Trash, until the next full
@@ -5092,7 +5171,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_and_reverse_keep_the_selected_unit() {
+    fn sort_and_reverse_jump_to_top() {
         let home = tempfile::tempdir().unwrap();
         let mut units = fixture_agent_units(home.path());
         assert_eq!(units.len(), 2);
@@ -5108,16 +5187,18 @@ mod tests {
         let mut app = App::new(fixture_report(), "/root".into());
         app.set_view(ViewKind::Agents);
         app.set_agent_units(units);
-        app.selected = 0;
-        let selected = app.selected_row_key();
+        app.selected = 1;
+        app.scroll_offset.set(1);
 
         let (_, work) = swamp_core::work_counters::measured(|| {
             app.set_sort(Sort::Name);
-            assert_eq!(app.selected, 1, "name order moves the selected row");
-            assert_eq!(app.selected_row_key(), selected);
+            assert_eq!(app.selected, 0);
+            assert_eq!(app.scroll_offset.get(), 0);
+            app.selected = 1;
+            app.scroll_offset.set(1);
             app.toggle_reverse();
             assert_eq!(app.selected, 0, "reverse moves it back to the first row");
-            assert_eq!(app.selected_row_key(), selected);
+            assert_eq!(app.scroll_offset.get(), 0);
         });
         assert_navigation_did_no_io(&app, work);
     }
@@ -5433,6 +5514,85 @@ mod tests {
                 "{view:?} resurrected model"
             );
         }
+    }
+
+    #[test]
+    fn deletion_updates_parent_and_cached_root_without_starting_an_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(fixture_report(), "/root".into());
+        app.store_dir = Some(tmp.path().to_path_buf());
+        let artifact = &mut app.report.projects[0].worktrees[0].artifacts[0];
+        artifact.hardlinked = false;
+        artifact.bytes = 100;
+        artifact.allocated_bytes = Some(100);
+        let parent = artifact.path.clone();
+        let deleted = parent.join("known-child");
+        app.reports_by_root
+            .insert(app.root.clone(), app.report.clone());
+        app.finish_delete(
+            vec![actions::UnitResult {
+                path: deleted,
+                outcome: Ok(swamp_core::execution::Outcome {
+                    unit_id: String::new(),
+                    status: "ok".into(),
+                    reason: None,
+                    intended_bytes: 30,
+                    observed_free_space_delta: None,
+                }),
+            }],
+            1,
+        );
+        assert!(
+            app.pending.is_none(),
+            "deletion must not start a scope observation"
+        );
+        assert!(
+            app.status.is_none(),
+            "must not invoke even the no-scope refresh path"
+        );
+        for report in [&app.report, &app.reports_by_root[&app.root]] {
+            let artifact = report.projects[0].worktrees[0]
+                .artifacts
+                .iter()
+                .find(|a| a.path == parent)
+                .unwrap();
+            assert_eq!(artifact.bytes, 70);
+            assert_eq!(artifact.allocated_bytes, Some(70));
+        }
+    }
+
+    #[test]
+    fn nested_deletion_keeps_hardlink_charge_stale_and_does_not_charge_source_again() {
+        let mut report = fixture_report();
+        let wt = &mut report.projects[0].worktrees[0];
+        let mut source = wt.artifacts[0].clone();
+        source.kind = swamp_core::report::ArtifactKind::Source;
+        source.path = wt.path.clone();
+        source.bytes = 50;
+        source.hardlinked = false;
+        wt.artifacts.push(source);
+        let artifact = &mut wt.artifacts[0];
+        artifact.bytes = 100;
+        artifact.allocated_bytes = Some(120);
+        artifact.hardlinked = true;
+        let deleted = artifact.path.join("known-child");
+        prune_report_paths(
+            &mut report,
+            std::slice::from_ref(&deleted),
+            &[(&deleted, 30)],
+        );
+        let wt = &report.projects[0].worktrees[0];
+        assert_eq!(
+            wt.artifacts[0].bytes, 100,
+            "unique charges require reconciliation"
+        );
+        assert_eq!(wt.artifacts[0].allocated_bytes, Some(90));
+        assert!(wt.artifacts[0].dedup_stale);
+        assert_eq!(
+            wt.artifacts.last().unwrap().bytes,
+            50,
+            "artifact bytes are not Source bytes"
+        );
     }
 
     #[test]

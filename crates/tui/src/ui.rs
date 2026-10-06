@@ -342,12 +342,13 @@ fn footer_legend(
     sortable: bool,
     backspace_hint: Option<&str>,
 ) -> String {
-    const BASE: [&str; 11] = [
+    const BASE: [&str; 12] = [
         "Space mark",
         "Tab section",
         "v view",
         "/ filter",
         "R refresh",
+        "Home top",
         "A review all",
         "↑↓ move",
         "→/← in/out",

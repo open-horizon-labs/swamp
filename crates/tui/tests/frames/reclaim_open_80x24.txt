@@ -21,4 +21,4 @@
 "Path: /Users/dev/.rustup/toolchains                                             "
 "                                                                                "
 "Row 2 of 8 · Enter close                                                        "
-"Space mark  ⌫ review  Tab section  v view  R refresh  ? help  q quit            "
+"Space mark  ⌫ review  Tab section  v view  R refresh  Home top  ? help  q quit  "

@@ -3701,3 +3701,32 @@ fn frames_do_not_depend_on_the_wall_clock() {
         }
     }
 }
+
+#[test]
+fn projects_show_current_sizes_with_zero_growth_and_sort_largest_first() {
+    let mut app = App::new(fixture_report(), "/Users/dev/src".into());
+    for project in &mut app.report.projects {
+        for wt in &mut project.worktrees {
+            for artifact in &mut wt.artifacts {
+                artifact.growth_bytes = Some(0);
+            }
+        }
+    }
+    app.clear_filter();
+    app.sort = swamp_tui::model::Sort::Size;
+    let rows = app.rows();
+    assert_eq!(rows.len(), app.report.projects.len());
+    assert!(rows.windows(2).all(|pair| pair[0].bytes >= pair[1].bytes));
+    assert!(rows.iter().all(|r| r.growth == Some(0)));
+    let sizes: Vec<_> = rows.iter().map(|r| r.bytes).collect();
+    app.report.series_window_secs = 7 * 86400;
+    assert_eq!(
+        sizes,
+        app.rows().iter().map(|r| r.bytes).collect::<Vec<_>>()
+    );
+    for (w, h) in [(80, 24), (200, 60)] {
+        let frame = capture(&app, w, h);
+        assert!(frame.contains("mole") && frame.contains("swamp"), "{frame}");
+        assert!(!frame.contains("4 Storage"), "{frame}");
+    }
+}

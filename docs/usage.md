@@ -993,6 +993,8 @@ Space marks a unit; Backspace opens review of its consequences, including sessio
 
 ## The TUI's sections and views
 
+Projects opens with all measured projects ranked by current size, including projects with no recorded growth. Changing sort or reversing its order jumps to the first row; Home returns to the top at any time. Saved project and growth filters are cleared on startup. Filters can be applied during the session; the comparison period only affects the Change column.
+
 The TUI has three sections, each holding a few views. `Tab` and `Shift-Tab` move
 between sections, `1` `2` `3` jump to one, and `v` cycles the views inside the
 current section (wrapping). Enter or → on a project opens Project folders; Esc returns to Projects.
@@ -1913,4 +1915,4 @@ Automatic host-storage observations exclude nested CoreDevice `devicefs` mounts 
 
 Trash review shows destination totals, restore cost, sourced last use and consequential exceptions. Model reviews name layers staying in `blobs/`; routine adapter, coverage and selection explanations stay under `l`. Unrecognized warnings remain in the summary. Press `l` for the complete path-and-size inventory and original facts; use arrows or PgUp/PgDn to scroll, Home/End to jump, and Esc to return. Enter is disabled in details, and inspecting every path is optional. Enter acts from the reviewed summary; Esc there cancels. Filesystem paths go to Trash; Docker removals are labelled permanent and have no Trash recovery.
 
-Successful Trash moves disappear immediately from Tool storage, Reclaim and other current views. Moving a model manifest keeps its shared layers and their recorded allocation; the next observation updates physical totals. Failed moves remain listed. Expanding or collapsing Inspect directories preserves the selected row and its screen position.
+Successful Trash moves disappear immediately from Tool storage, Reclaim and other current views. The UI applies the known removed paths to its current and cached root reports without starting an observation of the configured scope. Parent allocation figures update from the reviewed sizes; hardlink-dependent unique totals stay marked stale until an explicit or scheduled observation reconciles them. Moving a model manifest keeps its shared layers and their recorded allocation; the next observation updates physical totals. Failed moves remain listed. Expanding or collapsing Inspect directories preserves the selected row and its screen position.

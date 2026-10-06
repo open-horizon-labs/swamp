@@ -654,16 +654,12 @@ fn finish_startup(
         })
         .max();
     let saved = app::load_ui_state(store);
-    if !saved.filter.is_empty() {
-        app.filter_text = saved.filter;
-        app.commit_filter();
-    } else {
-        app.commit_filter();
-    }
-    if !saved.sort.is_empty() {
-        app.sort = app::sort_from_str(&saved.sort);
-    }
-    app.reverse = saved.reverse;
+    // Start with the complete inventory. A saved project or growth filter
+    // must not make existing storage disappear on the first screen.
+    app.filter_text = "0".into();
+    app.commit_filter();
+    app.sort = Sort::Size;
+    app.reverse = false;
     app.keep_executables = saved.keep_executables;
     // A store that has never shown the new views shows the pointer to them
     // once; the flag is written when either is opened.
@@ -782,6 +778,10 @@ fn advance(app: &mut App, gate: &mut RedrawGate, size: Option<(u16, u16)>) {
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut gate = RedrawGate::default();
     loop {
+        // Honor exit before installing a large observation or repainting.
+        if app.quit {
+            return Ok(());
+        }
         let size = terminal.size().ok().map(|sz| (sz.width, sz.height));
         advance(app, &mut gate, size);
         if gate.due(app) {
@@ -874,6 +874,52 @@ mod tests {
         assert!(!app.editing_filter);
         assert!(app.filter_error.is_none(), "{:?}", app.filter_error);
         assert!(app.filter_text.ends_with("idle > 48h"));
+    }
+
+    #[test]
+    fn startup_clears_saved_project_and_growth_filters_but_keeps_the_period() {
+        for filter in ["project:swamp", "growth > 100MB in 7d"] {
+            let store = tempfile::tempdir().unwrap();
+            std::fs::write(
+                store.path().join("ui_state.json"),
+                format!(r#"{{"filter":"{filter}","sort":"growth","reverse":true}}"#),
+            )
+            .unwrap();
+            let mut app = App::new(empty_report(), "/root".into());
+            app.report.series_window_secs = 86400;
+            finish_startup(&mut app, store.path(), None);
+            assert_eq!(app.view, app::ViewKind::Projects);
+            assert!(app.filter.predicates.is_empty());
+            assert_eq!(app.sort, Sort::Size);
+            assert!(!app.reverse);
+            assert_eq!(app.report.series_window_secs, 86400);
+        }
+    }
+
+    #[test]
+    fn observation_does_not_capture_quit_or_ctrl_c() {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        for code in [KeyCode::Char('q'), KeyCode::Char('c')] {
+            let mut app = App::new(empty_report(), "/root".into());
+            let (_sender, receiver) = std::sync::mpsc::channel();
+            app.pending = Some(receiver);
+            app.observing = Some((0, 0));
+            let modifiers = if code == KeyCode::Char('c') {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            handle_terminal_key(&mut app, KeyEvent::new(code, modifiers));
+            assert!(app.quit);
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let before = terminal.backend().buffer().clone();
+            event_loop(&mut terminal, &mut app).unwrap();
+            assert_eq!(
+                terminal.backend().buffer(),
+                &before,
+                "quit must not redraw or await observation"
+            );
+        }
     }
 
     #[test]
@@ -1309,6 +1355,7 @@ mod tests {
             "v view",
             "/ filter",
             "R refresh",
+            "Home top",
             "⌫ delete",
             "⌫ trash",
             "⌫ review",

@@ -1017,6 +1017,16 @@ fn every_key_the_legend_names_does_something() {
     for item in legend.split("  ") {
         let key = item.split(' ').next().unwrap_or("");
         let code = match key {
+            "Home" => {
+                let mut b = app();
+                b.select_last();
+                b.scroll_offset.set(10);
+                swamp_tui::handle_key(&mut b, KeyCode::Home);
+                assert_eq!(b.selected, 0);
+                assert_eq!(b.scroll_offset.get(), 0);
+                bound += 1;
+                continue;
+            }
             "Tab" => KeyCode::Tab,
             "v" => KeyCode::Char('v'),
             "/" => KeyCode::Char('/'),

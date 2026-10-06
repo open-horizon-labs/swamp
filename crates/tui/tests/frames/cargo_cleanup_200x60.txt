@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "Row 1 of 9                                                                                                                                                                                              "
-"Space mark  ⌫ review  Tab section  v view  / filter  R refresh  A review all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                            "
+"Space mark  ⌫ review  Tab section  v view  / filter  R refresh  Home top  A review all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                  "

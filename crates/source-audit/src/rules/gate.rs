@@ -1191,6 +1191,78 @@ pub fn bus_static_registration(ws: &Workspace) -> Vec<String> {
     problems
 }
 
+/// Fence observation entry points by resolved references, rather than trying
+/// to infer whether a transitive call graph eventually reaches deletion.
+/// Worker closures are deliberately included: broad work there still causes
+/// the post-delete rescan regression.
+pub fn tui_observation_is_explicit(ws: &Workspace) -> Vec<String> {
+    let allowed: &[(&str, &[&str])] = &[
+        ("observe_scope", &["@tui::app::App::observe_in_background"]),
+        (
+            "observe_in_background",
+            &[
+                "@tui::app::App::refresh_now",
+                "@tui::app::App::scan_if_no_index",
+            ],
+        ),
+        ("refresh_now", &["@tui::handle_key_mod"]),
+        ("scan_if_no_index", &["@tui::start_background_services"]),
+    ];
+    let mut problems = Vec::new();
+    for (mi, m) in ws.modules.iter().enumerate() {
+        if m.krate != Krate::Tui || m.test {
+            continue;
+        }
+        let check = |name: &str,
+                     in_fn: Option<usize>,
+                     site: &crate::model::Site,
+                     problems: &mut Vec<String>| {
+            let Some((_, callers)) = allowed.iter().find(|(symbol, _)| *symbol == name) else {
+                return;
+            };
+            let caller = in_fn.map(|fi| {
+                let f = &ws.fns[fi];
+                let mut path = ws.modules[f.module].abs();
+                if let Some(owner) = &f.owner {
+                    path.push(owner.clone());
+                }
+                path.push(f.name.clone());
+                path.join("::")
+            });
+            if !caller
+                .as_deref()
+                .is_some_and(|caller| callers.contains(&caller))
+            {
+                problems.push(format!("{site}: `{name}` is referenced outside its explicit observation boundary; deletion and rendering must apply known paths, never start a scope observation"));
+            }
+        };
+        for r in &m.refs {
+            if r.test {
+                continue;
+            }
+            let resolved = ws.resolve(mi, &r.segments);
+            if let Some(name) = resolved.last() {
+                check(name, r.in_fn, &r.site, &mut problems);
+                let live_report = resolved.starts_with(&["@core".into(), "report".into()])
+                    && (name == "report"
+                        || name.starts_with("report_with")
+                        || name.starts_with("report_full")
+                        || (name.starts_with("report_scope")
+                            && !name.starts_with("report_scope_from_store")));
+                if live_report || resolved.starts_with(&["@core".into(), "walk".into()]) {
+                    problems.push(format!("{}: `{}` bypasses the explicit observation boundary; UI reports must read stored facts", r.site, resolved.join("::")));
+                }
+            }
+        }
+        for call in &m.methods {
+            if !call.test {
+                check(&call.name, call.in_fn, &call.site, &mut problems);
+            }
+        }
+    }
+    problems
+}
+
 /// Gate capabilities that block: what the TUI event thread may not reach
 /// except through `worker::spawn`.
 const BLOCKING: &[&str] = &[
@@ -1527,6 +1599,12 @@ pub const RULES: &[Rule] = &[
         verdict(
             "consumers never name each other",
             bus_static_registration(ws),
+        )
+    }),
+    ("tui_observation_is_explicit", |ws| {
+        verdict(
+            "scope observation is confined to explicit refresh or first startup",
+            tui_observation_is_explicit(ws),
         )
     }),
     ("tui_event_thread_has_no_gate_calls", |ws| {

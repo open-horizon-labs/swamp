@@ -57,4 +57,4 @@
 "                                                    │                                                                                              │                                                    "
 "                                                    │Sections and views (Tab, v and 1 2 3 reach every one)                                         │                                                    "
 "                                                    │  1 Projects your projects and what they hold                                                 │                                                    "
-"Space mark  ⌫ review  Tab section  v view  / filter └──────────────────────────────────────────────────────────────────────────────────────────────┘                                                    "
+"Space mark  ⌫ review  Tab section  v view  / filter └──────────────────────────────────────────────────────────────────────────────────────────────┘it                                                  "
