@@ -252,11 +252,10 @@ fn adv2_section_keys_do_nothing_under_blocked_help_and_picker() {
 #[test]
 fn adv2_wraps_both_ways_at_both_ends() {
     let mut a = app();
-    a.set_section(Section::Storage);
     handle_key(&mut a, KeyCode::BackTab);
     assert_eq!(a.view, ViewKind::Disk, "Shift-Tab on the first section");
     handle_key(&mut a, KeyCode::Tab);
-    assert_eq!(a.view, ViewKind::Storage, "Tab on the last section");
+    assert_eq!(a.view, ViewKind::Projects, "Tab on the last section");
     for sec in Section::ALL {
         let mut a = app();
         a.set_section(sec);
@@ -267,15 +266,15 @@ fn adv2_wraps_both_ways_at_both_ends() {
             handle_key(&mut a, KeyCode::Char('v'));
         }
     }
-    // Four Tabs and four Shift-Tabs are identities from every view's section.
+    // Three Tabs and three Shift-Tabs are identities from every view's section.
     for v in ViewKind::ALL {
         let mut a = app();
         a.set_view(v);
-        for _ in 0..Section::ALL.len() {
+        for _ in 0..3 {
             handle_key(&mut a, KeyCode::Tab);
         }
         assert_eq!(a.view.section(), v.section());
-        for _ in 0..Section::ALL.len() {
+        for _ in 0..3 {
             handle_key(&mut a, KeyCode::BackTab);
         }
         assert_eq!(a.view.section(), v.section());
@@ -422,7 +421,7 @@ fn adv2_every_view_every_size_keeps_the_legend() {
 /// pressed (derived by pressing it, not by a copied list).
 #[test]
 fn adv2_removed_view_keys_are_unbound() {
-    for k in ['c', 'D', 'I', '5', '6', '7', '8', '9'] {
+    for k in ['c', 'D', 'I', '4', '5', '6', '7', '8', '9'] {
         for v in ViewKind::ALL {
             let mut a = app();
             a.set_view(v);
@@ -454,7 +453,7 @@ fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Tempting wrong patch: the keymap is rewired but a doc or comment still
-/// teaches a removed key (`c` for Reclaim, `D` Disk, `I`, digits 5-9 for
+/// teaches a removed key (`c` for Reclaim, `D` Disk, `I`, digits 4-9 for
 /// views).
 #[test]
 fn adv2_no_doc_or_help_teaches_a_removed_view_key() {
@@ -466,8 +465,8 @@ fn adv2_no_doc_or_help_teaches_a_removed_view_key() {
         files.push(r.join(f));
     }
     let pats = [
-        "press c ", "press c,", "press D", "press I", "`c`", "`D`", "`I`", "(`v`/`5`", "(`v`/`6`",
-        "(`v`/`7`", "(`v`/`8`", "(`v`/`9`", "`5`", "`6`", "`7`", "`8`", "`9`",
+        "press c ", "press c,", "press D", "press I", "`c`", "`D`", "`I`", "(`v`/`4`", "(`v`/`5`",
+        "(`v`/`6`", "(`v`/`7`", "(`v`/`8`", "(`v`/`9`", "`4`", "`5`", "`6`", "`7`", "`8`", "`9`",
     ];
     let mut bad = Vec::new();
     for f in files {

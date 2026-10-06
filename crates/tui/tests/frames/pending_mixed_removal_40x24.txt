@@ -1,7 +1,7 @@
 "observed just now · /Users/dev/src      "
 "Developer storage 10.9GB in 2 locations "
 "disk ledger: not measured yet           "
-"4 Storage  1 Projects  2 Tools  3 Disk  "
+"1 Projects  2 Tools  3 Disk             "
 "Project folders › mole · filter: none   "
 "Folder                  Size  Change 7d "
 "└─ ▾ M… checkout       2.7GB     +1.3GB "

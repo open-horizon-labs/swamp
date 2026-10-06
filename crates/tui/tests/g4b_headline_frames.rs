@@ -473,7 +473,6 @@ fn every_section_and_view_is_reachable_with_tab_v_and_1_to_3_and_no_key_is_bound
         KeyCode::Char('1'),
         KeyCode::Char('2'),
         KeyCode::Char('3'),
-        KeyCode::Char('4'),
     ];
     let mut reached: HashSet<ViewKind> = HashSet::new();
     let mut frontier: Vec<ViewKind> = vec![ViewKind::Projects];
@@ -492,10 +491,10 @@ fn every_section_and_view_is_reachable_with_tab_v_and_1_to_3_and_no_key_is_bound
     for v in ViewKind::ALL {
         assert!(reached.contains(&v), "{v:?} is unreachable");
     }
-    // 2. Sections: Tab and Shift-Tab are inverse and cover all four; 1-4 jump.
+    // 2. Sections: Tab and Shift-Tab are inverse and cover all three; 1-3 jump.
     let mut a = app();
     let mut seen = vec![a.view.section()];
-    for _ in 0..Section::ALL.len() {
+    for _ in 0..3 {
         swamp_tui::handle_key(&mut a, KeyCode::Tab);
         seen.push(a.view.section());
     }
@@ -505,19 +504,18 @@ fn every_section_and_view_is_reachable_with_tab_v_and_1_to_3_and_no_key_is_bound
             Section::Projects,
             Section::Tools,
             Section::Disk,
-            Section::Storage,
             Section::Projects
         ]
     );
     swamp_tui::handle_key(&mut a, KeyCode::BackTab);
-    assert_eq!(a.view.section(), Section::Storage);
+    assert_eq!(a.view.section(), Section::Disk);
     for s in Section::ALL {
         swamp_tui::handle_key(&mut a, KeyCode::Char(s.key()));
         assert_eq!(a.view, s.default_view());
     }
     assert_eq!(ViewKind::Reclaim, Section::Tools.default_view());
     // 3. The removed keys open nothing.
-    for k in ['5', '6', '7', '8', '9', 'c', 'D', 'I'] {
+    for k in ['4', '5', '6', '7', '8', '9', 'c', 'D', 'I'] {
         let mut a = app();
         swamp_tui::handle_key(&mut a, KeyCode::Char(k));
         assert_eq!(a.view, ViewKind::Projects, "{k} still opens a view");
@@ -525,7 +523,7 @@ fn every_section_and_view_is_reachable_with_tab_v_and_1_to_3_and_no_key_is_bound
     // 4. No key is bound twice in the main keymap (read from the source:
     // every `KeyCode::Char('x')` from the start of the main `match code` to
     // the end of the function), and no view key is a literal there other
-    // than the four digits.
+    // than the three digits.
     let src = include_str!("../src/lib.rs");
     let start = src
         .find("    match code {\n        KeyCode::Char('q') => app.quit = true,")
@@ -1019,6 +1017,16 @@ fn every_key_the_legend_names_does_something() {
     for item in legend.split("  ") {
         let key = item.split(' ').next().unwrap_or("");
         let code = match key {
+            "Home" => {
+                let mut b = app();
+                b.select_last();
+                b.scroll_offset.set(10);
+                swamp_tui::handle_key(&mut b, KeyCode::Home);
+                assert_eq!(b.selected, 0);
+                assert_eq!(b.scroll_offset.get(), 0);
+                bound += 1;
+                continue;
+            }
             "Tab" => KeyCode::Tab,
             "v" => KeyCode::Char('v'),
             "/" => KeyCode::Char('/'),

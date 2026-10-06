@@ -314,7 +314,7 @@ fn deliberate_control_c_and_supported_shift_events_keep_their_meaning() {
     );
     assert_eq!(
         reverse_section.view.section(),
-        swamp_tui::app::Section::Storage
+        swamp_tui::app::Section::Disk
     );
     assert!(reverse_section.operation.is_none());
 }

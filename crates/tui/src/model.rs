@@ -655,68 +655,6 @@ pub fn projects_rows(report: &Report, filter: &Filter) -> Vec<Row> {
     out
 }
 
-/// Global inventory uses current stored sizes and no comparison filter.
-/// Projects open onto the same folder tree as the focused project view.
-/// Tool branches retain their measured interiors and expansion identities.
-pub fn storage_rows(
-    report: &Report,
-    external: &[swamp_core::external::ExternalUnit],
-    interiors: &[swamp_core::artifact::NestedArtifact],
-    agents: &[swamp_core::agents::AgentUnit],
-    collapsed: &std::collections::HashSet<String>,
-    track: &std::collections::HashMap<std::path::PathBuf, swamp_core::ignore::TrackState>,
-) -> Vec<Row> {
-    let filter = Filter::default();
-    let mut rows = Vec::new();
-    for mut project in projects_rows(report, &filter) {
-        let Some(name) = report
-            .projects
-            .iter()
-            .find(|p| project_display_name(p) == project.label)
-            .map(|p| &p.name)
-        else {
-            continue;
-        };
-        let key = format!("storage-project:{name}");
-        let open = collapsed.contains(&key);
-        project.expansion_key = Some(key);
-        project.rail = if open { "▾ " } else { "▸ " }.into();
-        project.collapsed_children = (!open).then_some(
-            report
-                .projects
-                .iter()
-                .find(|p| &p.name == name)
-                .map_or(0, |p| p.worktrees.len()),
-        );
-        rows.push(project);
-        if open {
-            rows.extend(tree_rows(report, name, &filter, collapsed, track));
-        }
-    }
-    rows.extend(external_rows_with(
-        external,
-        interiors,
-        collapsed,
-        report.observed_at,
-    ));
-    rows.extend(agent_rows(agents));
-    rows.extend(unowned_rows(report));
-    // Project-owned Docker objects already appear in their project branch.
-    let owned: std::collections::HashSet<_> = report
-        .projects
-        .iter()
-        .flat_map(|p| &p.worktrees)
-        .flat_map(|wt| &wt.artifacts)
-        .map(|a| UnitId::for_artifact(&a.path))
-        .collect();
-    rows.extend(
-        docker_rows_with(report, collapsed)
-            .into_iter()
-            .filter(|r| r.unit.as_ref().is_none_or(|id| !owned.contains(id))),
-    );
-    rows
-}
-
 /// Tree view for one project: checkout/worktree -> (folded) artifact
 /// rows, built from the same [`swamp_core::tree::build_project_tree`]
 /// the CLI's `--project` drill uses, so the two never drift apart (#33).

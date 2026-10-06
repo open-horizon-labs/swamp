@@ -1,7 +1,7 @@
 "observed just now · /Users/dev/src · change over 7d                                                                                                                                                     "
 "Developer storage: 10.9GB across 2 projects                                                                                                                                                             "
 "disk ledger: not measured yet · 3 Disk for details                                                                                                                                                      "
-"4 Storage  1 Projects  2 Tools  3 Disk                                                                                                                                                                  "
+"1 Projects  2 Tools  3 Disk                                                                                                                                                                             "
 "Projects · w change period · filter: growth > 100MB in 7d · Compare project size, growth, and activity                                                                                                  "
 "Project                                                                                                                                                                   Size  Change 7d Change bar    "
 "mole  🔨                                                                                                                                                                 2.6GB     +1.3GB       │█████▌ " Hidden by multi-width symbols: [(7, " ")]
@@ -57,4 +57,4 @@
 "                                                                                                                                                                                                        "
 "                                                                                                                                                                                                        "
 "Row 1 of 2 · Enter open                                                                                                                                                                                 "
-"Space mark  ⌫ review  Tab section  v view  / filter  R refresh  A review all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                            "
+"Space mark  ⌫ review  Tab section  v view  / filter  R refresh  Home top  A review all  ↑↓ move  →/← in/out  g/s/n/t/a sort  r reverse  ? help  q quit                                                  "

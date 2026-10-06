@@ -342,12 +342,13 @@ fn footer_legend(
     sortable: bool,
     backspace_hint: Option<&str>,
 ) -> String {
-    const BASE: [&str; 11] = [
+    const BASE: [&str; 12] = [
         "Space mark",
         "Tab section",
         "v view",
         "/ filter",
         "R refresh",
+        "Home top",
         "A review all",
         "↑↓ move",
         "→/← in/out",
@@ -1534,9 +1535,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The section strip: one row naming the four sections, the current one
+/// The section strip: one row naming the three sections, the current one
 /// in reverse video (an attribute, not a color: it survives `NO_COLOR` and
-/// any theme). `4 Storage  1 Projects  2 Tools  3 Disk` while the digits fit, then the
+/// any theme). `1 Projects  2 Tools  3 Disk` while the digits fit, then the
 /// bare names; `· Tab section` follows when there is room. The sub-view is
 /// named on the line below (`view: Tools › Reclaim (1 of 3 · v next)`).
 pub fn view_strip_spans(app: &App, width: usize) -> Vec<Span<'static>> {
@@ -1601,16 +1602,6 @@ fn draw_view_strip(frame: &mut Frame, app: &App, area: Rect) {
 fn filter_clause(app: &App, width: usize) -> String {
     use crate::app::ViewKind as V;
     use swamp_core::filter::Predicate;
-    if app.view == V::Storage {
-        return fit_clauses(
-            &[
-                "Storage".into(),
-                "current size · largest first".into(),
-                "Enter/→ opens folders".into(),
-            ],
-            width,
-        );
-    }
     let title = if app.view == V::Tree {
         app.selected_project
             .as_ref()
@@ -1668,10 +1659,7 @@ fn filter_clause(app: &App, width: usize) -> String {
     } else {
         String::new()
     };
-    let sort = if matches!(
-        app.view,
-        V::Storage | V::Tree | V::Reclaim | V::Disk | V::DiskGaps
-    ) {
+    let sort = if matches!(app.view, V::Tree | V::Reclaim | V::Disk | V::DiskGaps) {
         String::new()
     } else {
         let name = match app.sort {
@@ -1790,7 +1778,6 @@ fn empty_state(app: &App) -> String {
         return "No matches for the active filters. Press / to edit, or 0 to clear.".into();
     }
     match app.view {
-        V::Storage => "No storage recorded. Press R to observe.".into(),
         V::Projects => format!(
             "No projects recorded under {}. Press R to scan again.",
             app.root.display()
@@ -1972,7 +1959,6 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect, rows: &[crate::model::Row
         "{}  {:>size_width$} {}{}{}",
         pad_display(
             match app.view {
-                V::Storage => "Storage item",
                 V::Projects => "Project",
                 V::Tree => "Folder",
                 V::Builds => "Build output",
@@ -2438,11 +2424,7 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
         }
     };
     heading(&mut out, "Common tasks");
-    entry(
-        &mut out,
-        "4  1  2  3",
-        "Storage · Projects · Tools and Reclaim · Disk",
-    );
+    entry(&mut out, "1  2  3", "Projects · Tools and Reclaim · Disk");
     entry(
         &mut out,
         "→ / Enter",
@@ -2544,8 +2526,8 @@ fn help_lines(app: &App, width: usize) -> Vec<(String, bool)> {
     );
     entry(
         &mut out,
-        "4 1 2 3",
-        "jump to a section: 4 Storage, 1 Projects, 2 Tools, 3 Disk",
+        "1 2 3",
+        "jump to a section: 1 Projects, 2 Tools, 3 Disk",
     );
     entry(
         &mut out,

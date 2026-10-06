@@ -251,7 +251,7 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
                 | KeyCode::Left
                 | KeyCode::Right
                 | KeyCode::Backspace
-                | KeyCode::Char('v' | '0'..='4' | '/' | ':' | ' ' | 'A')
+                | KeyCode::Char('v' | '0'..='3' | '/' | ':' | ' ' | 'A')
         )
     {
         return;
@@ -280,8 +280,6 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
                 } else {
                     app.cancel_confirm();
                 }
-            } else if app.view == app::ViewKind::Storage {
-                app.leave_row();
             } else if app.view != app::ViewKind::Projects {
                 app.set_view(app::ViewKind::Projects);
             }
@@ -295,13 +293,13 @@ pub fn handle_key_mod(app: &mut App, code: KeyCode, _shift: bool) {
         KeyCode::Char('w') => app.open_change_period(),
         KeyCode::Char(':') => app.start_filter_edit(),
         KeyCode::Char('0') => app.clear_filter(),
-        // Four sections, and the views inside them: Tab and Shift-Tab move
+        // Three sections, and the views inside them: Tab and Shift-Tab move
         // between sections, `1` `2` `3` jump to one, `v` cycles the views of
         // the current section. Nothing else opens a view.
         KeyCode::Tab => app.set_section(app.view.section().next()),
         KeyCode::BackTab => app.set_section(app.view.section().prev()),
         KeyCode::Char('v') => app.set_view(app.view.next()),
-        KeyCode::Char(k @ '1'..='4') => {
+        KeyCode::Char(k @ '1'..='3') => {
             if let Some(sec) = app::Section::from_key(k) {
                 app.set_section(sec);
             }
@@ -509,7 +507,6 @@ pub fn run(root: &Path) -> Result<()> {
             coverage_from_scope(&scope)
         });
     finish_startup(&mut app, &store, coverage.as_deref());
-    app.set_view(app::ViewKind::Storage);
     start_background_services(&mut app, has_index);
     run_terminal_loop(guard, &mut app)
 }
@@ -570,7 +567,6 @@ pub fn run_scope(scope: &swamp_core::scope::EffectiveScope) -> Result<()> {
             app
         }
     };
-    app.set_view(app::ViewKind::Storage);
     start_background_services(&mut app, has_index);
     run_terminal_loop(guard, &mut app)
 }
@@ -658,16 +654,12 @@ fn finish_startup(
         })
         .max();
     let saved = app::load_ui_state(store);
-    if !saved.filter.is_empty() {
-        app.filter_text = saved.filter;
-        app.commit_filter();
-    } else {
-        app.commit_filter();
-    }
-    if !saved.sort.is_empty() {
-        app.sort = app::sort_from_str(&saved.sort);
-    }
-    app.reverse = saved.reverse;
+    // Start with the complete inventory. A saved project or growth filter
+    // must not make existing storage disappear on the first screen.
+    app.filter_text = "0".into();
+    app.commit_filter();
+    app.sort = Sort::Size;
+    app.reverse = false;
     app.keep_executables = saved.keep_executables;
     // A store that has never shown the new views shows the pointer to them
     // once; the flag is written when either is opened.
@@ -882,6 +874,32 @@ mod tests {
         assert!(!app.editing_filter);
         assert!(app.filter_error.is_none(), "{:?}", app.filter_error);
         assert!(app.filter_text.ends_with("idle > 48h"));
+    }
+
+    #[test]
+    fn startup_clears_saved_project_and_growth_filters_but_keeps_the_period() {
+        for filter in ["project:swamp", "growth > 100MB in 7d"] {
+            let store = tempfile::tempdir().unwrap();
+            std::fs::write(
+                store.path().join("ui_state.json"),
+                serde_json::to_vec(&app::UiState {
+                    filter: filter.into(),
+                    sort: "growth".into(),
+                    reverse: true,
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let mut app = App::new(empty_report(), "/root".into());
+            app.report.series_window_secs = 86400;
+            finish_startup(&mut app, store.path(), None);
+            assert_eq!(app.view, app::ViewKind::Projects);
+            assert!(app.filter.predicates.is_empty());
+            assert_eq!(app.sort, Sort::Size);
+            assert!(!app.reverse);
+            assert_eq!(app.report.series_window_secs, 86400);
+        }
     }
 
     #[test]
@@ -1343,6 +1361,7 @@ mod tests {
             "v view",
             "/ filter",
             "R refresh",
+            "Home top",
             "⌫ delete",
             "⌫ trash",
             "⌫ review",

@@ -67,23 +67,16 @@ pub const STALE_AFTER_SECS: u64 = 15 * 60;
 /// inside the current one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
-    Storage,
     Projects,
     Tools,
     Disk,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
-        Section::Storage,
-        Section::Projects,
-        Section::Tools,
-        Section::Disk,
-    ];
+    pub const ALL: [Section; 3] = [Section::Projects, Section::Tools, Section::Disk];
 
     pub fn title(self) -> &'static str {
         match self {
-            Section::Storage => "Storage",
             Section::Projects => "Projects",
             Section::Tools => "Tools",
             Section::Disk => "Disk",
@@ -93,7 +86,6 @@ impl Section {
     /// The digit that jumps here.
     pub fn key(self) -> char {
         match self {
-            Section::Storage => '4',
             Section::Projects => '1',
             Section::Tools => '2',
             Section::Disk => '3',
@@ -108,7 +100,6 @@ impl Section {
     /// one a jump lands on.
     pub fn views(self) -> &'static [ViewKind] {
         match self {
-            Section::Storage => &[ViewKind::Storage],
             Section::Projects => &[
                 ViewKind::Projects,
                 ViewKind::Tree,
@@ -134,18 +125,17 @@ impl Section {
 
     pub fn next(self) -> Section {
         let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
-        Self::ALL[(at + 1) % Self::ALL.len()]
+        Self::ALL[(at + 1) % 3]
     }
 
     pub fn prev(self) -> Section {
         let at = Self::ALL.iter().position(|s| *s == self).unwrap_or(0);
-        Self::ALL[(at + Self::ALL.len() - 1) % Self::ALL.len()]
+        Self::ALL[(at + 2) % 3]
     }
 
     /// One line on what the section is for, for `?` help.
     pub fn describe(self) -> &'static str {
         match self {
-            Section::Storage => "all measured developer storage, largest first",
             Section::Projects => "your projects and what they hold",
             Section::Tools => "developer tools, Docker, and storage units to review",
             Section::Disk => "where the whole disk went, from the stored volume ledger",
@@ -159,7 +149,6 @@ impl Section {
 /// cycles this exact order on both surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewKind {
-    Storage,
     Projects,
     Tree,
     Builds,
@@ -196,7 +185,6 @@ impl ViewKind {
     /// The section this view lives in.
     pub fn section(self) -> Section {
         match self {
-            ViewKind::Storage => Section::Storage,
             ViewKind::Projects
             | ViewKind::Tree
             | ViewKind::Builds
@@ -214,7 +202,6 @@ impl ViewKind {
     /// The name on the view strip and in `?` help.
     pub fn title(self) -> &'static str {
         match self {
-            ViewKind::Storage => "Storage",
             ViewKind::Projects => "Projects",
             ViewKind::Tree => "Project folders",
             ViewKind::Builds => "Build outputs",
@@ -235,7 +222,6 @@ impl ViewKind {
     /// of `label()`, which is a stable machine-facing view identifier.
     pub fn purpose(self) -> &'static str {
         match self {
-            ViewKind::Storage => "All projects and tools · Enter opens folders",
             ViewKind::Projects => "Compare project size, growth, and activity",
             ViewKind::Tree => "Browse a project's worktrees and folders",
             ViewKind::Builds => "Compare build outputs across projects",
@@ -270,9 +256,6 @@ impl ViewKind {
     /// One line on what the view shows, for `?` help.
     pub fn describe(self) -> &'static str {
         match self {
-            ViewKind::Storage => {
-                "all measured developer storage by current size, independent of change period"
-            }
             ViewKind::Projects => "one row per project: size, growth, what can be rebuilt",
             ViewKind::Tree => "a project's worktrees and their folders",
             ViewKind::Builds => "build output across projects, by kind",
@@ -295,8 +278,7 @@ impl ViewKind {
 
     /// Every view, section by section, in the order `v` walks them within
     /// each.
-    pub const ALL: [ViewKind; 14] = [
-        ViewKind::Storage,
+    pub const ALL: [ViewKind; 13] = [
         ViewKind::Projects,
         ViewKind::Tree,
         ViewKind::Builds,
@@ -330,7 +312,6 @@ impl ViewKind {
     }
     pub fn label(self) -> &'static str {
         match self {
-            ViewKind::Storage => "storage",
             ViewKind::Projects => "projects",
             ViewKind::Tree => "tree",
             ViewKind::Builds => "builds",
@@ -1440,19 +1421,6 @@ impl App {
         // ranked list, so sort never reorders it -- reordering would break
         // the rail's parent/child adjacency.
         let mut rows = match self.view {
-            ViewKind::Storage => {
-                let mut rows = model::storage_rows(
-                    &self.report,
-                    &self.external_units,
-                    &self.store_interiors,
-                    &self.agent_units,
-                    &self.collapsed,
-                    &self.track,
-                );
-                // Sort whole branches; never detach a folder from its owner.
-                model::apply_root_sort(&mut rows, Sort::Size, false);
-                return rows;
-            }
             ViewKind::Projects => model::projects_rows(&self.report, &self.filter),
             ViewKind::Tree => {
                 let name = self
@@ -1527,17 +1495,13 @@ impl App {
     pub fn set_sort(&mut self, sort: Sort) {
         if matches!(
             self.view,
-            ViewKind::Storage
-                | ViewKind::Tree
-                | ViewKind::Reclaim
-                | ViewKind::Disk
-                | ViewKind::DiskGaps
+            ViewKind::Tree | ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps
         ) {
             return;
         }
-        let anchor = self.selected_row_key();
         self.sort = if self.sort == sort { Sort::None } else { sort };
-        self.restore_selection(anchor);
+        self.selected = 0;
+        self.scroll_offset.set(0);
         self.persist_ui_state();
     }
 
@@ -1545,17 +1509,13 @@ impl App {
     pub fn toggle_reverse(&mut self) {
         if matches!(
             self.view,
-            ViewKind::Storage
-                | ViewKind::Tree
-                | ViewKind::Reclaim
-                | ViewKind::Disk
-                | ViewKind::DiskGaps
+            ViewKind::Tree | ViewKind::Reclaim | ViewKind::Disk | ViewKind::DiskGaps
         ) {
             return;
         }
-        let anchor = self.selected_row_key();
         self.reverse = !self.reverse;
-        self.restore_selection(anchor);
+        self.selected = 0;
+        self.scroll_offset.set(0);
         self.persist_ui_state();
     }
 
@@ -1650,6 +1610,7 @@ impl App {
     /// Home.
     pub fn select_first(&mut self) {
         self.selected = 0;
+        self.scroll_offset.set(0);
     }
 
     /// End.
@@ -2117,7 +2078,7 @@ impl App {
             } else {
                 self.set_view(ViewKind::Projects);
             }
-        } else if self.view != ViewKind::Storage {
+        } else {
             self.set_view(ViewKind::Projects);
         }
     }
@@ -2128,11 +2089,7 @@ impl App {
         // builder (Docker).
         if !matches!(
             self.view,
-            ViewKind::Storage
-                | ViewKind::Tree
-                | ViewKind::External
-                | ViewKind::Docker
-                | ViewKind::Reclaim
+            ViewKind::Tree | ViewKind::External | ViewKind::Docker | ViewKind::Reclaim
         ) {
             return;
         }
@@ -2156,10 +2113,7 @@ impl App {
         }
         // A Reclaim row opens onto the unit's folders; there is no
         // project to drill into from it.
-        if matches!(
-            self.view,
-            ViewKind::Storage | ViewKind::Reclaim | ViewKind::External | ViewKind::Docker
-        ) {
+        if self.view == ViewKind::Reclaim {
             self.enter_row();
             return;
         }
@@ -2917,10 +2871,7 @@ impl App {
     fn path_target(&self, id: &str, row: &Row) -> Option<swamp_core::reclaim_trash::ReclaimTarget> {
         use swamp_core::reclaim_trash::{ReclaimTarget, find_target};
         let path = Path::new(id);
-        if matches!(
-            self.view,
-            ViewKind::Storage | ViewKind::Reclaim | ViewKind::External
-        ) {
+        if matches!(self.view, ViewKind::Reclaim | ViewKind::External) {
             let standalone = self.report.unowned.iter().any(|u| {
                 u.reason == swamp_core::report::UnownedReason::StandaloneCargoTarget
                     && Path::new(&u.path_or_object) == path
@@ -3247,10 +3198,7 @@ impl App {
         worker.store_dir = self.store_dir.clone();
         worker.store_interiors = self.store_interiors.clone();
         worker.agent_units = self.agent_units.clone();
-        if matches!(
-            self.view,
-            ViewKind::Storage | ViewKind::Reclaim | ViewKind::External
-        ) {
+        if matches!(self.view, ViewKind::Reclaim | ViewKind::External) {
             *worker.reclaim_cache.borrow_mut() = Some(self.reclaim_view());
         }
         worker.review_cancel = Some(cancel.clone());
@@ -5145,7 +5093,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_and_reverse_keep_the_selected_unit() {
+    fn sort_and_reverse_jump_to_top() {
         let home = tempfile::tempdir().unwrap();
         let mut units = fixture_agent_units(home.path());
         assert_eq!(units.len(), 2);
@@ -5161,16 +5109,18 @@ mod tests {
         let mut app = App::new(fixture_report(), "/root".into());
         app.set_view(ViewKind::Agents);
         app.set_agent_units(units);
-        app.selected = 0;
-        let selected = app.selected_row_key();
+        app.selected = 1;
+        app.scroll_offset.set(1);
 
         let (_, work) = swamp_core::work_counters::measured(|| {
             app.set_sort(Sort::Name);
-            assert_eq!(app.selected, 1, "name order moves the selected row");
-            assert_eq!(app.selected_row_key(), selected);
+            assert_eq!(app.selected, 0);
+            assert_eq!(app.scroll_offset.get(), 0);
+            app.selected = 1;
+            app.scroll_offset.set(1);
             app.toggle_reverse();
             assert_eq!(app.selected, 0, "reverse moves it back to the first row");
-            assert_eq!(app.selected_row_key(), selected);
+            assert_eq!(app.scroll_offset.get(), 0);
         });
         assert_navigation_did_no_io(&app, work);
     }
@@ -5994,9 +5944,8 @@ mod tests {
         assert_eq!(Section::from_key('2'), Some(Section::Tools));
         assert_eq!(Section::from_key('3'), Some(Section::Disk));
         // '0' is reserved for "clear filter" (crate::handle_key_mod), and
-        // 5-9 are not section keys.
-        assert_eq!(Section::from_key('4'), Some(Section::Storage));
-        for k in ['0', '9', 'c', 'D', 'I'] {
+        // 4-9 are no longer keys at all.
+        for k in ['0', '4', '9', 'c', 'D', 'I'] {
             assert_eq!(Section::from_key(k), None, "{k}");
         }
         // `v` wraps inside the section it is in.
@@ -6012,8 +5961,8 @@ mod tests {
         assert_eq!(ViewKind::Unowned.next(), ViewKind::Projects);
         assert_eq!(ViewKind::Reclaim.next(), ViewKind::Docker);
         assert_eq!(ViewKind::Agents.next(), ViewKind::Reclaim);
-        assert_eq!(Section::Disk.next(), Section::Storage);
-        assert_eq!(Section::Projects.prev(), Section::Storage);
+        assert_eq!(Section::Disk.next(), Section::Projects);
+        assert_eq!(Section::Projects.prev(), Section::Disk);
         // Every view is in exactly one section.
         let total: usize = Section::ALL.iter().map(|s| s.views().len()).sum();
         assert_eq!(total, ViewKind::ALL.len());
