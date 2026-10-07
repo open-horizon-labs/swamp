@@ -1,6 +1,6 @@
 //! Configured external outputs use the shared external fold, build adapter
 //! identification, and typed report tables.
-use std::{fs, path::Path};
+use std::{fs, os::unix::fs::MetadataExt, path::Path};
 use swamp_core::{
     fs_events::UnsupportedPlatformSource,
     locations::{Environment, Platform, Registry},
@@ -29,7 +29,10 @@ fn external_typescript_output_is_measured_identified_and_read_from_store() {
     fs::write(root.join("package.json"), "{}").unwrap();
     let output = home.join("compiled-app");
     fs::create_dir_all(&output).unwrap();
-    fs::write(output.join("index.js"), vec![b'x'; 8 * 1024]).unwrap();
+    let generated = output.join("index.js");
+    fs::write(&generated, vec![b'x'; 8 * 1024]).unwrap();
+    fs::File::open(&generated).unwrap().sync_all().unwrap();
+    let allocated_bytes = fs::metadata(&generated).unwrap().blocks() * 512;
     fs::write(
         root.join("tsconfig.json"),
         serde_json::json!({"compilerOptions": {"outDir": output}}).to_string(),
@@ -78,7 +81,10 @@ fn external_typescript_output_is_measured_identified_and_read_from_store() {
         unit.category,
         swamp_core::locations::StorageCategory::BuildOutput
     );
-    assert!(unit.bytes >= 8 * 1024);
+    assert_eq!(
+        unit.bytes, allocated_bytes,
+        "configured output charges allocated blocks, not payload length"
+    );
     assert!(unit.consumers.iter().any(|consumer| {
         consumer.label == root.display().to_string()
             && consumer
