@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+## v0.8.5 — 2026-10-07
+
 - Cache drilldown rows show modification age and separately sourced directory access timestamps captured before enumeration. Stored reports retain the access observation date and explain that earlier listings can update it; access metadata does not establish actual use.
 
 - Recognize Cargo build layouts inside measured cache roots without guessing their owning project. Distinguish unsupported usage tracking from a supported probe with no record.
