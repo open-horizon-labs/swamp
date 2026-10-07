@@ -1301,6 +1301,42 @@ mod tests {
         assert_eq!(unit.last_used, before);
     }
 
+    #[test]
+    fn an_unrecorded_derived_data_child_remains_supported_no_record() {
+        use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
+        let found = crate::last_used::probe(
+            Path::new("/fixture/DerivedData"),
+            &[crate::locations::LastUseSource::XcodeDerivedDataPlist],
+            1_790_000_000,
+        );
+        let mut unit = external_unit(
+            "xcode",
+            StorageCategory::BuildOutput,
+            Path::new("/fixture/DerivedData"),
+        );
+        unit.last_used = found.last_used;
+        unit.children = crate::last_used::with_child_last_used(
+            vec![UnitChild {
+                kind: ChildKind::Entry,
+                name: "Unrecorded-ghi".into(),
+                bytes: Some(10),
+                measure: ChildMeasure::Complete,
+                mtime_max: 0,
+                entries: 0,
+                not_measured: 0,
+                last_used: Default::default(),
+            }],
+            &found.children,
+            found.child_probe_applies,
+        );
+        apply_derived_data_last_used(&mut unit, &[]);
+        assert_eq!(
+            unit.children[0].last_used.source,
+            crate::last_used::LastUsedSource::None
+        );
+        assert_eq!(unit.children[0].last_used.fact(1_790_000_000), "no record");
+    }
+
     fn empty_report(root: &Path, projects: Vec<ProjectRow>) -> Report {
         Report {
             store_dir: None,

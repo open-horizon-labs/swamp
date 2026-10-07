@@ -169,7 +169,16 @@ impl BuildContainer {
     /// hangs off. Identical to what `cargo_artifacts` used before the
     /// port, so a stored report's units keep their ids.
     pub fn scope(&self) -> String {
-        NestedArtifact::storage_id(&self.path, "")
+        let path_scope = NestedArtifact::storage_id(&self.path, "");
+        if self.store_kind == Some(BuildStoreKind::GenericCacheBuildOutputs) {
+            // A generic cache root used to have no build-container identity.
+            // Namespace it so an empty result previously stored for a
+            // configured/project adapter at this same path cannot replay as
+            // Cargo's negative generic-cache result.
+            format!("generic-cache-build-outputs:{path_scope}")
+        } else {
+            path_scope
+        }
     }
 }
 
@@ -282,22 +291,18 @@ impl ContainerCache {
         }
     }
 
-    /// Seeds the cache from stored containers, each with the observation
-    /// that last verified it -- a machine-wide store's units carry their
-    /// own verification time, not one stamp for the whole table.
-    pub fn from_containers(containers: Vec<(u64, Vec<NestedArtifact>)>) -> Self {
-        let mut entries: HashMap<String, (u64, Vec<NestedArtifact>)> = HashMap::new();
-        for (stored_at, units) in containers {
-            let Some(key) = units
-                .first()
-                .map(|u| u.container_id.clone().unwrap_or_else(|| u.id.clone()))
-            else {
-                continue;
-            };
-            entries.insert(key, (stored_at, units));
-        }
+    /// Seeds by the typed persisted container key, including containers
+    /// whose adapter recognized no units. Keeping an empty result lets a
+    /// quiet event window replay a negative identification without
+    /// inventing a report row.
+    pub fn from_scoped_containers(containers: Vec<(String, u64, Vec<NestedArtifact>)>) -> Self {
         Self {
-            entries: RefCell::new(entries),
+            entries: RefCell::new(
+                containers
+                    .into_iter()
+                    .map(|(scope, stored_at, units)| (scope, (stored_at, units)))
+                    .collect(),
+            ),
             enabled: true,
         }
     }
@@ -1367,6 +1372,47 @@ mod tests {
         assert!(
             !ctx.can_reuse(&c),
             "an event *inside* the container is a change to it"
+        );
+    }
+
+    #[test]
+    fn a_keyed_empty_result_replays_without_inventing_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = BuildContainer::shared_store_of(
+            "cargo",
+            tmp.path().to_path_buf(),
+            BuildStoreKind::GenericCacheBuildOutputs,
+        );
+        let cache = ContainerCache::from_scoped_containers(vec![(c.scope(), 100, Vec::new())]);
+        let folded = FoldedIndex::default();
+        let trusted = EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 100);
+        let ctx = BuildCtx::new(200, &folded, &trusted, &cache);
+
+        assert!(ctx.can_reuse(&c));
+        assert!(
+            ctx.container(&c, &|| panic!("cached negative result should replay"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn generic_cache_scope_is_separate_from_an_existing_project_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = BuildContainer::project("node", tmp.path().to_path_buf(), tmp.path().into());
+        let generic = BuildContainer::shared_store_of(
+            "cargo",
+            tmp.path().to_path_buf(),
+            BuildStoreKind::GenericCacheBuildOutputs,
+        );
+        assert_ne!(project.scope(), generic.scope());
+        let cache =
+            ContainerCache::from_scoped_containers(vec![(project.scope(), 100, Vec::new())]);
+        let trusted = EventCoverage::trusted(tmp.path().to_path_buf(), Vec::new(), 100);
+        let folded = FoldedIndex::default();
+        let ctx = BuildCtx::new(200, &folded, &trusted, &cache);
+        assert!(
+            !ctx.can_reuse(&generic),
+            "a prior adapter's empty result cannot become this capability's result"
         );
     }
 

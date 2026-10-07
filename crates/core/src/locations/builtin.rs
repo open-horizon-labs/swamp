@@ -11,7 +11,8 @@
 //! how that folding happens; this file only proposes the candidates.
 
 use super::{
-    Detector, Environment, LocationStatus, Platform, ProposedLocation, Provenance, StorageCategory,
+    BuildStoreDecl, BuildStoreKind, Detector, Environment, LocationStatus, Platform,
+    ProposedLocation, Provenance, StorageCategory, StoreAnchor,
 };
 
 pub const BUILTIN_DEFAULTS_DETECTOR_ID: &str = "builtin-defaults";
@@ -36,6 +37,16 @@ impl Detector for BuiltinDefaultsDetector {
          Linux: ~/src, $XDG_CACHE_HOME (default ~/.cache)"
     }
 
+    fn build_stores(&self) -> &'static [BuildStoreDecl] {
+        &[BuildStoreDecl {
+            kind: BuildStoreKind::GenericCacheBuildOutputs,
+            anchor: StoreAnchor::Categorized {
+                category: StorageCategory::Cache,
+                suffix: &[],
+            },
+        }]
+    }
+
     /// Each platform gets the roots that platform actually has.
     ///
     /// `~/src` is shared: it is a habit, not an OS convention. The other
@@ -55,44 +66,50 @@ impl Detector for BuiltinDefaultsDetector {
     /// path invalid and ignore it") -- honouring one would propose a
     /// root relative to whatever the process's working directory was.
     fn detect(&self, env: &Environment) -> Vec<ProposedLocation> {
-        let candidates: Vec<(std::path::PathBuf, &str)> = match env.platform {
+        let candidates: Vec<(std::path::PathBuf, &str, StorageCategory)> = match env.platform {
             Platform::MacOS => vec![
                 (
                     env.home.join("src"),
                     "checkouts a developer keeps under a home-relative src tree",
+                    StorageCategory::Unclassified,
                 ),
                 (
                     env.home.join("Library/Developer"),
                     "Xcode/Android build, SDK, and simulator storage",
+                    StorageCategory::Unclassified,
                 ),
                 (
                     env.home.join("Library/Caches"),
                     "the platform-wide user cache directory",
+                    StorageCategory::Cache,
                 ),
                 (
                     xdg_cache_home(env),
                     "the XDG per-user cache root ($XDG_CACHE_HOME, default ~/.cache), \
                      where cross-platform developer tooling caches accumulate",
+                    StorageCategory::Cache,
                 ),
             ],
             Platform::Linux => vec![
                 (
                     env.home.join("src"),
                     "checkouts a developer keeps under a home-relative src tree",
+                    StorageCategory::Unclassified,
                 ),
                 (
                     xdg_cache_home(env),
                     "the XDG per-user cache root ($XDG_CACHE_HOME, default ~/.cache), \
                      where Linux build and package tooling caches accumulate",
+                    StorageCategory::Cache,
                 ),
             ],
         };
         candidates
             .into_iter()
-            .map(|(path, note)| ProposedLocation {
+            .map(|(path, note, category)| ProposedLocation {
                 detector_id: BUILTIN_DEFAULTS_DETECTOR_ID.to_string(),
                 path: Some(path),
-                category: StorageCategory::Unclassified,
+                category,
                 provenance: Provenance::BuiltinConvention,
                 status: LocationStatus::Resolved,
                 note: Some(note.to_string()),

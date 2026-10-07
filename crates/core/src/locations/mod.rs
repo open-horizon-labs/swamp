@@ -836,6 +836,9 @@ pub enum BuildStoreKind {
     /// An Ollama model store (`OLLAMA_MODELS`): `manifests/` naming
     /// content-addressed layers in `blobs/`.
     OllamaModels,
+    /// A generic per-user cache root whose measured descendants may
+    /// contain Cargo target directories.
+    GenericCacheBuildOutputs,
 }
 
 impl BuildStoreKind {
@@ -873,6 +876,7 @@ impl BuildStoreKind {
             Self::BuildKitCache => "buildkit-cache",
             Self::HuggingFaceHub => "huggingface-hub",
             Self::OllamaModels => "ollama-models",
+            Self::GenericCacheBuildOutputs => "generic-cache-build-outputs",
         }
     }
 
@@ -916,6 +920,7 @@ impl BuildStoreKind {
         Self::BuildKitCache,
         Self::HuggingFaceHub,
         Self::OllamaModels,
+        Self::GenericCacheBuildOutputs,
     ];
 }
 

@@ -85,10 +85,12 @@ pub const MATRIX: &[MatrixEntry] = &[
             "target/<target-triple>/<profile>/",
             "deps/, examples/, incremental/, build/, .fingerprint/",
             "effective target-dir/build-dir from ancestor .cargo/config[.toml] or observer CARGO_TARGET_DIR/CARGO_BUILD_TARGET_DIR/CARGO_BUILD_BUILD_DIR",
+            "measured generic cache descendants with Cargo's .rustc_info.json and a Cargo profile/category layout",
         ],
         attribution_limits: &[
             "Cargo's intermediate layout is an implementation detail and version-dependent",
             "ordinary scans fold dependencies; explicit inspect-cargo reports evidenced targets/variants, not inferred package identities",
+            "generic cache targets are not attributed to a project or an exact build command",
             "command-line overrides, historical shell environment, unresolved path templates and custom CARGO_HOME config outside the ancestor chain are invisible to an observer",
         ],
         operation_granularity: "profile directory, or one target's executable plus its fingerprint",

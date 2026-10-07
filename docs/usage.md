@@ -548,10 +548,11 @@ Every external unit shows one fact about use, with where it came from:
 Last run or opened: Jul 8 (file access time)
 Last run or opened: Sep 6 (Xcode DerivedData record)
 Last run or opened: no record
+Last run or opened: tracking unsupported
 ```
 
 In JSON it is `last_used`: `at` (epoch seconds, `null` for no record),
-`source` (`tool_native:<name>`, `file_atime` or `none`) and, beside a
+`source` (`tool_native:<name>`, `file_atime`, `none` or `unsupported`) and, beside a
 tool-native value, `atime` -- the key files' access time, kept so the two
 can be compared. The label is a fact about one file or one record. It is
 never "unused" and never "since": a unit whose row says Jul 8 was last
@@ -570,7 +571,7 @@ nothing needs it. Dates are UTC.
 3. **No record.** Never a date derived from a modification time.
 
 When both exist and disagree the tool-native value is shown and the access
-time stays in the JSON. A unit that declares no source shows no record.
+time stays in the JSON. A unit that declares no supported use source shows `tracking unsupported`. A supported source with no recorded value still shows `no record`; neither is evidence that the unit is unused.
 
 | Unit kind | Source | Read from | Checked on a real machine |
 |---|---|---|---|
@@ -587,7 +588,7 @@ time stays in the JSON. A unit that declares no source shows no record.
 | Hugging Face hub repos | file access time | the largest weight blob of the revision shown (the `model-stores` adapter; neither huggingface_hub nor transformers records use), with swamp's own header read set aside | yes: Sep 29 for the one model on this machine |
 | Ollama models | file access time | the model layer blob (`application/vnd.ollama.image.model`); Ollama records no use | yes: Aug 30 for `qwen3:0.6b` |
 | npm `_cacache`, Gradle | not implemented | | unverified |
-| everything else | no record | | |
+| everything else | tracking unsupported | | |
 
 Access time is a weak signal and the docs say so where it is used:
 
@@ -619,14 +620,12 @@ Access time is a weak signal and the docs say so where it is used:
 
 ### What is inside a big root
 
-A large `unclassified` root (`~/Library/Caches` was one 36.8 GB row) and
-every unit that declares a last-use source list their immediate child
-folders, largest first, with size, modification time and last-used:
+Generic XDG and native macOS cache roots, large `unclassified` roots, and every unit that declares a last-use source list their immediate child folders, largest first, with size, modification time and last-used:
 
 ```text
-36.9GB  unclassified  /Users/me/Library/Caches
+36.9GB  cache         /Users/me/Library/Caches
     inside, largest first (rows add up to the total the walk measured):
-           19.5GB  hiphi-endpoints  modified 1d ago  Last run or opened: no record
+           19.5GB  hiphi-endpoints  modified 1d ago  Last run or opened: tracking unsupported
            ...
           281.7MB  remainder: 145 other entries (the other folders, and files directly inside); 9 folders not measured
            -3.7MB  adjustment: hardlinked files are counted once in this unit's total
@@ -867,6 +866,8 @@ In the TUI, Reclaim is the first view of Tools (`2`, or `Tab` from Projects), or
 ### Configured build outputs outside a checkout
 
 During observation, build adapters read supported declarative configuration from known worktrees and nested project directories already seen by the walk. An output outside the checkout is measured through the external-storage pipeline and appears in Tools / External with its declared project consumers. A shared output is measured once, with every declaration retained. A containing cache excludes the separately measured output from its own total. When several adapters declare the same physical directory, the first adapter in the registry supplies its interior interpretation; every project reference remains visible. This interpretation does not prove that removing mixed outputs can be repaired by a single build command.
+
+Generic XDG and native macOS cache roots also expose Cargo build interiors when their measured directories contain Cargo's layout metadata. The directory's name is not a project reference: a `tdongle-*-target` cache can be identified as Cargo output while its owning project and regeneration source remain unknown. These interiors describe bytes already measured under the cache root; they are not another allocation to add to it. Recognition uses the same folded walk and stored event-based replay, and does not read build scripts.
 
 The initial declaration readers cover these forms:
 

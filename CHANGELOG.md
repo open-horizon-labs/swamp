@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- Recognize Cargo build layouts inside measured cache roots without guessing their owning project. Distinguish unsupported usage tracking from a supported probe with no record.
+
 - Follow configured Cargo, TypeScript and literal Maven build-output directories outside worktrees through shared external measurement, retaining project references and exclusions.
 
 - macOS default scope includes cross-platform caches in `$XDG_CACHE_HOME` (default `~/.cache`) alongside native `~/Library/Caches`. Relative XDG overrides fall back to the conventional home path.

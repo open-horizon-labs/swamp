@@ -1251,7 +1251,11 @@ pub(crate) fn observe_external_with_outputs(
         else {
             continue;
         };
-        let scope_key = crate::artifact::NestedArtifact::storage_id(path, "");
+        let scope_key = store_containers
+            .get(&idx)
+            .and_then(|containers| containers.iter().find(|container| container.path == *path))
+            .map(crate::build_adapters::BuildContainer::scope)
+            .unwrap_or_else(|| crate::artifact::NestedArtifact::storage_id(path, ""));
         output_declarations_by_scope.insert(scope_key, references.clone());
         let already_identified = store_containers
             .get(&idx)
@@ -1284,8 +1288,24 @@ pub(crate) fn observe_external_with_outputs(
         Some(dir) if !store_containers.is_empty() => crate::build_stores::load_units(dir),
         _ => HashMap::new(),
     };
-    let stored_cache = crate::build_adapters::ContainerCache::from_containers(
-        previous_units.values().cloned().collect(),
+    // Empty results are safe to replay only for typed generic-cache roots:
+    // their detector capability fixes the selected adapter. For other
+    // containers an empty vector carries no adapter identity, so retaining
+    // it could replay a negative result after adapter selection changes.
+    let stable_empty_scopes: HashSet<String> = store_containers
+        .values()
+        .flatten()
+        .filter(|container| {
+            container.store_kind == Some(crate::locations::BuildStoreKind::GenericCacheBuildOutputs)
+        })
+        .map(crate::build_adapters::BuildContainer::scope)
+        .collect();
+    let stored_cache = crate::build_adapters::ContainerCache::from_scoped_containers(
+        previous_units
+            .iter()
+            .filter(|(scope, (_, units))| !units.is_empty() || stable_empty_scopes.contains(*scope))
+            .map(|(scope, (stored_at, units))| (scope.clone(), *stored_at, units.clone()))
+            .collect(),
     );
     // A store holding only sealed read-only volumes whose stamps hold is
     // vouched for without a window (`sealed_only_unchanged`).
@@ -1557,6 +1577,12 @@ pub(crate) fn observe_external_with_outputs(
         sources_by_key.insert(key.clone(), sources.clone());
         let unit_id =
             crate::growth::external_unit_table_id(&detector_id, category_str(category), &canonical);
+        let generic_cache_layout = store_containers.get(&idx).is_some_and(|containers| {
+            containers.iter().any(|container| {
+                container.store_kind
+                    == Some(crate::locations::BuildStoreKind::GenericCacheBuildOutputs)
+            })
+        });
         // A unit that declares a last-use source is drilled into at any
         // size (its children are the depth-2 rows of a reclaim view); an
         // unclassified root only once it is big enough to be worth
@@ -1564,8 +1590,8 @@ pub(crate) fn observe_external_with_outputs(
         // threshold is not drilled, so a small unclassified root keeps
         // its replay.
         let want_children = crate::drilldown::wants_children(
-            category == StorageCategory::Unclassified,
-            !sources.is_empty(),
+            category == StorageCategory::Unclassified || generic_cache_layout,
+            !sources.is_empty() || generic_cache_layout,
             swamp_dir
                 .and_then(|dir| last_known_external(dir, &key).ok().flatten())
                 .map(|(bytes, _)| bytes),
@@ -1686,7 +1712,10 @@ pub(crate) fn observe_external_with_outputs(
         let drill_started = std::time::Instant::now();
         let children: Vec<crate::drilldown::UnitChild> = match &observation {
             crate::folded_measurement::UnitObservation::Unit(folded) if want_children => {
-                let big_enough = crate::drilldown::worth_listing(!sources.is_empty(), folded.bytes);
+                let big_enough = crate::drilldown::worth_listing(
+                    !sources.is_empty() || generic_cache_layout,
+                    folded.bytes,
+                );
                 match child_dirs {
                     Some(dirs) if big_enough => crate::drilldown::children_of(
                         &canonical,
@@ -1920,11 +1949,12 @@ pub(crate) fn observe_external_with_outputs(
         .flatten()
         .map(|c| c.scope())
         .collect();
-    let replay_cache = crate::build_adapters::ContainerCache::from_containers(
+    let replay_cache = crate::build_adapters::ContainerCache::from_scoped_containers(
         previous_units
             .iter()
             .filter(|(k, _)| replayable.contains(*k))
-            .map(|(_, v)| v.clone())
+            .filter(|(scope, (_, units))| !units.is_empty() || stable_empty_scopes.contains(*scope))
+            .map(|(scope, (stored_at, units))| (scope.clone(), *stored_at, units.clone()))
             .collect(),
     );
     let folded_rows = crate::build_adapters::FoldedIndex::from_dirs(store_dirs);
@@ -2202,7 +2232,11 @@ pub(crate) fn observe_external_with_outputs(
             overlap_count: overlap.map_or(0, |(n, _)| n as u32),
             last_used: found.last_used,
             children: crate::drilldown::reconciled(
-                crate::last_used::with_child_last_used(children, &found.children),
+                crate::last_used::with_child_last_used(
+                    children,
+                    &found.children,
+                    found.child_probe_applies,
+                ),
                 bytes,
             ),
         });
@@ -2304,7 +2338,11 @@ pub(crate) fn observe_external_with_outputs(
                 overlap_count: 0,
                 last_used: found.last_used,
                 children: crate::drilldown::reconciled(
-                    crate::last_used::with_child_last_used(children, &found.children),
+                    crate::last_used::with_child_last_used(
+                        children,
+                        &found.children,
+                        found.child_probe_applies,
+                    ),
                     bytes,
                 ),
             });

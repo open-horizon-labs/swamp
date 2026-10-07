@@ -702,6 +702,12 @@ fn tool_consequence(
     let root = interiors.iter().find(|i| {
         i.present && i.path == u.path && Some(i.id.as_str()) == i.container_id.as_deref()
     })?;
+    // A generic cache root can anchor a rendered interior while only some
+    // descendants have a known producer. Never turn that subset into a
+    // rebuild claim for the whole physical cache.
+    if !root.coverage.supported {
+        return None;
+    }
     let inside: Vec<crate::artifact::NestedArtifact> = interiors
         .iter()
         .filter(|i| i.present && i.container_id == root.container_id)
