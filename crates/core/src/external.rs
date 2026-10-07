@@ -693,9 +693,57 @@ mod parallel_measurement_tests {
                 dir_facts(actual.child_dirs.as_deref()),
                 dir_facts(expected_dirs.as_deref())
             );
+            let serial_rows =
+                crate::growth::folded_rows_for(serial_store.path(), &path.display().to_string());
+            let parallel_rows =
+                crate::growth::folded_rows_for(parallel_store.path(), &path.display().to_string());
+            assert_eq!(serial_rows.len(), parallel_rows.len());
+            let without_access_sample = |mut row: crate::growth::FoldedRow| {
+                row.access_atime = None;
+                row.access_observed_at = None;
+                row
+            };
+            for (serial, parallel) in serial_rows.iter().zip(&parallel_rows) {
+                if let Some(atime) = serial.access_atime {
+                    assert!(
+                        serial
+                            .access_observed_at
+                            .is_some_and(|sample| atime <= sample)
+                    );
+                }
+                if let Some(atime) = parallel.access_atime {
+                    assert!(
+                        parallel
+                            .access_observed_at
+                            .is_some_and(|sample| atime <= sample)
+                    );
+                }
+                assert_eq!(
+                    without_access_sample(serial.clone()),
+                    without_access_sample(parallel.clone()),
+                    "parallel and serial walks must agree on every non-access field"
+                );
+            }
+            assert!(serial_rows.iter().any(|row| row.access_atime.is_some()));
+            assert!(parallel_rows.iter().any(|row| row.access_atime.is_some()));
+
+            // Prove the normalization tolerates deliberately different
+            // per-scan samples but still detects a structural discrepancy.
+            let mut sample_a = serial_rows[0].clone();
+            let mut sample_b = sample_a.clone();
+            sample_a.access_atime = Some(10);
+            sample_a.access_observed_at = Some(20);
+            sample_b.access_atime = Some(11);
+            sample_b.access_observed_at = Some(21);
             assert_eq!(
-                crate::growth::folded_rows_for(serial_store.path(), &path.display().to_string()),
-                crate::growth::folded_rows_for(parallel_store.path(), &path.display().to_string())
+                without_access_sample(sample_a.clone()),
+                without_access_sample(sample_b.clone())
+            );
+            sample_b.bytes += 1;
+            assert_ne!(
+                without_access_sample(sample_a),
+                without_access_sample(sample_b),
+                "normalization must not hide byte-layout differences"
             );
         }
         assert!(folded(&parallel[&0].observation).hardlinked);
