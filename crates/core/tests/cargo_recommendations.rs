@@ -113,6 +113,7 @@ fn report_json_with_nested_artifacts_serializes_byte_identically_across_a_real_c
         summary: swamp_core::report::Summary::default(),
         github_enrichment: None,
         nested_artifacts: vec![unit],
+        configured_outputs: Vec::new(),
         store_dir: None,
     };
     // The same finalizer `bus::run_report` calls once per observe pass,

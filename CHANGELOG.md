@@ -5,6 +5,16 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+## v0.8.5 — 2026-10-07
+
+- Cache drilldown rows show modification age and separately sourced directory access timestamps captured before enumeration. Stored reports retain the access observation date and explain that earlier listings can update it; access metadata does not establish actual use.
+
+- Recognize Cargo build layouts inside measured cache roots without guessing their owning project. Distinguish unsupported usage tracking from a supported probe with no record.
+
+- Follow configured Cargo, TypeScript and literal Maven build-output directories outside worktrees through shared external measurement, retaining project references and exclusions.
+
+- macOS default scope includes cross-platform caches in `$XDG_CACHE_HOME` (default `~/.cache`) alongside native `~/Library/Caches`. Relative XDG overrides fall back to the conventional home path.
+
 ## v0.8.3 — 2026-10-02
 
 - Model rows separate repository and tag names from file-derived architecture, parameter count and precision. Selected details show last use once and distinguish shared model storage from the selected folder's size.

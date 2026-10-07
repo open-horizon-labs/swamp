@@ -98,6 +98,11 @@ impl Consumer for CargoConsumer {
             _ => ContainerCache::disabled(),
         };
 
+        let (roots, observed_dirs) = declaration_roots(&draft);
+        draft.configured_outputs = self
+            .adapters
+            .configured_outputs_for_roots(&roots, &observed_dirs);
+
         let folded = folded_index(&draft);
         let facts = draft.docker_facts.clone();
         let mut build_ctx = BuildCtx::new(ctx.observed_at, &folded, &coverage, &cache);
@@ -122,6 +127,33 @@ impl Consumer for CargoConsumer {
         draft.nested_artifacts = Arc::new(nested);
         Ok(vec![Event::CargoAnnotated(Arc::new(draft))])
     }
+}
+
+/// Source directories already seen by the walk. Artifact interiors are not
+/// project discovery roots: a package inside node_modules or a Cargo registry
+/// copy must not become a new consumer just because it has a manifest.
+fn declaration_roots(draft: &Draft) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let worktrees: std::collections::HashMap<&str, &crate::report::WorktreeRow> = draft
+        .projects
+        .iter()
+        .flat_map(|p| &p.worktrees)
+        .map(|w| (w.worktree_id.as_str(), w))
+        .collect();
+    let roots = worktrees.values().map(|w| w.path.clone()).collect();
+    let observed = draft
+        .dirs
+        .iter()
+        .filter_map(|d| {
+            let worktree = worktrees.get(d.worktree_id.as_str())?;
+            let path = worktree.path.join(&d.rel_path);
+            let inside_artifact = worktree
+                .artifacts
+                .iter()
+                .any(|a| !a.kind.is_worktree_remainder() && path.starts_with(&a.path));
+            (!inside_artifact).then_some(path)
+        })
+        .collect();
+    (roots, observed)
 }
 
 /// The folded walk's directory rows, as absolute paths.

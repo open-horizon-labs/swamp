@@ -337,7 +337,14 @@ pub struct ReclaimChild {
     /// measured (not zero).
     pub bytes: Option<i64>,
     pub measure: ChildMeasure,
+    /// Newest modification inside this child, copied from the observation.
+    #[serde(default)]
+    pub mtime_max: u64,
     pub last_used: LastUsed,
+    /// Access-time evidence for the listed directory itself. Listing it
+    /// during observation may refresh atime, so this is not proof of use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_evidence: Option<crate::evidence::Evidence>,
     /// The last-used fact as text; `None` for the remainder and
     /// adjustment rows.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -702,6 +709,12 @@ fn tool_consequence(
     let root = interiors.iter().find(|i| {
         i.present && i.path == u.path && Some(i.id.as_str()) == i.container_id.as_deref()
     })?;
+    // A generic cache root can anchor a rendered interior while only some
+    // descendants have a known producer. Never turn that subset into a
+    // rebuild claim for the whole physical cache.
+    if !root.coverage.supported {
+        return None;
+    }
     let inside: Vec<crate::artifact::NestedArtifact> = interiors
         .iter()
         .filter(|i| i.present && i.container_id == root.container_id)
@@ -1027,7 +1040,9 @@ fn child_of(
         name: c.name.clone(),
         bytes: c.bytes,
         measure: c.measure,
+        mtime_max: c.mtime_max,
         last_used: c.last_used.clone(),
+        access_evidence: c.access_evidence.clone(),
         last_used_text: is_entry.then(|| c.last_used.fact(now)),
         text,
         about: None,
@@ -1520,12 +1535,11 @@ pub fn render_text(view: &ReclaimView) -> String {
                     Some(b) => human_bytes_pub(b.max(0) as u64),
                     None => "not measured".to_string(),
                 };
-                let used = c
-                    .last_used_text
-                    .as_deref()
-                    .map(|t| format!("  last used: {t}"))
-                    .unwrap_or_default();
-                let _ = writeln!(out, "      {size:>12}  {}{used}", c.text);
+                let (child_text, access_detail) = reclaim_child_display(c, view.observed_at);
+                let _ = writeln!(out, "      {size:>12}  {child_text}");
+                if let Some(detail) = access_detail {
+                    let _ = writeln!(out, "                    {detail}");
+                }
                 if let Some(h) = &c.hold {
                     let _ = writeln!(out, "                    standing: {}", hold_line(h));
                 }
@@ -1564,10 +1578,105 @@ pub fn render_text(view: &ReclaimView) -> String {
     out
 }
 
+/// Compact child facts plus a separate full access-evidence line. Keeping
+/// these independent prevents directory atime from being read as last use.
+fn reclaim_child_display(c: &ReclaimChild, observed_at: u64) -> (String, Option<String>) {
+    let mut text = c.text.clone();
+    if c.kind == ChildKind::Entry && c.mtime_max > 0 {
+        text.push_str(&format!(
+            "  modified {}",
+            crate::render::modification_age_label(c.mtime_max, observed_at)
+        ));
+    }
+    let unsupported = c.last_used.source == crate::last_used::LastUsedSource::Unsupported;
+    if let Some(access) = &c.access_evidence {
+        text.push_str(&format!(
+            "  directory access time {}",
+            crate::render::access_summary(access)
+        ));
+        if unsupported {
+            text.push_str("  use tracking unsupported");
+        }
+    }
+    if let Some(last_used) = c.last_used_text.as_deref()
+        && (c.access_evidence.is_none() || !unsupported)
+    {
+        text.push_str(&format!("  last used: {last_used}"));
+    }
+    let detail = c
+        .access_evidence
+        .as_ref()
+        .map(crate::render::render_access_evidence);
+    (text, detail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn reclaim_cli_child_keeps_directory_access_separate_from_actual_use() {
+        let observed_at = 1_700_000_100;
+        let access = crate::evidence::Evidence::known(
+            crate::evidence::FactKind::Activity,
+            crate::evidence::FactSubtype::Accessed,
+            crate::evidence::FactValue::Timestamp(1_700_000_000),
+            crate::evidence::EvidenceSource::FilesystemMetadata {
+                detail: "access time of this directory".into(),
+            },
+            observed_at,
+        )
+        .with_event_at(1_700_000_000)
+        .with_note("directory listing may refresh atime; not proof of prior use");
+        let child = ReclaimChild {
+            kind: ChildKind::Entry,
+            name: "cache-entry".into(),
+            bytes: Some(4),
+            measure: ChildMeasure::Complete,
+            mtime_max: 1_699_000_000,
+            access_evidence: Some(access),
+            last_used: LastUsed {
+                at: Some(1_600_000_000),
+                source: crate::last_used::LastUsedSource::ToolNative("fixture-tool".into()),
+                ..LastUsed::default()
+            },
+            last_used_text: Some("2020-09-13 (fixture-tool record)".into()),
+            text: "cache-entry".into(),
+            about: None,
+            manager: Vec::new(),
+            hold: None,
+        };
+
+        let (compact, detail) = reclaim_child_display(&child, observed_at);
+        assert!(compact.contains("modified"));
+        assert!(compact.contains("directory access time 2023-"));
+        assert!(compact.contains("last used: 2020-09-13 (fixture-tool record)"));
+        let detail = detail.expect("access evidence gets its own detail line");
+        assert!(detail.contains("source: filesystem metadata"));
+        assert!(detail.contains("observed"));
+        assert!(detail.contains("not proof of prior use"));
+    }
+
+    #[test]
+    fn unknown_modification_age_does_not_crowd_the_child_label() {
+        let child = ReclaimChild {
+            kind: ChildKind::Entry,
+            name: "stable-toolchain".into(),
+            bytes: Some(1),
+            measure: ChildMeasure::Complete,
+            mtime_max: 0,
+            access_evidence: None,
+            last_used: LastUsed::default(),
+            last_used_text: None,
+            text: "stable-toolchain".into(),
+            about: None,
+            manager: Vec::new(),
+            hold: None,
+        };
+        let (compact, _) = reclaim_child_display(&child, 1_700_000_000);
+        assert_eq!(compact, "stable-toolchain");
+    }
 
     fn root(path: &str, state: DeclaredState) -> DeclaredRoot {
         DeclaredRoot {

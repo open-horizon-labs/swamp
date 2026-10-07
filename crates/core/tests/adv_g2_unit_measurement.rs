@@ -638,6 +638,8 @@ fn rollup(rel: &str, own: u64, entries: u32) -> DirRollup {
         entry_count: entries,
         symlink_count: 0,
         mod_time_min: 1,
+        access_atime: None,
+        access_observed_at: None,
         complete: true,
         growth_bytes: None,
     }
@@ -655,7 +657,7 @@ fn adv_top_n_ties_are_ordered_by_name_whatever_the_input_order() {
         for i in 0..names.len() {
             dirs.push(rollup(names[(i + rot) % names.len()], 100, 1));
         }
-        let kids = children_of(unit, dirs, 600, 3);
+        let kids = children_of(unit, dirs, 600, 1000, 3);
         let shown: Vec<String> = kids
             .iter()
             .filter(|c| c.kind == ChildKind::Entry)
@@ -985,6 +987,7 @@ fn adv_every_new_user_facing_string_has_no_verdict_word_and_no_em_dash() {
         entries: 3,
         not_measured: 2,
         last_used: Default::default(),
+        access_evidence: None,
     };
     for (kind, measure, bytes) in [
         (ChildKind::Entry, ChildMeasure::Complete, Some(10)),

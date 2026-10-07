@@ -300,6 +300,8 @@ mod tests {
             entry_count: 1,
             symlink_count: 0,
             mod_time_min: 0,
+            access_atime: None,
+            access_observed_at: None,
             complete: true,
             growth_bytes: None,
         }

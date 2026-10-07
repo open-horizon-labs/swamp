@@ -10,7 +10,9 @@
 //!    files directly inside a `bin` directory, never a directory's own
 //!    access time and never a symlink's -- only when no tool-native
 //!    record exists;
-//! 3. **no record**. Never a date derived from a modification time.
+//! 3. **no record** when a consulted source had no usable value, or
+//!    **unsupported** when no source applies. Never a date derived from a
+//!    modification time.
 //!
 //! When both a tool-native record and an access time exist and disagree,
 //! the tool-native value is the one shown and the access time stays on
@@ -50,6 +52,8 @@ pub enum LastUsedSource {
     ToolNative(String),
     /// Access time of the unit's key files.
     FileAtime,
+    /// No last-use source applies to this unit or child.
+    Unsupported,
     /// Nothing recorded the unit's use.
     #[default]
     None,
@@ -62,6 +66,7 @@ impl LastUsedSource {
         match self {
             Self::ToolNative(name) => format!("tool_native:{name}"),
             Self::FileAtime => "file_atime".to_string(),
+            Self::Unsupported => "unsupported".to_string(),
             Self::None => "none".to_string(),
         }
     }
@@ -69,6 +74,7 @@ impl LastUsedSource {
     pub fn from_label(label: &str) -> Self {
         match label {
             "file_atime" => Self::FileAtime,
+            "unsupported" => Self::Unsupported,
             other => match other.strip_prefix("tool_native:") {
                 Some(name) if !name.is_empty() => Self::ToolNative(name.to_string()),
                 _ => Self::None,
@@ -85,6 +91,7 @@ impl LastUsedSource {
                 other => format!("{other} record"),
             }),
             Self::FileAtime => Some("file access time".to_string()),
+            Self::Unsupported => None,
             Self::None => None,
         }
     }
@@ -225,7 +232,8 @@ pub(crate) fn resolve_at(
 impl LastUsed {
     /// Rebuilds a stored fact from its columns; an unknown source label
     /// or a missing value is `no record`. A `none:<why>` label keeps the
-    /// reason a consulted source was set aside.
+    /// reason a consulted source was set aside; `unsupported` stays distinct
+    /// from legacy `none` rows.
     pub fn from_columns(at: Option<u64>, source: Option<&str>, atime: Option<u64>) -> LastUsed {
         let label = source.unwrap_or("none");
         let why_none = label
@@ -233,7 +241,19 @@ impl LastUsed {
             .and_then(NoRecordWhy::from_label);
         let source = LastUsedSource::from_label(label);
         match (&source, at) {
-            (LastUsedSource::None, _) | (_, None) => LastUsed {
+            (LastUsedSource::None, _) => LastUsed {
+                at: None,
+                source: LastUsedSource::None,
+                atime,
+                why_none,
+            },
+            (LastUsedSource::Unsupported, _) => LastUsed {
+                at: None,
+                source: LastUsedSource::Unsupported,
+                atime,
+                why_none: None,
+            },
+            (_, None) => LastUsed {
                 at: None,
                 source: LastUsedSource::None,
                 atime,
@@ -289,6 +309,7 @@ impl LastUsed {
     pub fn fact(&self, now: u64) -> String {
         match (self.at, self.source.describe()) {
             (Some(at), Some(source)) => format!("{} ({source})", format_day(at, now)),
+            _ if self.source == LastUsedSource::Unsupported => "tracking unsupported".to_string(),
             _ => match self.why_none {
                 Some(why) => format!("no record ({})", why.describe()),
                 None => "no record".to_string(),
@@ -497,6 +518,7 @@ pub(crate) fn cargo_global_cache_newest(cargo_home: &Path, table: CargoCacheTabl
 pub(crate) struct UnitLastUse {
     pub(crate) last_used: LastUsed,
     pub(crate) children: BTreeMap<String, LastUsed>,
+    pub(crate) child_probe_applies: bool,
 }
 
 /// Time spent in [`probe`] this process, in microseconds (SWAMP_TRACE).
@@ -521,9 +543,11 @@ fn probe_inner(path: &Path, sources: &[LastUseSource], now: u64) -> UnitLastUse 
     let mut atime: Option<u64> = None;
     let mut children: BTreeMap<String, LastUsed> = BTreeMap::new();
     let mut limit_reached = false;
+    let mut child_probe_applies = false;
     for source in sources {
         match *source {
             LastUseSource::KeyFileAtime { max_depth } => {
+                child_probe_applies = true;
                 let scan = scan_key_file_atimes(path, max_depth);
                 if scan.truncated {
                     limit_reached = true;
@@ -544,19 +568,31 @@ fn probe_inner(path: &Path, sources: &[LastUseSource], now: u64) -> UnitLastUse 
             }
             // Read where its plist reads already happen
             // (`consumer_wiring::attach_build_output_associations`), not here.
-            LastUseSource::XcodeDerivedDataPlist => {}
+            LastUseSource::XcodeDerivedDataPlist => {
+                child_probe_applies = true;
+            }
             // Joined from the adapter's units after identification
             // (`build_adapters::model_stores::attach_last_read`).
-            LastUseSource::AdapterStated => {}
+            LastUseSource::AdapterStated => {
+                child_probe_applies = true;
+            }
         }
     }
-    let mut last_used = resolve_at(tool_native, atime, now);
+    let mut last_used = if sources.is_empty() {
+        LastUsed {
+            source: LastUsedSource::Unsupported,
+            ..LastUsed::default()
+        }
+    } else {
+        resolve_at(tool_native, atime, now)
+    };
     if last_used.at.is_none() && limit_reached {
         last_used = LastUsed::probe_limit_reached();
     }
     UnitLastUse {
         last_used,
         children,
+        child_probe_applies,
     }
 }
 
@@ -600,10 +636,20 @@ pub(crate) fn declared_sources(
 pub(crate) fn with_child_last_used(
     mut children: Vec<crate::drilldown::UnitChild>,
     found: &BTreeMap<String, LastUsed>,
+    probe_applies: bool,
 ) -> Vec<crate::drilldown::UnitChild> {
     for child in &mut children {
         if child.kind == crate::drilldown::ChildKind::Entry {
-            child.last_used = found.get(&child.name).cloned().unwrap_or_default();
+            child.last_used = found.get(&child.name).cloned().unwrap_or_else(|| {
+                if probe_applies {
+                    LastUsed::default()
+                } else {
+                    LastUsed {
+                        source: LastUsedSource::Unsupported,
+                        ..LastUsed::default()
+                    }
+                }
+            });
         }
     }
     children
@@ -675,6 +721,63 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_and_supported_empty_probe_remain_distinct_in_storage_and_text() {
+        let unsupported = probe(Path::new("/unused"), &[], 1_790_000_000).last_used;
+        let supported_empty = probe(
+            Path::new("/unused"),
+            &[LastUseSource::KeyFileAtime { max_depth: 2 }],
+            1_790_000_000,
+        )
+        .last_used;
+        assert_eq!(
+            unsupported.describe(1_790_000_000),
+            "Last run or opened: tracking unsupported"
+        );
+        assert_eq!(
+            supported_empty.describe(1_790_000_000),
+            "Last run or opened: no record"
+        );
+        for fact in [unsupported, supported_empty] {
+            let restored = LastUsed::from_columns(fact.at, Some(&fact.source_column()), fact.atime);
+            assert_eq!(restored, fact);
+        }
+    }
+
+    #[test]
+    fn child_without_a_record_says_whether_a_key_file_probe_applied() {
+        let rows = vec![crate::drilldown::UnitChild {
+            kind: crate::drilldown::ChildKind::Entry,
+            name: "child".into(),
+            bytes: Some(1),
+            measure: crate::drilldown::ChildMeasure::Complete,
+            mtime_max: 0,
+            entries: 0,
+            not_measured: 0,
+            last_used: LastUsed::default(),
+            access_evidence: None,
+        }];
+        let unsupported = with_child_last_used(rows.clone(), &BTreeMap::new(), false);
+        let probed = with_child_last_used(rows, &BTreeMap::new(), true);
+        assert_eq!(
+            unsupported[0].last_used.fact(1_790_000_000),
+            "tracking unsupported"
+        );
+        assert_eq!(probed[0].last_used.fact(1_790_000_000), "no record");
+    }
+
+    #[test]
+    fn xcode_and_adapter_sources_apply_to_child_rows_even_without_a_found_record() {
+        for source in [
+            LastUseSource::XcodeDerivedDataPlist,
+            LastUseSource::AdapterStated,
+        ] {
+            let result = probe(Path::new("/unused"), &[source], 1_790_000_000);
+            assert!(result.child_probe_applies);
+            assert_eq!(result.last_used.source, LastUsedSource::None);
+        }
+    }
+
+    #[test]
     fn a_date_after_now_is_set_aside_with_its_reason_never_a_fact() {
         let now = 1_790_000_000;
         // Milliseconds read as seconds, and a wrong-clock 2099.
@@ -733,12 +836,16 @@ mod tests {
     fn source_labels_round_trip_and_an_unknown_one_is_no_record() {
         for s in [
             LastUsedSource::None,
+            LastUsedSource::Unsupported,
             LastUsedSource::FileAtime,
             LastUsedSource::ToolNative("cargo-global-cache".into()),
         ] {
             assert_eq!(LastUsedSource::from_label(&s.label()), s);
         }
         assert_eq!(LastUsedSource::from_label("mtime"), LastUsedSource::None);
+        let legacy = LastUsed::from_columns(None, Some("none"), None);
+        assert_eq!(legacy.source, LastUsedSource::None);
+        assert_eq!(legacy.fact(1_790_000_000), "no record");
         assert_eq!(
             LastUsedSource::from_label("tool_native:"),
             LastUsedSource::None

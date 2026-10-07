@@ -2140,11 +2140,21 @@ pub fn describe_unit_child(child: &crate::drilldown::UnitChild, now: u64) -> Str
                 }
                 ChildMeasure::Complete => {}
             }
-            text.push_str(&format!(
-                "  modified {}  {}",
-                age_label(child.mtime_max, now),
-                child.last_used.describe(now)
-            ));
+            text.push_str(&format!("  modified {}", age_label(child.mtime_max, now)));
+            let last_used_is_unsupported =
+                child.last_used.source == crate::last_used::LastUsedSource::Unsupported;
+            if !last_used_is_unsupported || child.access_evidence.is_none() {
+                text.push_str(&format!("  {}", child.last_used.describe(now)));
+            }
+            if let Some(access) = &child.access_evidence {
+                text.push_str(&format!(
+                    "  directory access time {}",
+                    access_summary(access)
+                ));
+                if last_used_is_unsupported {
+                    text.push_str("  use tracking unsupported");
+                }
+            }
             text
         }
     }
@@ -2182,6 +2192,12 @@ fn render_unit_children(u: &crate::external::ExternalUnit, now: u64) -> Vec<Stri
             unit_child_size(child),
             describe_unit_child(child, now)
         ));
+        if let Some(access) = &child.access_evidence {
+            lines.push(format!(
+                "                 {}",
+                render_access_evidence(access)
+            ));
+        }
     }
     let sum = crate::drilldown::rows_total(&u.children);
     if sum != u.bytes as i64 {
@@ -2213,6 +2229,11 @@ fn age_label(mtime_max: u64, now: u64) -> String {
     }
     let secs = now.saturating_sub(mtime_max);
     format!("{} ago", crate::schedule::coarse_age(secs))
+}
+
+/// Public form of the same age wording used for unit-child modifications.
+pub fn modification_age_label(mtime_max: u64, now: u64) -> String {
+    age_label(mtime_max, now)
 }
 
 /// One short, source-qualified line per decision-evidence fact (#60):
@@ -2365,6 +2386,44 @@ pub fn render_evidence_lines(evidence: &[crate::evidence::Evidence]) -> Vec<Stri
             format!("{kind} ({subtype}): {value}  [source: {source}]{coverage}{note}")
         })
         .collect()
+}
+
+/// Access-time detail for a stored observation. Uses calendar timestamps
+/// so reopening an old report cannot make its access event look recent.
+pub fn render_access_evidence(e: &crate::evidence::Evidence) -> String {
+    use crate::evidence::{FactStatus, FactValue};
+    let value = match &e.status {
+        FactStatus::Known(FactValue::Timestamp(t)) => {
+            format!("{} (event)", timestamp_label(*t))
+        }
+        FactStatus::Known(v) => format!("{v:?}"),
+        FactStatus::Unknown { reason } => format!("unknown ({reason})"),
+        FactStatus::Unavailable { reason } => format!("unavailable ({reason})"),
+        FactStatus::Conflicting { reason, .. } => format!("conflicting ({reason})"),
+    };
+    let source = evidence_source_label(&e.source);
+    let note = e
+        .note
+        .as_deref()
+        .map(|n| format!("; note: {n}"))
+        .unwrap_or_default();
+    format!(
+        "{value} [source: {source}; observed {}{note}]",
+        timestamp_label(e.observed_at)
+    )
+}
+
+/// Compact access-time value for a row label; details stay in the evidence
+/// pane/indented line so source and caveat do not crowd a large cache list.
+pub fn access_summary(e: &crate::evidence::Evidence) -> String {
+    use crate::evidence::{FactStatus, FactValue};
+    match &e.status {
+        FactStatus::Known(FactValue::Timestamp(t)) => timestamp_label(*t),
+        FactStatus::Known(_) => "value recorded".into(),
+        FactStatus::Unknown { .. } => "unknown".into(),
+        FactStatus::Unavailable { .. } => "unavailable".into(),
+        FactStatus::Conflicting { .. } => "conflicting".into(),
+    }
 }
 
 /// Confirm-time warnings derived from a unit's decision evidence (#60,
@@ -2628,6 +2687,79 @@ pub fn activity_evidence_inventory_markdown() -> String {
         out.push_str(&format!("| {domain} | {evidence} |\n"));
     }
     out
+}
+
+#[cfg(test)]
+mod child_access_display_tests {
+    use super::describe_unit_child;
+    use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
+    use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+    use crate::last_used::{LastUsed, LastUsedSource};
+
+    fn access_evidence() -> Evidence {
+        Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Accessed,
+            FactValue::Timestamp(1_700_000_000),
+            EvidenceSource::FilesystemMetadata {
+                detail: "access time of this directory".into(),
+            },
+            1_700_000_100,
+        )
+        .with_event_at(1_700_000_000)
+        .with_note("listing may refresh this directory's access time; not proof of prior use")
+    }
+
+    fn child(last_used: LastUsed) -> UnitChild {
+        UnitChild {
+            kind: ChildKind::Entry,
+            name: "large".into(),
+            bytes: Some(4),
+            measure: ChildMeasure::Complete,
+            mtime_max: 1_699_000_000,
+            entries: 0,
+            not_measured: 0,
+            last_used,
+            access_evidence: Some(access_evidence()),
+        }
+    }
+
+    #[test]
+    fn directory_access_does_not_turn_unsupported_use_tracking_into_last_used() {
+        let text = describe_unit_child(
+            &child(LastUsed {
+                source: LastUsedSource::Unsupported,
+                ..LastUsed::default()
+            }),
+            1_800_000_000,
+        );
+        assert!(text.contains("modified"));
+        assert!(text.contains("directory access time"));
+        assert!(text.contains("use tracking unsupported"));
+        assert!(!text.contains("Last run or opened: tracking unsupported"));
+        assert!(
+            !text.contains("ago [source:"),
+            "stored access event must not be rendered as a fresh relative age"
+        );
+        let detail = super::render_access_evidence(&access_evidence());
+        assert!(detail.contains("listing may refresh"));
+        assert!(detail.contains("source: filesystem metadata"));
+        assert!(detail.contains("observed"));
+    }
+
+    #[test]
+    fn supported_tool_use_remains_visible_alongside_directory_access() {
+        let text = describe_unit_child(
+            &child(LastUsed {
+                at: Some(1_600_000_000),
+                source: LastUsedSource::ToolNative("fixture-tool".into()),
+                ..LastUsed::default()
+            }),
+            1_800_000_000,
+        );
+        assert!(text.contains("Last run or opened:"));
+        assert!(text.contains("directory access time"));
+    }
 }
 
 #[cfg(test)]

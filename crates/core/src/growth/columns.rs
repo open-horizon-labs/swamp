@@ -539,6 +539,12 @@ pub struct FoldedRow {
     pub rel_dir: String,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
+    /// Access time captured from this directory's own metadata before its
+    /// listing. This is measurement metadata, not byte-history evidence.
+    pub access_atime: Option<u64>,
+    /// Observation time for `access_atime`, retained when the byte row is
+    /// reused by a later pass.
+    pub access_observed_at: Option<u64>,
     /// Root row only: the folded byte total, whether any member was
     /// hardlinked, the newest member mtime, when it was measured, and a
     /// digest of the exclusion list it was measured under.
@@ -555,6 +561,8 @@ fn folded_schema() -> Arc<Schema> {
         Field::new("rel_dir", DataType::Utf8, false),
         Field::new("mtime_ns", DataType::Int64, false),
         Field::new("ctime_ns", DataType::Int64, false),
+        Field::new("access_atime", DataType::UInt64, true),
+        Field::new("access_observed_at", DataType::UInt64, true),
         Field::new("bytes", DataType::UInt64, false),
         Field::new("hardlinked", DataType::Boolean, false),
         Field::new("mtime_max", DataType::UInt64, false),
@@ -569,6 +577,8 @@ pub(super) fn write_folded_rows(path: &Path, rows: &[FoldedRow]) -> Result<()> {
     let rel_dir: Vec<&str> = rows.iter().map(|r| r.rel_dir.as_str()).collect();
     let mtime_ns: Vec<i64> = rows.iter().map(|r| r.mtime_ns).collect();
     let ctime_ns: Vec<i64> = rows.iter().map(|r| r.ctime_ns).collect();
+    let access_atime: Vec<Option<u64>> = rows.iter().map(|r| r.access_atime).collect();
+    let access_observed_at: Vec<Option<u64>> = rows.iter().map(|r| r.access_observed_at).collect();
     let bytes: Vec<u64> = rows.iter().map(|r| r.bytes).collect();
     let hardlinked: Vec<bool> = rows.iter().map(|r| r.hardlinked).collect();
     let mtime_max: Vec<u64> = rows.iter().map(|r| r.mtime_max).collect();
@@ -581,6 +591,8 @@ pub(super) fn write_folded_rows(path: &Path, rows: &[FoldedRow]) -> Result<()> {
             Arc::new(StringArray::from(rel_dir)),
             Arc::new(Int64Array::from(mtime_ns)),
             Arc::new(Int64Array::from(ctime_ns)),
+            Arc::new(UInt64Array::from(access_atime)),
+            Arc::new(UInt64Array::from(access_observed_at)),
             Arc::new(UInt64Array::from(bytes)),
             Arc::new(BooleanArray::from(hardlinked)),
             Arc::new(UInt64Array::from(mtime_max)),
@@ -607,6 +619,12 @@ pub(super) fn read_folded_rows(path: &Path) -> Result<Vec<FoldedRow>> {
         let rel_dir = downcast_str(&batch, "rel_dir")?;
         let mtime_ns = downcast_i64(&batch, "mtime_ns")?;
         let ctime_ns = downcast_i64(&batch, "ctime_ns")?;
+        let access_atime = batch
+            .column_by_name("access_atime")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+        let access_observed_at = batch
+            .column_by_name("access_observed_at")
+            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
         let bytes = downcast_u64(&batch, "bytes")?;
         let hardlinked = downcast_bool(&batch, "hardlinked")?;
         let mtime_max = downcast_u64(&batch, "mtime_max")?;
@@ -618,6 +636,9 @@ pub(super) fn read_folded_rows(path: &Path) -> Result<Vec<FoldedRow>> {
                 rel_dir: rel_dir.value(i).to_string(),
                 mtime_ns: mtime_ns.value(i),
                 ctime_ns: ctime_ns.value(i),
+                access_atime: access_atime.and_then(|c| c.is_valid(i).then(|| c.value(i))),
+                access_observed_at: access_observed_at
+                    .and_then(|c| c.is_valid(i).then(|| c.value(i))),
                 bytes: bytes.value(i),
                 hardlinked: hardlinked.value(i),
                 mtime_max: mtime_max.value(i),
@@ -4432,7 +4453,15 @@ impl Col for Option<String> {
         Arc::new(StringArray::from(values))
     }
     fn get(batch: &RecordBatch, name: &str, i: usize) -> Result<Self> {
-        let a = downcast_str(batch, name)?;
+        // A newly added nullable field in a typed table must remain
+        // backward-compatible with stores written before that field.
+        let Some(column) = batch.column_by_name(name) else {
+            return Ok(None);
+        };
+        let a = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .with_context(|| format!("column {name} is not Utf8"))?;
         Ok(a.is_valid(i).then(|| a.value(i).to_string()))
     }
 }
@@ -4641,6 +4670,7 @@ table! {
         last_used: Option<u64>,
         last_used_source: Option<String>,
         last_used_atime: Option<u64>,
+        access_evidence: Option<String>,
     }
 }
 
@@ -4851,5 +4881,18 @@ table! {
         // lower bound, flagged, exactly as the walk reported it.
         complete: bool,
         observed_at: u64,
+    }
+}
+
+table! {
+    /// `<store>/configured_outputs.parquet`: declarative adapter/project/path
+    /// references from configuration at one observation epoch, never byte history.
+    StoredConfiguredOutputRow, write_configured_output_rows, read_configured_output_rows {
+        scope_key: String,
+        observed_at: u64,
+        adapter_id: String,
+        path: String,
+        project_root: String,
+        evidence: String,
     }
 }

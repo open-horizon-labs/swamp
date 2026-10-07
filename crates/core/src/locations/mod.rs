@@ -245,7 +245,7 @@ pub fn shallow_dir_names(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-pub const CATALOG_VERSION: &str = "2026-09-30.3";
+pub const CATALOG_VERSION: &str = "2026-10-07.1";
 
 /// Detection platform. Data, not a compile-time cfg: tests inject any
 /// value so a Linux-configured `Environment` can be asserted to produce
@@ -836,6 +836,9 @@ pub enum BuildStoreKind {
     /// An Ollama model store (`OLLAMA_MODELS`): `manifests/` naming
     /// content-addressed layers in `blobs/`.
     OllamaModels,
+    /// A generic per-user cache root whose measured descendants may
+    /// contain Cargo target directories.
+    GenericCacheBuildOutputs,
 }
 
 impl BuildStoreKind {
@@ -873,6 +876,7 @@ impl BuildStoreKind {
             Self::BuildKitCache => "buildkit-cache",
             Self::HuggingFaceHub => "huggingface-hub",
             Self::OllamaModels => "ollama-models",
+            Self::GenericCacheBuildOutputs => "generic-cache-build-outputs",
         }
     }
 
@@ -916,6 +920,7 @@ impl BuildStoreKind {
         Self::BuildKitCache,
         Self::HuggingFaceHub,
         Self::OllamaModels,
+        Self::GenericCacheBuildOutputs,
     ];
 }
 

@@ -10,7 +10,7 @@
 //! `actions.rs`. Registering the first adapter before adding the second
 //! is the whole repair.
 
-use super::BuildAdapter;
+use super::{BuildAdapter, ConfiguredOutput};
 use super::{
     android, cargo, docker_buildkit, go, gradle, maven, model_stores, node, python, tool_stores,
     xcode_swift,
@@ -60,6 +60,16 @@ impl Registry {
 
     pub fn ids(&self) -> Vec<&'static str> {
         self.adapters.iter().map(|a| a.id()).collect()
+    }
+
+    /// Discover declarations from known project roots and nested roots already
+    /// present in the walk's directory rows.
+    pub fn configured_outputs_for_roots(
+        &self,
+        project_roots: &[std::path::PathBuf],
+        observed_dirs: &[std::path::PathBuf],
+    ) -> Vec<ConfiguredOutput> {
+        super::configured_outputs::discover(self, project_roots, observed_dirs)
     }
 }
 

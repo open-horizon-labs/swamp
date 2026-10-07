@@ -5,7 +5,7 @@
 //! facts a person acts on and keeps the honest caveat short.
 
 use crate::model::{Row, age_label, human_bytes};
-use swamp_core::evidence::{Evidence, FactKind, FactStatus, FactValue};
+use swamp_core::evidence::{Evidence, FactKind, FactStatus, FactSubtype, FactValue};
 use swamp_core::report::ArtifactKind;
 
 /// A space estimate that could be off by less than this is not worth a
@@ -68,6 +68,18 @@ fn sentence(e: &Evidence) -> Option<String> {
         }
         (FactKind::Consumer, FactStatus::Known(FactValue::List(who))) => {
             Some(format!("Projects: {}", who.join(", ")))
+        }
+        (FactKind::Activity, _) if e.subtype == FactSubtype::Accessed => Some(format!(
+            "Directory access time: {}",
+            swamp_core::render::render_access_evidence(e)
+        )),
+        (FactKind::Activity, FactStatus::Known(FactValue::Timestamp(_)))
+            if e.subtype == FactSubtype::ToolReportedUse =>
+        {
+            Some(format!(
+                "Tool-reported use: {}",
+                swamp_core::render::render_access_evidence(e)
+            ))
         }
         (FactKind::Activity, FactStatus::Known(FactValue::Timestamp(t))) => {
             let age = age_label(Some(e.observed_at.saturating_sub(*t)));
@@ -171,8 +183,13 @@ pub fn lines(row: &Row, sharing: &[String]) -> Vec<String> {
             e.status,
             FactStatus::Unknown { .. } | FactStatus::Unavailable { .. }
         ) && e.kind != FactKind::CurrentUse
+            && !(e.kind == FactKind::Activity && e.subtype == FactSubtype::Accessed)
         {
-            let n = unknown_name(e.kind);
+            let n = if e.kind == FactKind::Activity && e.subtype == FactSubtype::Accessed {
+                "directory access time"
+            } else {
+                unknown_name(e.kind)
+            };
             if !unknown.contains(&n) {
                 unknown.push(n);
             }
@@ -255,6 +272,26 @@ mod tests {
             10,
             Reason::fixed("clone/snapshot sharing is not queried"),
         )
+    }
+
+    #[test]
+    fn accessed_evidence_is_not_worded_as_a_modification_or_use_event() {
+        let evidence = Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Accessed,
+            FactValue::Timestamp(1_700_000_000),
+            EvidenceSource::FilesystemMetadata {
+                detail: "access time of the directory itself".into(),
+            },
+            1_700_000_100,
+        )
+        .with_event_at(1_700_000_000)
+        .with_note("directory listing may refresh atime; not proof of prior use");
+        let line = sentence(&evidence).unwrap();
+        assert!(line.starts_with("Directory access time:"));
+        assert!(line.contains("not proof of prior use"));
+        assert!(!line.contains("Last changed"));
+        assert!(!line.contains("Last used"));
     }
 
     #[test]

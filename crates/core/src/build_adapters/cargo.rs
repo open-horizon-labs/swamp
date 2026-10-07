@@ -22,7 +22,9 @@
 //! Cargo itself wrote. Nothing invokes Cargo, reads a build script, or
 //! executes project code.
 
-use super::{BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, NestedUnitBuilder};
+use super::{
+    BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, ConfiguredOutput, NestedUnitBuilder,
+};
 use crate::artifact::{
     ArtifactRole, ArtifactVariant, NestedArtifact, architecture_from_target, relative_path,
 };
@@ -43,16 +45,24 @@ impl BuildAdapter for Adapter {
         "Rust / Cargo"
     }
 
+    fn is_project_root(&self, path: &Path) -> bool {
+        crate::fs_gate::is_file(path.join("Cargo.toml"))
+    }
+
     fn capabilities(&self) -> BuildCapabilities {
         BuildCapabilities {
             // Cargo's registry/git caches are separate detector-resolved
             // locations, not something this adapter decomposes.
-            identifies_shared_stores: false,
+            identifies_shared_stores: true,
             // A fingerprint names the target; the package identity comes
             // from the checkout, not from the artifact.
             attributes_package_identity: true,
             actions_available: false,
         }
+    }
+
+    fn store_kinds(&self) -> &'static [crate::locations::BuildStoreKind] {
+        &[crate::locations::BuildStoreKind::GenericCacheBuildOutputs]
     }
 
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer> {
@@ -88,9 +98,63 @@ impl BuildAdapter for Adapter {
         out
     }
 
+    fn configured_outputs(&self, project_root: &Path) -> Vec<ConfiguredOutput> {
+        if !self.is_project_root(project_root) {
+            return Vec::new();
+        }
+        crate::cargo_artifacts::declared_build_paths(project_root)
+            .into_iter()
+            .map(|(path, evidence)| ConfiguredOutput {
+                adapter_id: self.id().to_string(),
+                path: super::configured_outputs::lexical_absolute(&path, project_root),
+                project_root: project_root.to_path_buf(),
+                evidence,
+            })
+            .collect()
+    }
+
     fn identify(&self, container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {
         let root = &container.path;
-        let measured = ctx.folded().under(root);
+        let rows = ctx.folded().under(root);
+        if container.store_kind == Some(crate::locations::BuildStoreKind::GenericCacheBuildOutputs)
+            && !cargo_target_has_layout(root, &rows)
+        {
+            let mut candidates = nested_cargo_targets(root, &rows);
+            candidates.sort();
+            let mut units = Vec::new();
+            for target in candidates {
+                let child = BuildContainer::shared_store("cargo", target);
+                for mut unit in self.identify(&child, ctx) {
+                    // The generic cache root owns the one replay window and
+                    // persisted adapter result. The Cargo target path remains
+                    // the physical location of each interior unit.
+                    unit.container_id = Some(container.scope());
+                    if let Some(consequence) = &mut unit.consequence {
+                        consequence.push_str(
+                            "; the layout alone does not establish which project or exact build command recreates this target",
+                        );
+                    }
+                    units.push(unit);
+                }
+            }
+            if units.is_empty() {
+                return Vec::new();
+            }
+            // The renderers group interiors beneath their persisted
+            // container row. This measured, explicitly unsupported root is
+            // a display/accounting anchor for the mixed cache; Cargo evidence
+            // below it does not establish that the entire cache is a Cargo
+            // output or that one build command can recreate it.
+            units.push(
+                NestedUnitBuilder::container_root(container, ctx, ArtifactRole::Container)
+                    .unsupported_layout(
+                        "only evidenced Cargo descendants are classified; this generic cache may contain unrelated data",
+                    )
+                    .build(),
+            );
+            return units;
+        }
+        let measured = rows;
         if measured.is_empty() {
             // Not "nothing here": a container the walk did not measure
             // is a container swamp cannot explain, and saying so is the
@@ -268,8 +332,100 @@ impl BuildAdapter for Adapter {
         });
         units.sort_by(|a, b| a.path.cmp(&b.path));
         units.dedup_by(|a, b| a.path == b.path);
+        if container.store_kind == Some(crate::locations::BuildStoreKind::GenericCacheBuildOutputs)
+        {
+            for unit in &mut units {
+                if let Some(consequence) = &mut unit.consequence {
+                    consequence.push_str(
+                        "; the layout alone does not establish which project or exact build command recreates this target",
+                    );
+                }
+            }
+        }
         units
     }
+}
+
+fn cargo_info_file(root: &Path) -> bool {
+    crate::fs_gate::symlink_metadata(root.join(".rustc_info.json"))
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
+fn profile_root_for(target: &Path, profile: &Path) -> bool {
+    let relative = relative_path(target, profile);
+    let parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    (parts.len() == 1 && matches!(parts[0], "debug" | "release"))
+        || (parts.len() == 2
+            && looks_like_target_triple(parts[0])
+            && matches!(parts[1], "debug" | "release"))
+}
+
+fn profile_has_cargo_structure(
+    profile: &Path,
+    measured_paths: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    ["deps", ".fingerprint", "build", "incremental"]
+        .iter()
+        .any(|child| measured_paths.contains(&profile.join(child)))
+}
+
+fn cargo_target_has_layout(target: &Path, rows: &[&super::FoldedDir]) -> bool {
+    if !cargo_info_file(target) {
+        return false;
+    }
+    let measured_paths: std::collections::HashSet<PathBuf> =
+        rows.iter().map(|row| row.path.clone()).collect();
+    rows.iter().any(|row| {
+        profile_root_for(target, &row.path)
+            && profile_has_cargo_structure(&row.path, &measured_paths)
+    })
+}
+
+/// Targets below a generic cache root are selected only from its measured
+/// directory rows. Their names carry no authority; Cargo's own rustc marker
+/// and a profile/category layout must both be present.
+fn nested_cargo_targets(root: &Path, rows: &[&super::FoldedDir]) -> Vec<PathBuf> {
+    let measured_paths: std::collections::HashSet<PathBuf> =
+        rows.iter().map(|row| row.path.clone()).collect();
+    let mut candidates = std::collections::BTreeSet::new();
+    for row in rows {
+        if !row
+            .path
+            .file_name()
+            .is_some_and(|name| matches!(name.to_str(), Some("debug" | "release")))
+        {
+            continue;
+        }
+        let profile = row.path.clone();
+        if !profile_has_cargo_structure(&profile, &measured_paths) {
+            continue;
+        }
+        let profile_parent = profile.parent().unwrap_or(root);
+        if profile_parent != root
+            && profile_parent.starts_with(root)
+            && profile_root_for(profile_parent, &profile)
+            && cargo_info_file(profile_parent)
+        {
+            // The immediate parent is the target root even when its name
+            // happens to resemble a target triple.
+            candidates.insert(profile_parent.to_path_buf());
+        } else if profile_parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(looks_like_target_triple)
+            && let Some(target) = profile_parent.parent()
+            && target != root
+            && target.starts_with(root)
+            && profile_root_for(target, &profile)
+            && cargo_info_file(target)
+        {
+            candidates.insert(target.to_path_buf());
+        }
+    }
+    candidates.into_iter().collect()
 }
 
 /// What removing a unit in this role would cost, in Cargo's own terms.

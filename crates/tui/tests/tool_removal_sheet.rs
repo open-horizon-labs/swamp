@@ -214,6 +214,7 @@ fn empty_report() -> Report {
         schedule_line: None,
         github_enrichment: None,
         nested_artifacts: Vec::new(),
+        configured_outputs: Vec::new(),
     }
 }
 

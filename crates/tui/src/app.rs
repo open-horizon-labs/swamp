@@ -4964,6 +4964,7 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         }
     }
 
@@ -5615,6 +5616,8 @@ mod tests {
                 entry_count: 1,
                 symlink_count: 0,
                 mod_time_min: 0,
+                access_atime: None,
+                access_observed_at: None,
                 complete: true,
                 growth_bytes: None,
             }],
@@ -6211,6 +6214,7 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         }
     }
 
@@ -6464,6 +6468,7 @@ mod tests {
             entries: 0,
             not_measured: 0,
             last_used: swamp_core::last_used::resolve(None, Some(1_783_468_800)),
+            access_evidence: None,
         };
         let mut report = minimal_report("/roots/a", "p", "/roots/a/p");
         report.projects.clear();
@@ -6614,6 +6619,7 @@ mod tests {
             entries: 0,
             not_measured: 0,
             last_used: Default::default(),
+            access_evidence: None,
         };
         let mut caches = drilled_unit("/fixture/Caches", vec![entry("a", 600), entry("b", 400)]);
         caches.category = swamp_core::locations::StorageCategory::Unclassified;

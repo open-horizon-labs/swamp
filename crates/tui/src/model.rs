@@ -2755,12 +2755,7 @@ pub fn reclaim_rows(
         row.table_note = Some(reclaim_table_note(r.regeneration.class).to_string());
         row.signals = vec![r.regeneration.words.clone()];
         row.last_used = Some(format!("Last used: {}", r.last_used_text));
-        row.mtime_max = r
-            .children
-            .iter()
-            .map(|c| c.last_used.at.unwrap_or(0))
-            .max()
-            .unwrap_or(0);
+        row.mtime_max = r.children.iter().map(|c| c.mtime_max).max().unwrap_or(0);
         let mut standing: Vec<String> = Vec::new();
         if let Some(h) = &r.hold {
             standing.push(swamp_core::reclaim::hold_line(h));
@@ -2790,7 +2785,9 @@ pub fn reclaim_rows(
             .children
             .iter()
             .enumerate()
-            .map(|(i, c)| reclaim_child_row(&r.path, c, &r.models, i + 1 == count))
+            .map(|(i, c)| {
+                reclaim_child_row(&r.path, c, &r.models, i + 1 == count, view.observed_at)
+            })
             .collect();
         let first = children.len();
         children.extend(tags.iter().enumerate().map(|(i, m)| {
@@ -2836,6 +2833,7 @@ fn reclaim_child_row(
     c: &swamp_core::reclaim::ReclaimChild,
     models: &[swamp_core::build_adapters::model_stores::ModelRow],
     last: bool,
+    observed_at: u64,
 ) -> Row {
     use swamp_core::drilldown::ChildKind;
     let flag = c
@@ -2865,17 +2863,50 @@ fn reclaim_child_row(
     row.signals = c
         .last_used_text
         .iter()
+        .filter(|_| {
+            c.access_evidence.is_none()
+                || c.last_used.source != swamp_core::last_used::LastUsedSource::Unsupported
+        })
         .map(|t| format!("last used {t}"))
+        .chain(c.access_evidence.iter().map(|e| {
+            format!(
+                "directory access time {}",
+                swamp_core::render::access_summary(e)
+            )
+        }))
         .chain(c.hold.iter().map(swamp_core::reclaim::hold_line))
         .chain(c.manager.iter().map(|q| q.line()))
         .collect();
-    row.last_used = c.last_used_text.as_ref().map(|t| format!("Last used: {t}"));
+    row.last_used = c.last_used_text.as_ref().and_then(|t| {
+        (c.access_evidence.is_none()
+            || c.last_used.source != swamp_core::last_used::LastUsedSource::Unsupported)
+            .then(|| format!("Last used: {t}"))
+    });
     row.detail_lines = c
         .hold
         .iter()
         .map(swamp_core::reclaim::hold_line)
         .chain(c.manager.iter().map(|q| q.line()))
         .collect();
+    if c.kind == ChildKind::Entry {
+        row.mtime_max = c.mtime_max;
+        let modified = swamp_core::render::modification_age_label(c.mtime_max, observed_at);
+        if c.mtime_max > 0 {
+            row.label = format!("{}  modified {modified}", row.label);
+        }
+        row.detail_lines.push(format!("Modified: {modified}"));
+        if let Some(access) = &c.access_evidence {
+            row.evidence.push(access.clone());
+        } else {
+            row.detail_lines
+                .push("Directory access evidence: not recorded in this observation".into());
+        }
+        if c.last_used.source == swamp_core::last_used::LastUsedSource::Unsupported
+            && c.access_evidence.is_some()
+        {
+            row.detail_lines.push("Last-used tracking: unsupported for this child; directory access is a separate observation".into());
+        }
+    }
     if c.kind == ChildKind::Entry
         && let Some(m) = models.iter().find(|m| {
             m.path
@@ -3533,6 +3564,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synthetic_reclaim_children_do_not_claim_missing_directory_activity() {
+        let child = swamp_core::reclaim::ReclaimChild {
+            kind: swamp_core::drilldown::ChildKind::Remainder,
+            name: String::new(),
+            bytes: Some(0),
+            measure: swamp_core::drilldown::ChildMeasure::Complete,
+            mtime_max: 0,
+            access_evidence: None,
+            last_used: swamp_core::last_used::LastUsed::default(),
+            last_used_text: None,
+            text: "remainder: 0 other entries".into(),
+            about: None,
+            manager: Vec::new(),
+            hold: None,
+        };
+        let row = reclaim_child_row("/cache", &child, &[], true, 1);
+        assert!(
+            !row.detail_lines
+                .iter()
+                .any(|line| line.contains("Directory access"))
+        );
+        assert!(
+            !row.detail_lines
+                .iter()
+                .any(|line| line.starts_with("Modified:"))
+        );
+    }
+
+    #[test]
+    fn unknown_child_mtime_stays_out_of_the_compact_label_but_is_explicit_in_details() {
+        let child = swamp_core::reclaim::ReclaimChild {
+            kind: swamp_core::drilldown::ChildKind::Entry,
+            name: "stable-toolchain".into(),
+            bytes: Some(1),
+            measure: swamp_core::drilldown::ChildMeasure::Complete,
+            mtime_max: 0,
+            access_evidence: None,
+            last_used: swamp_core::last_used::LastUsed::default(),
+            last_used_text: Some("tracking unsupported".into()),
+            text: "stable-toolchain".into(),
+            about: None,
+            manager: Vec::new(),
+            hold: None,
+        };
+        let row = reclaim_child_row("/cache", &child, &[], true, 1_700_000_000);
+        assert_eq!(row.label, "stable-toolchain");
+        assert!(
+            row.detail_lines
+                .iter()
+                .any(|line| line == "Modified: age unknown")
+        );
+    }
+
+    #[test]
     fn disk_rows_distinguish_known_zero_from_unmeasured_and_partial_rollups() {
         let mut known_zero = Row::leaf(0, "known zero".into(), 0, None);
         set_disk_row_size(&mut known_zero, Some(0));
@@ -3922,6 +4007,7 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         };
         let rows = tree_rows(
             &report,
@@ -4051,6 +4137,7 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         };
         assert_eq!(docker_unowned_bytes(&report), 100);
     }

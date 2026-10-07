@@ -50,6 +50,7 @@ fn entry(name: &str, bytes: i64) -> UnitChild {
         entries: 0,
         not_measured: 0,
         last_used: LastUsed::default(),
+        access_evidence: None,
     }
 }
 

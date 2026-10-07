@@ -129,6 +129,8 @@ pub struct Draft {
     pub github_enrichment: Option<GithubEnrichmentSummary>,
     pub schedule_line: Option<String>,
     pub nested_artifacts: Arc<Vec<crate::artifact::NestedArtifact>>,
+    /// Declarative output references discovered from the walk's directory rows.
+    pub configured_outputs: Vec<crate::build_adapters::ConfiguredOutput>,
     /// The Docker daemon's answers this pass, when it was asked and
     /// answered: what the build consumer hands the BuildKit adapter
     /// (`crate::build_stores::daemon_containers`). `None` when Docker

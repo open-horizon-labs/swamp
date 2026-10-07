@@ -107,7 +107,7 @@ tables `unit_meta.parquet` for an external unit's last-used and overlap and
 `unit_children.parquet` for its depth-2 rows); a volume's
 unowned rows (`unowned.parquet` + lists/evidence, and
 `docker_unowned.parquet` for the Docker objects no project claims);
-nested build-artifact units (`nested_artifacts.parquet` + lists/
+configured output references (`configured_outputs.parquet`); nested build-artifact units (`nested_artifacts.parquet` + lists/
 evidence); every row's decision evidence (`evidence.parquet`); per-root
 coverage with each walked root's own totals (`coverage.parquet`); the
 run's notes (`notes.parquet`); the run itself (`runs.parquet`: when,
@@ -186,16 +186,7 @@ the two classes under separate headings; `swamp report`'s per-root
 coverage says `detector location (measured as an external unit, not
 scanned for projects)` for the second class.
 
-1. **Built-in default roots**, per platform. Only `~/src` is a project
-   root. macOS also proposes `~/Library/Developer` and
-   `~/Library/Caches`; Linux also proposes `$XDG_CACHE_HOME` (default
-   `~/.cache`) -- both are detector locations, not project roots: a
-   project checked out inside either one is still discovered (as its
-   own external unit's interior, if its adapter identifies one) but
-   never becomes a "project" the way something under `~/src` would.
-   Neither platform's conventions appear in the other's build; see
-   [Platforms](platform.md#why-linuxs-default-roots-are-what-they-are)
-   for why Linux has two rather than three.
+1. **Built-in default roots**, per platform. Only `~/src` is a project root. macOS also proposes `~/Library/Developer`, `~/Library/Caches`, and the XDG cache root (`$XDG_CACHE_HOME` when absolute, otherwise `~/.cache`). Linux proposes the same XDG cache root without the macOS Library paths. These cache and developer-tool directories are detector locations, measured as external units rather than scanned for Git projects. On macOS, native caches and cross-platform command-line caches can coexist; neither convention replaces the other. See [Platforms](platform.md#why-linuxs-default-roots-are-what-they-are).
 2. **Detector results.** A built-in catalog of read-only detectors
    proposes locations for developer tools: language version managers
    (mise, asdf, pyenv, uv, Conda, rbenv, RVM, ruby-install, nvm,
@@ -557,10 +548,11 @@ Every external unit shows one fact about use, with where it came from:
 Last run or opened: Jul 8 (file access time)
 Last run or opened: Sep 6 (Xcode DerivedData record)
 Last run or opened: no record
+Last run or opened: tracking unsupported
 ```
 
 In JSON it is `last_used`: `at` (epoch seconds, `null` for no record),
-`source` (`tool_native:<name>`, `file_atime` or `none`) and, beside a
+`source` (`tool_native:<name>`, `file_atime`, `none` or `unsupported`) and, beside a
 tool-native value, `atime` -- the key files' access time, kept so the two
 can be compared. The label is a fact about one file or one record. It is
 never "unused" and never "since": a unit whose row says Jul 8 was last
@@ -579,7 +571,7 @@ nothing needs it. Dates are UTC.
 3. **No record.** Never a date derived from a modification time.
 
 When both exist and disagree the tool-native value is shown and the access
-time stays in the JSON. A unit that declares no source shows no record.
+time stays in the JSON. A unit that declares no supported use source shows `tracking unsupported`. A supported source with no recorded value still shows `no record`; neither is evidence that the unit is unused.
 
 | Unit kind | Source | Read from | Checked on a real machine |
 |---|---|---|---|
@@ -596,7 +588,7 @@ time stays in the JSON. A unit that declares no source shows no record.
 | Hugging Face hub repos | file access time | the largest weight blob of the revision shown (the `model-stores` adapter; neither huggingface_hub nor transformers records use), with swamp's own header read set aside | yes: Sep 29 for the one model on this machine |
 | Ollama models | file access time | the model layer blob (`application/vnd.ollama.image.model`); Ollama records no use | yes: Aug 30 for `qwen3:0.6b` |
 | npm `_cacache`, Gradle | not implemented | | unverified |
-| everything else | no record | | |
+| everything else | tracking unsupported | | |
 
 Access time is a weak signal and the docs say so where it is used:
 
@@ -628,14 +620,12 @@ Access time is a weak signal and the docs say so where it is used:
 
 ### What is inside a big root
 
-A large `unclassified` root (`~/Library/Caches` was one 36.8 GB row) and
-every unit that declares a last-use source list their immediate child
-folders, largest first, with size, modification time and last-used:
+Generic XDG and native macOS cache roots, large `unclassified` roots, and every unit that declares a last-use source list their immediate child folders, largest first, with size, modification time and last-used:
 
 ```text
-36.9GB  unclassified  /Users/me/Library/Caches
+36.9GB  cache         /Users/me/Library/Caches
     inside, largest first (rows add up to the total the walk measured):
-           19.5GB  hiphi-endpoints  modified 1d ago  Last run or opened: no record
+           19.5GB  hiphi-endpoints  modified 1d ago  Last run or opened: tracking unsupported
            ...
           281.7MB  remainder: 145 other entries (the other folders, and files directly inside); 9 folders not measured
            -3.7MB  adjustment: hardlinked files are counted once in this unit's total
@@ -664,6 +654,8 @@ folders, largest first, with size, modification time and last-used:
 - **From the one walk.** The rows come from the per-directory rows the
   folded walk already produces, are stored in `unit_children.parquet`, and
   are replayed with the unit when it is unchanged. In Tool storage, Enter opens the unit onto these rows; the selected details carry the last-used fact.
+
+Directory access is a separate filesystem clue, captured from metadata before the walk lists that directory. The displayed event date and observation date remain unchanged when an observation is replayed. Earlier scans or other tools can update directory atime, so it does not prove a build, run, or continued need. Mounts that suppress access updates report the signal as unavailable; older observations without a captured timestamp report it as unknown. Modification age, actual tool-use records, project references and recovery cost remain separate facts.
 
 ### Model caches
 
@@ -863,15 +855,34 @@ rows[]       { path, kind, detector, bytes, growth_bytes?,
                manager[ { manager, subject, quote, attribution } ],
                hold? { kind, label, subjects[], whole_unit },
                removal { kind, text }, regenerable_bytes, held_bytes, note?,
-               children[ { kind, name, bytes|null, measure, last_used,
-                           last_used_text?, text, manager[], hold? } ] }
+               children[ { kind, name, bytes|null, measure, mtime_max,
+                           access_evidence?, last_used, last_used_text?,
+                           text, manager[], hold? } ] }
 ```
 
 `bytes == regenerable_bytes + held_bytes + not_regenerable_bytes +
 not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
 is not measured). `totals` is the object the storage headline reuses (`remainder_bytes` is the part of it that is not developer storage; see "Developer storage: the headline").
 
-In the TUI, Reclaim is the first view of Tools (`2`, or `Tab` from Projects), ordered largest first. Its If removed column uses the stored regeneration class: Download again, Rebuild, Cannot regenerate, or Cost unknown. Selected details retain the original recovery wording, last-used fact and source, exact path and removal route. The scope statement stays under the heading. `→` or Enter expands a unit's recorded folders; `R` refreshes observations. Opening the view reads stored facts and starts no scan.
+In the TUI, Reclaim is the first view of Tools (`2`, or `Tab` from Projects), ordered largest first. Its If removed column uses the stored regeneration class: Download again, Rebuild, Cannot regenerate, or Cost unknown. Selected details retain the original recovery wording, last-used fact and source, exact path and removal route. Child rows keep newest modification age separate from directory access-time evidence. Directory access is timestamped with its source and observation time, and its detail explains that the timestamp was captured before enumeration and earlier listings may have refreshed atime; it is not proof of actual use. Unsupported last-used tracking remains explicit in details. The scope statement stays under the heading. `→` or Enter expands a unit's recorded folders; `R` refreshes observations. Opening the view reads stored facts and starts no scan.
+
+### Configured build outputs outside a checkout
+
+During observation, build adapters read supported declarative configuration from known worktrees and nested project directories already seen by the walk. An output outside the checkout is measured through the external-storage pipeline and appears in Tools / External with its declared project consumers. A shared output is measured once, with every declaration retained. A containing cache excludes the separately measured output from its own total. When several adapters declare the same physical directory, the first adapter in the registry supplies its interior interpretation; every project reference remains visible. This interpretation does not prove that removing mixed outputs can be repaired by a single build command.
+
+Generic XDG and native macOS cache roots also expose Cargo build interiors when their measured directories contain Cargo's layout metadata. The directory's name is not a project reference: a `tdongle-*-target` cache can be identified as Cargo output while its owning project and regeneration source remain unknown. These interiors describe bytes already measured under the cache root; they are not another allocation to add to it. Recognition uses the same folded walk and stored event-based replay, and does not read build scripts.
+
+The initial declaration readers cover these forms:
+
+| Tool | Followed declarations | Limits |
+| --- | --- | --- |
+| Cargo | Effective `build.target-dir` and `build.build-dir` in ancestor `.cargo/config` or `.cargo/config.toml`; the observer's `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` | Deeper settings override ancestor settings; environment overrides configuration. Relative configuration paths use the directory containing `.cargo`; relative environment paths use Swamp's working directory. Custom `CARGO_HOME` configuration outside that ancestry, command-line overrides and unresolved path templates are not inferred. |
+| TypeScript | `compilerOptions.outDir` and `compilerOptions.declarationDir` in `tsconfig.json`, including JSONC comments/trailing commas and relative `extends` | Inherited paths are relative to the declaring configuration file. Inheritance is bounded to eight configuration levels; cycles, package-name and absolute `extends`, arrays of base configurations and project references are not resolved. Missing, malformed or oversized configuration cannot supply a declaration. |
+| Maven | Literal `<build><directory>`, `<outputDirectory>` and `<testOutputDirectory>` in `pom.xml` | Only `basedir`/`project.basedir` and `build.directory`/`project.build.directory` (the local declaration, or `target` when absent) are expanded. Other properties, parent POMs, profiles and plugins are not evaluated. |
+
+Configuration is evidence of a reference, not proof that a project last wrote the files. Exclusions still win, including canonical aliases. A declaration of the checkout itself, its ancestors, or a filesystem root is not followed. Missing or unreadable output paths are reported as coverage gaps. Read-only reports use stored observations and do not read project configuration again.
+
+Build scripts, JavaScript configuration, shell exports from earlier builds, and command-line output overrides are not inspected or executed. Paths visible only through those mechanisms can still appear through cache or Disk coverage, without an inferred owner.
 
 ### Standalone Cargo target directories
 

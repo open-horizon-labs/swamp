@@ -71,7 +71,7 @@ swamp ui
 
 `swamp ui` opens on the last stored report at once and scans only when none exists; the schedule keeps it fresh and `R` refreshes on demand. It never watches the filesystem, so the header's `observed 4m ago` is the true age of what you see. Idle, it draws nothing.
 
-Without explicit roots, Swamp uses built-in locations, enabled tool-location detectors, and your configured additions and exclusions. Tell it where your source lives with `swamp config add-root <path>`; it never guesses. Homebrew is counted by default only for developer tooling, with everything else under its prefix as one `Homebrew (other)` line. `swamp scope` explains what is included, missing, excluded, or disabled; [scope configuration](docs/usage.md#scope-and-coverage) controls it.
+Without explicit roots, Swamp uses built-in locations, enabled tool-location detectors, and your configured additions and exclusions. On macOS this includes both `~/Library/Caches` and the XDG cache root (`$XDG_CACHE_HOME`, default `~/.cache`). Tell it where your source lives with `swamp config add-root <path>`; it never guesses. Homebrew is counted by default only for developer tooling, with everything else under its prefix as one `Homebrew (other)` line. `swamp scope` explains what is included, missing, excluded, or disabled; [scope configuration](docs/usage.md#scope-and-coverage) controls it.
 
 To work with a specific set of directories, pass the same roots to observation and reporting:
 

@@ -282,6 +282,12 @@ pub struct DirRollup {
     /// Newest mtime among this directory's own direct entries, in
     /// minutes since the Unix epoch.
     pub mod_time_min: i32,
+    /// Access time captured from this directory's own metadata before its
+    /// listing. It is carried only for a bounded child access signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_atime: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_observed_at: Option<u64>,
     pub complete: bool,
     #[serde(default)]
     pub growth_bytes: Option<i64>,
@@ -512,6 +518,11 @@ pub struct Report {
     /// serialization time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nested_artifacts: Vec<crate::artifact::NestedArtifact>,
+    /// Declarative build output references discovered from this report's
+    /// already-observed worktree directory rows. These are carried only to
+    /// the scope observation pipeline and persisted in their own typed table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_outputs: Vec<crate::build_adapters::ConfiguredOutput>,
     /// The store this report was produced against, when there was one.
     ///
     /// Carried so a later decision can consult *live* state rather than
@@ -553,6 +564,7 @@ impl Report {
             schedule_line: None,
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         }
     }
 }
@@ -2245,6 +2257,7 @@ pub fn report_scope_with_parts_covered(
         summary: Summary::default(),
         github_enrichment: None,
         nested_artifacts: Vec::new(),
+        configured_outputs: Vec::new(),
         store_dir: store_dir.map(Path::to_path_buf),
     };
 
@@ -2634,31 +2647,61 @@ pub fn observe_scope(
     let phase = std::time::Instant::now();
     let mut events = events;
     events.merge(unit_replay.coverage.clone());
+    let nested_worktrees: Vec<crate::external::NestedWorktree> = merged
+        .projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .map(|wt| crate::external::NestedWorktree {
+            path: wt.path.clone(),
+            reported_bytes: wt.artifacts.iter().map(|a| a.bytes).sum(),
+        })
+        .collect();
+    let mut configured_replay_roots = if want.external {
+        crate::external::configured_output_replay_roots(
+            scope,
+            &nested_worktrees,
+            &merged.configured_outputs,
+        )
+    } else {
+        Vec::new()
+    };
+    let already_replayed: std::collections::HashSet<PathBuf> = unit_roots
+        .iter()
+        .map(|p| crate::fs_gate::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+    configured_replay_roots.retain(|p| !already_replayed.contains(p));
+    // Configured roots are discovered after the project walk. Their anchor
+    // and subsequent external measurements share this later epoch; using the
+    // project epoch for cached rows leaves them older than their own cursor
+    // whenever the walk crosses a clock boundary.
+    let external_observed_at = crate::entities::now();
+    let configured_replay = {
+        crate::growth::replay_unit_roots(
+            store_dir,
+            &configured_replay_roots,
+            external_observed_at,
+            force_full,
+            fs_events_source,
+        )
+    };
+    events.merge(configured_replay.coverage.clone());
     let observed_at = merged.observed_at;
     let mut merged = merged;
     let pass = pass::DiscoveryPass::begin();
     let mut external_ok = true;
     let (mut external_units, store_interiors) = if want.external {
-        let nested_worktrees: Vec<crate::external::NestedWorktree> = merged
-            .projects
-            .iter()
-            .flat_map(|p| p.worktrees.iter())
-            .map(|wt| crate::external::NestedWorktree {
-                path: wt.path.clone(),
-                reported_bytes: wt.artifacts.iter().map(|a| a.bytes).sum(),
-            })
-            .collect();
-        let measured = crate::external::observe_external(
+        let measured = crate::external::observe_external_with_outputs(
             &pass,
             scope,
             &nested_worktrees,
             store_dir,
             observe,
             enrich,
-            observed_at,
+            external_observed_at,
             retention_days,
             since_secs,
             &events,
+            &merged.configured_outputs,
         );
         external_ok = measured.is_ok();
         let observation = measured.unwrap_or_default();
@@ -2669,6 +2712,21 @@ pub fn observe_scope(
     } else {
         (Vec::new(), Vec::new())
     };
+    // A configured path can also be recognized by the project adapter before
+    // its external fold runs. The delivered external interior owns that same
+    // physical identity, including its measured bytes and decision facts.
+    let external_interior_ids: std::collections::HashSet<&str> = store_interiors
+        .iter()
+        .map(|unit| unit.id.as_str())
+        .collect();
+    merged
+        .nested_artifacts
+        .retain(|unit| !external_interior_ids.contains(unit.id.as_str()));
+    for report in per_root.values_mut() {
+        report
+            .nested_artifacts
+            .retain(|unit| !external_interior_ids.contains(unit.id.as_str()));
+    }
     let _ = &mut external_units;
     if trace {
         eprintln!("[trace] observe: external units: {:?}", phase.elapsed());
@@ -2723,7 +2781,7 @@ pub fn observe_scope(
         eprintln!("[trace] observe: agent units: {:?}", phase.elapsed());
     }
     let phase = std::time::Instant::now();
-    let unit_root_coverage: Vec<crate::coverage::UnitRootCoverage> = unit_replay
+    let mut unit_root_coverage: Vec<crate::coverage::UnitRootCoverage> = unit_replay
         .outcomes
         .iter()
         .map(|(path, reason)| crate::coverage::UnitRootCoverage {
@@ -2732,6 +2790,13 @@ pub fn observe_scope(
             reason: reason.clone(),
         })
         .collect();
+    unit_root_coverage.extend(configured_replay.outcomes.iter().map(|(path, reason)| {
+        crate::coverage::UnitRootCoverage {
+            path: path.clone(),
+            event_covered: reason == "incremental",
+            reason: reason.clone(),
+        }
+    }));
     if std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty()) {
         for c in &unit_root_coverage {
             eprintln!(
@@ -2770,6 +2835,7 @@ pub fn observe_scope(
     }
     if observe && want.external && want.agents && external_ok && agents_ok {
         unit_replay.commit()?;
+        configured_replay.commit()?;
     }
     if trace {
         eprintln!("[trace] observe: commit replay: {:?}", phase.elapsed());
@@ -2893,6 +2959,12 @@ pub fn observe_scope(
             store_dir,
             &key,
             &observation.merged.projects,
+            observation.merged.observed_at,
+        )?;
+        crate::growth::write_configured_outputs(
+            store_dir,
+            &key,
+            &observation.merged.configured_outputs,
             observation.merged.observed_at,
         )?;
         // R16 item 1 of this slice: `external_units.parquet`/
@@ -3188,6 +3260,11 @@ pub fn merge_root_report_into(merged: &mut Report, r: Report) {
         }
         merged.nested_artifacts.push(u);
     }
+    for output in r.configured_outputs {
+        if !merged.configured_outputs.contains(&output) {
+            merged.configured_outputs.push(output);
+        }
+    }
 }
 
 /// Rebuilds one merged multi-root [`Report`] from scratch given every
@@ -3231,6 +3308,7 @@ pub fn merge_reports(
         summary: Summary::default(),
         github_enrichment: None,
         nested_artifacts: Vec::new(),
+        configured_outputs: Vec::new(),
     };
     // `dirs_by_worktree`/`files_by_worktree` are `Some` only when the
     // caller asked for them (`include_dirs`); infer that from whether
@@ -3823,6 +3901,7 @@ fn empty_snapshot(observed_at: u64, store_dir: &Path) -> ReportSnapshot {
             summary: Summary::default(),
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
             // The store this call read from -- known directly from the
             // argument, never something that needs to survive a store
             // round trip (`.oh/guardrails/protection-fails-closed.md`:
@@ -3996,6 +4075,13 @@ pub fn report_scope_from_store_with_window(
     // facts rebuilt above and the volumes' history, never read from a
     // table of its own.
     crate::growth::derive_report_views(store_dir, &key, &mut snapshot, window_secs);
+    match crate::growth::read_configured_outputs(store_dir, &key, snapshot.report.observed_at) {
+        Ok(outputs) => snapshot.report.configured_outputs = outputs,
+        Err(error) => snapshot
+            .report
+            .notes
+            .push(format!("configured output references unavailable: {error}")),
+    }
     Ok(snapshot)
 }
 
