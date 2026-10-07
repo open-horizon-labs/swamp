@@ -10858,3 +10858,109 @@ mod tests {
         assert!(empty.is_empty());
     }
 }
+
+/// Persist configuration references alongside a completed scope observation.
+/// A new sibling table leaves old stores readable and byte-history keys intact.
+pub(crate) fn write_configured_outputs(
+    swamp_dir: &Path,
+    scope_key: &str,
+    outputs: &[crate::build_adapters::ConfiguredOutput],
+    observed_at: u64,
+) -> Result<()> {
+    store::StoreDir::at(swamp_dir)?.create()?;
+    let path = swamp_dir.join("configured_outputs.parquet");
+    // An unreadable existing table must not erase other scopes' references.
+    let mut rows = columns::read_configured_output_rows(&path)?;
+    rows.retain(|r| r.scope_key != scope_key);
+    rows.extend(outputs.iter().map(|o| columns::StoredConfiguredOutputRow {
+        scope_key: scope_key.to_owned(),
+        observed_at,
+        adapter_id: o.adapter_id.clone(),
+        path: o.path.display().to_string(),
+        project_root: o.project_root.display().to_string(),
+        evidence: o.evidence.clone(),
+    }));
+    columns::write_configured_output_rows(&path, &rows)
+}
+
+/// Read references only for the completed observation epoch being rebuilt.
+/// A partial newer write cannot be mistaken for the previous report's facts.
+pub(crate) fn read_configured_outputs(
+    swamp_dir: &Path,
+    scope_key: &str,
+    observed_at: u64,
+) -> Result<Vec<crate::build_adapters::ConfiguredOutput>> {
+    Ok(
+        columns::read_configured_output_rows(&swamp_dir.join("configured_outputs.parquet"))?
+            .into_iter()
+            .filter(|r| r.scope_key == scope_key && r.observed_at == observed_at)
+            .map(|r| crate::build_adapters::ConfiguredOutput {
+                adapter_id: r.adapter_id,
+                path: PathBuf::from(r.path),
+                project_root: PathBuf::from(r.project_root),
+                evidence: r.evidence,
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod configured_output_table_tests {
+    use super::*;
+
+    fn reference(name: &str) -> crate::build_adapters::ConfiguredOutput {
+        crate::build_adapters::ConfiguredOutput {
+            adapter_id: "node".into(),
+            path: PathBuf::from(format!("/tmp/{name}")),
+            project_root: PathBuf::from(format!("/repo/{name}")),
+            evidence: "tsconfig compilerOptions.outDir".into(),
+        }
+    }
+
+    #[test]
+    fn configured_output_facts_keep_other_scopes_and_reject_partial_epochs() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = reference("first");
+        let second = reference("second");
+        write_configured_outputs(temp.path(), "scope-a", std::slice::from_ref(&first), 1000)
+            .unwrap();
+        write_configured_outputs(temp.path(), "scope-b", std::slice::from_ref(&second), 1001)
+            .unwrap();
+        assert_eq!(
+            read_configured_outputs(temp.path(), "scope-a", 1000).unwrap(),
+            vec![first]
+        );
+        assert_eq!(
+            read_configured_outputs(temp.path(), "scope-b", 1001).unwrap(),
+            vec![second]
+        );
+        assert!(
+            read_configured_outputs(temp.path(), "scope-a", 999)
+                .unwrap()
+                .is_empty()
+        );
+        write_configured_outputs(temp.path(), "scope-a", &[], 1002).unwrap();
+        assert!(
+            read_configured_outputs(temp.path(), "scope-a", 1002)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            read_configured_outputs(temp.path(), "scope-b", 1001)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unreadable_configured_output_table_is_not_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("configured_outputs.parquet");
+        std::fs::write(&file, b"not a parquet file").unwrap();
+        assert!(
+            write_configured_outputs(temp.path(), "scope-a", &[reference("new")], 1000).is_err()
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"not a parquet file");
+    }
+}

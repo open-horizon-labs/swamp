@@ -90,6 +90,7 @@ const TABLES: &[&str] = &[
     "runs.parquet",
     "coverage.parquet",
     "notes.parquet",
+    "configured_outputs.parquet",
     "projects.parquet",
     "worktrees.parquet",
     "worktree_facts.parquet",

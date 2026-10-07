@@ -3922,6 +3922,7 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         };
         let rows = tree_rows(
             &report,
@@ -4051,6 +4052,7 @@ mod tests {
             schedule_line: None,
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         };
         assert_eq!(docker_unowned_bytes(&report), 100);
     }

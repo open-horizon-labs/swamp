@@ -204,6 +204,10 @@ const ADAPTER_SOURCES: &[(&str, &str)] = &[
     ),
     ("cargo.rs", include_str!("build_adapters/cargo.rs")),
     (
+        "configured_outputs.rs",
+        include_str!("build_adapters/configured_outputs.rs"),
+    ),
+    (
         "docker_buildkit.rs",
         include_str!("build_adapters/docker_buildkit.rs"),
     ),

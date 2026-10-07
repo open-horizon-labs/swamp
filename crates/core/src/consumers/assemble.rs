@@ -88,6 +88,7 @@ impl Consumer for ReportAssembler {
             summary,
             github_enrichment: d.github_enrichment,
             nested_artifacts: Arc::try_unwrap(d.nested_artifacts).unwrap_or_else(|a| (*a).clone()),
+            configured_outputs: d.configured_outputs,
         };
         Ok(vec![Event::ReportAssembled(Arc::new(report))])
     }

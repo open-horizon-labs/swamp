@@ -416,7 +416,7 @@ fn is_derived_table(name: &str) -> bool {
         | "docker_values" | "docker_containers" | "runs" | "coverage" | "projects"
         | "worktrees" | "worktree_facts" | "artifact_shape" | "artifact_shape_lists"
         | "external_units" | "unit_children" | "unit_meta" | "manager_facts" | "agent_units"
-        | "agent_unit_members" | "unit_consumers"
+        | "agent_unit_members" | "unit_consumers" | "configured_outputs"
         | "agent_identifications" | "agent_containers" | "nested_artifacts"
         | "nested_artifact_lists" | "nested_artifact_evidence" | "evidence"
         // Historical rendered caches and removed derived views.
@@ -747,6 +747,7 @@ mod housekeeping_tests {
         fs::create_dir(&volume).unwrap();
         for path in [
             root.join("report_rows.parquet"),
+            root.join("configured_outputs.parquet"),
             root.join("summary.parquet"),
             volume.join("report_rows.parquet"),
             volume.join("current.parquet"),
@@ -803,6 +804,7 @@ mod housekeeping_tests {
         let lock_inode = fs::metadata(root.join("store-write.lock")).unwrap();
         assert!(store.reset_incompatible_format().unwrap());
         assert!(!root.join("report_rows.parquet").exists());
+        assert!(!root.join("configured_outputs.parquet").exists());
         assert!(!root.join("summary.parquet").exists());
         assert!(!volume.join("report_rows.parquet").exists());
         assert!(!volume.join("current.parquet").exists());

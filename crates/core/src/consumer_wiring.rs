@@ -1327,6 +1327,7 @@ mod tests {
             summary: Default::default(),
             github_enrichment: None,
             nested_artifacts: Vec::new(),
+            configured_outputs: Vec::new(),
         }
     }
 

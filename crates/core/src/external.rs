@@ -225,6 +225,7 @@ struct Candidate {
     category: StorageCategory,
     provenance: Provenance,
     path: PathBuf,
+    configured_output: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -773,6 +774,7 @@ fn authorized_candidates(scope: &EffectiveScope) -> (Vec<Candidate>, Vec<PathBuf
                 category: root.category,
                 provenance: root.provenance,
                 path: root.path,
+                configured_output: false,
             })
         })
         .collect();
@@ -837,6 +839,7 @@ fn expand_containers(
                 category: c.category,
                 provenance: c.provenance.clone(),
                 path: child,
+                configured_output: false,
             });
         }
     }
@@ -913,6 +916,46 @@ pub struct ExternalObservation {
     pub notes: Vec<String>,
 }
 
+/// The configured-output paths that may get their own event cursor. This
+/// shares the candidate authorization guards below so exclusions, project
+/// ancestors and locations already charged to worktrees never open a new
+/// event source window.
+pub(crate) fn configured_output_replay_roots(
+    scope: &EffectiveScope,
+    worktrees: &[NestedWorktree],
+    outputs: &[crate::build_adapters::ConfiguredOutput],
+) -> Vec<PathBuf> {
+    let worktree_roots_canonical: Vec<PathBuf> = worktrees
+        .iter()
+        .map(|w| crate::fs_gate::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()))
+        .collect();
+    let adapters = crate::build_adapters::registry::Registry::with_builtins();
+    let mut roots = Vec::new();
+    for output in outputs {
+        if adapters.get(&output.adapter_id).is_none() {
+            continue;
+        }
+        let path =
+            crate::fs_gate::canonicalize(&output.path).unwrap_or_else(|_| output.path.clone());
+        let project_root = crate::fs_gate::canonicalize(&output.project_root)
+            .unwrap_or_else(|_| output.project_root.clone());
+        if scope.exclusion_for(&output.path).is_some()
+            || scope.exclusion_for(&path).is_some()
+            || path.parent().is_none()
+            || project_root.starts_with(&path)
+            || worktree_roots_canonical
+                .iter()
+                .any(|root| path == *root || path.starts_with(root))
+        {
+            continue;
+        }
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    }
+    roots
+}
+
 /// [`discover_and_measure`], plus the store interiors. Takes the
 /// [`crate::report::DiscoveryPass`] only `report::observe_scope` mints
 /// (`.oh/guardrails/discovery-owned-by-report-pipeline.md`); the
@@ -933,6 +976,39 @@ pub fn observe_external(
     since_secs: u64,
     coverage: &crate::fs_events::EventCoverage,
 ) -> Result<ExternalObservation> {
+    observe_external_with_outputs(
+        _pass,
+        scope,
+        worktrees,
+        swamp_dir,
+        observe,
+        fetch,
+        observed_at,
+        retention_days,
+        since_secs,
+        coverage,
+        &[],
+    )
+}
+
+/// The report-owned observation path also supplies output references found
+/// from the already-observed project directory rows. They join the ordinary
+/// external candidate reduction and growth history; this function performs no
+/// separate traversal.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_external_with_outputs(
+    _pass: &crate::report::DiscoveryPass,
+    scope: &EffectiveScope,
+    worktrees: &[NestedWorktree],
+    swamp_dir: Option<&Path>,
+    observe: bool,
+    fetch: bool,
+    observed_at: u64,
+    retention_days: u64,
+    since_secs: u64,
+    coverage: &crate::fs_events::EventCoverage,
+    configured_outputs: &[crate::build_adapters::ConfiguredOutput],
+) -> Result<ExternalObservation> {
     let trace = std::env::var("SWAMP_TRACE").is_ok_and(|v| v != "0" && !v.is_empty());
     let trace_started = std::time::Instant::now();
     let mut trace_mark = trace_started;
@@ -943,8 +1019,118 @@ pub fn observe_external(
     // (`.oh/guardrails/discovery-consumes-effective-scope.md`).
     let detectors = crate::locations::Registry::with_builtins();
     let (candidates, out_of_scope) = authorized_candidates(scope);
-    let (candidates, mut out_of_scope, partial_containers) =
+    let (mut candidates, mut out_of_scope, partial_containers) =
         expand_containers(candidates, out_of_scope, scope, &detectors);
+    out_of_scope.extend(
+        scope
+            .normalized_exclude
+            .iter()
+            .map(|path| crate::fs_gate::canonicalize(path).unwrap_or_else(|_| path.clone())),
+    );
+    out_of_scope.sort();
+    out_of_scope.dedup();
+    // Configured references can name external paths, but they do not widen
+    // scope through an exclusion or by pointing at an ancestor of the
+    // declaring project. Paths already covered by a measured worktree retain
+    // that worktree's physical accounting owner.
+    let canonical_worktrees: Vec<PathBuf> = worktrees
+        .iter()
+        .map(|w| crate::fs_gate::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()))
+        .collect();
+    let mut outputs_by_path: HashMap<PathBuf, Vec<crate::build_adapters::ConfiguredOutput>> =
+        HashMap::new();
+    let mut configured_notes = Vec::new();
+    let output_adapters = crate::build_adapters::registry::Registry::with_builtins();
+    let existing_paths: HashSet<PathBuf> = candidates
+        .iter()
+        .map(|c| crate::fs_gate::canonicalize(&c.path).unwrap_or_else(|_| c.path.clone()))
+        .collect();
+    let mut appended_paths = HashSet::new();
+    for output in configured_outputs {
+        let path =
+            crate::fs_gate::canonicalize(&output.path).unwrap_or_else(|_| output.path.clone());
+        let project_root = crate::fs_gate::canonicalize(&output.project_root)
+            .unwrap_or_else(|_| output.project_root.clone());
+        if let Some(pattern) = scope
+            .exclusion_for(&output.path)
+            .or_else(|| scope.exclusion_for(&path))
+        {
+            out_of_scope.push(path.clone());
+            configured_notes.push(format!(
+                "not measured: configured build output {} is excluded by {pattern}",
+                output.path.display()
+            ));
+            continue;
+        }
+        if path.as_os_str().is_empty() || path.parent().is_none() || project_root.starts_with(&path)
+        {
+            configured_notes.push(format!(
+                "not measured: configured build output {} would contain its declaring project",
+                output.path.display()
+            ));
+            continue;
+        }
+        let refs = outputs_by_path.entry(path.clone()).or_default();
+        if !refs.contains(output) {
+            refs.push(output.clone());
+        }
+        if let Some(root) = canonical_worktrees
+            .iter()
+            .find(|root| path == **root || path.starts_with(root))
+        {
+            for reference in refs.iter() {
+                configured_notes.push(format!(
+                    "configured build output {} referenced by {} is counted under worktree {}",
+                    path.display(),
+                    reference.project_root.display(),
+                    root.display()
+                ));
+            }
+            continue;
+        }
+        if existing_paths.contains(&path) || !appended_paths.insert(path.clone()) {
+            continue;
+        }
+        let Some(adapter) = output_adapters.get(&output.adapter_id) else {
+            configured_notes.push(format!(
+                "not measured: configured build output {} names unknown adapter {}",
+                output.path.display(),
+                output.adapter_id
+            ));
+            outputs_by_path.remove(&path);
+            continue;
+        };
+        candidates.push(Candidate {
+            detector_id: format!("configured-build:{}", adapter.id()),
+            detector_name: adapter.name().to_string(),
+            category: StorageCategory::BuildOutput,
+            provenance: Provenance::ConfigField(output.evidence.clone()),
+            path: output.path.clone(),
+            configured_output: true,
+        });
+    }
+    // Match the physical unit's identity to the same registry order that
+    // selects its interior interpreter, independent of source-root ordering.
+    for candidate in candidates
+        .iter_mut()
+        .filter(|candidate| candidate.configured_output)
+    {
+        let canonical = crate::fs_gate::canonicalize(&candidate.path)
+            .unwrap_or_else(|_| candidate.path.clone());
+        if let Some(references) = outputs_by_path.get(&canonical)
+            && let Some((adapter, reference)) =
+                output_adapters.adapters().iter().find_map(|adapter| {
+                    references
+                        .iter()
+                        .find(|reference| reference.adapter_id == adapter.id())
+                        .map(|reference| (adapter.as_ref(), reference))
+                })
+        {
+            candidate.detector_id = format!("configured-build:{}", adapter.id());
+            candidate.detector_name = adapter.name().to_string();
+            candidate.provenance = Provenance::ConfigField(reference.evidence.clone());
+        }
+    }
     // Detector display names, captured from the authorized scope before
     // the candidates are consumed: a coverage note for an unreadable
     // unit still needs a human-readable tool name, and must not reach
@@ -1019,19 +1205,77 @@ pub fn observe_external(
     // adapter identifies each: the detector's declaration against the
     // adapter's, nothing else (`crate::build_stores::containers_for`).
     let adapters = crate::build_adapters::registry::Registry::with_builtins();
-    let store_containers: HashMap<usize, crate::build_adapters::BuildContainer> = {
-        let located: Vec<crate::build_stores::Located> = canon_candidates
+    let mut store_containers: HashMap<usize, Vec<crate::build_adapters::BuildContainer>> = {
+        let detector_indexes: Vec<usize> = canon_candidates
             .iter()
+            .enumerate()
+            .filter(|(_, (candidate, _))| !candidate.configured_output)
+            .map(|(idx, _)| idx)
+            .collect();
+        let located: Vec<crate::build_stores::Located> = detector_indexes
+            .iter()
+            .map(|idx| &canon_candidates[*idx])
             .map(|(c, canonical)| crate::build_stores::Located {
                 detector_id: &c.detector_id,
                 category: c.category,
                 path: canonical,
             })
             .collect();
-        crate::build_stores::containers_for(&adapters, &detectors, &located)
-            .into_iter()
-            .collect()
+        let mut by_index = HashMap::new();
+        for (located_idx, container) in
+            crate::build_stores::containers_for(&adapters, &detectors, &located)
+        {
+            let idx = detector_indexes[located_idx];
+            by_index.entry(idx).or_insert_with(Vec::new).push(container);
+        }
+        by_index
     };
+    // Configured project outputs use the same folded directory measurement,
+    // container cache and nested-unit history as detector-identified stores.
+    // A path keeps one adapter identity because the container cache is keyed
+    // by path; every declaration remains evidence on the one physical unit.
+    let mut output_declarations_by_scope: HashMap<
+        String,
+        Vec<crate::build_adapters::ConfiguredOutput>,
+    > = HashMap::new();
+    for (path, references) in &outputs_by_path {
+        if canonical_worktrees
+            .iter()
+            .any(|root| path == root || path.starts_with(root))
+        {
+            continue;
+        }
+        let Some(idx) = canon_candidates
+            .iter()
+            .position(|(_, candidate_path)| candidate_path == path)
+        else {
+            continue;
+        };
+        let scope_key = crate::artifact::NestedArtifact::storage_id(path, "");
+        output_declarations_by_scope.insert(scope_key, references.clone());
+        let already_identified = store_containers
+            .get(&idx)
+            .is_some_and(|containers| containers.iter().any(|c| c.path == *path));
+        if already_identified {
+            continue;
+        }
+        let output = adapters.adapters().iter().find_map(|adapter| {
+            references
+                .iter()
+                .find(|output| output.adapter_id == adapter.id())
+                .map(|output| (adapter.as_ref(), output))
+        });
+        let Some((adapter, output)) = output else {
+            continue;
+        };
+        store_containers.entry(idx).or_default().push(
+            crate::build_adapters::BuildContainer::project(
+                adapter.id(),
+                path.clone(),
+                output.project_root.clone(),
+            ),
+        );
+    }
     // The stores' previously identified units, and the question whether
     // this pass's window vouches for each -- asked before measuring, so
     // a store whose units cannot be replayed is measured with its
@@ -1046,7 +1290,7 @@ pub fn observe_external(
     // A store holding only sealed read-only volumes whose stamps hold is
     // vouched for without a window (`sealed_only_unchanged`).
     let mut vouched = coverage.clone();
-    for container in store_containers.values() {
+    for container in store_containers.values().flatten() {
         if crate::folded_measurement::sealed_only_unchanged(swamp_dir, &container.path) {
             vouched.merge(crate::fs_events::EventCoverage::trusted(
                 container.path.clone(),
@@ -1111,14 +1355,22 @@ pub fn observe_external(
     let mut order: Vec<usize> = (0..canon_candidates.len()).collect();
     order.sort_by_key(|i| remainder_roles.contains_key(i));
     let mut unmeasured: Vec<PathBuf> = Vec::new();
+    let mut configured_missing = Vec::new();
 
     // Where each measured location's last use is recorded, asked of the
     // detectors that declared it (never a table of tool names here), and
     // the drilldown rows an earlier pass stored for units whose folded
     // rows this pass may replay instead of re-walk.
     let last_use_decls: HashMap<usize, Vec<crate::locations::LastUseSource>> = {
-        let located: Vec<crate::build_stores::Located> = canon_candidates
+        let detector_indexes: Vec<usize> = canon_candidates
             .iter()
+            .enumerate()
+            .filter(|(_, (candidate, _))| !candidate.configured_output)
+            .map(|(idx, _)| idx)
+            .collect();
+        let located: Vec<crate::build_stores::Located> = detector_indexes
+            .iter()
+            .map(|idx| &canon_candidates[*idx])
             .map(|(c, canonical)| crate::build_stores::Located {
                 detector_id: &c.detector_id,
                 category: c.category,
@@ -1126,6 +1378,9 @@ pub fn observe_external(
             })
             .collect();
         crate::last_used::declared_sources(&detectors, &located)
+            .into_iter()
+            .map(|(located_idx, sources)| (detector_indexes[located_idx], sources))
+            .collect()
     };
     let previous_children: HashMap<String, Vec<crate::drilldown::UnitChild>> = swamp_dir
         .map(crate::growth::previous_unit_children)
@@ -1133,7 +1388,7 @@ pub fn observe_external(
     if trace {
         eprintln!(
             "[xtrace] build-store/cache/coverage setup containers={} elapsed={:?}",
-            store_containers.len(),
+            store_containers.values().map(Vec::len).sum::<usize>(),
             trace_mark.elapsed()
         );
         trace_mark = std::time::Instant::now();
@@ -1245,6 +1500,7 @@ pub fn observe_external(
             category,
             provenance,
             path: _,
+            configured_output: _,
         } = candidate;
         let category = *category;
         let detector_id = detector_id.clone();
@@ -1345,8 +1601,8 @@ pub fn observe_external(
             (result.observation, result.child_dirs)
         } else {
             match store_containers.get(&idx) {
-                Some(container) => {
-                    let reuse = probe.can_reuse(container) && reuse_ok;
+                Some(containers) => {
+                    let reuse = containers.iter().all(|c| probe.can_reuse(c)) && reuse_ok;
                     let (obs, dirs) = crate::folded_measurement::observe_unit_with_dirs(
                         swamp_dir,
                         &canonical,
@@ -1459,11 +1715,25 @@ pub fn observe_external(
             // measured before, this observation's own owned sweep
             // tombstones it correctly (a real removal, e.g. the tool was
             // uninstalled and its whole home deleted).
-            crate::folded_measurement::UnitObservation::Absent => continue,
+            crate::folded_measurement::UnitObservation::Absent => {
+                if outputs_by_path.contains_key(&canonical) {
+                    configured_missing.push(format!(
+                        "configured build output {} was referenced but is not present",
+                        canonical.display()
+                    ));
+                }
+                continue;
+            }
             // Present but not readable this pass: protect it from
             // tombstoning, and skip measuring rather than guessing.
             // Coverage is incomplete, which is not a storage change.
             crate::folded_measurement::UnitObservation::Unreadable(_) => {
+                if outputs_by_path.contains_key(&canonical) {
+                    configured_missing.push(format!(
+                        "configured build output {} could not be read this pass",
+                        canonical.display()
+                    ));
+                }
                 unmeasured.push(canonical.clone());
                 protected_keys.insert(key);
                 continue;
@@ -1477,6 +1747,12 @@ pub fn observe_external(
             // for one pass is coverage shrinking, not the unit shrinking
             // (`.oh/guardrails/coverage-changes-are-not-storage-changes.md`).
             crate::folded_measurement::UnitObservation::Unit(row) if !row.complete => {
+                if outputs_by_path.contains_key(&canonical) {
+                    configured_missing.push(format!(
+                        "configured build output {} was only partly readable this pass",
+                        canonical.display()
+                    ));
+                }
                 // A reused-but-incomplete unit (a sealed volume with
                 // root-only corners, replayed from its stamp) keeps its
                 // rows fresh too; otherwise the next pass's window
@@ -1566,6 +1842,10 @@ pub fn observe_external(
         })
         .collect();
     notes.extend(devicefs_report_notes.iter().cloned());
+    notes.extend(configured_notes);
+    notes.extend(configured_missing);
+    notes.sort();
+    notes.dedup();
     let ownership = crate::growth::ObservationOwnership::new(
         crate::growth::KeyFamily::External,
         meta_by_key.values().map(|m| m.path.clone()).collect(),
@@ -1629,12 +1909,16 @@ pub fn observe_external(
     // that walk produced, never from stored units that predate it.
     let containers: Vec<crate::build_adapters::BuildContainer> = measured_stores
         .iter()
-        .filter_map(|(i, _)| store_containers.get(i).cloned())
+        .filter_map(|(i, _)| store_containers.get(i))
+        .flatten()
+        .cloned()
         .collect();
     let replayable: HashSet<String> = measured_stores
         .iter()
         .filter(|(_, reused)| *reused)
-        .filter_map(|(i, _)| store_containers.get(i).map(|c| c.scope()))
+        .filter_map(|(i, _)| store_containers.get(i))
+        .flatten()
+        .map(|c| c.scope())
         .collect();
     let replay_cache = crate::build_adapters::ContainerCache::from_containers(
         previous_units
@@ -1672,7 +1956,101 @@ pub fn observe_external(
         let kept = cards.retained(&|k| !identified_stores.iter().any(|p| k.contains(p.as_str())));
         crate::build_stores::save_cards(dir, kept, observed_at);
     }
-    crate::report::nested_decision_evidence(&mut interiors, observed_at, true);
+    // Shallow adapter identification may discover names outside the folded
+    // rows (for example Maven's packaged jars). Excluded names cannot become
+    // delivered units or participate in the ownership history below.
+    interiors.retain(|unit| scope.exclusion_for(&unit.path).is_none());
+    for unit in &mut interiors {
+        let container = unit.container_id.as_ref().and_then(|scope_key| {
+            containers
+                .iter()
+                .find(|container| container.scope() == *scope_key)
+        });
+        // Adapter builders supply no decision facts. On a cached configured
+        // output, these are the previous observation's derived facts.
+        if unit
+            .container_id
+            .as_ref()
+            .is_some_and(|scope_key| output_declarations_by_scope.contains_key(scope_key))
+        {
+            unit.decision_evidence.clear();
+            if let Some(consequence) = &mut unit.consequence {
+                let caveat = " Several declarations reference this output; this adapter's repair command does not establish recovery for every consumer.";
+                if consequence.ends_with(caveat) {
+                    consequence.truncate(consequence.len() - caveat.len());
+                }
+            }
+            unit.consumer_evidence.retain(|evidence| {
+                !matches!(
+                    evidence.source.as_str(),
+                    "configured-output-reference" | "configured-output-interpretation"
+                )
+            });
+        }
+        crate::report::nested_decision_evidence(
+            std::slice::from_mut(unit),
+            observed_at,
+            container.is_none_or(|container| container.shared),
+        );
+        let declarations = unit
+            .container_id
+            .as_ref()
+            .and_then(|scope_key| output_declarations_by_scope.get(scope_key));
+        if let Some(declarations) = declarations {
+            for evidence in &mut unit.decision_evidence {
+                if evidence.kind == crate::evidence::FactKind::Recovery
+                    && evidence.subtype == crate::evidence::FactSubtype::Rebuild
+                {
+                    let recovery = if declarations.len() == 1 {
+                        let source = &declarations[0].project_root;
+                        crate::recovery::build_output_recovery(
+                            crate::fs_gate::is_dir(source),
+                            source,
+                        )
+                    } else {
+                        crate::recovery::cache_without_signal_recovery(
+                            "Several declarations reference this output; the last writer and a build command that restores every consumer's output are not established",
+                        )
+                    };
+                    *evidence = match recovery.follow_up_check {
+                        Some(check) => recovery.evidence.with_note(format!("check: {check}")),
+                        None => recovery.evidence,
+                    };
+                }
+            }
+            for declaration in declarations {
+                let evidence = crate::artifact::ArtifactEvidence {
+                    source: "configured-output-reference".into(),
+                    detail: format!(
+                        "{} declares this output through {} ({})",
+                        declaration.project_root.display(),
+                        declaration.evidence,
+                        declaration.adapter_id,
+                    ),
+                    confidence: crate::entities::Confidence::High,
+                };
+                if !unit.consumer_evidence.contains(&evidence) {
+                    unit.consumer_evidence.push(evidence);
+                }
+            }
+            if declarations.len() > 1 {
+                if let Some(consequence) = &mut unit.consequence {
+                    let caveat = " Several declarations reference this output; this adapter's repair command does not establish recovery for every consumer.";
+                    if !consequence.contains(caveat.trim()) {
+                        consequence.push_str(caveat);
+                    }
+                }
+                let evidence = crate::artifact::ArtifactEvidence {
+                    source: "configured-output-interpretation".into(),
+                    detail: "Several declarations reference this physical output. The selected adapter interprets its layout; declarations do not establish the last writer or prove that one build command restores every consumer's output.".into(),
+                    confidence: crate::entities::Confidence::High,
+                };
+                if !unit.consumer_evidence.contains(&evidence) {
+                    unit.consumer_evidence.push(evidence);
+                }
+            }
+        }
+    }
     let identified: Vec<crate::build_stores::IdentifiedStore> = measured_stores
         .iter()
         .filter_map(|(i, _)| {
@@ -1780,7 +2158,18 @@ pub fn observe_external(
                  growth is not shown until it is out of the growth window";
             append_coverage_note(&mut coverage_note, worktree_note);
         }
-        let consumers = consumers_by_key.get(&key).cloned().unwrap_or_default();
+        let mut consumers = consumers_by_key.get(&key).cloned().unwrap_or_default();
+        if let Some(references) = outputs_by_path.get(&path) {
+            for reference in references {
+                let consumer = ExternalConsumer {
+                    label: reference.project_root.display().to_string(),
+                    note: Some(reference.evidence.clone()),
+                };
+                if !consumers.contains(&consumer) {
+                    consumers.push(consumer);
+                }
+            }
+        }
         let mut evidence = consumers_evidence(&consumers);
         // Activity (#54): the folded walk's own newest-child mtime for
         // this location, labelled modification and never "last used".
@@ -2093,6 +2482,7 @@ mod devicefs_coverage_tests {
             category: StorageCategory::Unclassified,
             provenance: Provenance::BuiltinConvention,
             path: path.to_path_buf(),
+            configured_output: false,
         }
     }
 

@@ -219,6 +219,7 @@ impl Consumer for AssemblyGate {
             github_enrichment: gh_summary,
             schedule_line: None,
             nested_artifacts: Arc::new(Vec::new()),
+            configured_outputs: Vec::new(),
             docker_facts: p.docker_facts.clone(),
             protected_worktree_ids: p.protected_worktree_ids.clone(),
         }))])

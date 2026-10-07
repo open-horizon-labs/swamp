@@ -4853,3 +4853,16 @@ table! {
         observed_at: u64,
     }
 }
+
+table! {
+    /// `<store>/configured_outputs.parquet`: declarative adapter/project/path
+    /// references from configuration at one observation epoch, never byte history.
+    StoredConfiguredOutputRow, write_configured_output_rows, read_configured_output_rows {
+        scope_key: String,
+        observed_at: u64,
+        adapter_id: String,
+        path: String,
+        project_root: String,
+        evidence: String,
+    }
+}

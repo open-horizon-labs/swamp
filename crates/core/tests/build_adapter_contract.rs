@@ -111,6 +111,7 @@ fn blank_report(root: &Path) -> swamp_core::Report {
         summary: Default::default(),
         github_enrichment: None,
         nested_artifacts: Vec::new(),
+        configured_outputs: Vec::new(),
     }
 }
 

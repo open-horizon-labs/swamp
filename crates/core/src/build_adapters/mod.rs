@@ -47,6 +47,7 @@
 pub mod android;
 pub mod bounded_io;
 pub mod cargo;
+pub mod configured_outputs;
 pub mod docker_buildkit;
 pub mod go;
 pub mod gradle;
@@ -103,6 +104,17 @@ pub struct BuildContainer {
     /// `None` for a project-local container, and for a shared store a
     /// caller built without a declaration (the adapters' own fixtures).
     pub store_kind: Option<BuildStoreKind>,
+}
+
+/// A build output path declared by project metadata, with the project that
+/// consumes it and the declaration that supplied it. Several projects may
+/// declare the same physical path; callers must retain every declaration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConfiguredOutput {
+    pub adapter_id: String,
+    pub path: PathBuf,
+    pub project_root: PathBuf,
+    pub evidence: String,
 }
 
 impl BuildContainer {
@@ -564,6 +576,13 @@ pub trait BuildAdapter: Send + Sync {
         &[]
     }
 
+    /// Whether an already observed directory is a project root for this
+    /// adapter. This lets output discovery find nested projects without
+    /// walking or centralizing ecosystem markers.
+    fn is_project_root(&self, _path: &Path) -> bool {
+        false
+    }
+
     /// Which containers under `project_root` this adapter claims, given
     /// the artifact directories the walk found there.
     ///
@@ -571,6 +590,12 @@ pub trait BuildAdapter: Send + Sync {
     /// checkout; the adapter decides which ones are its own, by name and
     /// by the marker files beside them. It never scans for more.
     fn containers(&self, project_root: &Path, candidates: &[PathBuf]) -> Vec<BuildContainer>;
+
+    /// Declarative output paths at this project root. Implementations must
+    /// use bounded reads and must never execute project configuration.
+    fn configured_outputs(&self, _project_root: &Path) -> Vec<ConfiguredOutput> {
+        Vec::new()
+    }
 
     /// Identify the interior of one container.
     fn identify(&self, container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact>;

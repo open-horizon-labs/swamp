@@ -22,7 +22,9 @@
 //! Cargo itself wrote. Nothing invokes Cargo, reads a build script, or
 //! executes project code.
 
-use super::{BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, NestedUnitBuilder};
+use super::{
+    BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, ConfiguredOutput, NestedUnitBuilder,
+};
 use crate::artifact::{
     ArtifactRole, ArtifactVariant, NestedArtifact, architecture_from_target, relative_path,
 };
@@ -41,6 +43,10 @@ impl BuildAdapter for Adapter {
 
     fn name(&self) -> &'static str {
         "Rust / Cargo"
+    }
+
+    fn is_project_root(&self, path: &Path) -> bool {
+        crate::fs_gate::is_file(path.join("Cargo.toml"))
     }
 
     fn capabilities(&self) -> BuildCapabilities {
@@ -86,6 +92,21 @@ impl BuildAdapter for Adapter {
             }
         }
         out
+    }
+
+    fn configured_outputs(&self, project_root: &Path) -> Vec<ConfiguredOutput> {
+        if !self.is_project_root(project_root) {
+            return Vec::new();
+        }
+        crate::cargo_artifacts::declared_build_paths(project_root)
+            .into_iter()
+            .map(|(path, evidence)| ConfiguredOutput {
+                adapter_id: self.id().to_string(),
+                path: super::configured_outputs::lexical_absolute(&path, project_root),
+                project_root: project_root.to_path_buf(),
+                evidence,
+            })
+            .collect()
     }
 
     fn identify(&self, container: &BuildContainer, ctx: &BuildCtx) -> Vec<NestedArtifact> {

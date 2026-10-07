@@ -5,6 +5,10 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- Follow configured Cargo, TypeScript and literal Maven build-output directories outside worktrees through shared external measurement, retaining project references and exclusions.
+
+- macOS default scope includes cross-platform caches in `$XDG_CACHE_HOME` (default `~/.cache`) alongside native `~/Library/Caches`. Relative XDG overrides fall back to the conventional home path.
+
 ## v0.8.3 — 2026-10-02
 
 - Model rows separate repository and tag names from file-derived architecture, parameter count and precision. Selected details show last use once and distinguish shared model storage from the selected folder's size.

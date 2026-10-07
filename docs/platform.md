@@ -162,7 +162,7 @@ Shared portable code stays shared. Target gating is for genuinely different kern
 | Trash | `fs_gate::destroy` (`trash_move`, `Envelope`) | rename into `~/.Trash` | freedesktop `files/`+`info/` layout, `.trashinfo`, plain rename (no `renameat2`) |
 | Occupancy | `occupancy.rs` (tri-state, one scan for all anchors) | bounded `lsof` | procfs |
 | atime reliability | `activity.rs` contract | `statfs` mount flags | `/proc/mounts` |
-| Default scan roots | `locations/builtin.rs` | `~/src`, `~/Library/Developer`, `~/Library/Caches` | `~/src`, `$XDG_CACHE_HOME` |
+| Default scan roots | `locations/builtin.rs` | `~/src`, `~/Library/Developer`, `~/Library/Caches`, `$XDG_CACHE_HOME` | `~/src`, `$XDG_CACHE_HOME` |
 | Data and log directories | `platform::data_dir`, `schedule::log_dir` | `~/.local/share/swamp`, `~/Library/Logs/swamp` | `$XDG_DATA_HOME/swamp`, `$XDG_STATE_HOME/swamp` |
 
 Cargo enforces the dependency half: Apple framework crates (`core-foundation`, `core-foundation-sys`, `fsevent-sys`) sit under `[target.'cfg(target_os = "macos")'.dependencies]` in `crates/core/Cargo.toml`, and `scripts/platform-isolation.sh deps` asserts in CI that they are present in the macOS graph and absent from the Linux one. `scripts/platform-isolation.sh linkage` asserts the same thing one level lower, against the built binary's linkage and symbol table.
@@ -192,9 +192,9 @@ And one rule swamp adds: **no current-directory fallback.** If `HOME` is unset a
 
 `~/src` on both: a habit, not an OS convention.
 
-`~/Library/Developer` and `~/Library/Caches` are macOS's. `~/Library/Developer` is Xcode's, and no Linux directory holds "the SDK and simulator storage of the platform toolchain"; proposing `/usr/lib` or a distribution's package cache would mean walking system-owned storage a user cannot act on without root, which swamp never asks for. `~/Library/Caches` does have a real equivalent, `$XDG_CACHE_HOME` (default `~/.cache`), and that is what Linux gets.
+`~/Library/Developer` and `~/Library/Caches` are macOS's. `~/Library/Developer` is Xcode's, and no Linux directory holds "the SDK and simulator storage of the platform toolchain"; proposing `/usr/lib` or a distribution's package cache would mean walking system-owned storage a user cannot act on without root, which swamp never asks for. `~/Library/Caches` has an equivalent in `$XDG_CACHE_HOME` (default `~/.cache`). Swamp includes the XDG cache root on both platforms: cross-platform developer tools also use it on macOS, alongside native caches.
 
-Neither platform's conventions may appear in the other's build, which is asserted by `neither_platforms_conventions_leak_into_the_other` rather than left to review.
+Tests keep macOS Library paths out of Linux defaults and verify that macOS retains native caches alongside the XDG cache root.
 
 Homebrew is detected on both, with the prefixes each platform actually uses: `/opt/homebrew` and `/usr/local` on macOS, `/home/linuxbrew/.linuxbrew` on Linux. `/usr/local` is not proposed on Linux — there it is a distribution-owned directory Homebrew does not claim.
 

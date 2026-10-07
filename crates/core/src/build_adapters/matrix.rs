@@ -84,12 +84,12 @@ pub const MATRIX: &[MatrixEntry] = &[
             "target/<profile>/",
             "target/<target-triple>/<profile>/",
             "deps/, examples/, incremental/, build/, .fingerprint/",
-            "custom target-dir/build-dir from .cargo/config[.toml] or CARGO_TARGET_DIR",
+            "effective target-dir/build-dir from ancestor .cargo/config[.toml] or observer CARGO_TARGET_DIR/CARGO_BUILD_TARGET_DIR/CARGO_BUILD_BUILD_DIR",
         ],
         attribution_limits: &[
             "Cargo's intermediate layout is an implementation detail and version-dependent",
             "ordinary scans fold dependencies; explicit inspect-cargo reports evidenced targets/variants, not inferred package identities",
-            "a command-line --target-dir override is invisible to an observer",
+            "command-line overrides, historical shell environment, unresolved path templates and custom CARGO_HOME config outside the ancestor chain are invisible to an observer",
         ],
         operation_granularity: "profile directory, or one target's executable plus its fingerprint",
         actions: "TUI Cargo cleanup groups with fingerprint-aware membership",
@@ -115,6 +115,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             ".next/cache, .turbo, .parcel-cache, .cache, .vite, node_modules/.cache/<tool>",
             ".eslintcache, tsconfig.tsbuildinfo",
             "npm _cacache, pnpm content-addressable store",
+            "TypeScript tsconfig.json JSONC outDir/declarationDir with bounded relative extends",
         ],
         attribution_limits: &[
             "a package's identity comes from its own package.json name/version; a package.json \
@@ -124,6 +125,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "pnpm store entries are content-addressed: which project links a given object is not \
              derivable from the object",
             "no build generation is inferred -- npm records none",
+            "TypeScript package/absolute/array extends and project references are not resolved; configuration establishes a reference, never the last writer",
         ],
         operation_granularity: "one output directory, one cache directory, or one installed tree",
         actions: PROJECT_TRASH,
@@ -176,6 +178,7 @@ pub const MATRIX: &[MatrixEntry] = &[
             "target/*.jar, *.war",
             "<local-repository>/<group>/<artifact>/<version>/",
             "_remote.repositories, *.lastUpdated, maven-metadata-local.xml origin evidence",
+            "literal pom.xml build directory/outputDirectory/testOutputDirectory declarations",
         ],
         attribution_limits: &[
             "origin comes from _remote.repositories entries (a repository id means downloaded, an \
@@ -186,6 +189,7 @@ pub const MATRIX: &[MatrixEntry] = &[
              ${property} is an explicit identity gap",
             "plugins are never evaluated, so a plugin's own output directory under target/ is an \
              unidentified residual",
+            "output declarations expand only basedir and local/default build.directory; parent POMs and profiles are not evaluated",
         ],
         operation_granularity: "one project target directory, or one repository artifact version",
         actions: PROJECT_TRASH,

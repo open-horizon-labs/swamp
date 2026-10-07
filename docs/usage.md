@@ -107,7 +107,7 @@ tables `unit_meta.parquet` for an external unit's last-used and overlap and
 `unit_children.parquet` for its depth-2 rows); a volume's
 unowned rows (`unowned.parquet` + lists/evidence, and
 `docker_unowned.parquet` for the Docker objects no project claims);
-nested build-artifact units (`nested_artifacts.parquet` + lists/
+configured output references (`configured_outputs.parquet`); nested build-artifact units (`nested_artifacts.parquet` + lists/
 evidence); every row's decision evidence (`evidence.parquet`); per-root
 coverage with each walked root's own totals (`coverage.parquet`); the
 run's notes (`notes.parquet`); the run itself (`runs.parquet`: when,
@@ -186,16 +186,7 @@ the two classes under separate headings; `swamp report`'s per-root
 coverage says `detector location (measured as an external unit, not
 scanned for projects)` for the second class.
 
-1. **Built-in default roots**, per platform. Only `~/src` is a project
-   root. macOS also proposes `~/Library/Developer` and
-   `~/Library/Caches`; Linux also proposes `$XDG_CACHE_HOME` (default
-   `~/.cache`) -- both are detector locations, not project roots: a
-   project checked out inside either one is still discovered (as its
-   own external unit's interior, if its adapter identifies one) but
-   never becomes a "project" the way something under `~/src` would.
-   Neither platform's conventions appear in the other's build; see
-   [Platforms](platform.md#why-linuxs-default-roots-are-what-they-are)
-   for why Linux has two rather than three.
+1. **Built-in default roots**, per platform. Only `~/src` is a project root. macOS also proposes `~/Library/Developer`, `~/Library/Caches`, and the XDG cache root (`$XDG_CACHE_HOME` when absolute, otherwise `~/.cache`). Linux proposes the same XDG cache root without the macOS Library paths. These cache and developer-tool directories are detector locations, measured as external units rather than scanned for Git projects. On macOS, native caches and cross-platform command-line caches can coexist; neither convention replaces the other. See [Platforms](platform.md#why-linuxs-default-roots-are-what-they-are).
 2. **Detector results.** A built-in catalog of read-only detectors
    proposes locations for developer tools: language version managers
    (mise, asdf, pyenv, uv, Conda, rbenv, RVM, ruby-install, nvm,
@@ -872,6 +863,22 @@ not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
 is not measured). `totals` is the object the storage headline reuses (`remainder_bytes` is the part of it that is not developer storage; see "Developer storage: the headline").
 
 In the TUI, Reclaim is the first view of Tools (`2`, or `Tab` from Projects), ordered largest first. Its If removed column uses the stored regeneration class: Download again, Rebuild, Cannot regenerate, or Cost unknown. Selected details retain the original recovery wording, last-used fact and source, exact path and removal route. The scope statement stays under the heading. `→` or Enter expands a unit's recorded folders; `R` refreshes observations. Opening the view reads stored facts and starts no scan.
+
+### Configured build outputs outside a checkout
+
+During observation, build adapters read supported declarative configuration from known worktrees and nested project directories already seen by the walk. An output outside the checkout is measured through the external-storage pipeline and appears in Tools / External with its declared project consumers. A shared output is measured once, with every declaration retained. A containing cache excludes the separately measured output from its own total. When several adapters declare the same physical directory, the first adapter in the registry supplies its interior interpretation; every project reference remains visible. This interpretation does not prove that removing mixed outputs can be repaired by a single build command.
+
+The initial declaration readers cover these forms:
+
+| Tool | Followed declarations | Limits |
+| --- | --- | --- |
+| Cargo | Effective `build.target-dir` and `build.build-dir` in ancestor `.cargo/config` or `.cargo/config.toml`; the observer's `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR` | Deeper settings override ancestor settings; environment overrides configuration. Relative configuration paths use the directory containing `.cargo`; relative environment paths use Swamp's working directory. Custom `CARGO_HOME` configuration outside that ancestry, command-line overrides and unresolved path templates are not inferred. |
+| TypeScript | `compilerOptions.outDir` and `compilerOptions.declarationDir` in `tsconfig.json`, including JSONC comments/trailing commas and relative `extends` | Inherited paths are relative to the declaring configuration file. Inheritance is bounded to eight configuration levels; cycles, package-name and absolute `extends`, arrays of base configurations and project references are not resolved. Missing, malformed or oversized configuration cannot supply a declaration. |
+| Maven | Literal `<build><directory>`, `<outputDirectory>` and `<testOutputDirectory>` in `pom.xml` | Only `basedir`/`project.basedir` and `build.directory`/`project.build.directory` (the local declaration, or `target` when absent) are expanded. Other properties, parent POMs, profiles and plugins are not evaluated. |
+
+Configuration is evidence of a reference, not proof that a project last wrote the files. Exclusions still win, including canonical aliases. A declaration of the checkout itself, its ancestors, or a filesystem root is not followed. Missing or unreadable output paths are reported as coverage gaps. Read-only reports use stored observations and do not read project configuration again.
+
+Build scripts, JavaScript configuration, shell exports from earlier builds, and command-line output overrides are not inspected or executed. Paths visible only through those mechanisms can still appear through cache or Disk coverage, without an inferred owner.
 
 ### Standalone Cargo target directories
 

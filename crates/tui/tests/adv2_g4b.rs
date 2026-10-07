@@ -138,6 +138,7 @@ fn fixture_report() -> Report {
         schedule_line: None,
         github_enrichment: None,
         nested_artifacts: Vec::new(),
+        configured_outputs: Vec::new(),
         reconciliation: Reconciliation {
             unique_estimate: None,
             attributed: 0,

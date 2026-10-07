@@ -43,7 +43,9 @@
 //! identity gap, never a silently empty result -- the PR #123 review
 //! found exactly that shape returning `Ok(vec![])`.
 
-use super::{BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, NestedUnitBuilder};
+use super::{
+    BuildAdapter, BuildCapabilities, BuildContainer, BuildCtx, ConfiguredOutput, NestedUnitBuilder,
+};
 use crate::artifact::{ArtifactRole, ArtifactVariant, Membership, NestedArtifact, relative_path};
 use crate::entities::Confidence;
 use std::path::{Path, PathBuf};
@@ -189,6 +191,14 @@ impl BuildAdapter for Adapter {
 
     fn name(&self) -> &'static str {
         "Maven"
+    }
+
+    fn is_project_root(&self, path: &Path) -> bool {
+        crate::fs_gate::is_file(path.join("pom.xml"))
+    }
+
+    fn configured_outputs(&self, project_root: &Path) -> Vec<ConfiguredOutput> {
+        super::configured_outputs::maven_outputs(project_root, self.id())
     }
 
     fn capabilities(&self) -> BuildCapabilities {
