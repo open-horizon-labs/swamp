@@ -135,3 +135,7 @@ The installed `swamp observe --full --verbose` completed successfully in 26 seco
 ## Ship: 0.8.5 release
 
 User requested a new release. Delivery path: validated PR #227 plus version/notes → merge to main → tag v0.8.5 → exact-commit CI and full-tier gates plus optimized archive smoke tests → published GitHub release → published-archive checksum and runtime verification. Workspace package versions and lockfile move from 0.8.4 to 0.8.5; metadata with --locked, formatting and diff checks pass. Implementation validation and local observation are recorded above. Publishing stays behind the existing release workflow gates; no retagging or gate bypass.
+
+## Release correction: 0.8.6
+
+The v0.8.5 publication gate failed on Linux because the parallel-fold fixture compared scan-specific directory access timestamps across separate scans. The test now compares all structural/byte fields while validating each access sample independently; a deterministic counterexample proves differing access samples compare equivalent while a changed byte count still differs. This is a test-only fix. CI also encountered an independent ArtifactService/CreateArtifact upload timeout after build/package/smoke/Linux validation passed. The v0.8.5 tag remains immutable and unpublished; release notes and workspace versions move to 0.8.6. Exact-commit CI/full gates must pass before the next tag. User explicitly requested the Homebrew formula update once the macOS archive is published.
