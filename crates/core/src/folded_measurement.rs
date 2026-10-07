@@ -631,6 +631,8 @@ fn folded_rows(
             rel_dir: rel,
             mtime_ns: stamp.mtime_ns,
             ctime_ns: stamp.ctime_ns,
+            access_atime: stamp.access_atime,
+            access_observed_at: stamp.access_observed_at,
             bytes: 0,
             hardlinked: false,
             mtime_max: 0,
@@ -716,6 +718,8 @@ fn folded_rows(
                     rel_dir: format!("{name}/{RAW_BYTES_ROW}"),
                     mtime_ns: 0,
                     ctime_ns: 0,
+                    access_atime: None,
+                    access_observed_at: None,
                     bytes: raw.get(name).copied().unwrap_or(0),
                     hardlinked: true,
                     mtime_max: 0,
@@ -952,6 +956,7 @@ fn partial_measure(
                 .iter()
                 .find(|r| r.rel_dir == raw_name)
                 .map_or(child.bytes, |r| r.bytes);
+            let cached = carried.iter().find(|r| r.rel_dir == child.rel_dir);
             dirs.push(crate::report::DirRollup {
                 worktree_id: worktree_id.to_string(),
                 track: None,
@@ -963,6 +968,8 @@ fn partial_measure(
                 entry_count: 0,
                 symlink_count: 0,
                 mod_time_min: (newest / 60) as i32,
+                access_atime: cached.and_then(|r| r.access_atime),
+                access_observed_at: cached.and_then(|r| r.access_observed_at),
                 complete: true,
                 growth_bytes: None,
             });
@@ -1237,6 +1244,11 @@ pub fn folded_bytes_bounded_stamped(
             path: dir.clone(),
             mtime_ns,
             ctime_ns,
+            access_atime: {
+                use crate::fs_gate::MetadataExt;
+                (dir_meta.atime() > 0).then_some(dir_meta.atime() as u64)
+            },
+            access_observed_at: Some(crate::entities::now()),
             own_bytes: 0,
             files_mtime_max: 0,
             shared_inode: false,
@@ -1546,7 +1558,10 @@ mod tests {
         let (obs, dirs) =
             observe_unit_with_dirs(Some(fresh.path()), unit, &[], 9_000, &none, false, false);
         assert!(matches!(obs, UnitObservation::Unit(_)));
-        let children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 10);
+        let mut children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 9_000, 10);
+        for child in &mut children {
+            child.access_evidence = None;
+        }
         (
             f.bytes,
             f.mtime_max,
@@ -1561,7 +1576,10 @@ mod tests {
         unit: &Path,
         dirs: Option<Vec<crate::report::DirRollup>>,
     ) -> (u64, u64, bool, bool, String) {
-        let children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 10);
+        let mut children = crate::drilldown::children_of(unit, dirs.unwrap(), f.bytes, 9_000, 10);
+        for child in &mut children {
+            child.access_evidence = None;
+        }
         (
             f.bytes,
             f.mtime_max,
@@ -1590,7 +1608,11 @@ mod tests {
         let none = EventCoverage::untrusted();
         let (_, dirs) =
             observe_unit_with_dirs(Some(store.path()), &unit, &[], 1_000, &none, true, true);
-        assert!(dirs.is_some());
+        let initial_dirs = dirs.expect("initial child metadata");
+        let initial_c_access = initial_dirs
+            .iter()
+            .find(|d| d.rel_path == "c")
+            .map(|d| (d.access_atime, d.access_observed_at));
 
         // Pass 2: a file lands in `b`; the window names `b`.
         std::fs::write(unit.join("b/new"), crate::fs_gate::settle::noise(8192)).unwrap();
@@ -1607,6 +1629,13 @@ mod tests {
         assert_eq!(
             cost.dirs_listed, 3,
             "only the root and b are listed: {cost:?}"
+        );
+        assert_eq!(
+            dirs.as_ref()
+                .and_then(|rows| rows.iter().find(|d| d.rel_path == "c"))
+                .map(|d| (d.access_atime, d.access_observed_at)),
+            initial_c_access,
+            "partial replay preserves the original atime sample time for unchanged children"
         );
         assert_eq!(shape(&f, &unit, dirs), golden(&unit));
 
@@ -2075,6 +2104,8 @@ mod tests {
             },
             mtime_ns: 1,
             ctime_ns: 1,
+            access_atime: None,
+            access_observed_at: None,
             own_bytes: own,
             files_mtime_max: 5,
             shared_inode: false,

@@ -267,6 +267,63 @@ pub fn access_time_evidence(path: &Path, observed_at: u64) -> Evidence {
     }
 }
 
+/// Builds access-time evidence from the directory's own metadata captured
+/// before the walk listed it. This avoids sampling an atime the current
+/// `read_dir` may just have refreshed; callers must still state that prior
+/// scans or other tools can have updated atime.
+pub fn captured_access_time_evidence(
+    path: &Path,
+    atime: Option<u64>,
+    observed_at: u64,
+) -> Evidence {
+    let detail = "access time captured from this directory's own metadata before its listing";
+    match atime_reliability(path) {
+        AtimeReliability::Unreliable(reason) | AtimeReliability::Undetermined(reason) => {
+            Evidence::unavailable(
+                FactKind::Activity,
+                FactSubtype::Accessed,
+                EvidenceSource::FilesystemMetadata {
+                    detail: detail.into(),
+                },
+                observed_at,
+                crate::evidence::Reason::carried(reason),
+            )
+        }
+        AtimeReliability::Reliable => match atime {
+            Some(atime) if atime > observed_at => Evidence::unknown(
+                FactKind::Activity,
+                FactSubtype::Accessed,
+                EvidenceSource::FilesystemMetadata {
+                    detail: detail.into(),
+                },
+                observed_at,
+                crate::reason!(
+                    "recorded access time is after the observation; clock skew or a changing filesystem makes it unusable"
+                ),
+            ),
+            Some(atime) if atime > 0 => Evidence::known(
+                FactKind::Activity,
+                FactSubtype::Accessed,
+                FactValue::Timestamp(atime),
+                EvidenceSource::FilesystemMetadata {
+                    detail: detail.into(),
+                },
+                observed_at,
+            )
+            .with_event_at(atime),
+            _ => Evidence::unknown(
+                FactKind::Activity,
+                FactSubtype::Accessed,
+                EvidenceSource::FilesystemMetadata {
+                    detail: detail.into(),
+                },
+                observed_at,
+                crate::reason!("this directory's access time was not recorded during the walk"),
+            ),
+        },
+    }
+}
+
 /// Normalizes a tool's own reported use/build timestamp (Docker
 /// `last_used`, a Cargo fingerprint mtime, an agent session mtime) into
 /// the shared contract. `event_at` is the tool's own timestamp, when it
@@ -460,6 +517,27 @@ mod tests {
     fn ordinary_mount_options_are_reliable() {
         let r = atime_reliability_from_mount_options("rw,strictatime");
         assert_eq!(r, AtimeReliability::Reliable);
+    }
+
+    #[test]
+    fn captured_future_access_time_is_never_reported_as_recent_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence = captured_access_time_evidence(dir.path(), Some(2_001), 2_000);
+        assert!(!matches!(
+            evidence.status,
+            crate::evidence::FactStatus::Known(_)
+        ));
+        if atime_reliability(dir.path()) == AtimeReliability::Reliable {
+            assert!(matches!(
+                evidence.status,
+                crate::evidence::FactStatus::Unknown { .. }
+            ));
+        } else {
+            assert!(matches!(
+                evidence.status,
+                crate::evidence::FactStatus::Unavailable { .. }
+            ));
+        }
     }
 
     #[test]

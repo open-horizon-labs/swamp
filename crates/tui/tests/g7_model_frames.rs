@@ -145,6 +145,7 @@ fn hub_unit(f: &Fx) -> ExternalUnit {
             entries: 0,
             not_measured: 0,
             last_used: LastUsed::default(),
+            access_evidence: None,
         }],
     }
 }
@@ -376,6 +377,7 @@ fn what_a_move_leaves_behind_is_on_the_confirm_and_ollama_tags_are_rows() {
         entries: 0,
         not_measured: 0,
         last_used: LastUsed::default(),
+        access_evidence: None,
     });
     let mut ou = hub_unit(&f);
     ou.path = o.clone();

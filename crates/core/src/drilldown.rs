@@ -115,6 +115,11 @@ pub struct UnitChild {
     /// Remainder only: how many of those folders were not measured.
     pub not_measured: u32,
     pub last_used: LastUsed,
+    /// Filesystem access-time evidence captured during the observation,
+    /// for the listed directory only. This is separate from `last_used`;
+    /// the scan itself may have refreshed the directory's atime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_evidence: Option<crate::evidence::Evidence>,
 }
 
 impl UnitChild {
@@ -128,6 +133,7 @@ impl UnitChild {
             entries: 0,
             not_measured: 0,
             last_used: LastUsed::default(),
+            access_evidence: None,
         }
     }
 }
@@ -188,6 +194,7 @@ pub fn children_of(
     unit_path: &Path,
     dirs: Vec<crate::report::DirRollup>,
     unit_bytes: u64,
+    observed_at: u64,
     top_n: usize,
 ) -> Vec<UnitChild> {
     // Whether each folder's *own* listing worked, before completeness
@@ -196,6 +203,11 @@ pub fn children_of(
     let own_listed: HashMap<String, bool> = dirs
         .iter()
         .map(|d| (d.rel_path.clone(), d.complete))
+        .collect();
+    let access_times: HashMap<String, (Option<u64>, Option<u64>)> = dirs
+        .iter()
+        .filter(|d| !d.rel_path.is_empty() && !d.rel_path.contains('/'))
+        .map(|d| (d.rel_path.clone(), (d.access_atime, d.access_observed_at)))
         .collect();
     let root_entries = dirs
         .iter()
@@ -245,6 +257,28 @@ pub fn children_of(
     let room = top_n.saturating_sub(shown.len());
     let hidden_unlisted = unlisted.len().saturating_sub(room);
     shown.extend(unlisted.into_iter().take(room));
+    // Mount checks are per displayed directory, never per discovered
+    // child: a large cache can contain thousands of immediate folders,
+    // while the drilldown exposes at most `top_n` paths.
+    for child in &mut shown {
+        if child.kind != ChildKind::Entry || !own_listed.get(&child.name).copied().unwrap_or(true) {
+            continue;
+        }
+        let (access_atime, access_observed_at) = access_times
+            .get(&child.name)
+            .copied()
+            .unwrap_or((None, None));
+        child.access_evidence = Some(
+            crate::activity::captured_access_time_evidence(
+                &unit_path.join(&child.name),
+                access_atime,
+                access_observed_at.unwrap_or(observed_at),
+            )
+            .with_note(
+                "captured before this observation listed the directory; earlier scans or other tools may have updated access time, so this is not proof of actual use",
+            ),
+        );
+    }
 
     let shown_bytes: i64 = shown.iter().filter_map(|c| c.bytes).sum();
     let mut rows = shown;
@@ -290,6 +324,8 @@ mod tests {
             entry_count: files + dirs,
             symlink_count: 0,
             mod_time_min: 100,
+            access_atime: None,
+            access_observed_at: None,
             complete,
             growth_bytes: None,
         }
@@ -299,7 +335,7 @@ mod tests {
     fn rows_that_disagree_with_the_shown_total_get_a_named_gap_row() {
         let unit = Path::new("/u");
         let dirs = vec![row("", 0, 0, 1, true), row("a", 100, 1, 0, true)];
-        let rows = children_of(unit, dirs, 100, 15);
+        let rows = children_of(unit, dirs, 100, 1000, 15);
         assert_eq!(reconciled(rows.clone(), 100), rows, "already adding up");
         let short = reconciled(rows.clone(), 250);
         assert_eq!(rows_total(&short), 250);
@@ -338,7 +374,7 @@ mod tests {
         }
         dirs.push(row("d0/sub", 60, 1, 0, true));
         let total = 7 + 900 + 500 + 300 + 40 + 60;
-        let kids = children_of(unit, dirs, total, 2);
+        let kids = children_of(unit, dirs, total, 1000, 2);
         assert_eq!(rows_total(&kids), total as i64);
         assert_eq!(kids[0].name, "d0");
         assert_eq!(
@@ -363,7 +399,7 @@ mod tests {
             row("partial", 50, 1, 1, true),
             row("partial/deep", 0, 0, 0, false),
         ];
-        let kids = children_of(unit, dirs, 150, 15);
+        let kids = children_of(unit, dirs, 150, 1_000, 15);
         let locked = kids.iter().find(|c| c.name == "locked").unwrap();
         assert_eq!(locked.measure, ChildMeasure::NotMeasured);
         assert_eq!(locked.bytes, None, "not measured is absent, not 0");
@@ -383,7 +419,7 @@ mod tests {
             dirs.push(row(&format!("c{i:05}"), i + 1, 1, 0, true));
             total += i + 1;
         }
-        let kids = children_of(unit, dirs, total, DRILLDOWN_TOP_N);
+        let kids = children_of(unit, dirs, total, 1_000, DRILLDOWN_TOP_N);
         assert_eq!(
             kids.len(),
             DRILLDOWN_TOP_N + 1,
@@ -391,6 +427,72 @@ mod tests {
         );
         assert_eq!(rows_total(&kids), total as i64);
         assert_eq!(kids[0].bytes, Some(n as i64));
+        assert_eq!(
+            kids.iter().filter(|c| c.access_evidence.is_some()).count(),
+            DRILLDOWN_TOP_N,
+            "mount checks and evidence stay within the displayed top N"
+        );
+        assert!(kids.last().unwrap().access_evidence.is_none());
+    }
+
+    #[test]
+    fn child_access_evidence_uses_metadata_captured_before_its_listing() {
+        use crate::fs_gate::MetadataExt;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("cache");
+        let child = unit.join("package");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("payload"), b"fixture").unwrap();
+        let old_access = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        std::fs::File::open(&child)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_accessed(old_access))
+            .unwrap();
+        let before = crate::fs_gate::symlink_metadata(&child).unwrap().atime() as u64;
+        let reliability = crate::activity::atime_reliability(&child);
+        let observed_at = crate::entities::now();
+
+        let ((row, dirs, _, _), work) = crate::work_counters::measured(|| {
+            crate::walk::resize_artifact_stamped(
+                &unit,
+                crate::report::ArtifactKind::Unknown,
+                observed_at,
+                Some(("build-store", &unit)),
+                &[],
+                true,
+            )
+        });
+        let child_dir = dirs.iter().find(|d| d.rel_path == "package").unwrap();
+        assert_eq!(child_dir.access_atime, Some(before));
+        let access_observed_at = child_dir.access_observed_at.unwrap_or(observed_at);
+        assert_eq!(work.dirs_listed, 2, "one root and one child listing");
+        let after = crate::fs_gate::symlink_metadata(&child).unwrap().atime() as u64;
+        let shown = children_of(&unit, dirs, row.bytes, observed_at, 1);
+        let evidence = shown[0].access_evidence.as_ref().unwrap();
+        assert_eq!(evidence.observed_at, access_observed_at);
+        if reliability == crate::activity::AtimeReliability::Reliable {
+            assert_eq!(
+                evidence.status,
+                crate::evidence::FactStatus::Known(crate::evidence::FactValue::Timestamp(before)),
+                "a listing that refreshed atime must not replace its pre-listing value"
+            );
+            // Some mounts suppress or defer atime writes; when it changes,
+            // evidence still reports the metadata captured before listing.
+            let _listing_may_have_updated_atime = after != before;
+        } else {
+            assert!(matches!(
+                evidence.status,
+                crate::evidence::FactStatus::Unavailable { .. }
+            ));
+        }
+        assert!(
+            evidence
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("earlier scans or other tools"))
+        );
     }
 
     #[test]
@@ -402,7 +504,7 @@ mod tests {
             row("b", 100, 1, 0, true),
         ];
         // The walk counted a shared file once: 150, not 200.
-        let kids = children_of(unit, dirs, 150, 15);
+        let kids = children_of(unit, dirs, 150, 1_000, 15);
         assert_eq!(rows_total(&kids), 150);
         assert!(
             kids.iter()
@@ -417,7 +519,7 @@ mod tests {
         for i in 0..4 {
             dirs.push(row(&format!("x{i}"), 0, 0, 0, false));
         }
-        let kids = children_of(unit, dirs, 500, 2);
+        let kids = children_of(unit, dirs, 500, 1_000, 2);
         assert_eq!(
             kids.iter().filter(|c| c.kind == ChildKind::Entry).count(),
             2

@@ -1,5 +1,23 @@
 # Cache coverage and configured build outputs
 
+## Aim refinement: disk decisions
+
+The user clarified the aim: help a developer understand whether they need the things consuming substantial disk space. Filesystem activity is one source of evidence alongside ownership, contents and recovery cost; exposing a timestamp is a mechanism, not the outcome. Success means a large cache row offers useful evidence for that decision while distinguishing observed metadata from actual build or run history.
+
+## Execute: filesystem activity visibility
+
+Selected approach: retain access timestamps from metadata already read before directory enumeration, select bounded evidence for displayed child directories during observation, persist it with child rows, and show modification age plus explicitly sourced directory access in CLI/TUI reports. Existing real-use probes remain distinct. Assumptions: the mount honors access timestamps, and a developer can interpret weak evidence when its limitations are visible. Directory enumeration, including prior Swamp observations, can refresh directory access time; a recent timestamp therefore cannot establish that a developer still needs the contents. Sampling before the current enumeration avoids manufacturing a new access signal from this scan.
+
+Preserve read-only report behavior, physical accounting, configured project references and recovery evidence. No new recursive walk or script inspection. Each unit performs reliability checks for at most its existing top-N displayed child anchors; the existing walk supplies their access timestamps without extra metadata reads. Stop/pivot if report rendering reads the filesystem, weak access is relabeled last use, or synthetic remainder rows acquire invented activity.
+
+| Risk | Tempting wrong patch | Required check |
+| --- | --- | --- |
+| Access mistaken for actual use | Populate LastUsed from directory atime, or sample after enumeration | Separate access evidence and enumeration caveat; old-atime fixture preserves the pre-scan timestamp |
+| Historical report changes during listing | Stat children in reclaim projection | Persist observation evidence; read-only reconstruction preserves it |
+| Extra traversal or invented activity | Walk every file or probe remainder name | Bounded top-N anchors; synthetic rows have no access evidence |
+| Mount suppresses access updates | Display arbitrary atime as trustworthy | Existing noatime/relatime reliability refusal retained |
+| Empty decision display | Retain only tracking unsupported | Modification and sourced access available independently of use tracking |
+
 ## Aim
 
 Explain developer storage outside ~/src through its project references and cache conventions, so disk-pressure investigation finds real build output without scanning arbitrary scripts.
@@ -92,3 +110,24 @@ The final `scripts/check.sh` completed successfully on the frozen follow-up sour
 Installed the release build as `~/.local/bin/swamp` (the `/opt/homebrew/bin/swamp` symlink resolves there), verified matching SHA-256 `054b9990fa13bd85f0bb511357bd5ed44856db6201082232a147691a7b7bbcf0`. Cleaned only task-created Cargo targets: 66,515 files / 26.8 GiB reported for the validation target and 2,374 files / 678.2 MiB for the release target. The user’s caches and projects were not removed.
 
 Actual-machine observation completed in 57 seconds: 50 projects, 85 external units and 4,251 agent units. Stored external JSON contains Cargo dependency interiors for both `~/.cache/tdongle-tailnet-target/debug/deps` and `~/.cache/tdongle-rc-target/debug/deps`, with no declared consumers. Both child rows and the generic cache root persist last-use source `unsupported`; the cache physical total remains 10,705,567,744 bytes. External text exposes identified Cargo families and mixed-cache limits, so positive interpretation reaches the user-facing report. Native cache coverage reports the existing stalled `~/Library/Caches/com.apple.Music` subtree as unmeasured; that gap is explicit and outside this follow-up’s target classification. Local delivery and model-checkable risk gates are complete; practical usefulness of the new wording remains the user’s judgment.
+
+## Review and dissent: filesystem activity
+
+Sol reviewed the source and found no remaining actionable P1/P2 issues, conditional on final validation and the actual-machine observation. Dissent caught and retired the tempting post-scan sampling approach: the existing pre-enumeration metadata now supplies access time. Reliability checks were moved after top-N selection, and access observations retain their original date during quiet and partial replay. CLI/TUI use absolute access dates with source and observation details; the TUI no longer calls access evidence “changed.” Directory atime remains weak evidence that can result from earlier enumeration, so practical need remains a developer judgment alongside ownership, modification, use records and recovery cost.
+
+## Filesystem activity completion and local delivery
+
+The final `scripts/check.sh` passed on the final source at 17:35:27 local time: formatting, all-target Clippy, source audits, release graph, workspace unit/integration/doc tests, named targets, gate scripts and forbidden-pattern checks. The first complete run caught two TUI snapshots where unknown modification labels crowded child names; compact unknown labels were removed, their details remain explicit, and the original golden frames pass without changes. The final run includes the Reclaim CLI text route and its access-versus-use test, future-time refusal, pre-enumeration capture, typed child storage, actual read-only report projection and partial-replay sample-time preservation.
+
+| Named risk | Retirement evidence |
+| --- | --- |
+| Access conflated with use or created by the current scan | Old-atime walk fixture preserves the pre-listing value; CLI/TUI tests distinguish Accessed, Modified and actual use; real codex-runtimes retains September 8 access rather than today |
+| Read-only rendering changes metadata facts | Actual typed Parquet round-trip and report_scope_from_store equality preserve the same evidence; report projection adds no filesystem child probe |
+| Unbounded extra traversal or synthetic activity | Existing walk counters remain one root plus one child; source review verifies reliability checks after top-N truncation; 20,000-child fixture produces 15 facts and no remainder fact; real report has 108 access facts and none on synthetic rows |
+| Incorrect reliability or future recency | Existing mount noatime/relatime refusal remains; captured future timestamps never become recent-use facts |
+| Replay rebrands an old sample as current | Partial-replay test retains both raw atime and original access_observed_at; CLI/TUI show absolute event and original observation dates |
+| Practical need inferred from a weak clue | Accepted human decision boundary: prior directory enumeration can refresh access time, and every captured child fact states that limitation. Ownership, modification, use history and recovery remain independent |
+
+Built and atomically installed as `~/.local/bin/swamp`, reached by `/opt/homebrew/bin/swamp`; version remains 0.8.4 and SHA256 is `3e7c819226151a4343a7c531a242615ea517c190de753391842bd08471e73d17`. Task build targets were cleaned before observation: 17.8 GiB debug and 679.7 MiB release, plus the worker's earlier duplicate 5.3 GiB target. No user caches or projects were removed.
+
+The installed `swamp observe --full --verbose` completed successfully in 26 seconds: 50 projects, 81 external units, 4,260 agent units. The generic cache total remains exactly 10,705,567,744 bytes. Reclaim shows tdongle-tailnet-target at 5.2 GB, modified 8h ago, directory access October 7 at 12:40 UTC; codex-runtimes at 1.7 GB, modified 9d ago, directory access September 8 at 04:58 UTC. Details identify pre-enumeration filesystem metadata and the original October 7 21:36 UTC observation, with unsupported tool-use tracking kept distinct. Apple Music's previously stalled native-cache subtree remains explicitly unmeasured. Sol reviewed the installed output and final checks: Continue / Proceed, no remaining actionable P1/P2.

@@ -1262,6 +1262,7 @@ mod tests {
             not_measured: 0,
             // The folder was read today.
             last_used: crate::last_used::resolve(None, Some(1_790_000_000)),
+            access_evidence: None,
         };
         let mut unit = external_unit(
             "xcode",
@@ -1325,6 +1326,7 @@ mod tests {
                 entries: 0,
                 not_measured: 0,
                 last_used: Default::default(),
+                access_evidence: None,
             }],
             &found.children,
             found.child_probe_applies,

@@ -655,6 +655,8 @@ Generic XDG and native macOS cache roots, large `unclassified` roots, and every 
   folded walk already produces, are stored in `unit_children.parquet`, and
   are replayed with the unit when it is unchanged. In Tool storage, Enter opens the unit onto these rows; the selected details carry the last-used fact.
 
+Directory access is a separate filesystem clue, captured from metadata before the walk lists that directory. The displayed event date and observation date remain unchanged when an observation is replayed. Earlier scans or other tools can update directory atime, so it does not prove a build, run, or continued need. Mounts that suppress access updates report the signal as unavailable; older observations without a captured timestamp report it as unknown. Modification age, actual tool-use records, project references and recovery cost remain separate facts.
+
 ### Model caches
 
 The Hugging Face hub cache (`HF_HUB_CACHE`, else `$HF_HOME/hub`, else
@@ -853,15 +855,16 @@ rows[]       { path, kind, detector, bytes, growth_bytes?,
                manager[ { manager, subject, quote, attribution } ],
                hold? { kind, label, subjects[], whole_unit },
                removal { kind, text }, regenerable_bytes, held_bytes, note?,
-               children[ { kind, name, bytes|null, measure, last_used,
-                           last_used_text?, text, manager[], hold? } ] }
+               children[ { kind, name, bytes|null, measure, mtime_max,
+                           access_evidence?, last_used, last_used_text?,
+                           text, manager[], hold? } ] }
 ```
 
 `bytes == regenerable_bytes + held_bytes + not_regenerable_bytes +
 not_established_bytes`; a row's children add up to its `bytes` (`bytes: null`
 is not measured). `totals` is the object the storage headline reuses (`remainder_bytes` is the part of it that is not developer storage; see "Developer storage: the headline").
 
-In the TUI, Reclaim is the first view of Tools (`2`, or `Tab` from Projects), ordered largest first. Its If removed column uses the stored regeneration class: Download again, Rebuild, Cannot regenerate, or Cost unknown. Selected details retain the original recovery wording, last-used fact and source, exact path and removal route. The scope statement stays under the heading. `→` or Enter expands a unit's recorded folders; `R` refreshes observations. Opening the view reads stored facts and starts no scan.
+In the TUI, Reclaim is the first view of Tools (`2`, or `Tab` from Projects), ordered largest first. Its If removed column uses the stored regeneration class: Download again, Rebuild, Cannot regenerate, or Cost unknown. Selected details retain the original recovery wording, last-used fact and source, exact path and removal route. Child rows keep newest modification age separate from directory access-time evidence. Directory access is timestamped with its source and observation time, and its detail explains that the timestamp was captured before enumeration and earlier listings may have refreshed atime; it is not proof of actual use. Unsupported last-used tracking remains explicit in details. The scope statement stays under the heading. `→` or Enter expands a unit's recorded folders; `R` refreshes observations. Opening the view reads stored facts and starts no scan.
 
 ### Configured build outputs outside a checkout
 

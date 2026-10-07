@@ -1721,6 +1721,7 @@ pub(crate) fn observe_external_with_outputs(
                         &canonical,
                         dirs,
                         folded.bytes,
+                        observed_at,
                         crate::drilldown::DRILLDOWN_TOP_N,
                     ),
                     None if folded.reused && big_enough => {

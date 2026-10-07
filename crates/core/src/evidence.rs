@@ -21,9 +21,12 @@
 //! - `event_at` (when the underlying thing happened) is always distinct
 //!   from `observed_at` (when swamp looked). A filesystem mtime observed
 //!   today about a file written last year has `event_at` last year.
-//! - Evidence lives on current-state report/unit rows (this module), never
-//!   in the byte-history Parquet store (`growth.rs`). Refreshing evidence
-//!   alone must never create a byte-history delta or tombstone -- see
+//! - Derived Evidence lives on current-state report/unit rows (this module),
+//!   never in byte-history measurements. Incremental directory measurement
+//!   rows may retain raw access-time capture metadata so replay can preserve
+//!   the original sample; the derived evidence is stored in current-state
+//!   `unit_children`, so read-only reports do not sample the filesystem again.
+//!   That metadata alone must never create a byte-history delta or tombstone -- see
 //!   `crates/core/tests/evidence_contract.rs`'s
 //!   `refreshing_evidence_never_writes_byte_history_delta`.
 //! - Invalidation is explicit: [`Evidence::invalidated_for`] names the

@@ -754,6 +754,7 @@ mod tests {
             entries: 0,
             not_measured: 0,
             last_used: LastUsed::default(),
+            access_evidence: None,
         }];
         let unsupported = with_child_last_used(rows.clone(), &BTreeMap::new(), false);
         let probed = with_child_last_used(rows, &BTreeMap::new(), true);

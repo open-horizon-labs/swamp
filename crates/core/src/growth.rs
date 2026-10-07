@@ -2567,6 +2567,8 @@ fn dir_rollup_from_stored(r: columns::StoredDirRow) -> DirRollup {
         entry_count: r.entry_count,
         symlink_count: r.symlink_count,
         mod_time_min: r.mod_time_min,
+        access_atime: None,
+        access_observed_at: None,
         complete: r.complete,
         growth_bytes: None,
     }
@@ -3498,6 +3500,10 @@ fn stored_child_rows(
             last_used: c.last_used.at,
             last_used_source: Some(c.last_used.source_column()),
             last_used_atime: c.last_used.atime,
+            access_evidence: c
+                .access_evidence
+                .as_ref()
+                .and_then(|e| serde_json::to_string(e).ok()),
         })
         .collect()
 }
@@ -3522,6 +3528,10 @@ fn children_from_stored(rows: &[&columns::StoredUnitChildRow]) -> Vec<crate::dri
                     r.last_used_source.as_deref(),
                     r.last_used_atime,
                 ),
+                access_evidence: r
+                    .access_evidence
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok()),
             })
         })
         .collect()
@@ -5408,6 +5418,8 @@ fn reconstruct_attribution(dir: &Path) -> Result<crate::attribution::Attribution
             entry_count: r.entry_count,
             symlink_count: r.symlink_count,
             mod_time_min: r.mod_time_min,
+            access_atime: None,
+            access_observed_at: None,
             complete: r.complete,
             growth_bytes: None,
         })
@@ -6680,6 +6692,8 @@ fn resize_interior(
             entry_count: files + subdirs + symlinks,
             symlink_count: symlinks,
             mod_time_min: (dir_mtime / 60) as i32,
+            access_atime: None,
+            access_observed_at: None,
             complete: true,
             growth_bytes: None,
         };
@@ -8036,6 +8050,70 @@ mod tests {
     use std::fs::{self, File};
 
     #[test]
+    fn child_access_evidence_round_trips_through_typed_store() {
+        use super::*;
+        use crate::drilldown::{ChildKind, ChildMeasure, UnitChild};
+        use crate::evidence::{Evidence, EvidenceSource, FactKind, FactSubtype, FactValue};
+
+        let evidence = Evidence::known(
+            FactKind::Activity,
+            FactSubtype::Accessed,
+            FactValue::Timestamp(1_600_000_000),
+            EvidenceSource::FilesystemMetadata {
+                detail: "directory atime captured before listing".into(),
+            },
+            1_700_000_000,
+        )
+        .with_event_at(1_600_000_000);
+        let child = UnitChild {
+            kind: ChildKind::Entry,
+            name: "pkg".into(),
+            bytes: Some(123),
+            measure: ChildMeasure::Complete,
+            mtime_max: 10,
+            entries: 1,
+            not_measured: 0,
+            last_used: crate::last_used::LastUsed::default(),
+            access_evidence: Some(evidence.clone()),
+        };
+        let rows = stored_child_rows("scope", "unit", 1_700_000_000, &[child]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unit_children.parquet");
+        columns::write_unit_child_rows(&path, &rows).unwrap();
+        let persisted = columns::read_unit_child_rows(&path).unwrap();
+        let round_tripped = children_from_stored(&[&persisted[0]]);
+        assert_eq!(round_tripped[0].access_evidence.as_ref(), Some(&evidence));
+        assert_eq!(
+            round_tripped[0]
+                .access_evidence
+                .as_ref()
+                .map(|e| (e.observed_at, e.event_at)),
+            Some((1_700_000_000, Some(1_600_000_000)))
+        );
+
+        // A malformed serialized payload is deliberately treated as absent.
+        let mut malformed = persisted[0].clone();
+        malformed.access_evidence = Some("not-json".into());
+        let recovered = children_from_stored(&[&malformed]);
+        assert!(recovered[0].access_evidence.is_none());
+
+        let legacy = stored_child_rows(
+            "scope",
+            "legacy-unit",
+            1_700_000_000,
+            &[UnitChild {
+                access_evidence: None,
+                ..round_tripped[0].clone()
+            }],
+        );
+        assert!(
+            children_from_stored(&[&legacy[0]])[0]
+                .access_evidence
+                .is_none()
+        );
+    }
+
+    #[test]
     fn external_mount_scope_floor_survives_persistence_and_readonly_annotation() {
         use super::*;
         let tmp = tempfile::tempdir().unwrap();
@@ -8212,6 +8290,8 @@ mod tests {
             entry_count: 1,
             symlink_count: 0,
             mod_time_min: 1,
+            access_atime: None,
+            access_observed_at: None,
             complete: true,
             growth_bytes: None,
         });
@@ -8227,6 +8307,8 @@ mod tests {
                 entry_count: 1,
                 symlink_count: 0,
                 mod_time_min: 1,
+                access_atime: None,
+                access_observed_at: None,
                 complete: true,
                 growth_bytes: None,
             });
@@ -8338,6 +8420,8 @@ mod tests {
             entry_count: 1,
             symlink_count: 0,
             mod_time_min: 1,
+            access_atime: None,
+            access_observed_at: None,
             complete: true,
             growth_bytes: None,
         });
@@ -8354,6 +8438,8 @@ mod tests {
             entry_count: 10,
             symlink_count: 1,
             mod_time_min: 2,
+            access_atime: None,
+            access_observed_at: None,
             complete: true,
             growth_bytes: None,
         });
@@ -8460,6 +8546,8 @@ mod tests {
             entry_count: 1,
             symlink_count: 0,
             mod_time_min: 1,
+            access_atime: None,
+            access_observed_at: None,
             complete: true,
             growth_bytes: None,
         });

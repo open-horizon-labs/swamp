@@ -938,6 +938,11 @@ pub struct DirStamp {
     pub path: PathBuf,
     pub mtime_ns: i64,
     pub ctime_ns: i64,
+    /// Directory access time read from the same metadata captured before
+    /// this directory's `read_dir`; `None` when it was not observed.
+    pub access_atime: Option<u64>,
+    /// Wall time when `access_atime` was captured.
+    pub access_observed_at: Option<u64>,
     /// Allocated bytes of the regular files directly inside this
     /// directory, the newest of their mtimes (seconds, 0 when none), and
     /// whether any of them has another hard link. What
@@ -1303,6 +1308,8 @@ fn process_walk(path: PathBuf, known: &[KnownWorktree], shared: &AttrShared, poo
                 entry_count: dir_file_count + dir_dir_count + dir_symlink_count,
                 symlink_count: dir_symlink_count,
                 mod_time_min,
+                access_atime: None,
+                access_observed_at: None,
                 complete: true,
                 growth_bytes: None,
             },
@@ -1558,6 +1565,7 @@ fn process_size(
     // for the stamp and mtime, so it costs no extra call.
     crate::work_counters::record_files_statted(1);
     let own_meta = crate::fs_gate::symlink_metadata(&path);
+    let access_observed_at = crate::entities::now();
     let dataless = own_meta
         .as_ref()
         .is_ok_and(crate::fs_gate::read::is_dataless)
@@ -1582,6 +1590,8 @@ fn process_size(
                 path: path.clone(),
                 mtime_ns: 0,
                 ctime_ns: 0,
+                access_atime: None,
+                access_observed_at: None,
                 own_bytes: 0,
                 files_mtime_max: 0,
                 shared_inode: false,
@@ -1606,6 +1616,8 @@ fn process_size(
                     entry_count: 0,
                     symlink_count: 0,
                     mod_time_min: 0,
+                    access_atime: None,
+                    access_observed_at: None,
                     complete: false,
                     growth_bytes: None,
                 },
@@ -1731,6 +1743,8 @@ fn process_size(
             path: path.clone(),
             mtime_ns: m.mtime() * 1_000_000_000 + m.mtime_nsec(),
             ctime_ns: m.ctime() * 1_000_000_000 + m.ctime_nsec(),
+            access_atime: (m.atime() > 0).then_some(m.atime() as u64),
+            access_observed_at: Some(access_observed_at),
             own_bytes: own_allocated,
             files_mtime_max,
             shared_inode,
@@ -1755,6 +1769,13 @@ fn process_size(
                 entry_count: file_count + dir_count + symlink_count,
                 symlink_count,
                 mod_time_min: (dir_mtime_max / 60) as i32,
+                access_atime: own_meta
+                    .as_ref()
+                    .ok()
+                    .map(|m| m.atime())
+                    .filter(|atime| *atime > 0)
+                    .map(|atime| atime as u64),
+                access_observed_at: Some(access_observed_at),
                 complete: true,
                 growth_bytes: None,
             },

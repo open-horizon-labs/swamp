@@ -282,6 +282,12 @@ pub struct DirRollup {
     /// Newest mtime among this directory's own direct entries, in
     /// minutes since the Unix epoch.
     pub mod_time_min: i32,
+    /// Access time captured from this directory's own metadata before its
+    /// listing. It is carried only for a bounded child access signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_atime: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_observed_at: Option<u64>,
     pub complete: bool,
     #[serde(default)]
     pub growth_bytes: Option<i64>,

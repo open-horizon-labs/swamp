@@ -3177,6 +3177,7 @@ fn adv_a_not_measured_or_negative_drilldown_row_never_draws_a_zero_size() {
         entries: 2,
         not_measured: 0,
         last_used: Default::default(),
+        access_evidence: None,
     };
     let mut app = App::new(fixture_report(), "/Users/dev/src".into());
     app.filter_text.clear();
@@ -3297,6 +3298,7 @@ fn reclaim_child(
         entries: 1,
         not_measured: 0,
         last_used: Default::default(),
+        access_evidence: None,
     }
 }
 

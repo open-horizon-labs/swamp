@@ -105,6 +105,10 @@ fn unsupported_cache_child_and_supported_empty_probe_round_trip() {
         cache_child.last_used.fact(observed.merged.observed_at),
         "tracking unsupported"
     );
+    let cache_access = cache_child
+        .access_evidence
+        .as_ref()
+        .expect("cache child has a sourced access-time fact");
 
     let rustup_unit = observed
         .external_units
@@ -148,6 +152,11 @@ fn unsupported_cache_child_and_supported_empty_probe_round_trip() {
         .find(|child| child.name == "generic-child")
         .expect("replayed generic cache child");
     assert_eq!(replayed_cache_child.last_used, cache_child.last_used);
+    assert_eq!(
+        replayed_cache_child.access_evidence.as_ref(),
+        Some(cache_access),
+        "read-only report reconstruction preserves the original access sample"
+    );
     let replayed_rustup = replayed
         .external_units
         .iter()

@@ -62,6 +62,7 @@ fn child(kind: ChildKind, name: &str, bytes: Option<i64>) -> UnitChild {
         entries: 0,
         not_measured: 0,
         last_used: LastUsed::default(),
+        access_evidence: None,
     }
 }
 
