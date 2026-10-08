@@ -460,7 +460,9 @@ fn output_event_refreshes_bytes_and_stored_report_preserves_the_unit() {
     let output = fx.home.join("outside-output");
     fs::create_dir_all(&output).unwrap();
     let victim = output.join("artifact.bin");
-    fs::write(&victim, vec![b'x'; 1024]).unwrap();
+    let payloads = swamp_core::fs_gate::settle::noise(1024 + 3 * 32768);
+    fs::write(&victim, &payloads[..1024]).unwrap();
+    swamp_core::fs_gate::settle::settle();
     fs::write(
         fx.repo.join("tsconfig.json"),
         serde_json::json!({"compilerOptions":{"outDir": output}}).to_string(),
@@ -480,28 +482,42 @@ fn output_event_refreshes_bytes_and_stored_report_preserves_the_unit() {
         "a trusted quiet window reuses the independent output row"
     );
     let root_stamp = fs::metadata(&output).unwrap().modified().unwrap();
-    let append = || {
+    let mut append_index = 0;
+    let mut append = || {
         let mut file = fs::OpenOptions::new().append(true).open(&victim).unwrap();
-        file.write_all(&vec![b'y'; 32768]).unwrap();
+        let start = 1024 + append_index * 32768;
+        let end = start + 32768;
+        file.write_all(&payloads[start..end]).unwrap();
+        append_index += 1;
         file.sync_all().unwrap();
+        swamp_core::fs_gate::settle::settle();
         assert_eq!(
             fs::metadata(&output).unwrap().modified().unwrap(),
             root_stamp,
             "appending a file must leave the output directory timestamp unchanged"
         );
+        allocated(&victim)
     };
-    append();
+    let full_bytes = append();
+    assert!(
+        full_bytes > initial_bytes,
+        "the full-refresh append must change allocated bytes"
+    );
     let full = observe_with(&fx, &ScriptedSource::quiet(30), true);
     assert_eq!(
         build_output(&full.external_units, &output).bytes,
-        allocated(&victim),
+        full_bytes,
         "explicit full observation must refresh output bytes even without directory changes"
     );
-    append();
+    let no_window_bytes = append();
+    assert!(
+        no_window_bytes > full_bytes,
+        "the no-window append must change allocated bytes"
+    );
     let no_window = observe(&fx, &swamp_core::fs_events::UnsupportedPlatformSource);
     assert_eq!(
         build_output(&no_window.external_units, &output).bytes,
-        allocated(&victim),
+        no_window_bytes,
         "no trusted event window must force measurement rather than timestamp reuse"
     );
     let _ = observe(&fx, &ScriptedSource::quiet(40));
@@ -514,7 +530,11 @@ fn output_event_refreshes_bytes_and_stored_report_preserves_the_unit() {
                 && coverage.event_covered
                 && coverage.reason == "incremental")
     );
-    append();
+    let changed_bytes = append();
+    assert!(
+        changed_bytes > no_window_bytes,
+        "the event-local append must change allocated bytes"
+    );
     let after = observe(&fx, &ScriptedSource::changed(60, vec![victim.clone()]));
     assert!(
         after
@@ -527,7 +547,7 @@ fn output_event_refreshes_bytes_and_stored_report_preserves_the_unit() {
     );
     assert_eq!(
         build_output(&after.external_units, &output).bytes,
-        allocated(&victim),
+        changed_bytes,
         "an output-local event refreshes the independent unit"
     );
 
