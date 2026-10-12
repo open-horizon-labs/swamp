@@ -79,6 +79,8 @@ error/exit-code contract, and `swamp scope`'s own schema: see
 growth number or an implicit root: see
 `references/coverage-and-history.md`.
 
+For historical peaks, growth timelines, before-cleanup sizes, or analysis beyond the last report's comparison window, read [references/advanced-analytics.md](references/advanced-analytics.md). It provides read-only Parquet queries and the rules for interpreting retained observations; use it before searching implementation code for store relationships.
+
 ## Explaining what removal would cost -- never proposing to do it
 
 There is no plan, no approval, no execution and no grant left in
@@ -122,6 +124,7 @@ enough for read-only investigation.
 | `references/cleanup-and-recovery.md` | Where a TUI Trash move went (ledger, envelope/`restore.json`) and how to restore it -- no CLI command deletes anything | 5.1 KB |
 | `references/trust-model.md` | Report reads, observation/state writes, and the separate TUI removal flow | 4.6 KB |
 | `references/coverage-and-history.md` | `since`/history-window resolution, partial/unknown coverage fields, reconciliation, scope/coverage-change notes, what a growth number does and doesn't prove | 6.8 KB |
+| `references/advanced-analytics.md` | Historical peaks and timelines, cleanup ledger joins, Cargo variant inspection, and schema checks for read-only store analysis beyond the CLI's last observation | See file |
 | `references/filters.md` | The filter expression grammar (`kind:`, `growth >`, `idle >`, `merge-complete`, `pr:`, ...) | 2.8 KB |
 | `references/agent-storage.md` | Coding-agent-tool storage (Claude Code sessions/caches/logs/protected config): categories, project linkage, `swamp protect` | 3.4 KB |
 | `references/build-artifacts.md` | What is inside a build container (Cargo, Node, Gradle, Maven): role families, accounting basis, timestamp source, removal consequences, shared stores, and what is never inferred | 3.6 KB |

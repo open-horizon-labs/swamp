@@ -6,6 +6,8 @@ There is no `propose`/`approve`/`execute`/`grant`/`cleanup-check` command, and n
 
 The action ledger is `ledger.parquet` in the swamp store (normally `~/.local/share/swamp`), with the reviewed facts in `ledger_facts.parquet`. A `started` record precedes the move; its final outcome records the original path, recovery location, selected bytes and time. These are Parquet tables, not a JSON-lines log.
 
+Evidence rows use `record_id`, `seq`, `key`, and `value`; join `record_id` to the action's `id`, not its `entity_id`. See [advanced-analytics.md](advanced-analytics.md#cleanup-ledger-what-was-removed-and-how-large-it-was) for schema checks and executable read-only ledger queries.
+
 `recovery_location` records where a Trash move went. Permanent Docker and manager removals have no Trash recovery; check the action and outcome before looking for a restore path. `grant_id` is a historical field name kept for ledger compatibility; it carries no authorization, just the constant `human-marked`.
 
 For a Cargo group or an agent-storage session, several original paths
