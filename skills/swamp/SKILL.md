@@ -21,7 +21,7 @@ deletes scanned data. Removal is performed by a human in
 swamp's TUI (Space marks, Backspace shows current facts, Enter moves to
 the Trash) or a human running a shell command themselves. There is no
 `propose`/`approve`/`execute`/`grant` command any more; do not invent
-one.
+one. Do not call the whole executable read-only either: the TUI removes.
 
 For TUI controls, see [the usage guide](https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md#terminal-controls). Trash review shows restore cost, sourced last use and consequential exceptions; `l` opens full details. Successful moves disappear from current views; shared model layers remain.
 
@@ -77,9 +77,9 @@ error/exit-code contract, and `swamp scope`'s own schema: see
 `--project`/`--filter`: see `references/filters.md`. What "since"/
 "history"/partial coverage/scope actually mean before you trust a
 growth number or an implicit root: see
-`references/coverage-and-history.md`.
-
-For historical peaks, growth timelines, before-cleanup sizes, or analysis beyond the last report's comparison window, read [references/advanced-analytics.md](references/advanced-analytics.md). It provides read-only Parquet queries and the rules for interpreting retained observations; use it before searching implementation code for store relationships.
+`references/coverage-and-history.md`. Peaks, timelines and store queries
+beyond the last report (before searching code): see
+`references/advanced-analytics.md`.
 
 ## Explaining what removal would cost -- never proposing to do it
 
@@ -104,14 +104,6 @@ Before explaining build-container contents or removal, read
 `references/build-artifacts.md` for accounting bases, timestamp sources,
 consequences, and limits on inferred identity and rebuildability.
 
-## Writes and removal
-
-`swamp report` does not perform cleanup. Observation and administrative
-commands write their own state; the TUI has a separate removal flow.
-Do not describe the whole executable as read-only or unable to delete. See
-`references/trust-model.md` for the full statement of what swamp is now
-and what changed.
-
 ## Reference index
 
 Load a reference only when the task needs it -- this file alone is
@@ -130,5 +122,5 @@ enough for read-only investigation.
 | `references/build-artifacts.md` | What is inside a build container (Cargo, Node, Gradle, Maven): role families, accounting basis, timestamp source, removal consequences, shared stores, and what is never inferred | 3.6 KB |
 | `references/evidence.md` | The activity/consumer/current-use/recovery/reclaimability evidence contract: what each fact's `status`/`source`/`freshness` actually establishes, and what it does not | 5.2 KB |
 
-Load references independently as needed. Size estimates above are
-historical; use `wc -c` for current byte counts.
+Size estimates above are historical; use `wc -c` for current byte
+counts.
