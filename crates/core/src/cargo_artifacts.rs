@@ -576,7 +576,16 @@ struct ParsedCargoBuildPaths {
     /// `None`: absent; `Some(None)`: present but unresolved; `Some(Some(_))`:
     /// an observed literal path.
     target_dir: Option<Option<PathBuf>>,
-    build_dir: Option<Option<PathBuf>>,
+    build_dir: Option<BuildDirValue>,
+}
+
+/// `build.build-dir` is the one Cargo path setting that supports templates
+/// (Cargo Book, `build.build-dir`); `target-dir` does not, so a brace there
+/// stays unresolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BuildDirValue {
+    Literal(PathBuf),
+    Template(String),
 }
 
 use serde::{Deserialize, Serialize};
@@ -592,12 +601,14 @@ fn layout_with_env(
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> CargoLayout {
     let mut layout = CargoLayout::default();
-    let configs = config_files(worktree);
+    let cargo_home = cargo_home(&env);
+    let configs = config_files(worktree, cargo_home.as_deref());
     let config = configs.last().cloned();
     layout.config_path = config.clone();
 
     // Cargo merges per-directory config from the filesystem root toward the
-    // project. A deeper file overrides only keys it declares.
+    // project, with `$CARGO_HOME/config.toml` below all of them. A deeper
+    // file overrides only keys it declares.
     for path in &configs {
         let values =
             crate::fs_gate::read::bounded_string(path, crate::fs_gate::read::BoundedCap::MANIFEST)
@@ -609,7 +620,8 @@ fn layout_with_env(
                     layout.target_dir = target.map(|value| resolve_config_path(Some(path), value));
                 }
                 if let Some(build) = parsed.build_dir {
-                    layout.build_dir = build.map(|value| resolve_config_path(Some(path), value));
+                    layout.build_dir =
+                        resolve_build_dir(&build, Some(path), worktree, cargo_home.as_deref());
                 }
             }
             Some(None) | None => {
@@ -625,7 +637,12 @@ fn layout_with_env(
         layout.target_dir = resolve_env_path(p.into());
     }
     if let Some(p) = env("CARGO_BUILD_BUILD_DIR") {
-        layout.build_dir = resolve_env_path(p.into());
+        layout.build_dir = resolve_build_dir(
+            &env_build_dir_value(p),
+            None,
+            worktree,
+            cargo_home.as_deref(),
+        );
     }
     if layout.target_dir.is_none() {
         layout.target_dir = Some(worktree.join("target"));
@@ -641,7 +658,18 @@ fn layout_with_env(
     layout
 }
 
-fn config_files(worktree: &Path) -> Vec<PathBuf> {
+/// Cargo's home: `CARGO_HOME`, else `~/.cargo` (Cargo Book, "Cargo Home").
+/// Not canonicalized, matching Cargo's `{cargo-cache-home}`.
+fn cargo_home(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+}
+
+/// The config files Cargo would read for `worktree`, lowest precedence first:
+/// `$CARGO_HOME/config[.toml]` unless the ancestor walk already reaches it,
+/// then each ancestor's `.cargo/config[.toml]` from the filesystem root down.
+fn config_files(worktree: &Path, cargo_home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut cursor = Some(worktree);
     while let Some(dir) = cursor {
@@ -649,20 +677,33 @@ fn config_files(worktree: &Path) -> Vec<PathBuf> {
         cursor = dir.parent();
     }
     dirs.reverse();
-    dirs.into_iter()
-        .filter_map(|dir| {
-            ["config", "config.toml"]
-                .into_iter()
-                .map(|name| dir.join(".cargo").join(name))
-                .find(|p| crate::fs_gate::is_file(p))
-        })
-        .collect()
+    let config_in = |cargo_dir: &Path| {
+        ["config", "config.toml"]
+            .into_iter()
+            .map(|name| cargo_dir.join(name))
+            .find(|p| crate::fs_gate::is_file(p))
+    };
+    let ancestors: Vec<PathBuf> = dirs
+        .into_iter()
+        .filter_map(|dir| config_in(&dir.join(".cargo")))
+        .collect();
+    let home = cargo_home
+        .and_then(config_in)
+        .filter(|home| !ancestors.contains(home));
+    home.into_iter().chain(ancestors).collect()
 }
 
-/// Static Cargo output declarations. Only local `.cargo/config[.toml]`
-/// values and the observer's Cargo target/build environment are visible;
-/// custom CARGO_HOME configuration outside the ancestor chain and command-line
-/// overrides are not inferred.
+/// Static Cargo output declarations. Visible: every `.cargo/config[.toml]`
+/// Cargo would read for this project (its ancestors and
+/// `$CARGO_HOME/config.toml`) and the observer's Cargo target/build
+/// environment. Command-line overrides are not inferred.
+///
+/// A templated `build.build-dir` is resolved for this project's own manifest
+/// and declared only if that directory exists: a template in Cargo's home
+/// config applies to every project, so a missing directory means "never
+/// built here", not a coverage gap. A workspace member's template resolves
+/// to a directory Cargo never uses (Cargo hashes the workspace root's
+/// manifest) and is skipped the same way.
 pub fn declared_build_paths(worktree: &Path) -> Vec<(PathBuf, String)> {
     declared_build_paths_with_env(worktree, |key| std::env::var_os(key))
 }
@@ -671,9 +712,10 @@ fn declared_build_paths_with_env(
     worktree: &Path,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<(PathBuf, String)> {
+    let cargo_home = cargo_home(&env);
     let mut target = None;
-    let mut build = None;
-    for config in config_files(worktree) {
+    let mut build: Option<Option<(PathBuf, String)>> = None;
+    for config in config_files(worktree, cargo_home.as_deref()) {
         let Some(text) = crate::fs_gate::read::bounded_string(
             &config,
             crate::fs_gate::read::BoundedCap::MANIFEST,
@@ -696,15 +738,25 @@ fn declared_build_paths_with_env(
             });
         }
         if let Some(value) = parsed.build_dir {
-            build = value.map(|value| {
-                (
-                    resolve_config_path(Some(&config), value),
+            let evidence = match &value {
+                BuildDirValue::Literal(_) => {
                     format!(
                         "Cargo .cargo config build.build-dir in {}",
                         config.display()
-                    ),
-                )
-            });
+                    )
+                }
+                BuildDirValue::Template(template) => format!(
+                    "Cargo .cargo config build.build-dir template `{template}` in {}, resolved for {}",
+                    config.display(),
+                    worktree.join("Cargo.toml").display()
+                ),
+            };
+            let templated = matches!(value, BuildDirValue::Template(_));
+            build = Some(
+                resolve_build_dir(&value, Some(&config), worktree, cargo_home.as_deref())
+                    .filter(|path| !templated || crate::fs_gate::is_dir(path))
+                    .map(|path| (path, evidence)),
+            );
         }
     }
     if let Some(value) = env("CARGO_TARGET_DIR") {
@@ -723,14 +775,20 @@ fn declared_build_paths_with_env(
         });
     }
     if let Some(value) = env("CARGO_BUILD_BUILD_DIR") {
-        build = resolve_env_path(value.into()).map(|path| {
-            (
-                path,
-                "observer environment variable CARGO_BUILD_BUILD_DIR".into(),
-            )
-        });
+        let value = env_build_dir_value(value);
+        let templated = matches!(value, BuildDirValue::Template(_));
+        build = Some(
+            resolve_build_dir(&value, None, worktree, cargo_home.as_deref())
+                .filter(|path| !templated || crate::fs_gate::is_dir(path))
+                .map(|path| {
+                    (
+                        path,
+                        "observer environment variable CARGO_BUILD_BUILD_DIR".into(),
+                    )
+                }),
+        );
     }
-    target.into_iter().chain(build).collect()
+    target.into_iter().chain(build.flatten()).collect()
 }
 
 fn resolve_env_path(value: PathBuf) -> Option<PathBuf> {
@@ -741,18 +799,97 @@ fn resolve_env_path(value: PathBuf) -> Option<PathBuf> {
     }
 }
 
+fn env_build_dir_value(value: std::ffi::OsString) -> BuildDirValue {
+    match value.to_str() {
+        Some(text) if text.contains('{') || text.contains('}') => {
+            BuildDirValue::Template(text.to_string())
+        }
+        _ => BuildDirValue::Literal(PathBuf::from(value)),
+    }
+}
+
+/// A build-dir value as a path. Literal values resolve as before
+/// (config-relative, or the observer's working directory for the
+/// environment). Templates substitute Cargo's three variables for the
+/// project at `worktree`; an unknown variable (which Cargo itself rejects)
+/// leaves the value unresolved.
+fn resolve_build_dir(
+    value: &BuildDirValue,
+    config: Option<&Path>,
+    worktree: &Path,
+    cargo_home: Option<&Path>,
+) -> Option<PathBuf> {
+    let template = match value {
+        BuildDirValue::Literal(path) => {
+            return match config {
+                Some(_) => Some(resolve_config_path(config, path.clone())),
+                None => resolve_env_path(path.clone()),
+            };
+        }
+        BuildDirValue::Template(template) => template,
+    };
+    let manifest = worktree.join("Cargo.toml");
+    let mut resolved = template.clone();
+    if resolved.contains("{workspace-root}") {
+        resolved = resolved.replace("{workspace-root}", worktree.to_str()?);
+    }
+    if resolved.contains("{cargo-cache-home}") {
+        resolved = resolved.replace("{cargo-cache-home}", cargo_home?.to_str()?);
+    }
+    if resolved.contains("{workspace-path-hash}") {
+        // Cargo hashes the manifest's real path, falling back to the path
+        // as given when it cannot be canonicalized.
+        let real = crate::fs_gate::canonicalize(&manifest).unwrap_or(manifest);
+        resolved = resolved.replace("{workspace-path-hash}", &workspace_path_hash(&real));
+    }
+    if resolved.contains('{') || resolved.contains('}') {
+        return None;
+    }
+    let path = PathBuf::from(resolved);
+    Some(match config {
+        Some(_) => resolve_config_path(config, path),
+        None => resolve_env_path(path)?,
+    })
+}
+
+/// Cargo's `{workspace-path-hash}`: `StableSipHasher128` over the manifest
+/// path's `Hash`, little-endian hex, split after two characters
+/// (`cargo::util::context::GlobalContext::custom_build_dir`). Cargo documents
+/// this hasher as stable across releases and platforms.
+pub(crate) fn workspace_path_hash(real_manifest: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+    real_manifest.hash(&mut hasher);
+    let hex: String = Hasher::finish(&hasher)
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{}{}{}", &hex[..2], std::path::MAIN_SEPARATOR, &hex[2..])
+}
+
 fn parse_build_paths(text: &str) -> Option<ParsedCargoBuildPaths> {
     let value = text.parse::<toml::Value>().ok()?;
-    let path = |key| {
-        value.get("build").and_then(|b| b.get(key)).map(|v| {
-            v.as_str()
-                .filter(|value| !value.contains('{') && !value.contains('}'))
-                .map(PathBuf::from)
-        })
+    let build = value.get("build");
+    let target_dir = build.and_then(|b| b.get("target-dir")).map(|v| {
+        v.as_str()
+            .filter(|value| !value.contains('{') && !value.contains('}'))
+            .map(PathBuf::from)
+    });
+    let build_dir = match build.and_then(|b| b.get("build-dir")) {
+        None => None,
+        Some(v) => match v.as_str() {
+            Some(text) if text.contains('{') || text.contains('}') => {
+                Some(BuildDirValue::Template(text.to_string()))
+            }
+            Some(text) => Some(BuildDirValue::Literal(PathBuf::from(text))),
+            // Present but not a string: declared, value unknown.
+            None => Some(BuildDirValue::Template(String::from("{unreadable}"))),
+        },
     };
     Some(ParsedCargoBuildPaths {
-        target_dir: path("target-dir"),
-        build_dir: path("build-dir"),
+        target_dir,
+        build_dir,
     })
 }
 
@@ -1670,6 +1807,144 @@ mod tests {
                 .all(|(path, _)| path != &ancestor_target)
         );
         assert!(declarations.iter().all(|(path, _)| path != &local_target));
+    }
+
+    /// The value Cargo 1.98.1 itself created on macOS for this manifest
+    /// (`~/.cargo/build/b5/39d5cda724e19e` after `cargo build` with
+    /// `build-dir = "{cargo-cache-home}/build/{workspace-path-hash}"`).
+    #[cfg(unix)]
+    #[test]
+    fn workspace_path_hash_matches_cargo() {
+        assert_eq!(
+            workspace_path_hash(Path::new("/private/tmp/bdx.cjHC/demo/Cargo.toml")),
+            "b5/39d5cda724e19e"
+        );
+    }
+
+    /// A fixture: `$CARGO_HOME/config.toml` with `home_config`, and a
+    /// package at `<tmp>/src/<name>` outside the home's ancestry (as a
+    /// shared `/Volumes/src` checkout is).
+    fn cargo_home_fixture(home_config: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempdir().unwrap();
+        let cargo_home = tmp.path().join("home/.cargo");
+        fs::create_dir_all(&cargo_home).unwrap();
+        fs::write(cargo_home.join("config.toml"), home_config).unwrap();
+        let project = tmp.path().join("src/app");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname='app'\n").unwrap();
+        (tmp, cargo_home, project)
+    }
+
+    fn built_dir(cargo_home: &Path, project: &Path) -> PathBuf {
+        let manifest = fs::canonicalize(project.join("Cargo.toml")).unwrap();
+        let dir = cargo_home
+            .join("build")
+            .join(workspace_path_hash(&manifest));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn cargo_home_build_dir_template_links_the_directory_cargo_built() {
+        let (_tmp, cargo_home, project) = cargo_home_fixture(
+            "[build]\nbuild-dir = \"{cargo-cache-home}/build/{workspace-path-hash}\"\n",
+        );
+        let env = |key: &str| (key == "CARGO_HOME").then(|| cargo_home.clone().into_os_string());
+
+        // Never built here: the template resolves, but nothing is declared.
+        assert!(declared_build_paths_with_env(&project, env).is_empty());
+
+        let dir = built_dir(&cargo_home, &project);
+        let declarations = declared_build_paths_with_env(&project, env);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].0, dir);
+        assert!(declarations[0].1.contains("{workspace-path-hash}"));
+        assert!(declarations[0].1.contains("resolved for"));
+
+        let layout = layout_with_env(&project, env);
+        assert_eq!(layout.build_dir, Some(dir));
+        assert_eq!(layout.target_dir, Some(project.join("target")));
+    }
+
+    #[test]
+    fn cargo_home_defaults_to_dot_cargo_under_home() {
+        let (tmp, _cargo_home, project) = cargo_home_fixture(
+            "[build]\nbuild-dir = \"{cargo-cache-home}/build/{workspace-path-hash}\"\n",
+        );
+        let home = tmp.path().join("home");
+        let dir = built_dir(&home.join(".cargo"), &project);
+        let declarations = declared_build_paths_with_env(&project, |key| {
+            (key == "HOME").then(|| home.clone().into_os_string())
+        });
+        assert_eq!(
+            declarations.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            vec![&dir]
+        );
+    }
+
+    #[test]
+    fn project_config_overrides_cargo_home_config() {
+        let (_tmp, cargo_home, project) = cargo_home_fixture(
+            "[build]\nbuild-dir = \"{cargo-cache-home}/build/{workspace-path-hash}\"\n",
+        );
+        built_dir(&cargo_home, &project);
+        fs::create_dir_all(project.join(".cargo")).unwrap();
+        fs::write(
+            project.join(".cargo/config.toml"),
+            "[build]\nbuild-dir = 'local-build'\n",
+        )
+        .unwrap();
+        let env = |key: &str| (key == "CARGO_HOME").then(|| cargo_home.clone().into_os_string());
+        let declarations = declared_build_paths_with_env(&project, env);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].0, project.join("local-build"));
+    }
+
+    #[test]
+    fn workspace_member_template_is_not_declared() {
+        // Cargo hashes the workspace root's manifest, so a member's own
+        // resolution names a directory Cargo never creates.
+        let (_tmp, cargo_home, root) = cargo_home_fixture(
+            "[build]\nbuild-dir = \"{cargo-cache-home}/build/{workspace-path-hash}\"\n",
+        );
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=['member']\n").unwrap();
+        let member = root.join("member");
+        fs::create_dir_all(&member).unwrap();
+        fs::write(member.join("Cargo.toml"), "[package]\nname='member'\n").unwrap();
+        let root_dir = built_dir(&cargo_home, &root);
+        let env = |key: &str| (key == "CARGO_HOME").then(|| cargo_home.clone().into_os_string());
+        assert!(declared_build_paths_with_env(&member, env).is_empty());
+        assert_eq!(declared_build_paths_with_env(&root, env)[0].0, root_dir);
+    }
+
+    #[test]
+    fn unknown_template_variables_stay_unresolved() {
+        let (_tmp, cargo_home, project) =
+            cargo_home_fixture("[build]\nbuild-dir = \"{cargo-cache-home}/{not-a-variable}\"\n");
+        fs::create_dir_all(cargo_home.join("{not-a-variable}")).unwrap();
+        let env = |key: &str| (key == "CARGO_HOME").then(|| cargo_home.clone().into_os_string());
+        assert!(declared_build_paths_with_env(&project, env).is_empty());
+        assert_eq!(
+            layout_with_env(&project, env).build_dir,
+            Some(project.join("target"))
+        );
+    }
+
+    #[test]
+    fn environment_build_dir_template_resolves_like_config() {
+        let (_tmp, cargo_home, project) = cargo_home_fixture("");
+        let dir = built_dir(&cargo_home, &project);
+        let env = |key: &str| match key {
+            "CARGO_HOME" => Some(cargo_home.clone().into_os_string()),
+            "CARGO_BUILD_BUILD_DIR" => {
+                Some("{cargo-cache-home}/build/{workspace-path-hash}".into())
+            }
+            _ => None,
+        };
+        let declarations = declared_build_paths_with_env(&project, env);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].0, dir);
+        assert!(declarations[0].1.contains("CARGO_BUILD_BUILD_DIR"));
     }
 
     #[test]

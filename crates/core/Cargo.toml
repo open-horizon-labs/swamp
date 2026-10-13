@@ -14,6 +14,7 @@ toml_edit.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 blake3.workspace = true
+rustc-stable-hash.workspace = true
 gix = { version = "0.87", default-features = false, features = ["max-performance-safe", "status", "revision", "sha1"] }
 parquet.workspace = true
 serde.workspace = true
