@@ -18,6 +18,8 @@ anyhow = "1"
 arrow-array = "56"
 arrow-schema = "56"
 blake3 = "1"
+# Cargo's own hasher for `{workspace-path-hash}` (Cargo pins the same crate).
+rustc-stable-hash = "0.1.2"
 clap = { version = "4", features = ["derive"] }
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 parquet = { version = "56", features = ["arrow", "zstd"] }

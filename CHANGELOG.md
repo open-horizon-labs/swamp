@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- Follow a templated Cargo `build.build-dir` (`{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}`) to the directory Cargo builds into, and read `$CARGO_HOME/config.toml` as the lowest-precedence Cargo config. A project whose intermediates live under `~/.cargo/build/<hash>` now shows that directory as its own build output with the project as consumer, instead of an anonymous part of Cargo home. A template resolves only for directories that exist; workspace members and never-built projects declare nothing.
+
 ## v0.8.6 — 2026-10-07
 
 - Cache drilldown rows show modification age and separately sourced directory access timestamps captured before enumeration. Stored reports retain the access observation date and explain that earlier listings can update it; access metadata does not establish actual use.
