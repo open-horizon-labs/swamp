@@ -1,22 +1,23 @@
 name: CI
 
-# Native, non-release CI on both supported targets. Cross-compilation is
+# Native, non-release CI on all supported targets. Cross-compilation is
 # not acceptance (#87): every job builds and RUNS the workspace tests on
 # the operating system it claims to support.
 #
 #   linux-x86_64 -> ubuntu-24.04, pinned deliberately. Ubuntu 24.04 is the
 #                   selected Linux validation baseline (#77/#79); a newer
 #                   hosted image would test an environment nobody targets.
+#   linux-aarch64 -> ubuntu-24.04-arm, native arm64 Linux build and tests.
 #   macos-arm64  -> the org's Apple-silicon builder when
 #                   LOCAL_MACOS_CI_ENABLED is set, otherwise GitHub's hosted
 #                   macOS runner. Same runner selection as release.yml, so a
 #                   green CI run and a green release run mean the same thing.
 #
 # Packaging is exercised here too, on every push, with the same scripts
-# release.yml uses (#88): `linux-x86_64-package` builds the release
-# profile, packages the archives, smoke-tests the *extracted* archive and
-# runs the Linux validation (#89) against it; `linux-newer-smoke` runs
-# that 24.04-built archive on the newest hosted Ubuntu. Nothing is
+# release.yml uses (#88): the Linux package jobs build the release
+# profile and smoke-tests the *extracted* archive. The x86_64 job also
+# runs the Linux validation (#89); `linux-newer-smoke` runs that archive on
+# the newest hosted Ubuntu. Nothing is
 # published from this workflow.
 #
 # This is the fast tier only (target: under ~10 minutes per OS on a warm
@@ -35,12 +36,12 @@ name: CI
 # PR (remove and re-add to run again). Pushes to main and to integration/**
 # and stack/** branches still run it, and `release.yml`'s gate is unchanged
 # (it waits for this workflow on the tagged commit). Runner selection:
-# macOS already runs on the homelab (LOCAL_MACOS_CI_ENABLED); the Linux jobs
-# do the same when LOCAL_LINUX_CI_ENABLED is 'true': the homelab fleet broker
+# macOS already runs on the homelab (LOCAL_MACOS_CI_ENABLED); the Linux
+# x86_64 jobs do the same when LOCAL_LINUX_CI_ENABLED is 'true': the broker
 # (homelab-infra/broker) provisions an ephemeral ubuntu:24.04 runner container
-# on a linux-general host for the job (labels: self-hosted, linux, x64,
+# on a linux-general host for those jobs (labels: self-hosted, linux, x64,
 # linux-general; see CONTRIBUTING.md), otherwise they use GitHub's hosted
-# ubuntu-24.04.
+# ubuntu-24.04. Linux arm64 uses the native GitHub-hosted ubuntu-24.04-arm.
 
 on:
   push:
@@ -256,6 +257,59 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+
+  linux-aarch64:
+    name: Linux arm64 (Ubuntu 24.04)
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ci'
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - uses: actions/checkout@v5
+    - name: Rust toolchain (stable)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-unknown-linux-gnu
+        components: rustfmt, clippy
+    - name: Cargo cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ci-linux-aarch64
+    - name: Environment
+      run: |
+        set -euo pipefail
+        uname -a
+        rustc -vV
+        ldd --version | head -1
+    - name: Platform isolation — dependency graph
+      run: ./scripts/platform-isolation.sh deps aarch64-unknown-linux-gnu
+    - name: Test (native Linux arm64)
+      run: cargo test --workspace --locked --no-fail-fast
+    - name: Release graph has no test-fixture API
+      run: |
+        set -euo pipefail
+        if cargo tree -p swamp -e normal,build,features --prefix none --locked --target aarch64-unknown-linux-gnu |
+          grep -q 'swamp-core feature "testing"'; then
+          echo 'the swamp binary would enable swamp-core/testing' >&2
+          exit 1
+        fi
+    - name: Build release binary
+      run: cargo build --release --locked --target aarch64-unknown-linux-gnu -p swamp
+    - name: Package and smoke test
+      run: |
+        set -euo pipefail
+        v="$(./scripts/release-version.sh | cut -d= -f2)"
+        ./scripts/package-release.sh aarch64-unknown-linux-gnu "$v" target/aarch64-unknown-linux-gnu/release/swamp dist
+        ./scripts/release-smoke.sh "dist/swamp-${v}-aarch64-unknown-linux-gnu.tar.gz" "$v" dist/report
+        ./scripts/release-smoke.sh dist/swamp-aarch64-unknown-linux-gnu.tar.gz "$v"
+        ./scripts/platform-isolation.sh linkage target/aarch64-unknown-linux-gnu/release/swamp
+    - name: Upload archive and reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: swamp-aarch64-unknown-linux-gnu-ci
+        path: |
+          dist/*.tar.gz
+          dist/*.sha256
+          dist/report/*
 
   linux-newer-smoke:
     name: Linux x86_64 archive on the newest hosted Ubuntu (test-only)

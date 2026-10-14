@@ -10,7 +10,7 @@
 #                          needs and carries no symbol from the other OS's
 #                          backend.
 #
-# Run from the repository root. CI runs both on both targets
+# Run from the repository root. CI runs these checks on every published target
 # (.github/workflows/ci.yml); a contributor can run either by hand.
 
 set -euo pipefail
@@ -94,7 +94,7 @@ linkage() {
             # the documented Ubuntu 24.04 baseline has not agreed to.
             local unexpected
             unexpected="$(awk '{print $1}' <<<"$libs" |
-                grep -vE '^(linux-vdso\.so\.1|/lib64/ld-linux-x86-64\.so\.2|libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libutil\.so\.1|ld-linux-x86-64\.so\.2)$' |
+                grep -vE '^(linux-vdso\.so\.1|/lib64/ld-linux-x86-64\.so\.2|/lib/ld-linux-aarch64\.so\.1|libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|libdl\.so\.2|libpthread\.so\.0|librt\.so\.1|libutil\.so\.1|ld-linux-x86-64\.so\.2|ld-linux-aarch64\.so\.1)$' |
                 grep -v '^$' || true)"
             if [ -n "$unexpected" ]; then
                 echo "$unexpected" >&2

@@ -50,6 +50,22 @@ It needs no root, no daemon and no `lsof`. Update by repeating the download;
 there is no migration step. Versioned archives (`swamp-<version>-x86_64-unknown-linux-gnu.tar.gz`)
 are attached to each release as well.
 
+### Linux ARM64 (including Fedora Asahi Remix)
+
+Download the native ARM64 archive and checksum, verify, and install:
+
+```bash
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-aarch64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-aarch64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c swamp-aarch64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf swamp-aarch64-unknown-linux-gnu.tar.gz
+mkdir -p ~/.local/bin
+install -m 755 swamp-aarch64-unknown-linux-gnu/swamp ~/.local/bin/
+swamp --version
+```
+
+This glibc binary is built and smoke-tested on Ubuntu 24.04 ARM64. It needs no Rust or Cargo installation on the Fedora host. Update by repeating the download; versioned archives are attached to each release too.
+
 ## Observations and history
 
 ### Unique bytes and fast refresh

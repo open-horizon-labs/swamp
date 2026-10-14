@@ -13,6 +13,7 @@ Run `uname -s` and `uname -m`.
 | --- | --- | --- |
 | Darwin / arm64 | `aarch64-apple-darwin` | Homebrew; archive if Homebrew is unavailable |
 | Linux / x86_64 | `x86_64-unknown-linux-gnu` | Release archive; glibc, built on Ubuntu 24.04 |
+| Linux / aarch64 | `aarch64-unknown-linux-gnu` | Release archive; glibc, built on Ubuntu 24.04 ARM64 |
 | Anything else | No matching published binary | Explain the unsupported target; do not substitute another architecture |
 
 On a Mac running an x86_64 shell under Rosetta, check
@@ -45,6 +46,7 @@ checksum, extraction, or unsupported platform—do not continue with older files
   case "$(uname -s)/$(uname -m)" in
     Darwin/arm64) target=aarch64-apple-darwin ;;
     Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+    Linux/aarch64) target=aarch64-unknown-linux-gnu ;;
     *) echo "No published Swamp binary for this platform" >&2; exit 1 ;;
   esac
   archive="swamp-$target"
@@ -55,7 +57,7 @@ checksum, extraction, or unsupported platform—do not continue with older files
   curl -fLO "$base/$archive.tar.gz.sha256"
   case "$target" in
     aarch64-apple-darwin) shasum -a 256 -c "$archive.tar.gz.sha256" ;;
-    x86_64-unknown-linux-gnu) sha256sum -c "$archive.tar.gz.sha256" ;;
+    x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu) sha256sum -c "$archive.tar.gz.sha256" ;;
   esac
   tar -xzf "$archive.tar.gz"
   mkdir -p "$HOME/.local/bin"

@@ -1,19 +1,20 @@
 # Platforms
 
-Swamp supports two targets:
+Swamp ships three targets:
 
 | | Target triple | Validated on | Status |
 |---|---|---|---|
 | macOS | `aarch64-apple-darwin` | macOS arm64, in CI on every push | Builds, tests, releases |
 | Linux | `x86_64-unknown-linux-gnu` | Ubuntu 24.04 x86_64, in CI on every push; the archive also smoke-tested on the newest hosted Ubuntu | Builds, tests, releases (glibc; see [Release archives](#release-archives-and-what-they-require)) |
+| Linux | `aarch64-unknown-linux-gnu` | Ubuntu 24.04 ARM64, native build, tests and archive smoke in CI on every push | Builds, tests, releases (glibc; see [Release archives](#release-archives-and-what-they-require)) |
 
-No other target is supported, and none is planned here. Windows is not a target. ARM Linux is not a target. Nothing in this work makes either one closer; adding one means doing this exercise again for that kernel.
+No other target is supported. Windows is not a target. Linux ARM64 is supported; other Linux architectures are not.
 
-**CPU baseline: generic x86_64.** No `target-cpu=native`, ever, in a release profile. A binary built for the machine that built it is not a binary anyone else can run, and a measurement produced by a build nobody can reproduce is not evidence.
+**CPU baseline: generic x86_64 and generic AArch64.** No `target-cpu=native`, ever, in a release profile. A binary built for the machine that built it is not a binary anyone else can run, and a measurement produced by a build nobody can reproduce is not evidence.
 
 **No root, no assumed init system.** Everything swamp does on Linux runs as an ordinary user. It does not require `systemd`, a session bus, a container runtime, or membership in any group. Where a capability genuinely needs one of those, swamp refuses and names what is missing (see [Capabilities](#capabilities)) rather than escalating or guessing.
 
-**glibc, not musl.** `x86_64-unknown-linux-gnu` links glibc. `scripts/platform-isolation.sh linkage` asserts in CI that the binary's runtime dependencies stay within the loader, `libc`, `libm` and `libgcc_s` — so a new dependency that drags in a system library is a CI failure rather than a support question after the fact.
+**glibc, not musl.** Both Linux targets link glibc. `scripts/platform-isolation.sh linkage` asserts in CI that each binary's runtime dependencies stay within the architecture's loader, `libc`, `libm` and `libgcc_s` — so a new dependency that drags in a system library is a CI failure rather than a support question after the fact.
 
 ## Capabilities
 
@@ -30,7 +31,7 @@ This table is generated from `crates/core/src/platform/CAPABILITIES`, and `crate
 | `trash` | supported | supported | macOS renames into ~/.Trash. Linux follows the freedesktop Trash spec (home trash, or the mount's own .Trash-$uid) with a .trashinfo record; a rename or a refusal, never a copy or a permanent fallback. |
 | `occupancy` | supported | supported | macOS runs a bounded lsof; Linux reads procfs (fds, cwd, exe, maps) of this user's processes. Anything that cannot be read is Unknown -- never 'nothing is open': a Trash move names it as a warning on the confirm, and tool-managed removal (no Trash) names it as a warning and re-checks it at `Y`. |
 | `atime-reliability` | supported | supported | macOS reads statfs mount flags; Linux reads /proc/mounts. Either failing is Undetermined, not 'atime is fine'. |
-| `release-artifact` | supported | supported | Separate archives with checksums per target (binary, README, skill), each built and tested on its own runner; a release publishes only after both targets and a newer-Ubuntu test pass. |
+| `release-artifact` | supported | supported | Separate archives with checksums per target (binary, README, skill), each built and smoke-tested on its own runner; a release publishes only after macOS and Linux checks and the x86_64 newer-Ubuntu test pass. |
 
 "Unavailable" and "planned" both mean the same thing at runtime: swamp refuses and says why. The difference is whether an issue exists that would change the answer.
 
@@ -258,7 +259,7 @@ Everything else it cannot answer is **`Unknown`, shown as such on the confirm an
 
 ## Release archives and what they require
 
-`release.yml` builds each shipping binary once on its target runner. Publication requires full checks on both macOS and Ubuntu 24.04, smoke tests of both packaged binaries, and a smoke test of the same Linux archive on the newest hosted Ubuntu (#88).
+`release.yml` builds each shipping binary once on its target runner. Publication requires full checks on macOS and Linux x86_64, native build and workspace tests for Linux ARM64, smoke tests of every packaged binary, and a smoke test of the x86_64 archive on the newest hosted Ubuntu (#88).
 
 The full checks run the workspace tests, source audits, compile-fail cases, mutation sweep, and cost test. They use the normal test profile; we do not rebuild the whole test suite with shipping LTO settings. Optimized-code coverage comes from exercising the packaged binary, not from recompiling every test harness. This does not provide full unit-test coverage under release optimization. The newer-Ubuntu job validates archive compatibility without installing Rust or rebuilding the workspace.
 
@@ -266,9 +267,10 @@ The full checks run the workspace tests, source audits, compile-fail cases, muta
 |---|---|
 | `swamp-<version>-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | `swamp`, `README.md`, `skills/swamp/` |
 | `swamp-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | the same, under the name `releases/latest/download/` resolves |
+| `swamp-<version>-aarch64-unknown-linux-gnu.tar.gz`, `swamp-aarch64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | Linux ARM64 equivalents; built and smoke-tested on Ubuntu 24.04 ARM64 |
 | `swamp-<version>-aarch64-apple-darwin.tar.gz`, `swamp-aarch64-apple-darwin.tar.gz` (+ `.sha256`) | the macOS equivalents |
 
-No MCP server artifact exists for either target (#104). The same `scripts/package-release.sh` and `scripts/release-smoke.sh` run in `ci.yml` on every push, so the archive CI smoke-tests is the archive a release publishes. The smoke test verifies the checksum, extracts, and runs the *extracted* binary: `--version`, `--help`, the packaged skill, an explicit-root `report --json`, `observe` twice into a scratch store and a `report --json` of that history, and TUI startup and quit under a pseudo-terminal.
+No MCP server artifact exists for any target (#104). The same `scripts/package-release.sh` and `scripts/release-smoke.sh` run in `ci.yml` on every push, so the archive CI smoke-tests is the archive a release publishes. The smoke test verifies the checksum, extracts, and runs the *extracted* binary: `--version`, `--help`, the packaged skill, an explicit-root `report --json`, `observe` twice into a scratch store and a `report --json` of that history, and TUI startup and quit under a pseudo-terminal.
 
 Measured on the Ubuntu 24.04 runner (CI run 35789903497, 2026-09-22):
 
@@ -280,7 +282,7 @@ Measured on the Ubuntu 24.04 runner (CI run 35789903497, 2026-09-22):
 | Kernel features used | inotify, plain `rename(2)` (check-then-rename, not `renameat2(RENAME_NOREPLACE)`), procfs; tested on Linux 6.17 (Azure) |
 | Not required | root, `lsof`, D-Bus, a desktop session; `systemd --user` only for `swamp schedule` |
 
-The minimum glibc is a property of the build image, not a promise: it is re-measured by every CI run's smoke step, and would move if the baseline image moved. No musl or static build, no ARM Linux archive, and no Windows artifact exist or are implied.
+Both Linux archives are built on Ubuntu 24.04 and need glibc 2.39 or newer. CI records each binary's loader and highest required GLIBC symbol during smoke testing. Fedora Asahi Remix can install the `aarch64-unknown-linux-gnu` archive directly; no Rust toolchain or local build is needed. No musl or static build, other Linux architecture, or Windows artifact exists or is implied.
 
 ## Linux validation
 

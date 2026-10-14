@@ -131,19 +131,21 @@ fn every_compiled_capability_is_documented() {
 
 /// The supported baseline must be stated, not assumed. Each of these is
 /// a promise a user relies on and that this work deliberately made:
-/// exactly two targets, a generic CPU, no root, and Ubuntu 24.04 as the
+/// three supported targets, generic CPUs, no root, and Ubuntu 24.04 as the
 /// validation baseline rather than whatever the runner image is today.
 #[test]
 fn the_documented_baseline_states_every_commitment() {
     let text = std::fs::read_to_string(doc_path()).expect("read docs/platform.md");
     for required in [
         "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
         "aarch64-apple-darwin",
         "Ubuntu 24.04",
         "generic x86_64",
+        "generic AArch64",
         "target-cpu=native",
         "Windows is not a target",
-        "ARM Linux is not a target",
+        "Linux ARM64",
     ] {
         assert!(
             text.contains(required),

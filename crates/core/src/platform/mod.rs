@@ -120,7 +120,8 @@ impl Os {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     pub fn current() -> Self {
         compile_error!(
-            "swamp supports x86_64-unknown-linux-gnu and aarch64-apple-darwin; \
+            "swamp supports x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, and \
+             aarch64-apple-darwin; \
              see docs/platform.md before adding a target"
         )
     }
@@ -472,8 +473,8 @@ pub const CAPABILITIES: &[Capability] = &[
         macos: Support::Supported,
         linux: Support::Supported,
         note: "Separate archives with checksums per target (binary, README, skill), each built \
-               and tested on its own runner; a release publishes only after both targets and a \
-               newer-Ubuntu test pass.",
+               and smoke-tested on its own runner; a release publishes only after macOS and Linux \
+               checks and the x86_64 newer-Ubuntu test pass.",
     },
 ];
 

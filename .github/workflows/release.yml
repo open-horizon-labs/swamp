@@ -1,7 +1,7 @@
 name: Release
 
 # Tag pushes are the single release trigger (`git tag vX.Y.Z && git push --tags`,
-# or `gh release create`, which pushes the tag). Two build jobs, one per
+# or `gh release create`, which pushes the tag). Three build jobs, one per
 # supported target, each producing its own archives and checksums; an
 # archive-only job on a newer Ubuntu; a gate that both `ci.yml` (fast tier,
 # platform isolation, traversal and archive checks) and `check-full.yml`
@@ -14,17 +14,19 @@ name: Release
 #   macos-arm64              aarch64-apple-darwin, release binary, package, smoke
 #   linux-x86_64             x86_64-unknown-linux-gnu on Ubuntu 24.04 (the baseline),
 #                            generic x86-64 CPU, package, smoke, linkage + glibc
+#   linux-aarch64            aarch64-unknown-linux-gnu on native Ubuntu 24.04 arm64,
+#                            package and smoke
 #   linux-x86_64-newer       archive-only: the 24.04-built archive smoke-tested on the
 #                            newest hosted Ubuntu; no second build or workspace suite
 #   gates                    waits for (or, with none, dispatches) `ci.yml` and
 #                            `check-full.yml` on this commit; fails fast:
 #                            scripts/verify-gates.sh
-#   release                  needs all four; publishes every archive + checksum
+#   release                  needs all five; publishes every archive + checksum
 #
 # Each archive holds the CLI/TUI binary, README.md and the agent skill
 # (skills/swamp/). There is no separate MCP server binary (removed #104):
 # the CLI's --json output plus the packaged skill is the agent interface,
-# and no MCP artifact is built for either target.
+# and no MCP artifact is built for any target.
 #
 # macOS runner: the org's local Apple-silicon builder when
 # LOCAL_MACOS_CI_ENABLED is set, otherwise GitHub's hosted macOS runner.
@@ -198,6 +200,57 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
+  linux-aarch64:
+    name: Linux arm64 (Ubuntu 24.04)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-aarch64
+
+      - name: Version
+        id: v
+        run: ./scripts/release-version.sh >> "$GITHUB_OUTPUT"
+
+      - name: Release graph has no test-fixture API
+        run: |
+          set -euo pipefail
+          if cargo tree -p swamp -e normal,build,features --prefix none --locked --target aarch64-unknown-linux-gnu |
+            grep -q 'swamp-core feature "testing"'; then
+            echo 'the swamp binary would enable swamp-core/testing' >&2
+            exit 1
+          fi
+
+      - name: Build (release, aarch64-unknown-linux-gnu, generic arm64)
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu -p swamp
+
+      - name: Package
+        run: ./scripts/package-release.sh aarch64-unknown-linux-gnu "${{ steps.v.outputs.version }}" target/aarch64-unknown-linux-gnu/release/swamp dist
+
+      - name: Smoke and linkage (native arm64 runner)
+        run: |
+          set -euo pipefail
+          ./scripts/release-smoke.sh "dist/swamp-${{ steps.v.outputs.version }}-aarch64-unknown-linux-gnu.tar.gz" "${{ steps.v.outputs.version }}" dist/smoke
+          ./scripts/release-smoke.sh dist/swamp-aarch64-unknown-linux-gnu.tar.gz "${{ steps.v.outputs.version }}"
+          ./scripts/platform-isolation.sh linkage target/aarch64-unknown-linux-gnu/release/swamp
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swamp-aarch64-unknown-linux-gnu
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/smoke/*
+
   linux-x86_64-newer:
     name: Linux x86_64 (newest hosted Ubuntu, archive-only)
     needs: linux-x86_64
@@ -257,6 +310,7 @@ jobs:
       [
         macos-arm64,
         linux-x86_64,
+        linux-aarch64,
         linux-x86_64-newer,
         gates,
       ]
@@ -275,9 +329,9 @@ jobs:
           find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
           find artifacts -name '*.sha256' -exec cp {} dist/ \;
           (cd dist && ls -l && for f in *.sha256; do sha256sum -c "$f"; done)
-          # One archive name per target and version: two targets can
+          # One archive name per target and version: targets can
           # never write the same asset.
-          test "$(ls dist/*.tar.gz | wc -l)" -eq 4
+          test "$(ls dist/*.tar.gz | wc -l)" -eq 6
 
       # Release notes are written by a human in CHANGELOG.md under
       # `## vX.Y.Z`; the release fails if the tag has no entry.
@@ -313,7 +367,17 @@ jobs:
             echo 'mkdir -p ~/.local/bin'
             echo 'install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/'
             echo '```'
-            echo 'Versioned archives for both targets are also attached below.'
+            echo
+            echo "### Install (Linux arm64, glibc; built and tested on Ubuntu 24.04 arm64)"
+            echo '```bash'
+            echo 'curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-aarch64-unknown-linux-gnu.tar.gz'
+            echo 'curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-aarch64-unknown-linux-gnu.tar.gz.sha256'
+            echo 'sha256sum -c swamp-aarch64-unknown-linux-gnu.tar.gz.sha256'
+            echo 'tar -xzf swamp-aarch64-unknown-linux-gnu.tar.gz'
+            echo 'mkdir -p ~/.local/bin'
+            echo 'install -m 755 swamp-aarch64-unknown-linux-gnu/swamp ~/.local/bin/'
+            echo '```'
+            echo 'Versioned archives for all three targets are also attached below.'
           } >> release-notes.md
 
       - name: Release

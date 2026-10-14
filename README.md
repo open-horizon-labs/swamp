@@ -46,6 +46,20 @@ install -m 755 swamp-x86_64-unknown-linux-gnu/swamp ~/.local/bin/
 
 Linux releases target generic x86-64 with glibc, built on Ubuntu 24.04. See [platform requirements](docs/platform.md#release-archives-and-what-they-require) and the [installation guide](docs/usage.md#installing-a-release).
 
+On Linux ARM64, including Fedora Asahi Remix, use the native aarch64 release:
+
+```bash
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-aarch64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/open-horizon-labs/swamp/releases/latest/download/swamp-aarch64-unknown-linux-gnu.tar.gz.sha256
+sha256sum -c swamp-aarch64-unknown-linux-gnu.tar.gz.sha256 &&
+tar -xzf swamp-aarch64-unknown-linux-gnu.tar.gz &&
+mkdir -p ~/.local/bin &&
+install -m 755 swamp-aarch64-unknown-linux-gnu/swamp ~/.local/bin/
+~/.local/bin/swamp --version
+```
+
+The Linux ARM64 release targets generic AArch64 with glibc and is built on Ubuntu 24.04 ARM64. It requires no Rust or Cargo installation on the machine. See [platform requirements](docs/platform.md#release-archives-and-what-they-require).
+
 ### Build from source
 
 Use the repository's pinned Rust toolchain:
