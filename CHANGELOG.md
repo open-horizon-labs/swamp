@@ -5,6 +5,8 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+- Publish a native Linux ARM64 (`aarch64-unknown-linux-gnu`) release archive with a checksum. Fedora Asahi Remix and other glibc ARM64 Linux hosts can install the prebuilt binary without installing Rust or compiling Swamp locally.
+
 ## v0.8.7 — 2026-10-13
 
 - Follow a templated Cargo `build.build-dir` (`{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}`) to the directory Cargo builds into, and read `$CARGO_HOME/config.toml` as the lowest-precedence Cargo config. A project whose intermediates live under `~/.cargo/build/<hash>` now shows that directory as its own build output with the project as consumer, instead of an anonymous part of Cargo home. A template resolves only for directories that exist; workspace members and never-built projects declare nothing.
