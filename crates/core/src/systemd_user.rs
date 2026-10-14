@@ -44,6 +44,16 @@ pub const MARKER: &str =
 /// default); systemd's is a little longer so swamp's fires first and
 /// logs a `timeout` outcome rather than being killed silently.
 const START_TIMEOUT_SECS: u64 = 45 * 60;
+const RESTART_SECS: u64 = 300;
+const START_LIMIT_WINDOW_SECS: u64 = 3600;
+
+/// systemd counts successful timer activations against StartLimitBurst too.
+/// Leave room for every scheduled activation in the window, plus the number
+/// of five-minute failure retries that could fit in that same window.
+fn start_limit_burst(interval_secs: u64) -> u64 {
+    START_LIMIT_WINDOW_SECS.div_ceil(interval_secs)
+        + START_LIMIT_WINDOW_SECS.div_ceil(RESTART_SECS)
+}
 
 /// One `systemctl --user` invocation's result.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -211,17 +221,17 @@ pub fn render_service(cfg: &Config) -> Result<String> {
 [Unit]\n\
 Description=swamp: observe developer storage growth (scheduled)\n\
 Documentation=https://github.com/open-horizon-labs/swamp/blob/main/docs/usage.md\n\
-# Bounded retries: three failed starts in an hour and systemd stops trying\n\
-# until the next timer fire.\n\
-StartLimitIntervalSec=3600\n\
-StartLimitBurst=3\n\
+# StartLimitBurst includes successful timer activations as well as failures.\n\
+# Allow the configured cadence and five-minute retries in one hour.\n\
+StartLimitIntervalSec={START_LIMIT_WINDOW_SECS}\n\
+StartLimitBurst={start_limit_burst}\n\
 \n\
 [Service]\n\
 Type=oneshot\n\
 ExecStart={exec}\n\
 {env}\
 Restart=on-failure\n\
-RestartSec=300\n\
+RestartSec={RESTART_SECS}\n\
 TimeoutStartSec={START_TIMEOUT_SECS}\n\
 Nice=10\n\
 IOSchedulingClass=idle\n\
@@ -229,6 +239,7 @@ IOSchedulingClass=idle\n\
 # swamp also appends each run's outcome to its own observe.log.\n",
         exec = exec_line(cfg, "observe")?,
         env = env_lines(cfg)?,
+        start_limit_burst = start_limit_burst(cfg.interval_secs),
     ))
 }
 
@@ -742,7 +753,7 @@ mod tests {
             service.contains("Environment=\"SWAMP_DIR=/home/dev/store $$HOME\""),
             "{service}"
         );
-        assert!(service.contains("Type=oneshot") && service.contains("StartLimitBurst=3"));
+        assert!(service.contains("Type=oneshot") && service.contains("StartLimitBurst=13"));
         let timer = std::fs::read_to_string(dir.path().join(TIMER)).unwrap();
         assert!(timer.contains("OnUnitActiveSec=3600"), "{timer}");
         assert_eq!(
