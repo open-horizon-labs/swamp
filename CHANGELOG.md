@@ -5,7 +5,10 @@ observations, not general performance guarantees. See the README for current use
 
 ## Unreleased
 
+## v0.8.8 — 2026-10-14
+
 - Publish a native Linux ARM64 (`aarch64-unknown-linux-gnu`) release archive with a checksum. Fedora Asahi Remix and other glibc ARM64 Linux hosts can install the prebuilt binary without installing Rust or compiling Swamp locally.
+- Fix Linux scheduled observations being stopped by systemd's hourly start limit. The limit now allows the configured observation cadence as well as the five-minute retries.
 
 ## v0.8.7 — 2026-10-13
 

@@ -2754,7 +2754,7 @@ dependencies = [
 
 [[package]]
 name = "swamp"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "swamp-core"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2798,14 +2798,14 @@ dependencies = [
 
 [[package]]
 name = "swamp-harvest"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "swamp-core",
 ]
 
 [[package]]
 name = "swamp-source-audit"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "swamp-tui"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "anyhow",
  "crossterm",
